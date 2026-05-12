@@ -1,0 +1,31 @@
+# Secrets
+.env
+*.session
+*.session-journal
+
+# Pyrogram session
+session/
+_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node (for ui/)
+node_modules/
+dist/
+.parcel-cache/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+logs/

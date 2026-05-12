@@ -1,0 +1,55 @@
+name: tgarr
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tgarr-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tgarr
+      POSTGRES_DB: tgarr
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./_data/postgres:/var/lib/postgresql/data
+      - ./schema:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5433:5432"
+    networks:
+      - tgarr-net
+
+  meili:
+    image: getmeili/meilisearch:v1.11
+    container_name: tgarr-meili
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_ENV: production
+    volumes:
+      - ./_data/meili:/meili_data
+    ports:
+      - "127.0.0.1:7700:7700"
+    networks:
+      - tgarr-net
+
+  crawler:
+    build: ./crawler
+    container_name: tgarr-crawler
+    restart: unless-stopped
+    depends_on: [db, meili]
+    environment:
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TG_PHONE: ${TG_PHONE}
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      MEILI_URL: http://meili:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+    volumes:
+      - ./_data/session:/app/session
+    networks:
+      - tgarr-net
+    # First time login (interactive SMS code):
+    #   docker compose run --rm crawler python login.py
+
+networks:
+  tgarr-net:
+    driver: bridge
