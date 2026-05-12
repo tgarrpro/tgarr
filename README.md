@@ -1,6 +1,6 @@
 # tgarr — Telegram-as-source for Sonarr, Radarr & friends
 
-> The *arr you didn't know you needed.  
+> **NZB-tier quality for the few who knew. Telegram-grade safety for the millions who never could.**  
 > Make Telegram channels look like a Newznab indexer — Sonarr, Radarr, and the rest of the *arr stack discover, grab, and import without knowing the difference.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -9,22 +9,40 @@
 
 ---
 
-## Why tgarr exists
+## The thesis
 
-NZB indexers (NZBGeek, DrunkenSlug, etc.) serve roughly **200,000 power users globally** and have stagnated for a decade. Telegram, meanwhile, has become the largest single distribution channel for movies, TV shows, software, and books — **hundreds of millions of users**, channels with permanent retention, files up to 4 GB per part, no metadata loss, no DMCA-driven shutdowns.
+**NZB's curated quality + Telegram's mass-scale safety, finally bridged into the *arr stack.**
 
-The *arr ecosystem (Sonarr / Radarr / Lidarr / Readarr / Bazarr) has never had a Telegram integration. Every existing Telegram-piracy tool is either a stand-alone bot or a Plex sync script — none plug into the Sonarr → SAB → Plex/Jellyfin pipeline most self-hosters already run.
+- **NZB indexers** like NZBGeek delivered organized, parsed, high-def releases — but to roughly 200,000 power users globally, behind invite-only communities and $10-80/yr paywalls. A niche craft for the few who knew.
+- **Telegram** has become the largest single distribution channel for movies, TV shows, software, and books — 200M+ users, permanent retention, every language, every niche. But none of it plugs into Sonarr / Radarr / Jellyfin. Mass-accessible but tooling-orphaned.
+- **BitTorrent** is where most people end up by default — and where ISP DMCA letters, 5-strike policies, and DPI throttling happen.
 
-**tgarr fills that gap.** It crawls Telegram channels you subscribe to, indexes every release into a searchable database, and exposes a Newznab-compatible HTTP API. Point Sonarr or Radarr at it, and they treat it as just another indexer — but the source is Telegram, not Usenet.
+tgarr takes Telegram's reach + safety profile and gives it the *arr-stack ergonomics that NZB indexers earned over a decade. Sonarr searches → tgarr returns Newznab XML → on grab, the file streams from Telegram's CDN over plain HTTPS → SAB-style import → Jellyfin/Plex picks it up.
 
-## Architecture
+## Three real problems tgarr solves
+
+### 1. The *arr ecosystem has never had a Telegram source
+
+Every existing Telegram piracy tool is a stand-alone bot or a Plex-sync script. None integrate with the Sonarr → SABnzbd → Jellyfin pipeline most self-hosters already run. tgarr fills that exact gap as a drop-in Newznab indexer.
+
+### 2. BitTorrent puts you on every ISP and rights-holder dashboard
+
+Public-tracker users have their IP logged by tens of thousands of peers — many of which are rights-holder honeypots. US ISPs (Comcast, AT&T, Verizon, Spectrum) issue 5- or 6-strike DMCA letters, throttle BitTorrent at the DPI layer, and in some cases terminate accounts. Private trackers are safer but require maintaining ratios and surviving invite politics for years.
+
+**tgarr eliminates the P2P exposure entirely.** You never advertise an IP. You never seed. You never connect to a peer. From your ISP's view, you're talking HTTPS to Telegram — the same traffic profile 80% of the planet uses for chat. No DMCA letter has ever been observed to result from MTProto traffic.
+
+### 3. NZB indexers are aging, fragile, and closed
+
+200K global paid users across ~10 indexers. Single-indexer outages (NZBGeek had two today during this project's first session) routinely break Sonarr/Radarr for hours. Parser accuracy plateaued years ago. New indexer entrants can't bootstrap because the community-trust moat is decades old. The niche works for those already inside it; it doesn't scale to the median Plex/Jellyfin user.
+
+## How it works
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Telegram user account (yours)                                   │
-│    Joins the channels you want to monitor                        │
+│  Your Telegram user account                                      │
+│    Joins the channels you want indexed                           │
 └─────────────────────┬────────────────────────────────────────────┘
-                      │ MTProto API
+                      │ MTProto · HTTPS to Telegram
                       ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  tgarr-crawler   (Pyrogram, async)                               │
@@ -48,13 +66,28 @@ The *arr ecosystem (Sonarr / Radarr / Lidarr / Readarr / Bazarr) has never had a
 │  Sonarr / Radarr (your existing setup)                           │
 │    Sees tgarr as a regular Newznab indexer.                      │
 │    On grab, tgarr-worker MTProto-fetches the file and drops it   │
-│    into the SAB completed folder — Sonarr imports as usual.      │
+│    in the SABnzbd completed folder — Sonarr imports as usual.    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+## How tgarr compares
+
+| | tgarr | BitTorrent (public) | Private Tracker | NZB indexer |
+|---|---|---|---|---|
+| IP exposed to peers | ❌ never | ✅ every download | ✅ every download | ❌ never |
+| ISP DPI sees content | ❌ HTTPS to Telegram | ✅ trivially | ⚠️ visible without VPN | ❌ HTTPS to indexer |
+| DMCA letters / strikes | ❌ none reported | ✅ common | ⚠️ rare but possible | ❌ none |
+| Ratio requirement | ❌ no | n/a | ✅ maintain forever | ❌ no |
+| Invite required | ❌ no | ❌ no | ✅ years to get in | ⚠️ many invite-only |
+| File retention | ✅ permanent | ⚠️ dies when seeders quit | ✅ usually permanent | ✅ 5000+ days |
+| Speed | ✅ Telegram CDN, ~10-30 MB/s | ⚠️ depends on seeders | ✅ usually fast | ✅ usually fast |
+| Cost | ✅ free (Premium optional $5/mo) | ✅ free | ✅ free (after invite grind) | ⚠️ $10-80/yr |
+| Plug-and-play *arr | ✅ via tgarr | ⚠️ qBittorrent + jackett | ⚠️ qBittorrent + jackett | ✅ native |
+| Mass-user accessible | ✅ Telegram has 950M users | ❌ tech enthusiasts | ❌ tech enthusiasts | ❌ <200K globally |
+
 ## Quick start
 
-> Requires Docker + docker compose v2.
+> Requires Docker + docker compose v2. Runs on any platform that runs Docker — Synology, CasaOS, Unraid, TrueNAS, QNAP, Portainer, plain Linux, etc.
 
 ```bash
 git clone https://github.com/tgarrpro/tgarr.git
@@ -66,7 +99,7 @@ cp .env.example .env
 $EDITOR .env
 
 # 3. One-time interactive login — Telegram prompts for SMS code in the terminal,
-#    the code never appears in any config file or chat.
+#    the code never appears in any config file.
 docker compose run --rm crawler python login.py
 
 # 4. Run the full stack
@@ -82,6 +115,21 @@ Once running:
 2. **Sonarr/Radarr side**: Settings → Indexers → add Newznab → URL `http://<your-host>:8765/api`.
 3. tgarr's crawler picks up every new message; Sonarr/Radarr search against the index just like any NZB indexer.
 
+## Platform support
+
+| Platform | Status | Install guide |
+|---|---|---|
+| Plain docker / docker-compose | ✅ ready | `README` quickstart |
+| Synology DSM (Container Manager) | ✅ docker-compose | [docs/install/synology.md](docs/install/synology.md) |
+| CasaOS | ✅ app store entry coming | [docs/install/casaos.md](docs/install/casaos.md) |
+| Unraid | ✅ Community Apps XML coming | [docs/install/unraid.md](docs/install/unraid.md) |
+| TrueNAS Scale | ✅ TrueCharts catalog coming | [docs/install/truenas.md](docs/install/truenas.md) |
+| QNAP (Container Station) | ✅ docker-compose | [docs/install/qnap.md](docs/install/qnap.md) |
+| Portainer | ✅ stack template | [docs/install/portainer.md](docs/install/portainer.md) |
+| Kubernetes / k3s | 🛠 Helm chart v0.2 | [docs/install/kubernetes.md](docs/install/kubernetes.md) |
+
+Container images are multi-arch (`linux/amd64`, `linux/arm64`) — every modern NAS, Raspberry Pi 4/5, M-series Mac, and cloud ARM host runs them.
+
 ## Component matrix
 
 | Component | Purpose | Stack |
@@ -94,27 +142,30 @@ Once running:
 
 ## FAQ
 
+**Will my ISP send me DMCA letters?**  
+No DMCA letter has ever been observed to result from Telegram MTProto traffic, because Telegram (a) hosts the files itself, (b) does not respond to most takedown requests (Pavel Durov's documented stance), and (c) your client never advertises content to peers. Your ISP sees encrypted HTTPS to `app.telegram.org` and Telegram CDN endpoints — the same traffic profile as ordinary chat.
+
 **Is this legal?**  
-tgarr is a generic Telegram-to-Newznab bridge, like `youtube-dl` or `gallery-dl`. It does not host any content. What you choose to index is governed by Telegram's terms of service and the laws of your jurisdiction.
+tgarr is a generic Telegram-to-Newznab bridge, comparable to `youtube-dl` or `gallery-dl`. It does not host content; it indexes what's already in channels you have joined. What you choose to download is governed by Telegram's terms of service and the laws of your jurisdiction.
 
 **Will my Telegram account get banned?**  
-Heavy automated channel-joining can trigger Telegram's anti-spam systems. Run the crawler under a dedicated Telegram account, not your primary identity. Premium ($5/mo) doubles your file-size limit (2 → 4 GB) and lifts some rate limits — recommended for active deployments.
+Heavy automated channel-joining can trigger Telegram's anti-spam systems. Run the crawler under a dedicated Telegram account, not your primary identity. Telegram Premium ($5/mo) doubles file-size limits (2 → 4 GB) and lifts some rate limits — strongly recommended for active deployments.
 
 **Does it work with private channels?**  
 Yes. As long as the authenticated user account has joined the channel, tgarr can index its messages.
 
-**Does it work with public channels via search?**  
-Telegram's global search is limited to public channels and is rate-limited. tgarr's primary mode is *subscribe-then-index* (push), not global crawl (pull).
-
-**Why MTProto and not the Bot API?**  
-Bot API can't read messages from channels unless the bot is admin, and is limited to 20 MB file downloads. MTProto (user-account) sees every message in joined channels and downloads up to 2 GB (4 GB with Premium).
+**Why MTProto and not the Telegram Bot API?**  
+Bot API can't read channel messages unless the bot is admin and is limited to 20 MB file downloads. MTProto (user-account) sees every message in joined channels and downloads up to 2 GB (4 GB with Premium).
 
 **How does this compare to NZBHydra2?**  
-NZBHydra2 is a *meta-indexer* — it aggregates queries across existing NZB indexers. tgarr is a *primary source* — it indexes content directly from Telegram. They're complementary; tgarr can sit alongside NZBHydra2 as one of its backends.
+NZBHydra2 is a *meta-indexer* — it aggregates queries across existing NZB indexers. tgarr is a *primary source* — it indexes content directly from Telegram. They're complementary; you can run NZBHydra2 with tgarr configured as one of its backends.
+
+**Why open source?**  
+Self-hosting tools work best as open source. tgarr will never be SaaS, gated, or rent-seeking. MIT license — fork it, modify it, build on it.
 
 ## Status
 
-Active development. Public alpha targeted end of week — see [Project Board](https://github.com/tgarrpro/tgarr/projects).
+Active development. Public alpha targeted end of week — see [Issues](https://github.com/tgarrpro/tgarr/issues) for the live roadmap.
 
 ## License
 
@@ -122,11 +173,10 @@ MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-Issues and pull requests welcome. For larger changes, please open an issue first to discuss what you'd like to change.
+Issues and pull requests welcome. For larger changes, open an issue first to discuss the design.
 
-Email: [support@tgarr.me](mailto:support@tgarr.me)  
-Website: [tgarr.me](https://tgarr.me)
+Email: [support@tgarr.me](mailto:support@tgarr.me) · Website: [tgarr.me](https://tgarr.me)
 
 ---
 
-**Keywords**: sonarr telegram indexer, radarr telegram, *arr telegram, telegram newznab, telegram nzb alternative, self-hosted telegram downloader, sonarr radarr alternative source, telegram media automation, jellyfin plex telegram, pyrogram indexer.
+**Keywords**: sonarr telegram indexer · radarr telegram source · *arr telegram bridge · telegram newznab · nzb alternative telegram · self-hosted telegram downloader · sonarr without bittorrent · radarr without bittorrent · dmca-free media automation · jellyfin plex telegram integration · pyrogram indexer · casaos sonarr · unraid telegram source · synology sonarr telegram
