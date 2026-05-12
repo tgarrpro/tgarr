@@ -22,7 +22,20 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Skip if Codeberg token not configured
+        id: check-token
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          if [ -z "$CODEBERG_TOKEN" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "CODEBERG_TOKEN secret not set — skipping mirror (Codeberg setup pending)"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Push to Codeberg
+        if: steps.check-token.outputs.skip != 'true'
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
         run: |
