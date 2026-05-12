@@ -6,6 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/deploy-docker--compose-2496ED.svg)](docker-compose.yml)
 [![GitHub stars](https://img.shields.io/github/stars/tgarrpro/tgarr?style=social)](https://github.com/tgarrpro/tgarr)
+[![Codeberg mirror](https://img.shields.io/badge/mirror-codeberg-2185D0.svg)](https://codeberg.org/tgarrpro/tgarr)
 
 ---
 

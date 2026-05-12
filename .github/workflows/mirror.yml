@@ -1,0 +1,32 @@
+name: Mirror to Codeberg
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  schedule:
+    # Hourly safety re-sync — catches anything the push trigger missed
+    - cron: '17 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Push to Codeberg
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          git remote add codeberg "https://codeberg-mirror:${CODEBERG_TOKEN}@codeberg.org/tgarrpro/tgarr.git"
+          git push codeberg --all --force
+          git push codeberg --tags --force
+          echo "✓ Mirrored to https://codeberg.org/tgarrpro/tgarr"
