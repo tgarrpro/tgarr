@@ -163,6 +163,14 @@ NZBHydra2 is a *meta-indexer* — it aggregates queries across existing NZB inde
 **Why open source?**  
 Self-hosting tools work best as open source. tgarr will never be SaaS, gated, or rent-seeking. MIT license — fork it, modify it, build on it.
 
+## Responsible use & copyright
+
+tgarr is a content-neutral indexer of channels you have voluntarily joined. tgarr does **not** host content, does **not** seed files, does **not** solicit infringing material, and does **not** encourage copyright infringement.
+
+We expect tgarr operators to comply with the copyright law of their jurisdiction and Telegram's Terms of Service. Suggested use cases include public-domain archives, open-source distributions, language-learning material, course recordings, community channels, and the operator's own creative work.
+
+If you are a rights-holder and believe a Telegram channel is being indexed in a way that contributes to actionable infringement, see [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) and contact `abuse@tgarr.me`. Files remain on Telegram's platform; the canonical address for takedowns is [Telegram's DMCA process](https://telegram.org/dmca).
+
 ## Status
 
 Active development. Public alpha targeted end of week — see [Issues](https://github.com/tgarrpro/tgarr/issues) for the live roadmap.
