@@ -1,8 +1,8 @@
 """tgarr API — Newznab indexer + SABnzbd download-client emulation.
 
 Sonarr/Radarr/Lidarr configure tgarr in two places:
-1. Settings > Indexers > Add > Newznab → URL `http://<tgarr-host>:8088/newznab/`
-2. Settings > Download Clients > Add > SABnzbd → Host `<tgarr-host>` Port `8088`
+1. Settings > Indexers > Add > Newznab → URL `http://<tgarr-host>:8765/newznab/`
+2. Settings > Download Clients > Add > SABnzbd → Host `<tgarr-host>` Port `8765`
    URL Base `/sabnzbd/`
 
 Sonarr search → newznab feed.
@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 import login  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.2.0"
+TGARR_VERSION = "0.3.0"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -47,10 +47,10 @@ LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8"><title>tgarr — sign in to Telegram</title>
 <style>
-:root { --bg:#0e1621; --bg2:#17212B; --fg:#f0f3f5; --muted:#8b9aa8; --accent:#5eb6e5; --tg-blue:#229ED9; --border:#2a3849; --ok:#5cd97e; --bad:#e57373; }
+:root { --bg:#131923; --bg2:#1a2233; --fg:#e8eaed; --muted:#8b9aa8; --accent:#5eb6e5; --tg-blue:#229ED9; --border:#2a3849; --ok:#4ade80; --bad:#f87171; }
 * { box-sizing:border-box; margin:0; padding:0; }
 body { font:14px/1.5 -apple-system,Segoe UI,system-ui,sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
-.card { background:var(--bg2); border-radius:8px; padding:32px; max-width:520px; width:100%; }
+.card { background:var(--bg2); border:1px solid var(--border); border-radius:8px; padding:32px; max-width:520px; width:100%; }
 h1 { color:var(--tg-blue); font-size:28px; letter-spacing:-1px; margin-bottom:6px; }
 h1 span { color:var(--fg); }
 .sub { color:var(--muted); margin-bottom:24px; font-size:13px; }
@@ -61,8 +61,8 @@ h1 span { color:var(--fg); }
 .panel.active { display:block; }
 #qrimg { display:block; margin:16px auto; max-width:280px; padding:12px; background:#fff; border-radius:8px; }
 .status { padding:12px 16px; border-radius:6px; background:rgba(94,182,229,0.10); color:var(--accent); font-size:13px; margin-top:16px; min-height:44px; }
-.status.error { background:rgba(229,115,115,0.12); color:var(--bad); }
-.status.ok { background:rgba(92,217,126,0.12); color:var(--ok); }
+.status.error { background:rgba(248,113,113,0.12); color:var(--bad); }
+.status.ok { background:rgba(74,222,128,0.12); color:var(--ok); }
 input[type=text], input[type=tel], input[type=password] { width:100%; padding:10px 12px; background:var(--bg); color:var(--fg); border:1px solid var(--border); border-radius:4px; font-size:14px; font-family:inherit; margin-top:6px; }
 input:focus { outline:none; border-color:var(--accent); }
 label { display:block; margin-top:14px; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; }
@@ -182,7 +182,6 @@ function setStatus(tab, msg, cls) {
   e.textContent = msg;
   e.className = 'status' + (cls ? ' ' + cls : '');
 }
-// Auto-start QR on page load
 qrStart();
 </script>
 </body></html>"""
@@ -216,189 +215,610 @@ async def api_login_sms_verify(code: str = Form(...), password: Optional[str] = 
 
 
 # ════════════════════════════════════════════════════════════════════
-# Root / health / admin
+# UI — sidebar + topbar layout (Sonarr/Radarr-style)
+# ════════════════════════════════════════════════════════════════════
+CSS = """
+:root {
+  --bg:#131923; --surface:#1a2233; --surface2:#1f2937; --border:#2a3849;
+  --fg:#e8eaed; --muted:#8b9aa8;
+  --accent:#229ED9; --accent-hi:#5eb6e5;
+  --ok:#4ade80; --warn:#fbbf24; --bad:#f87171;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+html, body { height:100%; }
+body { font:14px/1.5 -apple-system,Segoe UI,system-ui,sans-serif; background:var(--bg); color:var(--fg); display:flex; }
+
+aside.nav { width:220px; min-width:220px; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; }
+.brand { padding:20px 18px; border-bottom:1px solid var(--border); }
+.brand .logo { font-size:24px; font-weight:800; letter-spacing:-1px; color:var(--accent); line-height:1; }
+.brand .logo span { color:var(--fg); }
+.brand .ver { font-size:10px; color:var(--muted); margin-top:4px; text-transform:uppercase; letter-spacing:1.5px; }
+.navlinks { padding:12px 0; flex:1; overflow-y:auto; }
+.navlink { display:flex; align-items:center; gap:12px; padding:10px 18px; color:var(--muted); text-decoration:none; font-weight:500; border-left:3px solid transparent; font-size:13px; }
+.navlink:hover { background:rgba(94,182,229,0.04); color:var(--fg); }
+.navlink.active { color:var(--accent-hi); background:rgba(94,182,229,0.08); border-left-color:var(--accent); font-weight:600; }
+.navlink svg { width:18px; height:18px; flex-shrink:0; }
+.user { padding:14px 18px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); }
+.user .name { color:var(--fg); font-weight:600; }
+.user a { color:var(--accent); text-decoration:none; font-size:11px; }
+
+main.main { flex:1; display:flex; flex-direction:column; min-width:0; }
+.topbar { height:60px; background:var(--surface); border-bottom:1px solid var(--border); display:flex; align-items:center; padding:0 24px; gap:20px; flex-shrink:0; }
+.topbar h1 { font-size:20px; font-weight:600; }
+.topbar .actions { margin-left:auto; display:flex; gap:10px; align-items:center; }
+.topbar input.search { background:var(--bg); border:1px solid var(--border); color:var(--fg); padding:8px 14px; border-radius:4px; width:280px; font-size:13px; font-family:inherit; }
+.topbar input.search:focus { outline:none; border-color:var(--accent); }
+
+.content { flex:1; overflow-y:auto; padding:28px 32px; }
+
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:28px; }
+.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:18px 20px; }
+.stat-card .n { font-size:28px; font-weight:700; color:var(--accent-hi); line-height:1; }
+.stat-card .l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1.5px; margin-top:8px; }
+
+h2.section { font-size:11px; text-transform:uppercase; letter-spacing:2.5px; color:var(--muted); margin:32px 0 14px; font-weight:600; display:flex; align-items:center; gap:12px; }
+h2.section .count { color:var(--accent); font-size:11px; font-weight:600; }
+h2.section .extra { margin-left:auto; }
+h2.section a { color:var(--accent); text-decoration:none; font-size:11px; }
+
+.cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:6px; overflow:hidden; transition:transform 0.1s, border-color 0.1s; }
+.card:hover { transform:translateY(-2px); border-color:var(--accent); }
+.card .avatar { aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; font-size:42px; font-weight:700; color:#fff; letter-spacing:-2px; }
+.card .body { padding:12px 14px; }
+.card .title { font-weight:600; font-size:13px; line-height:1.35; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.card .sub { font-size:11px; color:var(--muted); margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.card .footer { display:flex; gap:6px; padding:8px 14px; background:rgba(0,0,0,0.18); border-top:1px solid var(--border); font-size:10px; flex-wrap:wrap; }
+
+.pill { display:inline-block; padding:2px 10px; border-radius:10px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:1px; }
+.pill.ok { background:rgba(74,222,128,0.15); color:var(--ok); }
+.pill.warn { background:rgba(251,191,36,0.15); color:var(--warn); }
+.pill.bad { background:rgba(248,113,113,0.15); color:var(--bad); }
+.pill.muted { background:rgba(139,154,168,0.15); color:var(--muted); }
+.pill.accent { background:rgba(94,182,229,0.15); color:var(--accent-hi); }
+
+table { width:100%; border-collapse:collapse; background:var(--surface); border:1px solid var(--border); border-radius:6px; overflow:hidden; font-size:13px; }
+thead th { background:rgba(0,0,0,0.18); color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:2px; font-weight:600; padding:11px 14px; text-align:left; border-bottom:1px solid var(--border); }
+tbody td { padding:11px 14px; border-bottom:1px solid var(--border); }
+tbody tr:last-child td { border-bottom:none; }
+tbody tr:hover td { background:rgba(94,182,229,0.04); }
+tbody td.right { text-align:right; }
+tbody td.num { font-variant-numeric:tabular-nums; color:var(--muted); }
+tbody td.name { font-weight:600; }
+
+.dl-list { background:var(--surface); border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.dl-item { padding:14px 18px; border-bottom:1px solid var(--border); display:grid; grid-template-columns:24px 1fr auto; gap:14px; align-items:center; }
+.dl-item:last-child { border-bottom:none; }
+.dl-item .icon { font-size:18px; line-height:1; }
+.dl-item .info .name { font-weight:600; font-size:13px; }
+.dl-item .info .meta { font-size:11px; color:var(--muted); margin-top:3px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.dl-item .info .err { font-size:11px; color:var(--bad); margin-top:3px; font-family:ui-monospace,monospace; }
+.dl-item .right { text-align:right; font-size:11px; color:var(--muted); white-space:nowrap; }
+
+.empty-state { text-align:center; padding:48px 24px; color:var(--muted); background:var(--surface); border:1px dashed var(--border); border-radius:6px; }
+.empty-state .icon { font-size:36px; opacity:0.4; margin-bottom:12px; }
+
+input[type=text], input[type=tel], input[type=password] { background:var(--bg); border:1px solid var(--border); color:var(--fg); padding:8px 12px; border-radius:4px; font-size:13px; font-family:inherit; }
+input:focus { outline:none; border-color:var(--accent); }
+button, .btn { padding:8px 18px; background:var(--accent); color:#fff; border:none; border-radius:4px; font-weight:600; font-size:13px; cursor:pointer; text-decoration:none; display:inline-block; font-family:inherit; }
+button:hover, .btn:hover { background:var(--accent-hi); }
+button.ghost, .btn.ghost { background:transparent; border:1px solid var(--border); color:var(--fg); }
+button.ghost:hover, .btn.ghost:hover { border-color:var(--accent); color:var(--accent-hi); background:transparent; }
+
+code { background:rgba(94,182,229,0.13); padding:2px 7px; border-radius:3px; color:var(--accent-hi); font-family:ui-monospace,SF Mono,Menlo,monospace; font-size:12px; }
+"""
+
+NAV_ITEMS = [
+    ("/",          "Dashboard", "M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"),
+    ("/channels",  "Channels",  "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"),
+    ("/releases",  "Releases",  "M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"),
+    ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
+    ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
+    ("/settings",  "Settings",  "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94 0 .31.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"),
+]
+
+
+def _icon(svg_path: str) -> str:
+    return f'<svg viewBox="0 0 24 24" fill="currentColor"><path d="{svg_path}"/></svg>'
+
+
+def _fmt_size(n):
+    if not n:
+        return ""
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {u}".replace(".0 ", " ")
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _fmt_time(t):
+    return t.strftime("%Y-%m-%d %H:%M") if t else ""
+
+
+def _color_for(s: str) -> str:
+    """Deterministic accent color for an avatar."""
+    palette = ["#229ED9", "#7c3aed", "#06b6d4", "#10b981", "#f59e0b",
+               "#ec4899", "#ef4444", "#8b5cf6", "#14b8a6", "#f97316"]
+    return palette[sum(ord(c) for c in (s or "?")) % len(palette)]
+
+
+def _user_block() -> str:
+    if login.session_exists():
+        user = login.state.user_info or {}
+        name = user.get("username") or user.get("first_name") or "anonymous"
+        return f'<div class="name">@{html.escape(str(name))}</div><div>signed in</div>'
+    return '<div class="name">not signed in</div><a href="/login">sign in →</a>'
+
+
+def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str] = None,
+            top_actions_html: Optional[str] = None) -> str:
+    nav = "".join(
+        f'<a href="{path}" class="navlink{" active" if path == active else ""}">'
+        f'{_icon(svg)}<span>{name}</span></a>'
+        for path, name, svg in NAV_ITEMS
+    )
+    if top_actions_html is None:
+        top_actions_html = (
+            '<form action="/search" method="GET" style="margin-left:auto">'
+            '<input type="text" name="q" class="search" placeholder="Search releases…" />'
+            '</form>'
+        )
+    return f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>{html.escape(title)} · tgarr</title>
+<style>{CSS}</style>
+</head><body>
+<aside class="nav">
+  <div class="brand">
+    <div class="logo">tg<span>arr</span></div>
+    <div class="ver">v{TGARR_VERSION}</div>
+  </div>
+  <div class="navlinks">{nav}</div>
+  <div class="user">{_user_block()}</div>
+</aside>
+<main class="main">
+  <header class="topbar">
+    <h1>{html.escape(page_title or title)}</h1>
+    {top_actions_html}
+  </header>
+  <div class="content">{body_html}</div>
+</main>
+</body></html>"""
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Dashboard
 # ════════════════════════════════════════════════════════════════════
 @app.get("/")
 async def root(accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow(
-            """SELECT (SELECT count(*) FROM channels)                     AS channels,
-                      (SELECT count(*) FROM messages)                     AS messages,
-                      (SELECT count(*) FROM releases)                     AS releases,
+            """SELECT (SELECT count(*) FROM channels)                AS channels,
+                      (SELECT count(*) FROM messages)                AS messages,
+                      (SELECT count(*) FROM releases)                AS releases,
                       (SELECT count(*) FROM downloads
-                         WHERE status='pending')                          AS pending,
+                         WHERE status='pending')                     AS pending,
                       (SELECT count(*) FROM downloads
-                         WHERE status='downloading')                      AS downloading,
+                         WHERE status='downloading')                 AS downloading,
                       (SELECT count(*) FROM downloads
-                         WHERE status='completed')                        AS completed""")
-        dls = await conn.fetch(
-            """SELECT d.id, d.status, d.local_path, d.requested_at, d.finished_at,
-                      d.error_message, r.name, r.size_bytes
-               FROM downloads d
-               JOIN releases r ON r.id = d.release_id
-               ORDER BY d.requested_at DESC
-               LIMIT 50""")
-        rels = await conn.fetch(
-            """SELECT name, category, season, episode, quality, size_bytes,
-                      posted_at, parse_score
-               FROM releases
-               ORDER BY posted_at DESC NULLS LAST
-               LIMIT 30""")
-        chans = await conn.fetch(
-            """SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
-                      (SELECT count(*) FROM messages m WHERE m.channel_id = c.id)
-                                                                AS msg_count
-               FROM channels c
-               ORDER BY title""")
+                         WHERE status='completed')                   AS completed""")
 
     wants_html = accept and "text/html" in accept
     if not wants_html:
         return {"tgarr": TGARR_VERSION, "authed": login.session_exists(),
                 **dict(stats)}
 
-    # Browser hit without a Telegram session yet → redirect to login wizard
     if not login.session_exists():
         return RedirectResponse("/login")
 
-    def _fmt_size(n):
-        if not n:
-            return ""
-        for u in ("B", "KB", "MB", "GB", "TB"):
-            if n < 1024:
-                return f"{n:.1f} {u}"
-            n /= 1024
-        return f"{n:.1f} PB"
+    async with db_pool.acquire() as conn:
+        recent = await conn.fetch(
+            """SELECT d.id, d.status, d.local_path, d.requested_at, d.finished_at,
+                      d.error_message, r.name, r.size_bytes
+               FROM downloads d
+               JOIN releases r ON r.id = d.release_id
+               ORDER BY d.requested_at DESC LIMIT 10""")
 
-    def _fmt_time(t):
-        return t.strftime("%Y-%m-%d %H:%M") if t else ""
-
-    dl_rows = "\n".join(
-        f"<tr class='{d['status']}'>"
-        f"<td>{d['id']}</td>"
-        f"<td class='s-{d['status']}'>{d['status']}</td>"
-        f"<td>{html.escape(d['name'])}</td>"
-        f"<td>{_fmt_size(d['size_bytes'])}</td>"
-        f"<td>{_fmt_time(d['requested_at'])}</td>"
-        f"<td>{_fmt_time(d['finished_at'])}</td>"
-        f"<td title='{html.escape(d['local_path'] or '')}'>"
-        f"{html.escape((d['local_path'] or '').rsplit('/', 1)[-1])}</td>"
-        f"<td>{html.escape(d['error_message'] or '')}</td>"
-        f"</tr>"
-        for d in dls
-    )
-    if not dl_rows:
-        dl_rows = "<tr><td colspan='8' class='empty'>no downloads yet — grab something from Sonarr/Radarr</td></tr>"
-
-    rel_rows = "\n".join(
-        f"<tr>"
-        f"<td>{html.escape(r['name'])}</td>"
-        f"<td>{r['category']}</td>"
-        f"<td>{'S{:02}E{:02}'.format(r['season'], r['episode']) if r['season'] is not None and r['episode'] is not None else (str(r['season']) if r['season'] else '')}</td>"
-        f"<td>{r['quality'] or ''}</td>"
-        f"<td>{_fmt_size(r['size_bytes'])}</td>"
-        f"<td>{_fmt_time(r['posted_at'])}</td>"
-        f"<td>{r['parse_score']:.2f}</td>"
-        f"</tr>"
-        for r in rels
+    s = dict(stats)
+    stats_html = "".join(
+        f'<div class="stat-card"><div class="n">{v:,}</div><div class="l">{label}</div></div>'
+        for v, label in [
+            (s["channels"], "channels"),
+            (s["messages"], "messages indexed"),
+            (s["releases"], "parsed releases"),
+            (s["pending"], "pending"),
+            (s["downloading"], "downloading"),
+            (s["completed"], "completed"),
+        ]
     )
 
-    chan_rows = "\n".join(
-        f"<tr>"
-        f"<td>{html.escape(c['title'] or '')}</td>"
-        f"<td>{('@' + c['username']) if c['username'] else ''}</td>"
-        f"<td>{c['msg_count']}</td>"
-        f"<td>{'✓' if c['backfilled'] else '…'}</td>"
-        f"</tr>"
-        for c in chans
+    if recent:
+        items = []
+        for d in recent:
+            icon = ({"pending": "⏳", "downloading": "⬇", "completed": "✓",
+                     "failed": "✗", "cancelled": "—"}).get(d["status"], "?")
+            pill_cls = ({"pending": "warn", "downloading": "accent",
+                        "completed": "ok", "failed": "bad", "cancelled": "muted"}
+                       ).get(d["status"], "muted")
+            err = (f'<div class="err">{html.escape(d["error_message"])}</div>'
+                   if d["error_message"] else "")
+            items.append(
+                f'<div class="dl-item">'
+                f'<div class="icon">{icon}</div>'
+                f'<div class="info">'
+                f'<div class="name">{html.escape(d["name"])}</div>'
+                f'<div class="meta">'
+                f'<span class="pill {pill_cls}">{d["status"]}</span>'
+                f'<span>· {_fmt_size(d["size_bytes"])}</span>'
+                f'<span>· {_fmt_time(d["requested_at"])}</span>'
+                f'</div>{err}'
+                f'</div>'
+                f'<div class="right">{_fmt_time(d["finished_at"]) or "—"}</div>'
+                f'</div>'
+            )
+        recent_html = f'<div class="dl-list">{"".join(items)}</div>'
+    else:
+        recent_html = (
+            '<div class="empty-state">'
+            '<div class="icon">⬇</div>'
+            '<div>No downloads yet — grab something from Sonarr or Radarr to see activity here.</div>'
+            '</div>'
+        )
+
+    base_url = os.environ.get("TGARR_BASE_URL") or "http://&lt;host&gt;:8765"
+
+    body = f"""
+<div class="stats">{stats_html}</div>
+
+<h2 class="section">Recent activity <span class="extra"><a href="/downloads">view all →</a></span></h2>
+{recent_html}
+
+<h2 class="section">Wiring info</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🔌</div>
+    <div class="info">
+      <div class="name">Newznab indexer</div>
+      <div class="meta">For Sonarr / Radarr / Lidarr → Settings → Indexers → ➕ Newznab</div>
+    </div>
+    <div class="right"><code>{base_url}/newznab/</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">⬇</div>
+    <div class="info">
+      <div class="name">SABnzbd download client</div>
+      <div class="meta">For Sonarr / Radarr → Settings → Download Clients → ➕ SABnzbd</div>
+    </div>
+    <div class="right"><code>/sabnzbd</code> · same host/port</div>
+  </div>
+</div>
+"""
+    return HTMLResponse(_layout("Dashboard", "/", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Channels
+# ════════════════════════════════════════════════════════════════════
+@app.get("/channels", response_class=HTMLResponse)
+async def page_channels():
+    if not login.session_exists():
+        return RedirectResponse("/login")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
+                      (SELECT count(*) FROM messages m WHERE m.channel_id = c.id)
+                                                                AS msg_count,
+                      (SELECT count(*) FROM messages m
+                         WHERE m.channel_id = c.id AND m.file_name IS NOT NULL)
+                                                                AS media_count
+               FROM channels c
+               ORDER BY msg_count DESC""")
+
+    if not rows:
+        body = ('<h2 class="section">Indexed channels <span class="count">0</span></h2>'
+               '<div class="empty-state">'
+               '<div class="icon">📡</div>'
+               '<div>No channels indexed yet.</div>'
+               '<div style="margin-top:8px;font-size:12px">Open Telegram on your phone → join channels with media files → tgarr will pick them up automatically.</div>'
+               '</div>')
+    else:
+        cards_html = []
+        for r in rows:
+            title = r["title"] or "(untitled)"
+            initial = (title.strip() or "?")[0].upper()
+            color = _color_for(title)
+            handle = ("@" + r["username"]) if r["username"] else f"id {r['tg_chat_id']}"
+            status_pill = ('<span class="pill ok">backfilled</span>' if r["backfilled"]
+                          else '<span class="pill warn">backfilling…</span>')
+            cards_html.append(
+                f'<div class="card">'
+                f'<div class="avatar" style="background:{color}">{html.escape(initial)}</div>'
+                f'<div class="body">'
+                f'<div class="title">{html.escape(title)}</div>'
+                f'<div class="sub">{html.escape(handle)}</div>'
+                f'</div>'
+                f'<div class="footer">'
+                f'<span class="pill muted">{r["msg_count"]:,} msgs</span>'
+                f'<span class="pill accent">{r["media_count"]:,} media</span>'
+                f'{status_pill}'
+                f'</div>'
+                f'</div>'
+            )
+        body = (f'<h2 class="section">Indexed channels <span class="count">{len(rows)}</span></h2>'
+               f'<div class="cards">{"".join(cards_html)}</div>')
+    return HTMLResponse(_layout("Channels", "/channels", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Releases
+# ════════════════════════════════════════════════════════════════════
+@app.get("/releases", response_class=HTMLResponse)
+async def page_releases(q: Optional[str] = None, cat: Optional[str] = None, limit: int = 100):
+    if not login.session_exists():
+        return RedirectResponse("/login")
+    where = ["1=1"]
+    params = []
+    if q:
+        for w in q.split():
+            params.append(f"%{w}%")
+            where.append(f"name ILIKE ${len(params)}")
+    if cat in ("movie", "tv"):
+        where.append(f"category = '{cat}'")
+    sql = (f"SELECT id, guid, name, category, season, episode, quality, "
+          f"size_bytes, posted_at, parse_score FROM releases WHERE "
+          f"{' AND '.join(where)} ORDER BY posted_at DESC NULLS LAST "
+          f"LIMIT {max(1, min(limit, 500))}")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+
+    def _chip(val: str, label: str) -> str:
+        active = (cat or "") == val
+        extra = f"&q={html.escape(q)}" if q else ""
+        href = f"/releases?cat={val}{extra}" if val else f"/releases{'?q=' + html.escape(q) if q else ''}"
+        style = ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
+                'border-color:var(--accent);') if active else ''
+        return (f'<a class="btn ghost" href="{href}" '
+               f'style="{style}padding:5px 12px;font-size:11px">{label}</a>')
+
+    filters = (f'<div style="display:flex;gap:8px;margin-bottom:18px">'
+              f'{_chip("","all")}{_chip("movie","movies")}{_chip("tv","tv")}'
+              f'</div>')
+
+    if not rows:
+        body_html = ('<div class="empty-state"><div class="icon">🎬</div>'
+                    '<div>No releases match this filter.</div></div>')
+    else:
+        body_rows = "".join(
+            f'<tr>'
+            f'<td class="name">{html.escape(r["name"])}</td>'
+            f'<td><span class="pill {"accent" if r["category"]=="movie" else "ok" if r["category"]=="tv" else "muted"}">{r["category"]}</span></td>'
+            f'<td>{("S%02dE%02d" % (r["season"], r["episode"])) if r["season"] and r["episode"] else ""}</td>'
+            f'<td>{r["quality"] or ""}</td>'
+            f'<td class="num">{_fmt_size(r["size_bytes"])}</td>'
+            f'<td class="num">{_fmt_time(r["posted_at"])}</td>'
+            f'<td class="num">{r["parse_score"]:.2f}</td>'
+            f'</tr>'
+            for r in rows
+        )
+        body_html = (f'<table><thead><tr>'
+                    f'<th>name</th><th>category</th><th>S/E</th><th>quality</th>'
+                    f'<th>size</th><th>posted</th><th>score</th>'
+                    f'</tr></thead><tbody>{body_rows}</tbody></table>')
+
+    body = (f'<h2 class="section">Parsed releases <span class="count">{len(rows)} shown</span></h2>'
+           f'{filters}{body_html}')
+    actions = (f'<form action="/releases" method="GET" style="margin-left:auto">'
+              f'<input type="text" name="q" class="search" placeholder="filter…" '
+              f'value="{html.escape(q) if q else ""}" /></form>')
+    return HTMLResponse(_layout("Releases", "/releases", body, top_actions_html=actions))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Downloads (queue + history)
+# ════════════════════════════════════════════════════════════════════
+@app.get("/downloads", response_class=HTMLResponse)
+async def page_downloads():
+    if not login.session_exists():
+        return RedirectResponse("/login")
+    async with db_pool.acquire() as conn:
+        active = await conn.fetch(
+            """SELECT d.id, d.status, d.requested_at, r.name, r.size_bytes
+               FROM downloads d JOIN releases r ON r.id = d.release_id
+               WHERE d.status IN ('pending','downloading')
+               ORDER BY d.requested_at""")
+        done = await conn.fetch(
+            """SELECT d.id, d.status, d.local_path, d.requested_at, d.finished_at,
+                      d.error_message, r.name, r.size_bytes
+               FROM downloads d JOIN releases r ON r.id = d.release_id
+               WHERE d.status IN ('completed','failed','cancelled')
+               ORDER BY d.finished_at DESC NULLS LAST LIMIT 100""")
+
+    def _render(rows, show_finished):
+        if not rows:
+            return ('<div class="empty-state"><div class="icon">⬇</div>'
+                   '<div>nothing here yet</div></div>')
+        items = []
+        for d in rows:
+            icon = ({"pending": "⏳", "downloading": "⬇", "completed": "✓",
+                    "failed": "✗", "cancelled": "—"}).get(d["status"], "?")
+            pill_cls = ({"pending": "warn", "downloading": "accent",
+                        "completed": "ok", "failed": "bad", "cancelled": "muted"}
+                       ).get(d["status"], "muted")
+            err_html = ""
+            error_msg = d["error_message"] if "error_message" in d.keys() else None
+            if error_msg:
+                err_html = f'<div class="err">{html.escape(error_msg)}</div>'
+            local = ""
+            if show_finished and "local_path" in d.keys() and d["local_path"]:
+                local = " · " + html.escape(d["local_path"].rsplit("/", 1)[-1])
+            finished = d["finished_at"] if "finished_at" in d.keys() else None
+            items.append(
+                f'<div class="dl-item">'
+                f'<div class="icon">{icon}</div>'
+                f'<div class="info">'
+                f'<div class="name">{html.escape(d["name"])}</div>'
+                f'<div class="meta">'
+                f'<span class="pill {pill_cls}">{d["status"]}</span>'
+                f'<span>· {_fmt_size(d["size_bytes"])}</span>'
+                f'<span>· {_fmt_time(d["requested_at"])}{local}</span>'
+                f'</div>{err_html}'
+                f'</div>'
+                f'<div class="right">{_fmt_time(finished) if show_finished else ""}</div>'
+                f'</div>'
+            )
+        return f'<div class="dl-list">{"".join(items)}</div>'
+
+    body = (f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
+           f'{_render(active, show_finished=False)}'
+           f'<h2 class="section">History <span class="count">last 100</span></h2>'
+           f'{_render(done, show_finished=True)}')
+    return HTMLResponse(_layout("Downloads", "/downloads", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Search
+# ════════════════════════════════════════════════════════════════════
+@app.get("/search", response_class=HTMLResponse)
+async def page_search(q: Optional[str] = None):
+    if not login.session_exists():
+        return RedirectResponse("/login")
+
+    results_html = ""
+    if q:
+        where = ["1=1"]
+        params = []
+        for w in q.split():
+            params.append(f"%{w}%")
+            where.append(f"name ILIKE ${len(params)}")
+        sql = (f"SELECT id, guid, name, category, season, episode, quality, "
+              f"size_bytes, posted_at FROM releases WHERE "
+              f"{' AND '.join(where)} ORDER BY posted_at DESC NULLS LAST LIMIT 100")
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+
+        if not rows:
+            results_html = ('<div class="empty-state">'
+                          '<div class="icon">🔍</div>'
+                          f'<div>No matches for <strong>{html.escape(q)}</strong></div>'
+                          '<div style="margin-top:8px;font-size:12px">Try fewer words or different spelling.</div>'
+                          '</div>')
+        else:
+            items = "".join(
+                f'<div class="dl-item">'
+                f'<div class="icon">{"🎬" if r["category"]=="movie" else "📺" if r["category"]=="tv" else "📦"}</div>'
+                f'<div class="info">'
+                f'<div class="name">{html.escape(r["name"])}</div>'
+                f'<div class="meta">'
+                f'<span class="pill {"accent" if r["category"]=="movie" else "ok"}">{r["category"]}</span>'
+                f'{("<span>· S%02dE%02d</span>" % (r["season"],r["episode"])) if r["season"] and r["episode"] else ""}'
+                f'{f"<span>· {r['quality']}</span>" if r["quality"] else ""}'
+                f'<span>· {_fmt_size(r["size_bytes"])}</span>'
+                f'<span>· {_fmt_time(r["posted_at"])}</span>'
+                f'</div></div>'
+                f'<div class="right">'
+                f'<a class="btn" href="/newznab/api?t=get&id={r["guid"]}&apikey=tgarr">⬇ Grab</a>'
+                f'</div></div>'
+                for r in rows
+            )
+            results_html = (f'<h2 class="section">Results <span class="count">{len(rows)}</span></h2>'
+                          f'<div class="dl-list">{items}</div>')
+
+    body = f"""
+<form action="/search" method="GET" style="margin-bottom:24px;display:flex;gap:10px">
+  <input type="text" name="q" value="{html.escape(q) if q else ''}"
+         placeholder="Search parsed releases… (multi-word AND)"
+         style="flex:1;font-size:15px;padding:11px 16px" autofocus />
+  <button type="submit">Search</button>
+</form>
+{results_html}"""
+    return HTMLResponse(_layout("Search", "/search", body, top_actions_html=""))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Settings
+# ════════════════════════════════════════════════════════════════════
+@app.get("/settings", response_class=HTMLResponse)
+async def page_settings():
+    authed = login.session_exists()
+    user = login.state.user_info or {}
+    user_html = (
+        f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
+        f'<span class="pill ok">signed in</span></div>'
+        if authed else
+        '<div class="name">not signed in <span class="pill bad">no session</span></div>'
     )
+    user_right = ('<a class="btn ghost" href="/login">re-link</a>' if not authed
+                 else '<span style="font-size:11px;color:var(--muted)">to unlink, delete _data/session/ + restart</span>')
 
-    body = f"""<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<title>tgarr — dashboard</title>
-<meta http-equiv="refresh" content="10">
-<style>
-:root {{ --bg:#0e1621; --bg2:#17212B; --fg:#f0f3f5; --muted:#8b9aa8; --accent:#5eb6e5; --tg-blue:#229ED9; --border:#2a3849; --ok:#5cd97e; --warn:#d4a83a; --bad:#e57373; }}
-* {{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ font:14px/1.5 -apple-system,Segoe UI,system-ui,sans-serif; background:var(--bg); color:var(--fg); padding:24px; }}
-header {{ display:flex; align-items:baseline; gap:16px; margin-bottom:24px; flex-wrap:wrap; }}
-h1 {{ font-size:28px; color:var(--tg-blue); letter-spacing:-1px; }}
-h1 span {{ color:var(--fg); }}
-.ver {{ color:var(--muted); font-size:12px; }}
-.stats {{ display:flex; gap:24px; flex-wrap:wrap; padding:16px 20px; background:var(--bg2); border-radius:6px; margin-bottom:24px; }}
-.stat {{ }}
-.stat .n {{ font-size:24px; font-weight:600; color:var(--accent); }}
-.stat .l {{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; }}
-h2 {{ font-size:12px; text-transform:uppercase; color:var(--accent); letter-spacing:2px; margin:32px 0 12px; }}
-table {{ width:100%; border-collapse:collapse; background:var(--bg2); border-radius:6px; overflow:hidden; font-size:13px; }}
-th, td {{ padding:8px 12px; text-align:left; border-bottom:1px solid var(--border); }}
-th {{ background:rgba(94,182,229,0.08); color:var(--accent); font-size:11px; text-transform:uppercase; letter-spacing:1px; font-weight:600; }}
-tr:last-child td {{ border-bottom:none; }}
-tr:hover td {{ background:rgba(94,182,229,0.04); }}
-.s-pending {{ color:var(--warn); font-weight:600; }}
-.s-downloading {{ color:var(--accent); font-weight:600; }}
-.s-completed {{ color:var(--ok); font-weight:600; }}
-.s-failed {{ color:var(--bad); font-weight:600; }}
-.s-cancelled {{ color:var(--muted); }}
-.empty {{ color:var(--muted); text-align:center; padding:24px !important; font-style:italic; }}
-footer {{ margin-top:32px; color:var(--muted); font-size:12px; text-align:center; }}
-footer a {{ color:var(--accent); }}
-code {{ background:rgba(94,182,229,0.13); padding:2px 6px; border-radius:3px; color:var(--accent); font-family:ui-monospace,SF Mono,Menlo,monospace; }}
-</style>
-</head><body>
-
-<header>
-  <h1>tg<span>arr</span></h1>
-  <span class="ver">v{TGARR_VERSION} · auto-refresh 10s</span>
-</header>
-
-<div class="stats">
-  <div class="stat"><div class="n">{stats['channels']}</div><div class="l">channels</div></div>
-  <div class="stat"><div class="n">{stats['messages']:,}</div><div class="l">messages indexed</div></div>
-  <div class="stat"><div class="n">{stats['releases']:,}</div><div class="l">parsed releases</div></div>
-  <div class="stat"><div class="n">{stats['pending']}</div><div class="l">pending</div></div>
-  <div class="stat"><div class="n">{stats['downloading']}</div><div class="l">downloading</div></div>
-  <div class="stat"><div class="n">{stats['completed']}</div><div class="l">completed</div></div>
+    body = f"""
+<h2 class="section">Telegram account</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">👤</div>
+    <div class="info">{user_html}
+      <div class="meta">API ID <code>{os.environ.get("TG_API_ID","-")}</code> · session at <code>_data/session/tgarr.session</code></div>
+    </div>
+    <div class="right">{user_right}</div>
+  </div>
 </div>
 
-<h2>Downloads</h2>
-<table>
-  <thead><tr>
-    <th>#</th><th>status</th><th>release</th><th>size</th>
-    <th>requested</th><th>finished</th><th>file</th><th>error</th>
-  </tr></thead>
-  <tbody>
-{dl_rows}
-  </tbody>
-</table>
+<h2 class="section">Crawler</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">⚙</div>
+    <div class="info"><div class="name">Parser score threshold</div>
+      <div class="meta">Messages below this score don't become releases</div></div>
+    <div class="right"><code>{os.environ.get("TG_PARSE_SCORE_MIN","0.30")}</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">📁</div>
+    <div class="info"><div class="name">Download root</div>
+      <div class="meta">Where MTProto-fetched files land</div></div>
+    <div class="right"><code>{os.environ.get("TG_DOWNLOAD_ROOT","/downloads/tgarr")}</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">🔢</div>
+    <div class="info"><div class="name">Backfill limit per channel</div>
+      <div class="meta">Max historical messages scanned on first run</div></div>
+    <div class="right"><code>{os.environ.get("TG_BACKFILL_LIMIT","5000")}</code></div>
+  </div>
+</div>
 
-<h2>Recent releases (last 30)</h2>
-<table>
-  <thead><tr>
-    <th>name</th><th>cat</th><th>se/ep</th><th>quality</th><th>size</th><th>posted</th><th>score</th>
-  </tr></thead>
-  <tbody>
-{rel_rows}
-  </tbody>
-</table>
+<h2 class="section">External endpoints</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🔌</div>
+    <div class="info"><div class="name">Newznab indexer URL</div>
+      <div class="meta">Paste into Sonarr / Radarr → Settings → Indexers → ➕ Newznab</div></div>
+    <div class="right"><code>{os.environ.get("TGARR_BASE_URL","")}/newznab/</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">⬇</div>
+    <div class="info"><div class="name">SABnzbd URL base</div>
+      <div class="meta">Paste into Sonarr / Radarr → Download Clients → ➕ SABnzbd → URL Base</div></div>
+    <div class="right"><code>/sabnzbd</code></div>
+  </div>
+</div>
 
-<h2>Indexed channels</h2>
-<table>
-  <thead><tr><th>title</th><th>username</th><th>messages</th><th>backfilled</th></tr></thead>
-  <tbody>
-{chan_rows}
-  </tbody>
-</table>
-
-<footer>
-  Newznab indexer: <code>http://&lt;host&gt;:8765/newznab/</code> ·
-  SAB download client: <code>/sabnzbd</code> on the same host/port ·
-  <a href="https://tgarr.me">tgarr.me</a> · <a href="https://github.com/tgarrpro/tgarr">github</a>
-</footer>
-</body></html>"""
-    return HTMLResponse(body)
+<h2 class="section">About</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">ℹ</div>
+    <div class="info"><div class="name">tgarr v{TGARR_VERSION}</div>
+      <div class="meta">Self-hosted Telegram-as-source bridge · MIT license</div></div>
+    <div class="right"><a class="btn ghost" href="https://tgarr.me" target="_blank">tgarr.me ↗</a></div>
+  </div>
+</div>
+"""
+    return HTMLResponse(_layout("Settings", "/settings", body))
 
 
+# ════════════════════════════════════════════════════════════════════
+# Admin JSON endpoints
+# ════════════════════════════════════════════════════════════════════
 @app.get("/api/admin/channels")
 async def list_channels():
     async with db_pool.acquire() as conn:
@@ -417,12 +837,10 @@ async def list_releases(limit: int = 50, q: Optional[str] = None):
     params = []
     if q:
         params.append(f"%{q}%")
-        where = f"WHERE name ILIKE $1"
-    sql = f"""SELECT id, guid, name, category, season, episode, quality,
-                     size_bytes, posted_at, parse_score
-              FROM releases {where}
-              ORDER BY posted_at DESC NULLS LAST
-              LIMIT {max(1, min(limit, 500))}"""
+        where = "WHERE name ILIKE $1"
+    sql = (f"SELECT id, guid, name, category, season, episode, quality, "
+          f"size_bytes, posted_at, parse_score FROM releases {where} "
+          f"ORDER BY posted_at DESC NULLS LAST LIMIT {max(1, min(limit, 500))}")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
     return [dict(r) for r in rows]
@@ -533,7 +951,7 @@ async def newznab_api(
     apikey: Optional[str] = "tgarr",
     id: Optional[str] = None,
 ):
-    base_url = os.environ.get("TGARR_BASE_URL", "")  # set in compose if needed
+    base_url = os.environ.get("TGARR_BASE_URL", "")
     if t == "caps":
         return Response(CAPS_XML, media_type="application/xml")
 
@@ -544,9 +962,6 @@ async def newznab_api(
     params = []
 
     if q:
-        # Split into words, require all to match (ILIKE %word%). Lets users
-        # type "our planet" and match release names with any separator
-        # (Our.Planet.S01E01..., Our Planet S01E01...).
         for word in q.split():
             params.append(f"%{word}%")
             where_parts.append(f"name ILIKE ${len(params)}")
@@ -563,12 +978,10 @@ async def newznab_api(
         where_parts.append("category = 'movie'")
 
     limit_val = max(1, min(limit, 200))
-    sql = f"""SELECT id, guid, name, category, season, episode, quality,
-                     source, codec, size_bytes, posted_at
-              FROM releases
-              WHERE {" AND ".join(where_parts)}
-              ORDER BY posted_at DESC NULLS LAST
-              LIMIT {limit_val} OFFSET {max(0, offset)}"""
+    sql = (f"SELECT id, guid, name, category, season, episode, quality, "
+          f"source, codec, size_bytes, posted_at FROM releases WHERE "
+          f"{' AND '.join(where_parts)} ORDER BY posted_at DESC NULLS LAST "
+          f"LIMIT {limit_val} OFFSET {max(0, offset)}")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
@@ -580,7 +993,6 @@ async def newznab_api(
 
 
 async def _handle_grab(guid: Optional[str]) -> Response:
-    """Sonarr is grabbing — queue download + return stub NZB."""
     if not guid:
         return Response("missing id", status_code=400)
     async with db_pool.acquire() as conn:
@@ -618,7 +1030,7 @@ async def _handle_grab(guid: Optional[str]) -> Response:
 # SABnzbd download-client emulation
 # ════════════════════════════════════════════════════════════════════
 @app.get("/sabnzbd/api")
-@app.get("/api")  # SAB API is sometimes hit at /api directly
+@app.get("/api")
 async def sab_api(
     mode: str = Query("queue"),
     name: Optional[str] = None,
@@ -647,9 +1059,7 @@ async def sab_api(
         return await _sab_queue()
     if mode == "history":
         return await _sab_history()
-    if mode == "addurl":
-        return await _sab_addurl(name or value or "", nzbname, cat)
-    if mode == "addfile":
+    if mode in ("addurl", "addfile"):
         return await _sab_addurl(name or value or "", nzbname, cat)
     if mode == "delete":
         return await _sab_delete(name or value or "")
@@ -662,8 +1072,7 @@ async def _sab_queue():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT d.id, d.status, r.name, r.size_bytes, r.guid
-               FROM downloads d
-               JOIN releases r ON r.id = d.release_id
+               FROM downloads d JOIN releases r ON r.id = d.release_id
                WHERE d.status IN ('pending','downloading')
                ORDER BY d.requested_at""")
     slots = []
@@ -687,29 +1096,15 @@ async def _sab_queue():
         })
     return {"queue": {
         "status": "Idle" if not slots else "Downloading",
-        "version": "3.7.2",
-        "paused": False,
-        "noofslots_total": len(slots),
-        "noofslots": len(slots),
-        "slots": slots,
-        "speedlimit": "",
-        "speedlimit_abs": "",
-        "speed": "0 K",
-        "kbpersec": "0",
-        "size": "0 MB",
-        "sizeleft": "0 MB",
-        "mb": "0",
-        "mbleft": "0",
-        "diskspace1": "1000",
-        "diskspace2": "1000",
-        "diskspace1_norm": "1 T",
-        "diskspace2_norm": "1 T",
-        "diskspacetotal1": "2000",
-        "diskspacetotal2": "2000",
-        "limit": "0",
-        "have_warnings": "0",
-        "pause_int": "0",
-        "loadavg": "",
+        "version": "3.7.2", "paused": False,
+        "noofslots_total": len(slots), "noofslots": len(slots),
+        "slots": slots, "speedlimit": "", "speedlimit_abs": "",
+        "speed": "0 K", "kbpersec": "0",
+        "size": "0 MB", "sizeleft": "0 MB", "mb": "0", "mbleft": "0",
+        "diskspace1": "1000", "diskspace2": "1000",
+        "diskspace1_norm": "1 T", "diskspace2_norm": "1 T",
+        "diskspacetotal1": "2000", "diskspacetotal2": "2000",
+        "limit": "0", "have_warnings": "0", "pause_int": "0", "loadavg": "",
     }}
 
 
@@ -718,40 +1113,28 @@ async def _sab_history():
         rows = await conn.fetch(
             """SELECT d.id, d.status, d.local_path, d.finished_at,
                       r.name, r.size_bytes, r.guid, d.error_message
-               FROM downloads d
-               JOIN releases r ON r.id = d.release_id
+               FROM downloads d JOIN releases r ON r.id = d.release_id
                WHERE d.status IN ('completed','failed')
-               ORDER BY d.finished_at DESC NULLS LAST
-               LIMIT 200""")
+               ORDER BY d.finished_at DESC NULLS LAST LIMIT 200""")
     slots = []
     for r in rows:
         size_mb = (r["size_bytes"] or 0) / 1048576
         slots.append({
             "nzo_id": f"tgarr-{r['guid']}",
-            "name": r["name"],
-            "category": "tv",
+            "name": r["name"], "category": "tv",
             "storage": r["local_path"] or "/downloads/tgarr",
             "status": "Completed" if r["status"] == "completed" else "Failed",
             "size": f"{size_mb:.1f} MB",
             "bytes": r["size_bytes"] or 0,
             "completed": int(r["finished_at"].timestamp()) if r["finished_at"] else 0,
             "fail_message": r["error_message"] or "",
-            "action_line": "",
-            "show_details": "True",
-            "script_log": "",
-            "report": "",
-            "pp": "3",
-            "script": "None",
-            "url": "",
+            "action_line": "", "show_details": "True", "script_log": "",
+            "report": "", "pp": "3", "script": "None", "url": "",
             "id": str(r["id"]),
         })
     return {"history": {
-        "noofslots": len(slots),
-        "slots": slots,
-        "total_size": "0 B",
-        "month_size": "0 B",
-        "week_size": "0 B",
-        "day_size": "0 B",
+        "noofslots": len(slots), "slots": slots,
+        "total_size": "0 B", "month_size": "0 B", "week_size": "0 B", "day_size": "0 B",
         "version": "3.7.2",
     }}
 
