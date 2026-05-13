@@ -15,6 +15,7 @@ import re
 
 import asyncpg
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 from parser import parse_filename, to_release_name
@@ -110,6 +111,9 @@ async def ingest_message(msg: Message) -> bool:
     mime_type = None
     file_unique_id = None
     media_type = None
+    audio_title = None
+    audio_performer = None
+    audio_duration_sec = None
 
     # Identify the media kind explicitly so /gallery can find photos cleanly.
     if msg.video:
@@ -118,6 +122,9 @@ async def ingest_message(msg: Message) -> bool:
         media, media_type = msg.document, "document"
     elif msg.audio:
         media, media_type = msg.audio, "audio"
+        audio_title = getattr(msg.audio, "title", None)
+        audio_performer = getattr(msg.audio, "performer", None)
+        audio_duration_sec = getattr(msg.audio, "duration", None)
     elif msg.photo:
         media, media_type = msg.photo, "photo"
     else:
@@ -148,12 +155,14 @@ async def ingest_message(msg: Message) -> bool:
             """INSERT INTO messages
                  (channel_id, tg_message_id, tg_chat_id,
                   file_unique_id, file_name, caption, file_size, mime_type,
-                  media_type, posted_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                  media_type, audio_title, audio_performer, audio_duration_sec,
+                  posted_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
-            caption[:8000], file_size, mime_type, media_type, msg.date,
+            caption[:8000], file_size, mime_type, media_type,
+            audio_title, audio_performer, audio_duration_sec, msg.date,
         )
 
         if new_msg_id and file_name:
@@ -280,6 +289,12 @@ async def download_worker() -> None:
 
 SESSION_PATH = "/app/session/tgarr.session"
 THUMBS_ROOT = "/downloads/thumbs"
+AUDIO_ROOT = "/downloads/audio"
+LIBRARY_ROOT = "/downloads/library"
+MAX_AUDIO_BYTES = int(os.environ.get("TG_MAX_AUDIO_BYTES", str(150 * 1024 * 1024)))
+MAX_BOOK_BYTES = int(os.environ.get("TG_MAX_BOOK_BYTES", str(80 * 1024 * 1024)))
+MAX_AUDIO_COUNT = int(os.environ.get("TG_MAX_AUDIO_COUNT", "300"))
+MAX_BOOK_COUNT = int(os.environ.get("TG_MAX_BOOK_COUNT", "300"))
 
 
 def _session_authed() -> bool:
@@ -389,6 +404,51 @@ async def thumb_downloader() -> None:
             await asyncio.sleep(10)
 
 
+async def channel_meta_refresher() -> None:
+    """Update members_count for each channel via get_chat. Once a day per channel.
+    A friend group has ~5 members; a resource channel has 10K-100K+. This
+    column drives the /channels filter chips so personal chats stay separated
+    from public media channels.
+    """
+    log.info("[meta] channel meta refresher started")
+    await asyncio.sleep(15)  # let connect settle first
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT tg_chat_id FROM channels
+                       WHERE meta_updated_at IS NULL
+                          OR meta_updated_at < NOW() - INTERVAL '24 hours'
+                       ORDER BY meta_updated_at NULLS FIRST
+                       LIMIT 1""")
+            if not row:
+                await asyncio.sleep(900)
+                continue
+            try:
+                chat = await app.get_chat(row["tg_chat_id"])
+                members = getattr(chat, "members_count", None)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels SET members_count=$1, meta_updated_at=NOW()
+                           WHERE tg_chat_id=$2""", members, row["tg_chat_id"])
+                log.info("[meta] chat_id=%s members=%s", row["tg_chat_id"], members)
+            except FloodWait as fw:
+                wait = getattr(fw, "value", 60) + 5
+                log.warning("[meta] flood-wait %ds", wait)
+                await asyncio.sleep(min(wait, 600))
+                continue
+            except Exception as e:
+                log.warning("[meta] failed chat_id=%s: %s", row["tg_chat_id"], e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET meta_updated_at=NOW() WHERE tg_chat_id=$1",
+                        row["tg_chat_id"])
+            await asyncio.sleep(3)
+        except Exception as e:
+            log.exception("[meta] outer: %s", e)
+            await asyncio.sleep(30)
+
+
 async def thumb_hash_backfill() -> None:
     """One-off-ish: compute MD5 for thumbs saved before MD5 tracking landed.
     Walks rows with thumb_path set + thumb_md5 NULL, hashes file, dedupes."""
@@ -439,6 +499,87 @@ async def thumb_hash_backfill() -> None:
             await asyncio.sleep(5)
 
 
+async def local_media_downloader() -> None:
+    """Background: cache recent audio + ebook documents to disk so /music and
+    /library can serve them with Range support. Bounded by env limits."""
+    log.info("[media-dl] audio root=%s library root=%s", AUDIO_ROOT, LIBRARY_ROOT)
+    os.makedirs(AUDIO_ROOT, exist_ok=True)
+    os.makedirs(LIBRARY_ROOT, exist_ok=True)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                audio_n = await conn.fetchval(
+                    """SELECT count(*) FROM messages
+                       WHERE local_path IS NOT NULL
+                         AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                         AND media_type='audio'""")
+                book_n = await conn.fetchval(
+                    """SELECT count(*) FROM messages
+                       WHERE local_path IS NOT NULL
+                         AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                         AND media_type='document'""")
+                cond_parts = []
+                if audio_n < MAX_AUDIO_COUNT:
+                    cond_parts.append(
+                        f"(m.media_type='audio' AND COALESCE(m.file_size,0) < {MAX_AUDIO_BYTES})")
+                if book_n < MAX_BOOK_COUNT:
+                    cond_parts.append(
+                        f"(m.media_type='document' "
+                        f"AND m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$' "
+                        f"AND COALESCE(m.file_size,0) < {MAX_BOOK_BYTES})")
+                if not cond_parts:
+                    await asyncio.sleep(180)
+                    continue
+                row = await conn.fetchrow(f"""
+                    SELECT m.id, m.tg_chat_id, m.tg_message_id, m.media_type,
+                           m.file_name, m.file_size
+                    FROM messages m
+                    WHERE m.local_path IS NULL
+                      AND ({' OR '.join(cond_parts)})
+                    ORDER BY m.posted_at DESC NULLS LAST
+                    LIMIT 1
+                """)
+            if not row:
+                await asyncio.sleep(90)
+                continue
+
+            root = AUDIO_ROOT if row["media_type"] == "audio" else LIBRARY_ROOT
+            base = (row["file_name"] or f"item-{row['id']}")
+            safe = SAFE_NAME.sub("_", base)[:180]
+            target = os.path.join(root, safe)
+            try:
+                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                if not msg:
+                    raise RuntimeError("message gone")
+                media = msg.audio if row["media_type"] == "audio" else msg.document
+                if not media:
+                    raise RuntimeError("no media on message")
+                path = await app.download_media(media, file_name=target)
+                rel = os.path.relpath(str(path), "/downloads")
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET local_path=$1 WHERE id=$2",
+                        rel, row["id"])
+                log.info("[media-dl] %s id=%s → %s", row["media_type"], row["id"], rel)
+            except FloodWait as fw:
+                # Cross-DC auth.ExportAuthorization rate-limits us. Respect the
+                # server-supplied wait verbatim; don't mark the row failed.
+                wait = getattr(fw, "value", 60) + 5
+                log.warning("[media-dl] flood-wait %ds (id=%s left unmarked, will retry)", wait, row["id"])
+                await asyncio.sleep(min(wait, 1800))  # cap to 30 min, then loop
+                continue
+            except Exception as e:
+                log.warning("[media-dl] failed id=%s: %s", row["id"], e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET local_path='__failed__' WHERE id=$1",
+                        row["id"])
+            await asyncio.sleep(2)  # bigger files than thumbs — slower
+        except Exception as e:
+            log.exception("[media-dl] outer: %s", e)
+            await asyncio.sleep(10)
+
+
 async def main() -> None:
     await init_db()
     await wait_for_session()
@@ -449,6 +590,8 @@ async def main() -> None:
     asyncio.create_task(download_worker())
     asyncio.create_task(thumb_downloader())
     asyncio.create_task(thumb_hash_backfill())
+    asyncio.create_task(local_media_downloader())
+    asyncio.create_task(channel_meta_refresher())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()

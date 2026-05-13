@@ -24,7 +24,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.3.3"
+TGARR_VERSION = "0.3.5"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -66,9 +66,16 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_md5 TEXT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS members_count INTEGER;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS meta_updated_at TIMESTAMPTZ;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER;
             CREATE INDEX IF NOT EXISTS idx_messages_media_type ON messages (media_type);
             CREATE INDEX IF NOT EXISTS idx_messages_thumb ON messages (thumb_path) WHERE thumb_path IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_md5 ON messages (thumb_md5) WHERE thumb_md5 IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_messages_local ON messages (local_path) WHERE local_path IS NOT NULL;
         """)
 
 
@@ -164,6 +171,26 @@ async def serve_thumb(fname: str):
         return Response("not found", status_code=404)
     return FileResponse(path, media_type="image/jpeg",
                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/media/{msg_id}")
+async def serve_media(msg_id: int):
+    """Serve a cached audio/document. FileResponse handles HTTP Range so audio
+    players can seek mid-stream."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT local_path, file_name, mime_type, media_type
+               FROM messages WHERE id=$1""", msg_id)
+    if not row or not row["local_path"] or row["local_path"].startswith("__"):
+        return Response("not cached", status_code=404)
+    path = os.path.join("/downloads", row["local_path"])
+    if not os.path.exists(path):
+        return Response("file missing", status_code=404)
+    mime = row["mime_type"] or (
+        "audio/mpeg" if row["media_type"] == "audio" else "application/octet-stream")
+    headers = {"Cache-Control": "private, max-age=3600"}
+    fn = row["file_name"]
+    return FileResponse(path, media_type=mime, filename=fn, headers=headers)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -604,6 +631,36 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .fxFlip        { animation:fxFlip        0.9s cubic-bezier(0.4,0,0.2,1) both; }
 .fxRotateScale { animation:fxRotateScale 0.85s cubic-bezier(0.34,1.56,0.64,1) both; }
 .fxBlur        { animation:fxBlur        0.7s cubic-bezier(0.4,0,0.2,1) both; }
+
+/* ── Music page ─────────────────── */
+.music-list tr { cursor:pointer; transition:background 0.1s; }
+.music-list .play-cell { width:48px; text-align:center; }
+.music-list .play-ico { width:34px; height:34px; line-height:34px; border-radius:50%; background:#e0f2fe; color:var(--accent); display:inline-block; font-size:14px; }
+.music-list tr:hover .play-ico { background:var(--accent); color:#fff; }
+.music-list tr.playing td { background:#e0f2fe; }
+.music-list tr.playing .play-ico { background:var(--ok); color:#fff; }
+.music-list .title-cell .t { font-weight:600; font-size:15px; color:var(--fg); }
+.music-list .title-cell .a { font-size:13px; color:var(--muted); margin-top:3px; }
+.player-bar { position:fixed; bottom:0; left:260px; right:0; background:var(--surface); border-top:1px solid var(--border); padding:14px 24px; display:flex; align-items:center; gap:16px; box-shadow:0 -6px 16px rgba(15,23,42,0.06); z-index:100; }
+.player-bar .np { display:flex; align-items:center; gap:12px; min-width:220px; }
+.player-bar .np-icon { width:46px; height:46px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; display:flex; align-items:center; justify-content:center; font-size:22px; }
+.player-bar .np-t { font-weight:600; font-size:14px; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.player-bar .np-a { font-size:13px; color:var(--muted); max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:2px; }
+.player-bar audio { height:42px; }
+.player-bar button { padding:9px 14px; font-size:18px; line-height:1; }
+.music-list + .player-bar + .content { padding-bottom:100px; }
+body:has(.player-bar) .content { padding-bottom:110px; }
+
+/* ── Library page ─────────────────── */
+.book-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(380px, 1fr)); gap:16px; }
+.book-card { display:flex; gap:16px; padding:18px 20px; background:var(--surface); border:1px solid var(--border); border-radius:8px; box-shadow:var(--shadow); align-items:center; transition:transform 0.1s, box-shadow 0.1s; }
+.book-card:hover { transform:translateY(-2px); box-shadow:0 8px 20px rgba(15,23,42,0.10); }
+.book-card .book-ico { font-size:48px; flex-shrink:0; line-height:1; }
+.book-card .book-body { flex:1; min-width:0; }
+.book-card .book-title { font-weight:700; font-size:15px; line-height:1.35; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.book-card .book-meta { margin-top:8px; font-size:13px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.book-card .book-actions { display:flex; flex-direction:column; gap:6px; flex-shrink:0; }
+.book-card .book-actions .btn { padding:6px 14px; font-size:13px; text-align:center; min-width:96px; }
 """
 
 NAV_ITEMS = [
@@ -611,6 +668,8 @@ NAV_ITEMS = [
     ("/channels",  "Channels",  "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"),
     ("/releases",  "Releases",  "M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"),
     ("/gallery",   "Gallery",   "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"),
+    ("/music",     "Music",     "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"),
+    ("/library",   "Library",   "M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 18H6V4h7v6l2-1 2 1V4h1v16z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
     ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
     ("/settings",  "Settings",  "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94 0 .31.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"),
@@ -837,26 +896,55 @@ async def root(accept: Optional[str] = Header(None)):
 # Page: Channels
 # ════════════════════════════════════════════════════════════════════
 @app.get("/channels", response_class=HTMLResponse)
-async def page_channels():
+async def page_channels(min_members: int = 500):
     if not login.session_exists():
         return RedirectResponse("/login")
+    # Filter on members_count when populated, falling back to msg_count for
+    # channels whose meta-refresher hasn't run yet (NULL ≈ unknown). For unset
+    # rows, COALESCE to a very large value so the filter keeps them visible.
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
+            f"""SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
+                      c.members_count,
                       (SELECT count(*) FROM messages m WHERE m.channel_id = c.id)
                                                                 AS msg_count,
                       (SELECT count(*) FROM messages m
                          WHERE m.channel_id = c.id AND m.file_name IS NOT NULL)
                                                                 AS media_count
                FROM channels c
-               ORDER BY msg_count DESC""")
+               WHERE COALESCE(c.members_count, 999999) >= {max(0, min_members)}
+               ORDER BY COALESCE(c.members_count, 0) DESC, msg_count DESC""")
+        total = await conn.fetchval("SELECT count(*) FROM channels")
+        with_meta = await conn.fetchval(
+            "SELECT count(*) FROM channels WHERE members_count IS NOT NULL")
+
+    def _chip(val: int, label: str) -> str:
+        active = (min_members == val)
+        style = ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
+                'border-color:var(--accent);') if active else ''
+        return (f'<a class="btn ghost" href="/channels?min_members={val}" '
+               f'style="{style}padding:6px 14px;font-size:13px">{label}</a>')
+
+    filter_bar = (
+        '<div style="display:flex;gap:8px;margin-bottom:20px;align-items:center;flex-wrap:wrap">'
+        f'{_chip(0, "all (" + str(total) + ")")}'
+        f'{_chip(20, "≥20")}'
+        f'{_chip(100, "≥100")}'
+        f'{_chip(500, "≥500 ⭐")}'
+        f'{_chip(5000, "≥5K")}'
+        f'{_chip(50000, "≥50K")}'
+        + (f'<span style="margin-left:auto;color:var(--muted);font-size:12px">'
+           f'member counts: {with_meta}/{total} resolved</span>' if with_meta < total else '')
+        + '</div>'
+    )
 
     if not rows:
-        body = ('<h2 class="section">Indexed channels <span class="count">0</span></h2>'
+        body = (f'<h2 class="section">Indexed channels <span class="count">0 of {total}</span></h2>'
+               + filter_bar +
                '<div class="empty-state">'
                '<div class="icon">📡</div>'
-               '<div>No channels indexed yet.</div>'
-               '<div style="margin-top:8px;font-size:12px">Open Telegram on your phone → join channels with media files → tgarr will pick them up automatically.</div>'
+               f'<div>No channels with ≥{min_msgs} messages.</div>'
+               '<div style="margin-top:8px;font-size:13px">Try a lower threshold above, or join more active channels in Telegram.</div>'
                '</div>')
     else:
         cards_html = []
@@ -867,6 +955,11 @@ async def page_channels():
             handle = ("@" + r["username"]) if r["username"] else f"id {r['tg_chat_id']}"
             status_pill = ('<span class="pill ok">backfilled</span>' if r["backfilled"]
                           else '<span class="pill warn">backfilling…</span>')
+            members_pill = ''
+            if r["members_count"] is not None:
+                m = r["members_count"]
+                m_str = (f"{m/1000:.1f}K" if m >= 1000 else str(m)).replace(".0K", "K")
+                members_pill = f'<span class="pill accent">👥 {m_str}</span>'
             cards_html.append(
                 f'<div class="card">'
                 f'<div class="avatar" style="background:{color}">{html.escape(initial)}</div>'
@@ -875,14 +968,16 @@ async def page_channels():
                 f'<div class="sub">{html.escape(handle)}</div>'
                 f'</div>'
                 f'<div class="footer">'
+                f'{members_pill}'
                 f'<span class="pill muted">{r["msg_count"]:,} msgs</span>'
-                f'<span class="pill accent">{r["media_count"]:,} media</span>'
+                f'<span class="pill muted">{r["media_count"]:,} media</span>'
                 f'{status_pill}'
                 f'</div>'
                 f'</div>'
             )
-        body = (f'<h2 class="section">Indexed channels <span class="count">{len(rows)}</span></h2>'
-               f'<div class="cards">{"".join(cards_html)}</div>')
+        body = (f'<h2 class="section">Indexed channels <span class="count">{len(rows)} of {total}</span></h2>'
+               + filter_bar
+               + f'<div class="cards">{"".join(cards_html)}</div>')
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 
@@ -1065,6 +1160,202 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
         '</script>'
     )
     return HTMLResponse(_layout("Gallery", "/gallery", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Music
+# ════════════════════════════════════════════════════════════════════
+def _fmt_dur(secs):
+    if not secs:
+        return ""
+    m, s = divmod(int(secs), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+@app.get("/music", response_class=HTMLResponse)
+async def page_music(limit: int = 200):
+    async with db_pool.acquire() as conn:
+        n = await conn.fetchval("SELECT count(*) FROM channels")
+    if not login.session_exists() and not n:
+        return RedirectResponse("/login")
+
+    async with db_pool.acquire() as conn:
+        cached_n = await conn.fetchval(
+            """SELECT count(*) FROM messages
+               WHERE media_type='audio' AND local_path IS NOT NULL
+                 AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'""")
+        pending_n = await conn.fetchval(
+            "SELECT count(*) FROM messages WHERE media_type='audio' AND local_path IS NULL")
+        rows = await conn.fetch(f"""
+            SELECT m.id, m.audio_title, m.audio_performer, m.audio_duration_sec,
+                   m.file_name, m.file_size, m.posted_at,
+                   c.title AS ch_title, c.username AS ch_user
+            FROM messages m
+            JOIN channels c ON c.id = m.channel_id
+            WHERE m.media_type = 'audio'
+              AND m.local_path IS NOT NULL
+              AND m.local_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+            ORDER BY m.posted_at DESC NULLS LAST
+            LIMIT {max(1, min(limit, 500))}
+        """)
+
+    if not rows:
+        body = (
+            f'<h2 class="section">Music <span class="count">0 cached</span></h2>'
+            '<div class="empty-state">'
+            '<div class="icon">🎵</div>'
+            '<div>No audio cached yet.</div>'
+            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio messages indexed — crawler is downloading in the background (capped to recent 300 tracks).</div>'
+            '</div>'
+        )
+        return HTMLResponse(_layout("Music", "/music", body))
+
+    rows_html = "".join(
+        f'<tr data-id="{r["id"]}" onclick="tgMusicPlay(this)">'
+        f'<td class="play-cell"><div class="play-ico">▶</div></td>'
+        f'<td class="title-cell">'
+        f'<div class="t">{html.escape(r["audio_title"] or r["file_name"] or "(untitled)")}</div>'
+        f'<div class="a">{html.escape((r["audio_performer"] or "") + (" · " + r["ch_title"] if r["ch_title"] else ""))}</div>'
+        f'</td>'
+        f'<td class="num">{_fmt_dur(r["audio_duration_sec"])}</td>'
+        f'<td class="num">{_fmt_size(r["file_size"])}</td>'
+        f'<td class="num">{_fmt_time(r["posted_at"])[:10]}</td>'
+        f'</tr>'
+        for r in rows
+    )
+
+    body = (
+        f'<h2 class="section">Music <span class="count">{len(rows)} cached</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} pending</span>'
+           if pending_n else '')
+        + '</h2>'
+        '<table class="music-list">'
+        '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th><th>posted</th></tr></thead>'
+        f'<tbody>{rows_html}</tbody></table>'
+        '<div class="player-bar">'
+        '  <div class="np">'
+        '    <div class="np-icon">🎵</div>'
+        '    <div class="np-text"><div class="np-t" id="npT">— select a track —</div><div class="np-a" id="npA"></div></div>'
+        '  </div>'
+        '  <audio id="audio" controls preload="metadata" style="flex:1;min-width:0"></audio>'
+        '  <button class="ghost" onclick="tgMusicNext()" title="next (n)">⏭</button>'
+        '  <button class="ghost" id="shuffleBtn" onclick="tgMusicShuffle(this)" title="shuffle">🔀</button>'
+        '</div>'
+        '<script>'
+        '(() => {'
+        '  const rows = [...document.querySelectorAll(".music-list tbody tr")];'
+        '  const ids = rows.map(r => r.dataset.id);'
+        '  const audio = document.getElementById("audio");'
+        '  let cur = -1, shuffled = false;'
+        '  window.tgMusicPlay = function(row) {'
+        '    cur = rows.indexOf(row);'
+        '    rows.forEach(r => r.classList.remove("playing"));'
+        '    row.classList.add("playing");'
+        '    audio.src = "/media/" + row.dataset.id;'
+        '    document.getElementById("npT").textContent = row.querySelector(".t").textContent;'
+        '    document.getElementById("npA").textContent = row.querySelector(".a").textContent;'
+        '    audio.play().catch(() => {});'
+        '  };'
+        '  window.tgMusicNext = function() {'
+        '    if (!rows.length) return;'
+        '    let nxt = shuffled ? Math.floor(Math.random()*rows.length) : (cur+1) % rows.length;'
+        '    tgMusicPlay(rows[nxt]);'
+        '  };'
+        '  window.tgMusicShuffle = function(btn) {'
+        '    shuffled = !shuffled;'
+        '    btn.style.background = shuffled ? "var(--accent)" : "";'
+        '    btn.style.color = shuffled ? "#fff" : "";'
+        '  };'
+        '  audio.addEventListener("ended", tgMusicNext);'
+        '  document.addEventListener("keydown", e => {'
+        '    if (e.target.tagName === "INPUT") return;'
+        '    if (e.key === "n") tgMusicNext();'
+        '    else if (e.key === " " && audio.src) { e.preventDefault(); audio.paused ? audio.play() : audio.pause(); }'
+        '  });'
+        '})();'
+        '</script>'
+    )
+    return HTMLResponse(_layout("Music", "/music", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Library (ebooks)
+# ════════════════════════════════════════════════════════════════════
+@app.get("/library", response_class=HTMLResponse)
+async def page_library(limit: int = 200):
+    async with db_pool.acquire() as conn:
+        n = await conn.fetchval("SELECT count(*) FROM channels")
+    if not login.session_exists() and not n:
+        return RedirectResponse("/login")
+
+    async with db_pool.acquire() as conn:
+        cached_n = await conn.fetchval(
+            r"""SELECT count(*) FROM messages
+               WHERE media_type='document' AND local_path IS NOT NULL
+                 AND local_path NOT LIKE '\_\_%' ESCAPE '\'""")
+        pending_n = await conn.fetchval(
+            r"""SELECT count(*) FROM messages
+               WHERE media_type='document' AND local_path IS NULL
+                 AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'""")
+        rows = await conn.fetch(f"""
+            SELECT m.id, m.file_name, m.file_size, m.mime_type, m.caption, m.posted_at,
+                   c.title AS ch_title, c.username AS ch_user
+            FROM messages m
+            JOIN channels c ON c.id = m.channel_id
+            WHERE m.media_type = 'document'
+              AND m.local_path IS NOT NULL
+              AND m.local_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+              AND m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'
+            ORDER BY m.posted_at DESC NULLS LAST
+            LIMIT {max(1, min(limit, 500))}
+        """)
+
+    def _ext(fn):
+        return (fn or "").rsplit(".", 1)[-1].upper() if "." in (fn or "") else "DOC"
+    def _ico(ext):
+        return {"PDF": "📄", "EPUB": "📘", "MOBI": "📕", "AZW3": "📕", "AZW": "📕",
+                "DJVU": "📃", "CBR": "📚", "CBZ": "📚", "FB2": "📖",
+                "TXT": "📝"}.get(ext, "📄")
+
+    if not rows:
+        body = (
+            '<h2 class="section">Library <span class="count">0 cached</span></h2>'
+            '<div class="empty-state">'
+            '<div class="icon">📚</div>'
+            '<div>No ebooks cached yet.</div>'
+            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook messages indexed — crawler is downloading in the background.</div>'
+            '</div>'
+        )
+        return HTMLResponse(_layout("Library", "/library", body))
+
+    items = "".join(
+        f'<div class="book-card">'
+        f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>'
+        f'<div class="book-body">'
+        f'<div class="book-title">{html.escape(r["file_name"] or "(untitled)")}</div>'
+        f'<div class="book-meta">'
+        f'<span class="pill accent">{_ext(r["file_name"])}</span>'
+        f'<span class="pill muted">{_fmt_size(r["file_size"])}</span>'
+        f'<span>· {html.escape(r["ch_title"] or "")}</span>'
+        f'</div>'
+        f'</div>'
+        f'<div class="book-actions">'
+        f'<a class="btn" href="/media/{r["id"]}" target="_blank">Open</a>'
+        f'<a class="btn ghost" href="/media/{r["id"]}" download="{html.escape(r["file_name"] or "")}">Download</a>'
+        f'</div>'
+        f'</div>'
+        for r in rows
+    )
+
+    body = (
+        f'<h2 class="section">Library <span class="count">{len(rows)} cached</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} pending</span>'
+           if pending_n else '')
+        + '</h2>'
+        f'<div class="book-grid">{items}</div>'
+    )
+    return HTMLResponse(_layout("Library", "/library", body))
 
 
 # ════════════════════════════════════════════════════════════════════
