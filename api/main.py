@@ -68,6 +68,8 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_md5 TEXT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS members_count INTEGER;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS meta_updated_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS audience TEXT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS audience_manual BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
@@ -445,6 +447,23 @@ async def api_grab(guid: str):
             "INSERT INTO downloads (release_id, status) VALUES ($1, 'pending')",
             rel["id"])
     return {"status": "queued", "name": rel["name"]}
+
+
+async def _is_nsfw_enabled() -> bool:
+    """Adult content is gated behind an explicit user opt-in. Off by default."""
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval("SELECT value FROM config WHERE key='nsfw_enabled'")
+    return v == "true"
+
+
+@app.post("/api/settings/nsfw_enabled")
+async def settings_nsfw_enabled(value: str = Form("false")):
+    val = "true" if value == "true" else "false"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('nsfw_enabled', $1)
+               ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""", val)
+    return RedirectResponse("/settings", status_code=302)
 
 
 @app.post("/api/settings/tmdb_key")
@@ -902,10 +921,59 @@ CONTRIB_MIN_MEMBERS = 500
 CONTRIB_MIN_MEDIA = 100
 
 
+# Heuristic NSFW keyword classifier. Multi-script — Telegram resource
+# channels span many languages.
+import re as _re_aud
+NSFW_RX = _re_aud.compile(
+    r"(porn|xxx|nsfw|adult|18\+|hentai|erotic|nude|naked|onlyfan|onlyfans|"
+    r"sexy|sex\b|"
+    r"\b色情|\b成人|\b18禁|\b裸\b|\b淫|"
+    r"эротик|порно|секс|"
+    r"اباحي|سكس)",
+    _re_aud.IGNORECASE,
+)
+
+# CSAM hardcoded block — never displayable, never federated, regardless of
+# any user opt-in. Conservative keyword set; reports any match to
+# /var/log/tgarr-csam-flags.log for human + IWF/NCMEC review.
+CSAM_RX = _re_aud.compile(
+    r"\b(loli|lolicon|shota|shotacon|child\s*porn|kid\s*porn|"
+    r"pre[\s_-]*teen|under[\s_-]*age|\bcp\d+|\bcp_)\b",
+    _re_aud.IGNORECASE,
+)
+
+
+def classify_audience(title: str, username: str) -> str:
+    """Returns 'blocked_csam' (hard ban), 'nsfw' (gated), or 'sfw'."""
+    blob = (title or "") + " " + (username or "")
+    if CSAM_RX.search(blob):
+        # Hard block. NEVER show. NEVER federate. Logged for review.
+        try:
+            with open("/tmp/tgarr-csam-flags.log", "a") as f:
+                f.write(f"{time.time()}\t{title!r}\t{username!r}\n")
+        except Exception:
+            pass
+        return "blocked_csam"
+    return "nsfw" if NSFW_RX.search(blob) else "sfw"
+
+
+@app.post("/api/channel/{tg_chat_id}/audience")
+async def api_set_audience(tg_chat_id: int, value: str = Form(...)):
+    if value not in ("sfw", "nsfw", "unknown"):
+        return JSONResponse({"status": "error", "message": "value must be sfw/nsfw/unknown"},
+                          status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE channels SET audience=$1, audience_manual=TRUE WHERE tg_chat_id=$2",
+            None if value == "unknown" else value, tg_chat_id)
+    return {"status": "ok", "audience": value}
+
+
 @app.get("/channels", response_class=HTMLResponse)
 async def page_channels(min_members: int = 500,
                         max_members: Optional[int] = None,
-                        eligible: int = 0):
+                        eligible: int = 0,
+                        audience: str = ""):
     if not login.session_exists():
         return RedirectResponse("/login")
     # Range filter: COALESCE NULL members to a big number so unresolved
@@ -919,10 +987,32 @@ async def page_channels(min_members: int = 500,
             f"AND (SELECT count(*) FROM messages m WHERE m.channel_id = c.id "
             f"AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}"
         )
+    nsfw_on = await _is_nsfw_enabled()
+    if audience == "sfw":
+        where_extra += " AND COALESCE(c.audience, 'sfw') = 'sfw'"
+    elif audience == "nsfw" and nsfw_on:
+        where_extra += " AND c.audience = 'nsfw'"
+    elif audience == "unknown":
+        where_extra += " AND c.audience IS NULL"
+    if not nsfw_on:
+        where_extra += " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"
+    # CSAM hard-block — no setting can unblock this.
+    where_extra += " AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
     async with db_pool.acquire() as conn:
+        # Lazy classify (Python-side) — pulls untagged rows and tags them
+        # before listing. Manual overrides untouched.
+        untagged = await conn.fetch(
+            """SELECT tg_chat_id, title, username FROM channels
+               WHERE audience IS NULL AND audience_manual = FALSE
+                 AND (title IS NOT NULL OR username IS NOT NULL)""")
+        for u in untagged:
+            await conn.execute(
+                "UPDATE channels SET audience=$1 WHERE tg_chat_id=$2",
+                classify_audience(u["title"], u["username"]), u["tg_chat_id"])
+
         rows = await conn.fetch(
             f"""SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
-                      c.members_count,
+                      c.members_count, c.audience, c.audience_manual,
                       (SELECT count(*) FROM messages m WHERE m.channel_id = c.id)
                                                                 AS msg_count,
                       (SELECT count(*) FROM messages m
@@ -962,6 +1052,12 @@ async def page_channels(min_members: int = 500,
                f'style="{style}padding:6px 12px;font-size:13px">'
                f'✓ moat ({eligible_total})</a>')
 
+    def _aud_chip(val: str, label: str, color: str = "var(--accent)") -> str:
+        active = (audience == val)
+        style = (f'background:{color}22;color:{color};border-color:{color};') if active else ''
+        return (f'<a class="btn ghost" href="/channels?audience={val}" '
+               f'style="{style}padding:6px 12px;font-size:13px">{label}</a>')
+
     filter_bar = (
         '<div style="display:flex;gap:6px;margin-bottom:20px;align-items:center;flex-wrap:wrap">'
         f'{_chip(0, None, f"all ({total})")}'
@@ -973,6 +1069,9 @@ async def page_channels(min_members: int = 500,
         f'{_chip(1000, 5000, "5K")}'
         f'{_chip(500, None, "500+ ⭐")}'
         f'{_eligible_chip()}'
+        '<span style="border-left:1px solid var(--border);margin:0 4px;height:24px"></span>'
+        f'{_aud_chip("sfw", "✓ SFW", "#15803d")}'
+        f'{_aud_chip("nsfw", "🔞 NSFW", "#b91c1c")}'
         + (f'<span style="margin-left:auto;color:var(--muted);font-size:12px">'
            f'members resolved {with_meta}/{total}</span>' if with_meta < total else '')
         + '</div>'
@@ -1048,6 +1147,11 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
     if channel:
         params.append(channel)
         where.append(f"c.username = ${len(params)}")
+    # Gate NSFW unless user has explicitly opted in via /settings.
+    if not await _is_nsfw_enabled():
+        where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
+    # CSAM hard-block — overrides every setting, always.
+    where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
 
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
@@ -1669,6 +1773,7 @@ async def page_settings():
             FROM releases
         """)
     tmdb_masked = (tmdb_raw[:6] + "…" + tmdb_raw[-4:]) if tmdb_raw else ""
+    nsfw_on = await _is_nsfw_enabled()
     user_html = (
         f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
         f'<span class="pill ok">signed in</span></div>'
@@ -1727,6 +1832,48 @@ async def page_settings():
     <div class="info"><div class="name">SABnzbd URL base</div>
       <div class="meta">Paste into Sonarr / Radarr → Download Clients → ➕ SABnzbd → URL Base</div></div>
     <div class="right"><code>/sabnzbd</code></div>
+  </div>
+</div>
+
+<h2 class="section">Content policy</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🔞</div>
+    <div class="info">
+      <div class="name">Adult content (NSFW) — <span class="pill {'ok' if nsfw_on else 'muted'}">{'enabled' if nsfw_on else 'hidden (default)'}</span></div>
+      <div class="meta">
+        By default, channels flagged adult are hidden everywhere in tgarr.
+        You can opt in below — only enable if you are <strong>18+</strong> and
+        understand you are responsible for compliance with your local laws.
+        tgarr is content-neutral self-hosted software; <strong>we are not
+        responsible for materials shared by others on Telegram</strong>.
+      </div>
+      <form method="POST" action="/api/settings/nsfw_enabled" style="margin-top:12px">
+        <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:14px;line-height:1.55">
+          <input type="checkbox" name="value" value="true" {'checked' if nsfw_on else ''} onchange="this.form.submit()" style="margin-top:4px" />
+          <span>I am 18+ and want to view channels tgarr has classified as adult.
+            I understand tgarr is a viewer/indexer of Telegram content I have already joined,
+            not the publisher.</span>
+        </label>
+      </form>
+    </div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">🛑</div>
+    <div class="info">
+      <div class="name">CSAM hard block — <span class="pill bad">always on, cannot be disabled</span></div>
+      <div class="meta">
+        Child Sexual Abuse Material. Channels matching a hardcoded keyword
+        blocklist (loli/shota/child-porn/etc. across multiple scripts) are
+        permanently blocked regardless of any setting. They are never displayed
+        in tgarr, never federated to <code>registry.tgarr.me</code>, and never
+        downloaded. Matches are logged at <code>/tmp/tgarr-csam-flags.log</code>
+        for review. If you encounter CSAM, report to
+        <a href="https://report.cybertip.org" target="_blank">NCMEC CyberTipline</a>
+        or your jurisdiction's hotline via
+        <a href="https://www.inhope.org" target="_blank">INHOPE</a>.
+      </div>
+    </div>
   </div>
 </div>
 
