@@ -9,9 +9,12 @@ Responsibilities:
 """
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
+import urllib.request
+import uuid as uuidlib
 
 import asyncpg
 from pyrogram import Client
@@ -289,6 +292,11 @@ async def download_worker() -> None:
 
 SESSION_PATH = "/app/session/tgarr.session"
 THUMBS_ROOT = "/downloads/thumbs"
+
+REGISTRY_URL = os.environ.get("TGARR_REGISTRY_URL", "https://tgarr.me").rstrip("/")
+CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true"
+CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
+INSTANCE_UUID_ROTATE_DAYS = 7
 AUDIO_ROOT = "/downloads/audio"
 LIBRARY_ROOT = "/downloads/library"
 MAX_AUDIO_BYTES = int(os.environ.get("TG_MAX_AUDIO_BYTES", str(150 * 1024 * 1024)))
@@ -578,6 +586,98 @@ async def local_media_downloader() -> None:
         except Exception as e:
             log.exception("[media-dl] outer: %s", e)
             await asyncio.sleep(10)
+
+
+async def contribute_to_registry() -> None:
+    """Federation: push our eligible channels to registry.tgarr.me periodically.
+
+    Eligibility (same rule as /channels UI ✓ moat pill):
+      members_count >= 500  AND  media_count >= 100  AND  audience IN (sfw, nsfw)
+      AND audience <> blocked_csam
+
+    Privacy:
+    - Instance UUID is random hex, stored in `config` table, rotated weekly.
+    - Server SHA-256-hashes it before storing; raw UUID never persisted on
+      either side after each rotation.
+    - No user identity, no message content — only public channel @usernames.
+
+    Opt-out: TGARR_CONTRIBUTE=false on container.
+    """
+    if not CONTRIBUTE_ENABLED:
+        log.info("[federation] TGARR_CONTRIBUTE=false — contribute task disabled")
+        return
+    log.info("[federation] contribute task started; endpoint=%s interval=%ds",
+             REGISTRY_URL, CONTRIBUTE_INTERVAL_SEC)
+    await asyncio.sleep(120)  # let backfill + metadata settle first
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                # Rotate instance UUID weekly.
+                row = await conn.fetchrow(
+                    "SELECT value, updated_at FROM config WHERE key='instance_uuid'")
+                rotate = True
+                if row:
+                    age = (await conn.fetchval(
+                        "SELECT EXTRACT(EPOCH FROM (NOW() - $1))::int", row["updated_at"]))
+                    rotate = age >= INSTANCE_UUID_ROTATE_DAYS * 86400
+                if rotate:
+                    uuid_val = uuidlib.uuid4().hex
+                    await conn.execute(
+                        """INSERT INTO config (key, value) VALUES ('instance_uuid', $1)
+                           ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""",
+                        uuid_val)
+                else:
+                    uuid_val = row["value"]
+
+                rows = await conn.fetch(
+                    """SELECT c.username, c.title, c.members_count, c.audience,
+                              (SELECT count(*) FROM messages m WHERE m.channel_id=c.id
+                                 AND m.file_name IS NOT NULL) AS media_count
+                       FROM channels c
+                       WHERE c.username IS NOT NULL
+                         AND c.members_count >= 500
+                         AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+                         AND (SELECT count(*) FROM messages m WHERE m.channel_id=c.id
+                              AND m.file_name IS NOT NULL) >= 100"""
+                )
+
+            if not rows:
+                log.info("[federation] no eligible channels — sleeping %ds",
+                         CONTRIBUTE_INTERVAL_SEC)
+                await asyncio.sleep(CONTRIBUTE_INTERVAL_SEC)
+                continue
+
+            payload = {
+                "instance_uuid": uuid_val,
+                "tgarr_version": "0.3.6",
+                "channels": [{
+                    "username": r["username"],
+                    "title": r["title"],
+                    "members_count": r["members_count"],
+                    "media_count": r["media_count"],
+                    "audience": r["audience"] or "sfw",
+                } for r in rows],
+            }
+
+            try:
+                req = urllib.request.Request(
+                    REGISTRY_URL + "/api/v1/contribute",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json",
+                             "User-Agent": "tgarr/0.3.6 (+https://tgarr.me)"},
+                    method="POST")
+                resp = await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(req, timeout=30).read())
+                result = json.loads(resp.decode())
+                log.info("[federation] contributed %s channels: %s",
+                         len(rows), result)
+            except Exception as e:
+                log.warning("[federation] contribute call failed: %s", e)
+
+            await asyncio.sleep(CONTRIBUTE_INTERVAL_SEC)
+        except Exception as e:
+            log.exception("[federation] outer loop: %s", e)
+            await asyncio.sleep(600)
 
 
 async def main() -> None:

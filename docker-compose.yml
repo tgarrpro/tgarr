@@ -74,6 +74,24 @@ services:
     networks:
       - tgarr-net
 
+  # Central federation registry. Runs ONLY on the tgarr.me host (1.37):
+  #   docker compose --profile server up -d
+  # End-user instances skip this service entirely.
+  registry:
+    profiles: ["server"]
+    build: ./registry
+    container_name: tgarr-registry
+    restart: unless-stopped
+    depends_on: [db]
+    environment:
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+    volumes:
+      - ./registry:/app
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks:
+      - tgarr-net
+
 networks:
   tgarr-net:
     driver: bridge
