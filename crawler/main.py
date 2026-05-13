@@ -256,20 +256,37 @@ async def download_worker() -> None:
 SESSION_PATH = "/app/session/tgarr.session"
 
 
-async def wait_for_session() -> None:
-    """First-run: block until the api container's login flow writes a session.
+def _session_authed() -> bool:
+    """True only if the SQLite session row has a non-NULL user_id.
 
-    The api service serves /login (web QR / SMS wizard). When a user signs in
-    there, Pyrogram persists tgarr.session in the shared volume. We poll.
+    The api container's qr_start() opens a Pyrogram connection which writes
+    auth_key but leaves user_id NULL until login actually completes.
+    Without this check, we would proceed to app.start() and Pyrogram would
+    prompt for phone via stdin (EOFError in container).
     """
-    if os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0:
+    import sqlite3
+    if not (os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0):
+        return False
+    try:
+        con = sqlite3.connect(f"file:{SESSION_PATH}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute("SELECT user_id FROM sessions LIMIT 1").fetchone()
+        finally:
+            con.close()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
+async def wait_for_session() -> None:
+    """Block until the api container's login flow finishes signing in."""
+    if _session_authed():
         return
-    log.info("[startup] no Telegram session yet — open http://<host>:8765/login")
-    log.info("[startup] waiting for session file at %s …", SESSION_PATH)
-    while not (os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0):
+    log.info("[startup] no Telegram session yet — open http://<host>:8765/login + scan QR")
+    log.info("[startup] waiting for signed-in session at %s …", SESSION_PATH)
+    while not _session_authed():
         await asyncio.sleep(5)
-    # Small grace period in case file is still being written by api.
-    await asyncio.sleep(2)
+    await asyncio.sleep(2)  # let api flush
     log.info("[startup] session detected, continuing")
 
 
