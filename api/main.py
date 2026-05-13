@@ -896,12 +896,15 @@ async def root(accept: Optional[str] = Header(None)):
 # Page: Channels
 # ════════════════════════════════════════════════════════════════════
 @app.get("/channels", response_class=HTMLResponse)
-async def page_channels(min_members: int = 500):
+async def page_channels(min_members: int = 500,
+                        max_members: Optional[int] = None):
     if not login.session_exists():
         return RedirectResponse("/login")
-    # Filter on members_count when populated, falling back to msg_count for
-    # channels whose meta-refresher hasn't run yet (NULL ≈ unknown). For unset
-    # rows, COALESCE to a very large value so the filter keeps them visible.
+    # Range filter: COALESCE NULL members to a big number so unresolved
+    # channels stay in the default "500+" view rather than disappearing.
+    where_extra = f"AND COALESCE(c.members_count, 999999) >= {max(0, min_members)}"
+    if max_members:
+        where_extra += f" AND COALESCE(c.members_count, 0) < {max_members}"
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             f"""SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
@@ -912,29 +915,34 @@ async def page_channels(min_members: int = 500):
                          WHERE m.channel_id = c.id AND m.file_name IS NOT NULL)
                                                                 AS media_count
                FROM channels c
-               WHERE COALESCE(c.members_count, 999999) >= {max(0, min_members)}
+               WHERE 1=1 {where_extra}
                ORDER BY COALESCE(c.members_count, 0) DESC, msg_count DESC""")
         total = await conn.fetchval("SELECT count(*) FROM channels")
         with_meta = await conn.fetchval(
             "SELECT count(*) FROM channels WHERE members_count IS NOT NULL")
 
-    def _chip(val: int, label: str) -> str:
-        active = (min_members == val)
+    def _chip(lo: int, hi: Optional[int], label: str) -> str:
+        active = (min_members == lo and max_members == hi)
         style = ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
                 'border-color:var(--accent);') if active else ''
-        return (f'<a class="btn ghost" href="/channels?min_members={val}" '
-               f'style="{style}padding:6px 14px;font-size:13px">{label}</a>')
+        href = f"/channels?min_members={lo}"
+        if hi is not None:
+            href += f"&max_members={hi}"
+        return (f'<a class="btn ghost" href="{href}" '
+               f'style="{style}padding:6px 12px;font-size:13px">{label}</a>')
 
     filter_bar = (
-        '<div style="display:flex;gap:8px;margin-bottom:20px;align-items:center;flex-wrap:wrap">'
-        f'{_chip(0, "all (" + str(total) + ")")}'
-        f'{_chip(20, "≥20")}'
-        f'{_chip(100, "≥100")}'
-        f'{_chip(500, "≥500 ⭐")}'
-        f'{_chip(5000, "≥5K")}'
-        f'{_chip(50000, "≥50K")}'
+        '<div style="display:flex;gap:6px;margin-bottom:20px;align-items:center;flex-wrap:wrap">'
+        f'{_chip(0, None, f"all ({total})")}'
+        f'{_chip(0, 20, "20")}'
+        f'{_chip(20, 50, "50")}'
+        f'{_chip(50, 100, "100")}'
+        f'{_chip(100, 500, "500")}'
+        f'{_chip(500, 1000, "1K")}'
+        f'{_chip(1000, 5000, "5K")}'
+        f'{_chip(500, None, "500+ ⭐")}'
         + (f'<span style="margin-left:auto;color:var(--muted);font-size:12px">'
-           f'member counts: {with_meta}/{total} resolved</span>' if with_meta < total else '')
+           f'members resolved {with_meta}/{total}</span>' if with_meta < total else '')
         + '</div>'
     )
 
