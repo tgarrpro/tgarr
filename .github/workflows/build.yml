@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        component: [crawler]
+        component: [crawler, api]
     steps:
       - uses: actions/checkout@v4
 
