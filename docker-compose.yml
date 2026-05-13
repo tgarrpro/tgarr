@@ -68,7 +68,7 @@ services:
     volumes:
       - ./api:/app
       - ./_data/session:/app/session
-      - ./_data/downloads:/downloads:ro
+      - ./_data/downloads:/downloads
     ports:
       - "${TGARR_PORT:-8765}:8088"
     networks:

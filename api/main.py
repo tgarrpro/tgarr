@@ -352,6 +352,37 @@ async def api_login_logout():
     return login.logout()
 
 
+@app.post("/api/photo/{msg_id}/delete")
+async def api_photo_delete(msg_id: int):
+    """Mark a cached photo as deleted; remove the file. Thumb downloader
+    skips `__deleted__` so it won't reappear — unless redownload forced."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT thumb_path FROM messages WHERE id=$1", msg_id)
+        if not row:
+            return JSONResponse({"status": "not_found"}, status_code=404)
+        if row["thumb_path"] and not row["thumb_path"].startswith("__"):
+            path = os.path.join(THUMBS_DIR, row["thumb_path"])
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        await conn.execute(
+            "UPDATE messages SET thumb_path='__deleted__' WHERE id=$1", msg_id)
+    return {"status": "deleted"}
+
+
+@app.post("/api/photo/{msg_id}/redownload")
+async def api_photo_redownload(msg_id: int):
+    """Force re-download: clear thumb_path so worker picks it up again."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET thumb_path=NULL WHERE id=$1 "
+            "AND thumb_path IS NOT NULL", msg_id)
+    return {"status": "queued"}
+
+
 @app.post("/api/grab/{guid}")
 async def api_grab(guid: str):
     """User clicks Grab in tgarr UI → queue download directly. Avoids the
@@ -524,14 +555,42 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .gallery .item .meta .ch { font-weight:700; }
 .gallery .item .meta .cap { margin-top:4px; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 
-/* ── Lightbox ─────────────────── */
-.lightbox { position:fixed; inset:0; background:rgba(15,23,42,0.92); display:none; align-items:center; justify-content:center; z-index:9999; cursor:zoom-out; padding:20px; }
+/* ── Lightbox + slideshow ─────────────────── */
+.lightbox { position:fixed; inset:0; background:rgba(15,23,42,0.96); display:none; align-items:center; justify-content:center; z-index:9999; padding:20px; overflow:hidden; }
 .lightbox.open { display:flex; }
-.lightbox img { max-width:96vw; max-height:88vh; border-radius:4px; box-shadow:0 12px 40px rgba(0,0,0,0.4); }
-.lightbox .lb-meta { position:absolute; left:24px; right:24px; bottom:24px; color:#fff; font-size:14px; line-height:1.5; max-width:600px; }
-.lightbox .lb-meta .ch { color:var(--accent-hi); font-weight:700; font-size:13px; }
-.lightbox .lb-close { position:absolute; top:18px; right:24px; color:#fff; font-size:32px; cursor:pointer; opacity:0.7; }
+.lightbox img { max-width:94vw; max-height:88vh; border-radius:6px; box-shadow:0 16px 50px rgba(0,0,0,0.5); will-change:transform,opacity,filter; }
+.lightbox .lb-meta { position:absolute; left:32px; right:32px; bottom:80px; color:#fff; font-size:15px; line-height:1.55; max-width:660px; pointer-events:none; transition:opacity 0.3s; }
+.lightbox .lb-meta .ch { color:var(--accent-hi); font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
+.lightbox .lb-close { position:absolute; top:18px; right:24px; color:#fff; font-size:36px; cursor:pointer; opacity:0.6; line-height:1; padding:6px 12px; background:none; border:none; }
 .lightbox .lb-close:hover { opacity:1; }
+.lightbox .lb-prev, .lightbox .lb-next { position:absolute; top:50%; transform:translateY(-50%); width:56px; height:56px; border-radius:50%; background:rgba(255,255,255,0.10); color:#fff; border:none; font-size:32px; cursor:pointer; display:flex; align-items:center; justify-content:center; padding-bottom:4px; backdrop-filter:blur(6px); transition:background 0.2s, transform 0.2s; opacity:0.7; }
+.lightbox .lb-prev { left:24px; } .lightbox .lb-next { right:24px; }
+.lightbox .lb-prev:hover, .lightbox .lb-next:hover { opacity:1; background:rgba(255,255,255,0.20); }
+.lightbox .lb-controls { position:absolute; bottom:24px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:14px; padding:8px 16px; background:rgba(255,255,255,0.08); border-radius:24px; backdrop-filter:blur(8px); }
+.lightbox .lb-controls button { background:none; border:none; color:#fff; font-size:20px; cursor:pointer; padding:4px 10px; line-height:1; opacity:0.85; }
+.lightbox .lb-controls button:hover { opacity:1; }
+.lightbox .lb-count { color:#fff; font-size:13px; font-variant-numeric:tabular-nums; opacity:0.85; min-width:60px; text-align:center; }
+.lightbox .lb-progress { position:absolute; top:0; left:0; right:0; height:3px; background:rgba(255,255,255,0.10); }
+.lightbox .lb-progress-bar { height:100%; background:var(--accent); width:0; transition:width linear; }
+
+/* ── 8 transition effects ─────────────────── */
+@keyframes fxFade        { from { opacity:0 } to { opacity:1 } }
+@keyframes fxZoomIn      { from { opacity:0; transform:scale(0.65) } to { opacity:1; transform:scale(1) } }
+@keyframes fxZoomOut     { from { opacity:0; transform:scale(1.35) } to { opacity:1; transform:scale(1) } }
+@keyframes fxSlideRight  { from { opacity:0; transform:translateX(100px) } to { opacity:1; transform:translateX(0) } }
+@keyframes fxSlideLeft   { from { opacity:0; transform:translateX(-100px) } to { opacity:1; transform:translateX(0) } }
+@keyframes fxFlip        { from { opacity:0; transform:perspective(1000px) rotateY(70deg) } to { opacity:1; transform:perspective(1000px) rotateY(0) } }
+@keyframes fxRotateScale { from { opacity:0; transform:rotate(-12deg) scale(0.6) } to { opacity:1; transform:rotate(0) scale(1) } }
+@keyframes fxBlur        { from { opacity:0; filter:blur(28px); transform:scale(1.08) } to { opacity:1; filter:blur(0); transform:scale(1) } }
+
+.fxFade        { animation:fxFade        0.7s cubic-bezier(0.4,0,0.2,1) both; }
+.fxZoomIn      { animation:fxZoomIn      0.8s cubic-bezier(0.34,1.56,0.64,1) both; }
+.fxZoomOut     { animation:fxZoomOut     0.75s cubic-bezier(0.4,0,0.2,1) both; }
+.fxSlideRight  { animation:fxSlideRight  0.7s cubic-bezier(0.16,1,0.3,1) both; }
+.fxSlideLeft   { animation:fxSlideLeft   0.7s cubic-bezier(0.16,1,0.3,1) both; }
+.fxFlip        { animation:fxFlip        0.9s cubic-bezier(0.4,0,0.2,1) both; }
+.fxRotateScale { animation:fxRotateScale 0.85s cubic-bezier(0.34,1.56,0.64,1) both; }
+.fxBlur        { animation:fxBlur        0.7s cubic-bezier(0.4,0,0.2,1) both; }
 """
 
 NAV_ITEMS = [
@@ -618,24 +677,6 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
   <div class="content">{body_html}</div>
 </main>
 <script>
-function tgLightboxOpen(item) {{
-  const lb = document.querySelector('.lightbox');
-  if (!lb) return;
-  document.getElementById('lbImg').src = item.dataset.src;
-  document.getElementById('lbCh').textContent = item.dataset.ch || '';
-  document.getElementById('lbCap').textContent = item.dataset.cap || '';
-  lb.classList.add('open');
-}}
-function tgLightboxClose(e) {{
-  if (e) e.stopPropagation();
-  document.querySelector('.lightbox')?.classList.remove('open');
-}}
-document.addEventListener('DOMContentLoaded', () => {{
-  document.querySelectorAll('.gallery .item').forEach(item => {{
-    item.addEventListener('click', () => tgLightboxOpen(item));
-  }});
-  document.addEventListener('keydown', e => {{ if (e.key === 'Escape') tgLightboxClose(); }});
-}});
 async function tgGrab(btn) {{
   const guid = btn.dataset.guid;
   const orig = btn.textContent;
@@ -844,7 +885,9 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
         if not n:
             return RedirectResponse("/login")
 
-    where = ["m.thumb_path IS NOT NULL", "m.thumb_path <> '__failed__'"]
+    where = ["m.thumb_path IS NOT NULL",
+             "m.thumb_path <> '__failed__'",
+             "m.thumb_path <> '__deleted__'"]
     params = []
     if channel:
         params.append(channel)
@@ -882,7 +925,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
         return HTMLResponse(_layout("Gallery", "/gallery", body))
 
     items = "".join(
-        f'<figure class="item" data-src="/thumbs/{html.escape(r["thumb_path"])}" '
+        f'<figure class="item" data-id="{r["id"]}" '
+        f'data-src="/thumbs/{html.escape(r["thumb_path"])}" '
         f'data-cap="{html.escape((r["caption"] or "")[:300])}" '
         f'data-ch="{html.escape(r["ch_title"] or r["ch_user"] or "")}">'
         f'<img src="/thumbs/{html.escape(r["thumb_path"])}" loading="lazy" />'
@@ -896,15 +940,98 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
 
     body = (
         f'<h2 class="section">Gallery <span class="count">{len(rows)} of {total:,} cached</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending:,} pending download</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{pending:,} pending</span>'
            if pending else '')
-        + '</h2>'
+        + ' <span class="extra" style="color:var(--muted);font-size:13px">'
+        '← → arrows · Space pause · Del delete · Esc close</span></h2>'
         f'<div class="gallery">{items}</div>'
-        '<div class="lightbox" onclick="tgLightboxClose(event)">'
-        '  <span class="lb-close" onclick="tgLightboxClose(event)">×</span>'
-        '  <img id="lbImg" />'
+        '<div class="lightbox">'
+        '  <div class="lb-progress"><div class="lb-progress-bar" id="lbProgress"></div></div>'
+        '  <button class="lb-close" id="lbClose">×</button>'
+        '  <button class="lb-prev" id="lbPrev">‹</button>'
+        '  <button class="lb-next" id="lbNext">›</button>'
+        '  <img id="lbImg" alt="" />'
+        '  <div class="lb-controls">'
+        '    <button id="lbPlay" title="play / pause (Space)">▶</button>'
+        '    <span class="lb-count" id="lbCount">– / –</span>'
+        '    <button id="lbDel" title="delete (Del) — will not be redownloaded">🗑</button>'
+        '  </div>'
         '  <div class="lb-meta"><div class="ch" id="lbCh"></div><div id="lbCap"></div></div>'
         '</div>'
+        '<script>'
+        '(() => {'
+        '  const items = [...document.querySelectorAll(".gallery .item")];'
+        '  const photos = items.map(el => ({el, id:el.dataset.id, src:el.dataset.src, cap:el.dataset.cap, ch:el.dataset.ch}));'
+        '  if (!photos.length) return;'
+        '  const lb = document.querySelector(".lightbox");'
+        '  const img = document.getElementById("lbImg");'
+        '  const chEl = document.getElementById("lbCh");'
+        '  const capEl = document.getElementById("lbCap");'
+        '  const counter = document.getElementById("lbCount");'
+        '  const playBtn = document.getElementById("lbPlay");'
+        '  const prog = document.getElementById("lbProgress");'
+        '  const FX = ["fxFade","fxZoomIn","fxZoomOut","fxSlideRight","fxSlideLeft","fxFlip","fxRotateScale","fxBlur"];'
+        '  const DELAY = 4500;'
+        '  let cur = -1, playing = false, timer = null, startTimer = null, lastFx = -1;'
+        '  function show(idx) {'
+        '    if (!photos.length) return;'
+        '    idx = ((idx % photos.length) + photos.length) % photos.length;'
+        '    cur = idx;'
+        '    const p = photos[idx];'
+        '    FX.forEach(c => img.classList.remove(c));'
+        '    void img.offsetHeight;'
+        '    img.src = p.src;'
+        '    let fx; do { fx = Math.floor(Math.random() * FX.length); } while (fx === lastFx && FX.length > 1);'
+        '    lastFx = fx;'
+        '    img.classList.add(FX[fx]);'
+        '    chEl.textContent = p.ch || "";'
+        '    capEl.textContent = p.cap || "";'
+        '    counter.textContent = (idx+1) + " / " + photos.length;'
+        '    updateProg();'
+        '  }'
+        '  function updateProg() {'
+        '    prog.style.transition = "none"; prog.style.width = "0";'
+        '    if (playing) { void prog.offsetHeight; prog.style.transition = "width " + DELAY + "ms linear"; prog.style.width = "100%"; }'
+        '  }'
+        '  function play() { playing = true; playBtn.textContent = "⏸"; clearInterval(timer); timer = setInterval(() => show(cur+1), DELAY); updateProg(); }'
+        '  function pause() { playing = false; playBtn.textContent = "▶"; clearInterval(timer); prog.style.transition = "none"; prog.style.width = "0"; }'
+        '  async function del() {'
+        '    const p = photos[cur];'
+        '    if (!confirm("Delete this photo? Will not be redownloaded.")) return;'
+        '    try {'
+        '      const r = await fetch("/api/photo/" + p.id + "/delete", {method:"POST"});'
+        '      if (!r.ok) throw new Error("HTTP " + r.status);'
+        '      p.el.remove(); photos.splice(cur, 1);'
+        '      if (!photos.length) { close(); return; }'
+        '      show(cur);'
+        '    } catch (e) { alert("Delete failed: " + e.message); }'
+        '  }'
+        '  function open(id) {'
+        '    const idx = photos.findIndex(p => p.id === id);'
+        '    if (idx < 0) return;'
+        '    lb.classList.add("open");'
+        '    show(idx);'
+        '    clearTimeout(startTimer);'
+        '    startTimer = setTimeout(play, 5000);'
+        '  }'
+        '  function close() { pause(); clearTimeout(startTimer); lb.classList.remove("open"); }'
+        '  items.forEach(it => it.addEventListener("click", () => open(it.dataset.id)));'
+        '  document.getElementById("lbPrev").addEventListener("click", e => { e.stopPropagation(); pause(); show(cur-1); });'
+        '  document.getElementById("lbNext").addEventListener("click", e => { e.stopPropagation(); pause(); show(cur+1); });'
+        '  playBtn.addEventListener("click", e => { e.stopPropagation(); playing ? pause() : play(); });'
+        '  document.getElementById("lbDel").addEventListener("click", e => { e.stopPropagation(); del(); });'
+        '  document.getElementById("lbClose").addEventListener("click", e => { e.stopPropagation(); close(); });'
+        '  lb.addEventListener("click", e => { if (e.target === lb) close(); });'
+        '  document.addEventListener("keydown", e => {'
+        '    if (!lb.classList.contains("open")) return;'
+        '    if (e.key === "Escape") close();'
+        '    else if (e.key === "ArrowRight") { pause(); show(cur+1); }'
+        '    else if (e.key === "ArrowLeft") { pause(); show(cur-1); }'
+        '    else if (e.key === " ") { e.preventDefault(); playing ? pause() : play(); }'
+        '    else if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); del(); }'
+        '  });'
+        '})();'
+        '</script>'
     )
     return HTMLResponse(_layout("Gallery", "/gallery", body))
 
