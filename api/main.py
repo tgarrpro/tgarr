@@ -447,6 +447,23 @@ button.ghost, .btn.ghost { background:#fff; border:1px solid var(--border); colo
 button.ghost:hover, .btn.ghost:hover { border-color:var(--accent); color:var(--accent); background:#f8fafc; }
 
 code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; font-family:ui-monospace,SF Mono,Menlo,monospace; font-size:14px; border:1px solid var(--border); }
+
+/* ── Poster grid (Sonarr/Radarr style) ─────────────────── */
+.poster-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:18px; }
+.poster-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; overflow:hidden; box-shadow:var(--shadow); display:flex; flex-direction:column; transition:transform 0.12s, box-shadow 0.12s; }
+.poster-card:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,0.12); border-color:var(--accent); }
+.poster-card .poster { aspect-ratio:2/3; background:#f1f5f9; background-size:cover; background-position:center; position:relative; }
+.poster-card .poster .fallback { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; }
+.poster-card .poster .badge { position:absolute; top:8px; right:8px; padding:3px 10px; border-radius:11px; background:rgba(15,23,42,0.78); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; backdrop-filter:blur(4px); }
+.poster-card .info { padding:12px 14px 8px; flex:1; }
+.poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
+.poster-card .info .sub { font-size:13px; color:var(--muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.poster-card .pills { padding:0 14px 10px; display:flex; gap:5px; flex-wrap:wrap; }
+.poster-card .grab-row { padding:8px 14px 12px; border-top:1px solid var(--border); margin-top:auto; background:var(--surface2); }
+.poster-card .grab-row .btn { width:100%; text-align:center; padding:8px; font-size:13px; }
+.view-toggle { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.view-toggle a { padding:6px 14px; color:var(--muted); text-decoration:none; font-size:13px; font-weight:600; }
+.view-toggle a.active { background:var(--accent); color:#fff; }
 """
 
 NAV_ITEMS = [
@@ -704,8 +721,45 @@ async def page_channels():
 # ════════════════════════════════════════════════════════════════════
 # Page: Releases
 # ════════════════════════════════════════════════════════════════════
+def _release_card(r) -> str:
+    """Sonarr/Radarr-style poster card."""
+    title_disp = r["canonical_title"] or r["name"].replace(".", " ")
+    poster = r["poster_url"]
+    se = ""
+    if r["season"] and r["episode"]:
+        se = f"S{r['season']:02}E{r['episode']:02}"
+    elif r["season"]:
+        se = f"Season {r['season']}"
+    posted = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
+    sub_bits = [b for b in (se, posted) if b]
+    cat_pill = ("accent" if r["category"] == "movie"
+                else "ok" if r["category"] == "tv" else "muted")
+    poster_style = (f'style="background-image:url(\'{html.escape(poster)}\')"'
+                    if poster else '')
+    fallback = '<div class="fallback">🎬</div>' if not poster else ""
+    quality_badge = (f'<div class="badge">{html.escape(r["quality"])}</div>'
+                     if r["quality"] else "")
+    return (
+        f'<div class="poster-card">'
+        f'<div class="poster" {poster_style}>{fallback}{quality_badge}</div>'
+        f'<div class="info">'
+        f'<div class="title">{html.escape(title_disp)}</div>'
+        f'<div class="sub">{" · ".join(html.escape(x) for x in sub_bits)}</div>'
+        f'</div>'
+        f'<div class="pills">'
+        f'<span class="pill {cat_pill}">{r["category"]}</span>'
+        f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
+        f'</div>'
+        f'<div class="grab-row">'
+        f'<a class="btn" href="/newznab/api?t=get&id={r["guid"]}&apikey=tgarr">⬇ Grab</a>'
+        f'</div>'
+        f'</div>'
+    )
+
+
 @app.get("/releases", response_class=HTMLResponse)
-async def page_releases(q: Optional[str] = None, cat: Optional[str] = None, limit: int = 100):
+async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
+                        view: str = "grid", limit: int = 120):
     if not login.session_exists():
         return RedirectResponse("/login")
     where = ["1=1"]
@@ -723,38 +777,50 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None, limi
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
+    def _qs(**overrides) -> str:
+        bits = []
+        for k, v in {"q": q, "cat": cat, "view": view, **overrides}.items():
+            if v:
+                bits.append(f"{k}={html.escape(str(v))}")
+        return "?" + "&".join(bits) if bits else ""
+
     def _chip(val: str, label: str) -> str:
         active = (cat or "") == val
-        extra = f"&q={html.escape(q)}" if q else ""
-        href = f"/releases?cat={val}{extra}" if val else f"/releases{'?q=' + html.escape(q) if q else ''}"
+        href = f"/releases{_qs(cat=val if val else None)}"
         style = ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
                 'border-color:var(--accent);') if active else ''
         return (f'<a class="btn ghost" href="{href}" '
-               f'style="{style}padding:5px 12px;font-size:11px">{label}</a>')
+               f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
 
-    filters = (f'<div style="display:flex;gap:8px;margin-bottom:18px">'
-              f'{_chip("","all")}{_chip("movie","movies")}{_chip("tv","tv")}'
-              f'</div>')
-
-    def _poster(url: str | None) -> str:
-        if url:
-            return (f'<img src="{html.escape(url)}" loading="lazy" '
-                   f'style="width:44px;height:64px;object-fit:cover;'
-                   f'border-radius:3px;display:block;background:#f1f5f9" />')
-        return ('<div style="width:44px;height:64px;background:#f1f5f9;'
-               'border:1px solid var(--border);border-radius:3px;'
-               'display:flex;align-items:center;justify-content:center;'
-               'font-size:18px;color:#cbd5e1">🎬</div>')
+    grid_active = "active" if view != "list" else ""
+    list_active = "active" if view == "list" else ""
+    toolbar = (
+        f'<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
+        f'{_chip("","all")}{_chip("movie","movies")}{_chip("tv","tv")}'
+        f'<div style="margin-left:auto" class="view-toggle">'
+        f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ Grid</a>'
+        f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ List</a>'
+        f'</div></div>'
+    )
 
     if not rows:
         body_html = ('<div class="empty-state"><div class="icon">🎬</div>'
                     '<div>No releases match this filter.</div></div>')
-    else:
+    elif view == "list":
+        def _row_thumb(url):
+            if url:
+                return (f'<img src="{html.escape(url)}" loading="lazy" '
+                       f'style="width:44px;height:64px;object-fit:cover;'
+                       f'border-radius:3px;display:block;background:#f1f5f9" />')
+            return ('<div style="width:44px;height:64px;background:#f1f5f9;'
+                   'border:1px solid var(--border);border-radius:3px;'
+                   'display:flex;align-items:center;justify-content:center;'
+                   'font-size:18px;color:#cbd5e1">🎬</div>')
         body_rows = "".join(
             f'<tr>'
-            f'<td style="width:60px;padding:8px 12px">{_poster(r["poster_url"])}</td>'
+            f'<td style="width:60px;padding:8px 12px">{_row_thumb(r["poster_url"])}</td>'
             f'<td class="name">'
-            f'{html.escape(r["canonical_title"]) + "<br>" if r["canonical_title"] and r["canonical_title"] != r["name"] else ""}'
+            f'{(html.escape(r["canonical_title"]) + "<br>") if r["canonical_title"] and r["canonical_title"] != r["name"] else ""}'
             f'<span style="color:var(--muted);font-weight:400;font-size:13px">{html.escape(r["name"])}</span>'
             f'</td>'
             f'<td><span class="pill {"accent" if r["category"]=="movie" else "ok" if r["category"]=="tv" else "muted"}">{r["category"]}</span></td>'
@@ -762,17 +828,20 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None, limi
             f'<td>{r["quality"] or ""}</td>'
             f'<td class="num">{_fmt_size(r["size_bytes"])}</td>'
             f'<td class="num">{_fmt_time(r["posted_at"])}</td>'
-            f'<td class="num">{r["parse_score"]:.2f}</td>'
             f'</tr>'
             for r in rows
         )
         body_html = (f'<table><thead><tr>'
-                    f'<th></th><th>name</th><th>category</th><th>S/E</th><th>quality</th>'
-                    f'<th>size</th><th>posted</th><th>score</th>'
+                    f'<th></th><th>name</th><th>cat</th><th>S/E</th><th>quality</th>'
+                    f'<th>size</th><th>posted</th>'
                     f'</tr></thead><tbody>{body_rows}</tbody></table>')
+    else:
+        body_html = (f'<div class="poster-grid">'
+                    f'{"".join(_release_card(r) for r in rows)}'
+                    f'</div>')
 
     body = (f'<h2 class="section">Parsed releases <span class="count">{len(rows)} shown</span></h2>'
-           f'{filters}{body_html}')
+           f'{toolbar}{body_html}')
     actions = (f'<form action="/releases" method="GET" style="margin-left:auto">'
               f'<input type="text" name="q" class="search" placeholder="filter…" '
               f'value="{html.escape(q) if q else ""}" /></form>')
@@ -857,8 +926,9 @@ async def page_search(q: Optional[str] = None):
             params.append(f"%{w}%")
             where.append(f"name ILIKE ${len(params)}")
         sql = (f"SELECT id, guid, name, category, season, episode, quality, "
-              f"size_bytes, posted_at FROM releases WHERE "
-              f"{' AND '.join(where)} ORDER BY posted_at DESC NULLS LAST LIMIT 100")
+              f"size_bytes, posted_at, parse_score, poster_url, canonical_title "
+              f"FROM releases WHERE {' AND '.join(where)} "
+              f"ORDER BY posted_at DESC NULLS LAST LIMIT 120")
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
 
@@ -869,25 +939,12 @@ async def page_search(q: Optional[str] = None):
                           '<div style="margin-top:8px;font-size:12px">Try fewer words or different spelling.</div>'
                           '</div>')
         else:
-            items = "".join(
-                f'<div class="dl-item">'
-                f'<div class="icon">{"🎬" if r["category"]=="movie" else "📺" if r["category"]=="tv" else "📦"}</div>'
-                f'<div class="info">'
-                f'<div class="name">{html.escape(r["name"])}</div>'
-                f'<div class="meta">'
-                f'<span class="pill {"accent" if r["category"]=="movie" else "ok"}">{r["category"]}</span>'
-                f'{("<span>· S%02dE%02d</span>" % (r["season"],r["episode"])) if r["season"] and r["episode"] else ""}'
-                f'{f"<span>· {r['quality']}</span>" if r["quality"] else ""}'
-                f'<span>· {_fmt_size(r["size_bytes"])}</span>'
-                f'<span>· {_fmt_time(r["posted_at"])}</span>'
-                f'</div></div>'
-                f'<div class="right">'
-                f'<a class="btn" href="/newznab/api?t=get&id={r["guid"]}&apikey=tgarr">⬇ Grab</a>'
-                f'</div></div>'
-                for r in rows
+            results_html = (
+                f'<h2 class="section">Results <span class="count">{len(rows)}</span></h2>'
+                f'<div class="poster-grid">'
+                f'{"".join(_release_card(r) for r in rows)}'
+                f'</div>'
             )
-            results_html = (f'<h2 class="section">Results <span class="count">{len(rows)}</span></h2>'
-                          f'<div class="dl-list">{items}</div>')
 
     body = f"""
 <form action="/search" method="GET" style="margin-bottom:24px;display:flex;gap:10px">

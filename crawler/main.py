@@ -50,6 +50,10 @@ async def init_db() -> None:
     log.info("postgres pool ready")
 
 
+MIN_MOVIE_BYTES = 100 * 1024 * 1024   # 100 MB — anything smaller is sample/trailer/junk
+MIN_TV_BYTES = 30 * 1024 * 1024       # 30 MB — short TV ep can be 50MB at 480p
+
+
 async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at):
     """Parse filename + insert release row if score is high enough."""
     parsed = parse_filename(file_name or "")
@@ -60,6 +64,13 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
     if not rname:
         return None
     type_ = parsed.get("type", "unknown")
+    # Size sanity: filename-only parse calls trailers/samples "movie".
+    # Real video files exceed these floors. Skip junk before it pollutes releases.
+    if file_size:
+        if type_ == "movie" and file_size < MIN_MOVIE_BYTES:
+            return None
+        if type_ == "tv" and file_size < MIN_TV_BYTES:
+            return None
     await conn.execute(
         """INSERT INTO releases
              (name, category, series_title, season, episode,
