@@ -51,8 +51,12 @@ LOGIN_HTML = """<!DOCTYPE html>
 * { box-sizing:border-box; margin:0; padding:0; }
 body { font:16px/1.55 -apple-system,Segoe UI,system-ui,sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
 .card { background:var(--bg2); border:1px solid var(--border); border-radius:10px; padding:40px; max-width:560px; width:100%; box-shadow:0 4px 12px rgba(15,23,42,0.06); }
-h1 { color:var(--tg-blue); font-size:34px; letter-spacing:-1px; margin-bottom:8px; }
+.brand-row { display:flex; align-items:center; gap:14px; margin-bottom:8px; }
+.brand-row .mark { width:52px; height:52px; color:var(--tg-blue); flex-shrink:0; }
+.brand-row h1 { margin-bottom:0; }
+h1 { color:var(--tg-blue); font-size:52px; font-weight:900; letter-spacing:-2.5px; margin-bottom:8px; line-height:0.9; }
 h1 span { color:var(--fg); }
+.tag { color:var(--muted); font-size:15px; text-transform:uppercase; letter-spacing:2px; font-weight:700; margin-bottom:24px; }
 .sub { color:var(--muted); margin-bottom:28px; font-size:16px; line-height:1.55; }
 .tabs { display:flex; gap:0; margin-bottom:28px; border-bottom:1px solid var(--border); }
 .tab { padding:13px 24px; cursor:pointer; color:var(--muted); border-bottom:2px solid transparent; font-weight:600; font-size:16px; user-select:none; }
@@ -74,7 +78,11 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 </style>
 </head><body>
 <div class="card">
-  <h1>tg<span>arr</span> · sign in</h1>
+  <div class="brand-row">
+    <svg class="mark" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    <h1>tg<span>arr</span></h1>
+  </div>
+  <div class="tag">sign in to Telegram</div>
   <div class="sub">tgarr needs to log in to your Telegram account once. Session is stored locally — never leaves your tgarr instance.</div>
 
   <div class="tabs">
@@ -188,8 +196,8 @@ qrStart();
 
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page():
-    if login.session_exists():
+async def login_page(preview: Optional[int] = None):
+    if login.session_exists() and not preview:
         return RedirectResponse("/")
     return HTMLResponse(LOGIN_HTML)
 
@@ -234,11 +242,13 @@ CSS = """
 html, body { height:100%; }
 body { font:16px/1.55 -apple-system,Segoe UI,system-ui,sans-serif; background:var(--bg); color:var(--fg); display:flex; }
 
-aside.nav { width:240px; min-width:240px; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; }
-.brand { padding:24px 22px; border-bottom:1px solid var(--border); }
-.brand .logo { font-size:30px; font-weight:800; letter-spacing:-1px; color:var(--accent); line-height:1; }
+aside.nav { width:260px; min-width:260px; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; }
+.brand { padding:28px 22px 24px; border-bottom:1px solid var(--border); }
+.brand .logo-row { display:flex; align-items:center; gap:12px; }
+.brand .mark { width:46px; height:46px; flex-shrink:0; color:var(--accent); }
+.brand .logo { font-size:48px; font-weight:900; letter-spacing:-2.5px; color:var(--accent); line-height:0.9; }
 .brand .logo span { color:var(--fg); }
-.brand .ver { font-size:12px; color:var(--muted); margin-top:6px; text-transform:uppercase; letter-spacing:1.5px; font-weight:600; }
+.brand .ver { font-size:12px; color:var(--muted); margin-top:10px; text-transform:uppercase; letter-spacing:1.5px; font-weight:700; }
 .navlinks { padding:16px 0; flex:1; overflow-y:auto; }
 .navlink { display:flex; align-items:center; gap:14px; padding:13px 22px; color:#475569; text-decoration:none; font-weight:500; border-left:3px solid transparent; font-size:16px; }
 .navlink:hover { background:#f1f5f9; color:var(--fg); }
@@ -380,7 +390,10 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
 </head><body>
 <aside class="nav">
   <div class="brand">
-    <div class="logo">tg<span>arr</span></div>
+    <div class="logo-row">
+      <svg class="mark" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      <div class="logo">tg<span>arr</span></div>
+    </div>
     <div class="ver">v{TGARR_VERSION}</div>
   </div>
   <div class="navlinks">{nav}</div>
