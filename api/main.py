@@ -2000,6 +2000,10 @@ def _category_id(rel) -> str:
 def _item_xml(r, base_url: str, apikey: str) -> str:
     guid = str(r["guid"])
     link = f"{base_url}/newznab/api?t=get&id={guid}&apikey={apikey}"
+    # XML 1.0 requires & to be escaped as &amp; even inside element body —
+    # Sonarr's strict XDocument parser bails out on raw &id= otherwise.
+    link_text = html.escape(link)
+    link_attr = html.escape(link, quote=True)
     pubdate = (r["posted_at"].strftime("%a, %d %b %Y %H:%M:%S +0000")
                if r["posted_at"] else "")
     size = r["size_bytes"] or 0
@@ -2009,13 +2013,13 @@ def _item_xml(r, base_url: str, apikey: str) -> str:
         f"    <item>\n"
         f"      <title>{title}</title>\n"
         f"      <guid isPermaLink=\"false\">{guid}</guid>\n"
-        f"      <link>{link}</link>\n"
-        f"      <comments>{link}</comments>\n"
+        f"      <link>{link_text}</link>\n"
+        f"      <comments>{link_text}</comments>\n"
         f"      <pubDate>{pubdate}</pubDate>\n"
         f"      <category>{cat_id}</category>\n"
         f"      <size>{size}</size>\n"
         f"      <description>tgarr release via Telegram MTProto</description>\n"
-        f"      <enclosure url=\"{link}\" length=\"{size}\" type=\"application/x-nzb\"/>\n"
+        f"      <enclosure url=\"{link_attr}\" length=\"{size}\" type=\"application/x-nzb\"/>\n"
         f"      <newznab:attr name=\"category\" value=\"{cat_id}\"/>\n"
         f"      <newznab:attr name=\"size\" value=\"{size}\"/>\n"
         f"      <newznab:attr name=\"guid\" value=\"{guid}\"/>\n"
