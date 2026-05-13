@@ -19,7 +19,10 @@ import uuid as uuidlib
 
 import asyncpg
 from pyrogram import Client
-from pyrogram.errors import FloodWait
+from pyrogram.errors import (
+    FloodWait, UsernameNotOccupied, UsernameInvalid,
+    ChannelInvalid, ChannelPrivate,
+)
 from pyrogram.types import Message
 
 from parser import parse_filename, to_release_name
@@ -708,6 +711,171 @@ async def subscription_poller() -> None:
             await asyncio.sleep(60)
 
 
+SEED_VALIDATOR_ENABLED = os.environ.get("TGARR_SEED_VALIDATOR", "").lower() == "true"
+SEED_VALIDATOR_INTERVAL = int(os.environ.get("TGARR_SEED_VALIDATOR_INTERVAL", "30"))  # 30s/candidate
+
+# Same CSAM regex as registry server — defense in depth.
+_CSAM_RX = re.compile(
+    r"\b(loli|lolicon|shota|shotacon|child\s*porn|kid\s*porn|"
+    r"pre[\s_-]*teen|under[\s_-]*age|\bcp\d+|\bcp_)\b", re.IGNORECASE)
+_NSFW_RX = re.compile(
+    r"(porn|xxx|nsfw|adult|18\+|hentai|erotic|nude|naked|onlyfan|"
+    r"sexy|sex\b|色情|成人|18禁|裸|淫|эротик|порно|секс|اباحي|سكس)",
+    re.IGNORECASE)
+
+
+def _classify(title: str, username: str, hint: str | None) -> str:
+    blob = (title or "") + " " + (username or "")
+    if _CSAM_RX.search(blob):
+        return "blocked_csam"
+    if _NSFW_RX.search(blob) or hint == "nsfw":
+        return "nsfw"
+    return "sfw"
+
+
+async def seed_validator() -> None:
+    """Resolve seed_candidates one at a time via Pyrogram.
+
+    Survey-mode pipeline: 6924 YAML candidates → registry_channels rows
+    with seeded=true on success. Mark dead/banned/csam appropriately so we
+    don't waste calls re-resolving them next pass.
+
+    Only runs on the central tgarr.me instance — gated by TGARR_SEED_VALIDATOR=true
+    in the .env. End-user instances never validate seeds; they only consume
+    the registry the central operator validated.
+
+    Conservative 30s/call pace to avoid Telegram FloodWait. 6924 × 30s ≈
+    57 hours background work; designed to keep running across multiple days.
+    """
+    if not SEED_VALIDATOR_ENABLED:
+        return
+    log.info("[seed-validator] enabled, interval=%ds per candidate",
+             SEED_VALIDATOR_INTERVAL)
+    await asyncio.sleep(60)  # let backfill settle first
+
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT username, audience_hint, category, language, region
+                       FROM seed_candidates
+                       WHERE validation_status = 'pending' OR validation_status IS NULL
+                       ORDER BY added_at
+                       LIMIT 1""")
+            if not row:
+                log.info("[seed-validator] all candidates processed — sleeping 1h")
+                await asyncio.sleep(3600)
+                continue
+
+            uname = row["username"]
+            # Pre-check CSAM by name — never even resolve these.
+            if _CSAM_RX.search(uname):
+                log.warning("[seed-validator] CSAM-pattern skipped: @%s", uname)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE seed_candidates SET validation_status='csam',
+                           validated_at=NOW() WHERE username=$1""", uname)
+                    # Also pre-block in registry_channels
+                    await conn.execute(
+                        """INSERT INTO registry_channels
+                             (username, audience, blocked, block_reason, seeded)
+                           VALUES ($1, 'blocked_csam', TRUE, 'csam-keyword', TRUE)
+                           ON CONFLICT (username) DO UPDATE SET
+                             audience='blocked_csam', blocked=TRUE,
+                             block_reason='csam-keyword'""", uname)
+                continue
+
+            try:
+                chat = await app.get_chat(uname)
+            except FloodWait as fw:
+                log.warning("[seed-validator] FloodWait %ds on @%s — backing off",
+                            fw.value, uname)
+                await asyncio.sleep(min(fw.value + 10, 1800))
+                continue
+            except (UsernameNotOccupied, UsernameInvalid):
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE seed_candidates SET validation_status='dead',
+                           validated_at=NOW() WHERE username=$1""", uname)
+                continue
+            except (ChannelInvalid, ChannelPrivate):
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE seed_candidates SET validation_status='forbidden',
+                           validated_at=NOW() WHERE username=$1""", uname)
+                continue
+            except Exception as e:
+                log.warning("[seed-validator] err @%s: %s", uname, e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE seed_candidates SET validation_status='err',
+                           validated_at=NOW() WHERE username=$1""", uname)
+                continue
+
+            title = chat.title or uname
+            members = getattr(chat, "members_count", None)
+            description = (getattr(chat, "description", None) or "")[:1000] or None
+            audience = _classify(title, uname, row["audience_hint"])
+
+            # Last message timestamp via 1-msg history pull
+            last_msg = None
+            try:
+                async for m in app.get_chat_history(chat.id, limit=1):
+                    last_msg = m.date
+                    break
+            except Exception:
+                pass
+
+            async with db_pool.acquire() as conn:
+                if audience == "blocked_csam":
+                    await conn.execute(
+                        """INSERT INTO registry_channels
+                             (username, title, audience, blocked, block_reason,
+                              seeded, members_count, description, last_msg_at,
+                              health_status, health_checked_at)
+                           VALUES ($1,$2,'blocked_csam',TRUE,'csam-after-resolve',
+                                   TRUE,$3,$4,$5,'banned',NOW())
+                           ON CONFLICT (username) DO UPDATE SET
+                             audience='blocked_csam', blocked=TRUE,
+                             health_checked_at=NOW()""",
+                        uname, title, members, description, last_msg)
+                    status = "csam"
+                else:
+                    await conn.execute(
+                        """INSERT INTO registry_channels
+                             (username, title, members_count, audience, language,
+                              category, description, last_msg_at, seeded,
+                              health_status, health_checked_at)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,'alive',NOW())
+                           ON CONFLICT (username) DO UPDATE SET
+                             title=EXCLUDED.title,
+                             members_count=EXCLUDED.members_count,
+                             audience=CASE WHEN registry_channels.audience='blocked_csam'
+                                          THEN 'blocked_csam'
+                                          ELSE EXCLUDED.audience END,
+                             language=COALESCE(EXCLUDED.language, registry_channels.language),
+                             category=COALESCE(EXCLUDED.category, registry_channels.category),
+                             description=EXCLUDED.description,
+                             last_msg_at=COALESCE(EXCLUDED.last_msg_at, registry_channels.last_msg_at),
+                             seeded=TRUE,
+                             health_status='alive',
+                             health_checked_at=NOW()""",
+                        uname, title, members, audience,
+                        row["language"], row["category"], description, last_msg)
+                    status = "alive"
+
+                await conn.execute(
+                    """UPDATE seed_candidates SET validation_status=$1,
+                       validated_at=NOW() WHERE username=$2""", status, uname)
+
+            log.info("[seed-validator] @%s → %s (%s members, %s)",
+                     uname, status, members, audience)
+            await asyncio.sleep(SEED_VALIDATOR_INTERVAL)
+        except Exception as e:
+            log.exception("[seed-validator] outer loop: %s", e)
+            await asyncio.sleep(120)
+
+
 async def registry_puller() -> None:
     """Pull curated channel list from registry.tgarr.me into local `discovered` table.
 
@@ -934,6 +1102,7 @@ async def main() -> None:
     asyncio.create_task(subscription_poller())
     asyncio.create_task(contribute_to_registry())
     asyncio.create_task(registry_puller())
+    asyncio.create_task(seed_validator())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()

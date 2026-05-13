@@ -73,3 +73,33 @@ CREATE TABLE IF NOT EXISTS registry_pulls (
     pulled_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_pulls_ip_at ON registry_pulls (ip_hash, pulled_at DESC);
+
+-- Seed pipeline. Candidate channels from YAML files (Claude-recall + tgstat
+-- scrape) land here. seed_validator task picks them one-by-one, calls
+-- Pyrogram get_chat to validate, and on success promotes them to
+-- registry_channels with seeded=true.
+CREATE TABLE IF NOT EXISTS seed_candidates (
+    username           TEXT PRIMARY KEY,
+    title              TEXT,
+    category           TEXT,
+    region             TEXT,
+    language           TEXT,
+    audience_hint      TEXT,    -- from YAML, may be overridden after validate
+    tags               TEXT[],
+    source             TEXT,    -- claude-knowledge / tgstat-scrape / curated
+    added_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    validated_at       TIMESTAMPTZ,
+    validation_status  TEXT     -- pending|alive|dead|banned|csam|forbidden|err
+);
+CREATE INDEX IF NOT EXISTS idx_seed_status ON seed_candidates (validation_status, added_at);
+
+-- Channel-intelligence columns on registry_channels (set by validator + ongoing
+-- meta refresher). Lets clients judge "is this channel worth subscribing".
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS seeded BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS first_msg_at TIMESTAMPTZ;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS last_msg_at TIMESTAMPTZ;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS health_status TEXT;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS health_checked_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_reg_health ON registry_channels (health_status, health_checked_at);
+CREATE INDEX IF NOT EXISTS idx_reg_seeded ON registry_channels (seeded) WHERE seeded;
