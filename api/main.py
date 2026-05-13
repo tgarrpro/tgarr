@@ -41,11 +41,29 @@ async def _shutdown():
 
 
 # ════════════════════════════════════════════════════════════════════
+# Favicon (paper-plane SVG, served as /favicon.svg and /favicon.ico)
+# ════════════════════════════════════════════════════════════════════
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<circle cx="12" cy="12" r="12" fill="#229ED9"/>'
+    '<path d="M5.5 17 L19 12 L5.5 7 L5 11 L13 12 L5 13 Z" fill="white"/>'
+    '</svg>'
+)
+
+
+@app.get("/favicon.svg")
+@app.get("/favicon.ico")  # browsers auto-request this; serve same SVG payload
+async def favicon():
+    return Response(FAVICON_SVG, media_type="image/svg+xml")
+
+
+# ════════════════════════════════════════════════════════════════════
 # Login (Telegram QR + SMS)
 # ════════════════════════════════════════════════════════════════════
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8"><title>tgarr — sign in to Telegram</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <style>
 :root { --bg:#f5f7fa; --bg2:#ffffff; --fg:#1e293b; --muted:#64748b; --accent:#229ED9; --tg-blue:#229ED9; --border:#e2e8f0; --ok:#15803d; --bad:#b91c1c; }
 * { box-sizing:border-box; margin:0; padding:0; }
@@ -386,6 +404,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
 <html><head>
 <meta charset="utf-8">
 <title>{html.escape(title)} · tgarr</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <style>{CSS}</style>
 </head><body>
 <aside class="nav">
