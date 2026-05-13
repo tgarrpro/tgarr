@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import urllib.parse
 import urllib.request
 import uuid as uuidlib
 
@@ -591,6 +592,11 @@ async def local_media_downloader() -> None:
 SUBSCRIBE_POLL_INTERVAL = int(os.environ.get("TG_SUBSCRIBE_POLL_INTERVAL", "1800"))  # 30m
 SUBSCRIBE_BACKFILL_LIMIT = int(os.environ.get("TG_SUBSCRIBE_BACKFILL_LIMIT", "1000"))
 
+# Registry pull cadence — deliberately slow to keep tgarr.me load sane at scale.
+# UUID-derived hour-of-day stagger means 100K instances spread evenly.
+REGISTRY_PULL_INTERVAL_SEC = int(os.environ.get("TGARR_REGISTRY_PULL_INTERVAL", "43200"))  # 12h
+REGISTRY_PULL_ENABLED = os.environ.get("TGARR_REGISTRY_PULL", "true").lower() == "true"
+
 
 async def subscription_poller() -> None:
     """Poll public channels the user has subscribed to (without joining).
@@ -702,6 +708,100 @@ async def subscription_poller() -> None:
             await asyncio.sleep(60)
 
 
+async def registry_puller() -> None:
+    """Pull curated channel list from registry.tgarr.me into local `discovered` table.
+
+    Thundering-herd safety:
+    - First-ever pull is deterministically offset by hash(instance_uuid) % 24h,
+      so 100K instances spread evenly across the day instead of stampeding
+      at boot.
+    - Subsequent pulls are every 12h by default (rare, since the registry
+      doesn't change fast). Each tier may tune via env.
+    - Each pull sends `since=<last_pulled_at>` so the server returns only
+      changes — most calls return small payloads.
+    - HTTP Cache-Control on the server response means Cloudflare absorbs
+      99% of legit traffic before it hits the origin.
+
+    Discovered channels are NOT auto-subscribed. They land in the `discovered`
+    table and the user picks which to actually subscribe to via /discover UI.
+    """
+    if not REGISTRY_PULL_ENABLED:
+        log.info("[pull] TGARR_REGISTRY_PULL=false — disabled")
+        return
+
+    # Compute initial offset from instance UUID hash → even spread.
+    async with db_pool.acquire() as conn:
+        uuid_val = await conn.fetchval(
+            "SELECT value FROM config WHERE key='instance_uuid'") or "bootstrap"
+    initial_offset = (int(hashlib.sha256(uuid_val.encode()).hexdigest(), 16)
+                      % REGISTRY_PULL_INTERVAL_SEC)
+    log.info("[pull] registry puller — initial offset %ds (deterministic from UUID),"
+             " then every %ds", initial_offset, REGISTRY_PULL_INTERVAL_SEC)
+    await asyncio.sleep(min(initial_offset, 3600))  # cap initial wait so dev/test boots fast
+
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                last_pulled = await conn.fetchval(
+                    "SELECT max(last_pulled_at) FROM discovered")
+            params = {"audience": "sfw", "only_verified": "1", "limit": "5000"}
+            if last_pulled:
+                params["since"] = last_pulled.isoformat()
+            qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
+            url = REGISTRY_URL + "/api/v1/registry?" + qs
+
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "tgarr/0.3.7 (+https://tgarr.me)",
+                             "Accept": "application/json"},
+                )
+                resp = await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(req, timeout=30).read())
+                data = json.loads(resp.decode())
+                channels = data.get("channels", [])
+            except Exception as e:
+                log.warning("[pull] registry GET failed: %s", e)
+                channels = []
+
+            inserted = updated = 0
+            async with db_pool.acquire() as conn:
+                for c in channels:
+                    u = (c.get("username") or "").strip()
+                    if not u:
+                        continue
+                    is_new = await conn.fetchval(
+                        """INSERT INTO discovered
+                             (username, title, members_count, media_count, audience,
+                              language, category, distinct_contributors, verified)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                           ON CONFLICT (username) DO UPDATE SET
+                             title = EXCLUDED.title,
+                             members_count = EXCLUDED.members_count,
+                             media_count = EXCLUDED.media_count,
+                             audience = EXCLUDED.audience,
+                             language = EXCLUDED.language,
+                             category = EXCLUDED.category,
+                             distinct_contributors = EXCLUDED.distinct_contributors,
+                             verified = EXCLUDED.verified,
+                             last_pulled_at = NOW()
+                           RETURNING (xmax = 0)""",
+                        u, c.get("title"), c.get("members_count"), c.get("media_count"),
+                        c.get("audience"), c.get("language"), c.get("category"),
+                        c.get("distinct_contributors", 0), c.get("verified", False))
+                    if is_new:
+                        inserted += 1
+                    else:
+                        updated += 1
+
+            log.info("[pull] registry sync: %d new, %d updated (of %d returned)",
+                     inserted, updated, len(channels))
+            await asyncio.sleep(REGISTRY_PULL_INTERVAL_SEC)
+        except Exception as e:
+            log.exception("[pull] outer: %s", e)
+            await asyncio.sleep(600)
+
+
 async def contribute_to_registry() -> None:
     """Federation: push our eligible channels to registry.tgarr.me periodically.
 
@@ -808,6 +908,7 @@ async def main() -> None:
     asyncio.create_task(channel_meta_refresher())
     asyncio.create_task(subscription_poller())
     asyncio.create_task(contribute_to_registry())
+    asyncio.create_task(registry_puller())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()

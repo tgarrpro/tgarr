@@ -190,14 +190,38 @@ async def contribute(request: Request):
 # ════════════════════════════════════════════════════════════════════
 # GET /api/v1/registry
 # ════════════════════════════════════════════════════════════════════
+# Per-IP-hash pull rate limit (defense in depth — Cloudflare absorbs 99%
+# of legit traffic but origin still gets hit on cache misses). Free tier
+# gets a much lower budget than paid; API key passes mark the request as
+# paid and skip the free quota.
+PULL_LIMIT_FREE_PER_DAY = 24
+PULL_LIMIT_PAID_PER_DAY = 1000  # standard tier; plus tier currently same in code
+
+
 @app.get("/api/v1/registry")
 async def get_registry(
+    request: Request,
     audience: str = Query("sfw"),
     min_contributors: int = Query(1),
     only_verified: int = Query(0),
     limit: int = Query(5000),
     since: Optional[str] = None,
+    api_key: Optional[str] = Query(None),
 ):
+    ip_hash = _ip_hash(request)
+    # TODO v0.4: look up api_key, derive tier. For now, presence = paid grace.
+    daily_cap = PULL_LIMIT_PAID_PER_DAY if api_key else PULL_LIMIT_FREE_PER_DAY
+    async with db_pool.acquire() as conn:
+        today_pulls = await conn.fetchval(
+            """SELECT count(*) FROM registry_contributions
+               WHERE remote_ip_hash = $1
+                 AND submitted_at > NOW() - INTERVAL '24 hours'""", ip_hash)
+        if today_pulls and today_pulls > daily_cap:
+            raise HTTPException(
+                429, f"daily registry-pull limit exceeded ({daily_cap} for "
+                     f"{'paid' if api_key else 'free'} tier — see "
+                     f"https://tgarr.me/docs/PRICING.md)")
+
     where = ["blocked = FALSE", "audience <> 'blocked_csam'"]
     if audience in ("sfw", "nsfw"):
         where.append(f"audience = '{audience}'")
@@ -218,10 +242,22 @@ async def get_registry(
                      COALESCE(members_count, 0) DESC
             LIMIT {limit}
         """)
-    return {"version": VERSION,
+    def _row_json(r):
+        d = dict(r)
+        if d.get("last_seen_at"):
+            d["last_seen_at"] = d["last_seen_at"].isoformat()
+        return d
+    body = {"version": VERSION,
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "count": len(rows),
-            "channels": [dict(r) for r in rows]}
+            "channels": [_row_json(r) for r in rows]}
+    # Cloudflare CDN absorbs the load for 100K users. 15 min fresh +
+    # 1 hour stale-while-revalidate means origin sees ~96 fills/day per
+    # distinct (audience, only_verified, min_contributors) tuple.
+    return JSONResponse(body, headers={
+        "Cache-Control": "public, max-age=900, stale-while-revalidate=3600",
+        "Vary": "Accept-Encoding",
+    })
 
 
 # ════════════════════════════════════════════════════════════════════

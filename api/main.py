@@ -75,6 +75,25 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribe_error TEXT;
             CREATE INDEX IF NOT EXISTS idx_channels_subscribed ON channels (subscribed, last_polled_at) WHERE subscribed;
+
+            -- Channels pulled from registry.tgarr.me but NOT yet subscribed.
+            -- Pure local catalog; user clicks Subscribe in /discover to start
+            -- the no-join subscription_poller against them.
+            CREATE TABLE IF NOT EXISTS discovered (
+                username TEXT PRIMARY KEY,
+                title TEXT,
+                members_count INTEGER,
+                media_count INTEGER,
+                audience TEXT,
+                language TEXT,
+                category TEXT,
+                distinct_contributors INTEGER,
+                verified BOOLEAN,
+                first_pulled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_pulled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                dismissed BOOLEAN NOT NULL DEFAULT FALSE
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovered_audience ON discovered (audience);
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
