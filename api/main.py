@@ -895,9 +895,17 @@ async def root(accept: Optional[str] = Header(None)):
 # ════════════════════════════════════════════════════════════════════
 # Page: Channels
 # ════════════════════════════════════════════════════════════════════
+# Federation eligibility — channels matching both rules get pushed to
+# registry.tgarr.me. Friend chats, small groups, and content-sparse channels
+# stay private; only sizeable resource channels seed the central moat.
+CONTRIB_MIN_MEMBERS = 500
+CONTRIB_MIN_MEDIA = 100
+
+
 @app.get("/channels", response_class=HTMLResponse)
 async def page_channels(min_members: int = 500,
-                        max_members: Optional[int] = None):
+                        max_members: Optional[int] = None,
+                        eligible: int = 0):
     if not login.session_exists():
         return RedirectResponse("/login")
     # Range filter: COALESCE NULL members to a big number so unresolved
@@ -905,6 +913,12 @@ async def page_channels(min_members: int = 500,
     where_extra = f"AND COALESCE(c.members_count, 999999) >= {max(0, min_members)}"
     if max_members:
         where_extra += f" AND COALESCE(c.members_count, 0) < {max_members}"
+    if eligible:
+        where_extra += (
+            f" AND c.members_count >= {CONTRIB_MIN_MEMBERS} "
+            f"AND (SELECT count(*) FROM messages m WHERE m.channel_id = c.id "
+            f"AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}"
+        )
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             f"""SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
@@ -913,16 +927,25 @@ async def page_channels(min_members: int = 500,
                                                                 AS msg_count,
                       (SELECT count(*) FROM messages m
                          WHERE m.channel_id = c.id AND m.file_name IS NOT NULL)
-                                                                AS media_count
+                                                                AS media_count,
+                      (c.members_count >= {CONTRIB_MIN_MEMBERS} AND
+                       (SELECT count(*) FROM messages m WHERE m.channel_id = c.id
+                          AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}
+                      ) AS eligible_moat
                FROM channels c
                WHERE 1=1 {where_extra}
                ORDER BY COALESCE(c.members_count, 0) DESC, msg_count DESC""")
         total = await conn.fetchval("SELECT count(*) FROM channels")
         with_meta = await conn.fetchval(
             "SELECT count(*) FROM channels WHERE members_count IS NOT NULL")
+        eligible_total = await conn.fetchval(
+            f"""SELECT count(*) FROM channels c
+               WHERE c.members_count >= {CONTRIB_MIN_MEMBERS}
+                 AND (SELECT count(*) FROM messages m WHERE m.channel_id = c.id
+                      AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}""")
 
     def _chip(lo: int, hi: Optional[int], label: str) -> str:
-        active = (min_members == lo and max_members == hi)
+        active = (min_members == lo and max_members == hi and not eligible)
         style = ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
                 'border-color:var(--accent);') if active else ''
         href = f"/channels?min_members={lo}"
@@ -930,6 +953,14 @@ async def page_channels(min_members: int = 500,
             href += f"&max_members={hi}"
         return (f'<a class="btn ghost" href="{href}" '
                f'style="{style}padding:6px 12px;font-size:13px">{label}</a>')
+
+    def _eligible_chip() -> str:
+        active = bool(eligible)
+        style = ('background:rgba(74,222,128,0.18);color:var(--ok);'
+                'border-color:var(--ok);') if active else ''
+        return (f'<a class="btn ghost" href="/channels?eligible=1" '
+               f'style="{style}padding:6px 12px;font-size:13px">'
+               f'✓ moat ({eligible_total})</a>')
 
     filter_bar = (
         '<div style="display:flex;gap:6px;margin-bottom:20px;align-items:center;flex-wrap:wrap">'
@@ -941,9 +972,15 @@ async def page_channels(min_members: int = 500,
         f'{_chip(500, 1000, "1K")}'
         f'{_chip(1000, 5000, "5K")}'
         f'{_chip(500, None, "500+ ⭐")}'
+        f'{_eligible_chip()}'
         + (f'<span style="margin-left:auto;color:var(--muted);font-size:12px">'
            f'members resolved {with_meta}/{total}</span>' if with_meta < total else '')
         + '</div>'
+        f'<div style="font-size:12px;color:var(--muted);margin-bottom:18px">'
+        f'<strong>✓ moat</strong> = ≥{CONTRIB_MIN_MEMBERS} members AND ≥{CONTRIB_MIN_MEDIA} media files. '
+        f'Only these get pushed to <code>registry.tgarr.me</code> when federation is enabled. '
+        f'Private chats and small groups stay local.'
+        f'</div>'
     )
 
     if not rows:
@@ -968,6 +1005,8 @@ async def page_channels(min_members: int = 500,
                 m = r["members_count"]
                 m_str = (f"{m/1000:.1f}K" if m >= 1000 else str(m)).replace(".0K", "K")
                 members_pill = f'<span class="pill accent">👥 {m_str}</span>'
+            moat_pill = ('<span class="pill ok" title="eligible for federation">✓ moat</span>'
+                        if r["eligible_moat"] else '')
             cards_html.append(
                 f'<div class="card">'
                 f'<div class="avatar" style="background:{color}">{html.escape(initial)}</div>'
@@ -979,6 +1018,7 @@ async def page_channels(min_members: int = 500,
                 f'{members_pill}'
                 f'<span class="pill muted">{r["msg_count"]:,} msgs</span>'
                 f'<span class="pill muted">{r["media_count"]:,} media</span>'
+                f'{moat_pill}'
                 f'{status_pill}'
                 f'</div>'
                 f'</div>'
