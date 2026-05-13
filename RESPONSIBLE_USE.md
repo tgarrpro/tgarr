@@ -4,13 +4,14 @@ tgarr is a content-neutral software tool. It does not host any content, does not
 
 ## What tgarr is
 
-tgarr indexes messages from Telegram channels that **the operator has voluntarily joined** using **their own Telegram user account**. It is a thin index layer over Telegram's existing platform — comparable in function to how `youtube-dl` enumerates a public YouTube playlist, or how a search engine indexes a publicly accessible web page.
+tgarr is **a search engine** for Telegram channels that the operator has voluntarily joined under their own Telegram user account. It indexes filenames, captions, and message identifiers — comparable in function to how Google indexes the publicly accessible web, NZBGeek indexes Usenet posts, or `youtube-dl` enumerates a public YouTube playlist.
 
 ## What tgarr is not
 
-- tgarr is **not a content host**. No files are stored on tgarr's servers. Files remain on Telegram's infrastructure; tgarr only records metadata (message IDs, filenames, captions).
-- tgarr is **not a peer-to-peer network**. There is no seeding, no peer exchange, no DHT participation.
-- tgarr is **not affiliated with Telegram**. We use Telegram's documented MTProto API as any user-account client would.
+- tgarr is **not a content host**. **No file content is stored on tgarr.** The index stores only metadata: filename, caption, mime type, channel ID, message ID, posted timestamp. Files themselves remain entirely on Telegram's infrastructure.
+- tgarr **does not warrant that indexed targets still exist**. As with any search engine, indexed entries reflect the state of the source at crawl time. By the time a user retrieves a release, the originating channel may have been deleted, banned, or otherwise made unreachable; the specific message may have been deleted by its poster; Telegram may have made the file unavailable. tgarr does not promise persistence.
+- tgarr is **not a peer-to-peer network**. There is no seeding, no peer exchange, no DHT participation, no IP exposure to other users.
+- tgarr is **not affiliated with Telegram**. We use Telegram's documented MTProto API as any user-account client does.
 - tgarr is **not affiliated with Sonarr, Radarr, or any *arr-stack project**. We implement the Newznab API specification, which they happen to consume.
 
 ## We respect copyright
