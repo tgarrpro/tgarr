@@ -1,0 +1,120 @@
+# tgarr — end-user docker-compose
+#
+# AUTO-UPDATE: this compose ships with Watchtower, which polls the
+# image registry every 5 minutes and recreates containers when central
+# publishes a new tgarr image. Set TGARR_AUTOUPDATE=false in .env to
+# opt out (default: on).
+#
+# Source-build fallback: if you'd rather build from your own checkout,
+# delete the `image:` line on crawler+api and uncomment `build:` —
+# Watchtower will skip source-built containers automatically.
+
+name: tgarr
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tgarr-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tgarr
+      POSTGRES_DB: tgarr
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./_data/postgres:/var/lib/postgresql/data
+      - ./schema:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5433:5432"
+    networks:
+      - tgarr-net
+
+  meili:
+    image: getmeili/meilisearch:v1.11
+    container_name: tgarr-meili
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_ENV: production
+    volumes:
+      - ./_data/meili:/meili_data
+    ports:
+      - "127.0.0.1:7700:7700"
+    networks:
+      - tgarr-net
+
+  crawler:
+    image: ghcr.io/tgarrpro/tgarr-crawler:${TGARR_TAG:-latest}
+    # build: ./crawler   # source-build fallback (opt out of auto-update)
+    container_name: tgarr-crawler
+    restart: unless-stopped
+    depends_on: [db, meili]
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    environment:
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TG_PHONE: ${TG_PHONE}
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      MEILI_URL: http://meili:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      TG_DOWNLOAD_ROOT: /downloads/tgarr
+      TG_PARSE_SCORE_MIN: "0.30"
+      # Federation swarm validator — pull seeds from central, validate
+      # locally, push back. Default on. Each client contributes its TG
+      # quota to the network.
+      TGARR_FEDERATION_VALIDATOR: "true"
+    volumes:
+      - ./_data/session:/app/session
+      - ./_data/downloads:/downloads
+    networks:
+      - tgarr-net
+    # First time login (interactive SMS code):
+    #   docker compose run --rm crawler python login.py
+
+  api:
+    image: ghcr.io/tgarrpro/tgarr-api:${TGARR_TAG:-latest}
+    # build: ./api      # source-build fallback (opt out of auto-update)
+    container_name: tgarr-api
+    restart: unless-stopped
+    depends_on: [db]
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    environment:
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      TGARR_BASE_URL: ${TGARR_BASE_URL:-}
+    ports:
+      - "127.0.0.1:8088:8088"
+    networks:
+      - tgarr-net
+
+  # ─── Auto-update (Watchtower) ────────────────────────────────────────
+  # Polls the image registry on TGARR_AUTOUPDATE_INTERVAL (default 300s),
+  # and re-creates any container labeled com.centurylinklabs.watchtower.enable=true
+  # when a newer image digest is available.
+  #
+  # WATCHTOWER_LABEL_ENABLE means it ONLY touches tgarr containers, NOT
+  # other Docker services on the host. Db + meili are pinned to upstream
+  # postgres/meilisearch — Watchtower will follow those too if they ship
+  # a new minor, which is desirable for security patches.
+  #
+  # Opt out: set TGARR_AUTOUPDATE=false in .env (this service will exit).
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: tgarr-watchtower
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "${TGARR_AUTOUPDATE_INTERVAL:-300}"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_NOTIFICATION_REPORT: "true"
+      # If you want notifications: set WATCHTOWER_NOTIFICATION_URL=tgram://<token>/<chat_id>
+      # WATCHTOWER_NOTIFICATIONS: shoutrrr
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    profiles:
+      - autoupdate  # default-active via .env  (compose --profile autoupdate up -d)
+
+networks:
+  tgarr-net:
+    driver: bridge

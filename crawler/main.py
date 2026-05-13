@@ -301,6 +301,15 @@ REGISTRY_URL = os.environ.get("TGARR_REGISTRY_URL", "https://tgarr.me").rstrip("
 CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true"
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
+
+# Federation swarm validator (v0.4.0+): client pulls seed candidates from
+# central, validates on this client's TG account, pushes back via /contribute.
+# Each client validates a slice — quota scales linearly with # of clients.
+# See reference_tgarr_federation_swarm_design.md.
+FEDERATION_VALIDATOR_ENABLED = os.environ.get("TGARR_FEDERATION_VALIDATOR", "true").lower() == "true"
+SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "20"))
+SEEDS_INTERVAL_SEC = int(os.environ.get("TGARR_SEEDS_INTERVAL_SEC", "3600"))  # 1h
+PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/seed -> 1/min resolveUsername
 AUDIO_ROOT = "/downloads/audio"
 LIBRARY_ROOT = "/downloads/library"
 MAX_AUDIO_BYTES = int(os.environ.get("TG_MAX_AUDIO_BYTES", str(150 * 1024 * 1024)))
@@ -1087,6 +1096,144 @@ async def contribute_to_registry() -> None:
             await asyncio.sleep(600)
 
 
+
+async def federation_validator() -> None:
+    """Swarm-validator: pull seed candidates from central, validate locally,
+    push back via /api/v1/contribute.
+
+    This is how end-user instances participate in the federation. Each client
+    validates a fresh random batch every interval using its own TG account
+    quota. Central aggregates all clients' results via distinct_contributors
+    consensus on registry_channels.
+
+    Pattern per batch:
+      1. GET REGISTRY_URL/api/v1/seeds?batch=N
+      2. For each seed, app.get_chat(@username) or app.join_chat(invite_link)
+      3. POST verified-alive channels to REGISTRY_URL/api/v1/contribute
+
+    Rate-limited per-seed (default 60s) to keep resolveUsername quota safe.
+    On FloodWait, abort current batch and wait full cooldown.
+
+    Opt-out: TGARR_FEDERATION_VALIDATOR=false
+    """
+    if not FEDERATION_VALIDATOR_ENABLED:
+        log.info("[fed-validator] TGARR_FEDERATION_VALIDATOR=false — disabled")
+        return
+    log.info("[fed-validator] enabled; batch=%d interval=%ds per_seed=%ds endpoint=%s",
+             SEEDS_BATCH, SEEDS_INTERVAL_SEC, PER_SEED_DELAY_SEC, REGISTRY_URL)
+    await asyncio.sleep(180)  # let backfill + metadata settle first
+
+    while True:
+        try:
+            # ─── 1. Fetch a batch from central ──────────────────────────
+            try:
+                url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "tgarr/0.4.0 (+https://tgarr.me)"})
+                resp = await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(req, timeout=30).read())
+                doc = json.loads(resp.decode())
+                seeds = doc.get("seeds", []) or []
+            except Exception as e:
+                log.warning("[fed-validator] seed fetch failed: %s", e)
+                await asyncio.sleep(SEEDS_INTERVAL_SEC)
+                continue
+
+            if not seeds:
+                log.info("[fed-validator] no pending seeds; sleeping %ds",
+                         SEEDS_INTERVAL_SEC)
+                await asyncio.sleep(SEEDS_INTERVAL_SEC)
+                continue
+
+            log.info("[fed-validator] received %d seeds to validate", len(seeds))
+            verified_alive = []
+            flood_aborted = False
+
+            # ─── 2. Validate each via TG ────────────────────────────────
+            for seed in seeds:
+                uname = seed.get("username") or ""
+                invite = seed.get("invite_link")
+                if not uname and not invite:
+                    continue
+                try:
+                    if invite:
+                        # join_chat → different rate-limit bucket
+                        chat = await app.join_chat(invite)
+                    else:
+                        chat = await app.get_chat(uname)
+                    members = getattr(chat, "members_count", None)
+                    title = chat.title or (chat.username or uname)
+                    real_username = chat.username or uname
+                    verified_alive.append({
+                        "username": real_username,
+                        "title": title,
+                        "members_count": members,
+                        "audience": seed.get("audience_hint") or "sfw",
+                        "language": seed.get("language"),
+                        "category": seed.get("category"),
+                    })
+                    log.info("[fed-validator] alive @%s (%s members) %r",
+                             real_username, members, title[:40] if title else "")
+                except FloodWait as fw:
+                    log.warning("[fed-validator] FloodWait %ds — aborting batch",
+                                fw.value)
+                    await asyncio.sleep(min(fw.value + 10, 1800))
+                    flood_aborted = True
+                    break
+                except (UsernameNotOccupied, UsernameInvalid):
+                    log.info("[fed-validator] dead @%s", uname)
+                except (ChannelInvalid, ChannelPrivate):
+                    log.info("[fed-validator] private/forbidden @%s", uname)
+                except Exception as e:
+                    log.warning("[fed-validator] err @%s: %s", uname, str(e)[:80])
+                await asyncio.sleep(PER_SEED_DELAY_SEC)
+
+            # ─── 3. Push verified-alive back to central ─────────────────
+            if verified_alive:
+                try:
+                    async with db_pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            "SELECT value, updated_at FROM config WHERE key='instance_uuid'")
+                        rotate = True
+                        if row:
+                            age = (await conn.fetchval(
+                                "SELECT EXTRACT(EPOCH FROM (NOW() - $1))::int",
+                                row["updated_at"]))
+                            rotate = age >= INSTANCE_UUID_ROTATE_DAYS * 86400
+                        if rotate:
+                            uuid_val = uuidlib.uuid4().hex
+                            await conn.execute(
+                                """INSERT INTO config (key, value) VALUES ('instance_uuid', $1)
+                                   ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""",
+                                uuid_val)
+                        else:
+                            uuid_val = row["value"]
+                    payload = {
+                        "instance_uuid": uuid_val,
+                        "tgarr_version": "0.4.0",
+                        "channels": verified_alive,
+                    }
+                    req = urllib.request.Request(
+                        REGISTRY_URL + "/api/v1/contribute",
+                        data=json.dumps(payload).encode(),
+                        headers={"Content-Type": "application/json",
+                                 "User-Agent": "tgarr/0.4.0 (+https://tgarr.me)"},
+                        method="POST")
+                    resp = await asyncio.to_thread(
+                        lambda: urllib.request.urlopen(req, timeout=30).read())
+                    result = json.loads(resp.decode())
+                    log.info("[fed-validator] pushed %d alive: %s",
+                             len(verified_alive), result)
+                except Exception as e:
+                    log.warning("[fed-validator] contribute-back failed: %s", e)
+
+            # Honor flood abort by waiting full interval before next batch
+            await asyncio.sleep(SEEDS_INTERVAL_SEC)
+        except Exception as e:
+            log.exception("[fed-validator] outer: %s", e)
+            await asyncio.sleep(600)
+
+
 async def main() -> None:
     await init_db()
     await wait_for_session()
@@ -1101,6 +1248,7 @@ async def main() -> None:
     asyncio.create_task(channel_meta_refresher())
     asyncio.create_task(subscription_poller())
     asyncio.create_task(contribute_to_registry())
+    asyncio.create_task(federation_validator())
     asyncio.create_task(registry_puller())
     asyncio.create_task(seed_validator())
 

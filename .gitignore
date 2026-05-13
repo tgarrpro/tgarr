@@ -29,3 +29,6 @@ dist/
 # Logs
 *.log
 logs/
+
+# Private central-only fork (kept in a separate private repo)
+central-crawler/
