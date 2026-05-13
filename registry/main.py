@@ -276,17 +276,30 @@ async def get_registry(
     api_key: Optional[str] = Query(None),
 ):
     ip_hash = _ip_hash(request)
+    # TODO v0.4: validate api_key against an auth table linked to Stripe.
+    # Today a non-empty api_key just unlocks the paid-tier cap.
     daily_cap = PULL_LIMIT_PAID_PER_DAY if api_key else PULL_LIMIT_FREE_PER_DAY
     async with db_pool.acquire() as conn:
+        # Count this IP's pulls in the last 24h. Real query against pulls
+        # table, not contributions.
         today_pulls = await conn.fetchval(
-            """SELECT count(*) FROM registry_contributions
-               WHERE remote_ip_hash = $1
-                 AND submitted_at > NOW() - INTERVAL '24 hours'""", ip_hash)
-        if today_pulls and today_pulls > daily_cap:
+            """SELECT count(*) FROM registry_pulls
+               WHERE ip_hash = $1
+                 AND pulled_at > NOW() - INTERVAL '24 hours'""", ip_hash)
+        if today_pulls and today_pulls >= daily_cap:
             raise HTTPException(
                 429, f"daily registry-pull limit exceeded ({daily_cap} for "
                      f"{'paid' if api_key else 'free'} tier — see "
                      f"https://tgarr.me/docs/PRICING.md)")
+        # Record this pull now (before serving) so concurrent pulls count.
+        await conn.execute(
+            "INSERT INTO registry_pulls (ip_hash, api_key_set) VALUES ($1, $2)",
+            ip_hash, bool(api_key))
+        # Cheap prune: 1% chance per request to drop >7d-old rows.
+        import random as _r
+        if _r.random() < 0.01:
+            await conn.execute(
+                "DELETE FROM registry_pulls WHERE pulled_at < NOW() - INTERVAL '7 days'")
 
     # Response degradation based on suspicion score
     susp = await _suspicion_score(ip_hash)
@@ -311,7 +324,7 @@ async def get_registry(
                 "channels": [_row_json(r) for r in rows]},
                 headers={"Cache-Control": "no-store"})
 
-    # 10-30: sprinkle in honeypots; 30-60: 90% honeypots
+    # Compute honeypot ratio for suspicious-but-not-tarpit range.
     honeypot_ratio = 0.0
     if susp >= 30:
         honeypot_ratio = 0.9
@@ -319,9 +332,6 @@ async def get_registry(
         honeypot_ratio = 0.3
 
     where = ["blocked = FALSE", "audience <> 'blocked_csam'"]
-    # Hide honeypots from normal-trust clients; surface to suspicious ones.
-    if susp < 10:
-        where.append("is_honeypot = FALSE")
     if audience in ("sfw", "nsfw"):
         where.append(f"audience = '{audience}'")
     if only_verified:
@@ -331,16 +341,37 @@ async def get_registry(
     if since:
         where.append(f"last_seen_at >= '{since}'")
     limit = max(1, min(limit, 20000))
+    base_cols = ("username, title, members_count, media_count, audience, "
+                "language, category, distinct_contributors, verified, "
+                "last_seen_at")
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(f"""
-            SELECT username, title, members_count, media_count, audience,
-                   language, category, distinct_contributors, verified, last_seen_at
-            FROM registry_channels
-            WHERE {' AND '.join(where)}
-            ORDER BY distinct_contributors DESC,
-                     COALESCE(members_count, 0) DESC
-            LIMIT {limit}
-        """)
+        if honeypot_ratio > 0:
+            # Suspicious tier: poison the well. Compute split, fetch separately,
+            # interleave randomly so attacker can't sort honeypots out trivially.
+            n_honey = max(1, int(limit * honeypot_ratio))
+            n_real = max(0, limit - n_honey)
+            where_real = where + ["is_honeypot = FALSE"]
+            where_honey = where + ["is_honeypot = TRUE"]
+            real = await conn.fetch(
+                f"SELECT {base_cols} FROM registry_channels "
+                f"WHERE {' AND '.join(where_real)} "
+                f"ORDER BY distinct_contributors DESC, "
+                f"COALESCE(members_count,0) DESC LIMIT {n_real}")
+            honey = await conn.fetch(
+                f"SELECT {base_cols} FROM registry_channels "
+                f"WHERE {' AND '.join(where_honey)} "
+                f"ORDER BY random() LIMIT {n_honey}")
+            import random as _r
+            rows = list(real) + list(honey)
+            _r.shuffle(rows)
+        else:
+            # Normal tier: real channels only.
+            where_real = where + ["is_honeypot = FALSE"]
+            rows = await conn.fetch(
+                f"SELECT {base_cols} FROM registry_channels "
+                f"WHERE {' AND '.join(where_real)} "
+                f"ORDER BY distinct_contributors DESC, "
+                f"COALESCE(members_count,0) DESC LIMIT {limit}")
     def _row_json(r):
         d = dict(r)
         if d.get("last_seen_at"):

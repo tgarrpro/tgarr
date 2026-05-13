@@ -709,6 +709,7 @@ body:has(.player-bar) .content { padding-bottom:110px; }
 NAV_ITEMS = [
     ("/",          "Dashboard", "M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"),
     ("/channels",  "Channels",  "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"),
+    ("/discover",  "Discover",  "M12 10.9c-.61 0-1.1.49-1.1 1.1s.49 1.1 1.1 1.1c.61 0 1.1-.49 1.1-1.1s-.49-1.1-1.1-1.1zM12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm2.19 12.19L6 18l3.81-8.19L18 6l-3.81 8.19z"),
     ("/releases",  "Releases",  "M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"),
     ("/gallery",   "Gallery",   "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"),
     ("/music",     "Music",     "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"),
@@ -1198,6 +1199,131 @@ async def page_channels(min_members: int = 500,
                + filter_bar
                + f'<div class="cards">{"".join(cards_html)}</div>')
     return HTMLResponse(_layout("Channels", "/channels", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Discover (registry-pulled channels awaiting subscription)
+# ════════════════════════════════════════════════════════════════════
+@app.get("/discover", response_class=HTMLResponse)
+async def page_discover(audience: str = "sfw"):
+    async with db_pool.acquire() as conn:
+        # Auth check
+        n_channels = await conn.fetchval("SELECT count(*) FROM channels")
+        if not login.session_exists() and not n_channels:
+            return RedirectResponse("/login")
+        # Auto-subscribed check
+        known = {r["username"]: r["subscribed"] for r in await conn.fetch(
+            "SELECT username, subscribed FROM channels WHERE username IS NOT NULL")}
+        where = ["dismissed = FALSE"]
+        if audience in ("sfw", "nsfw"):
+            where.append(f"audience = '{audience}'")
+        rows = await conn.fetch(f"""
+            SELECT username, title, members_count, media_count, audience,
+                   language, category, distinct_contributors, verified,
+                   last_pulled_at
+            FROM discovered
+            WHERE {' AND '.join(where)}
+            ORDER BY verified DESC, distinct_contributors DESC,
+                     COALESCE(members_count, 0) DESC
+            LIMIT 200
+        """)
+        total = await conn.fetchval("SELECT count(*) FROM discovered")
+        last_pull = await conn.fetchval(
+            "SELECT max(last_pulled_at) FROM discovered")
+
+    if not rows:
+        body = (
+            f'<h2 class="section">Discover <span class="count">'
+            f'0 of {total or 0}</span></h2>'
+            '<div class="empty-state">'
+            '<div class="icon">🔭</div>'
+            '<div>No channels pulled from registry yet.</div>'
+            '<div style="margin-top:8px;font-size:13px">'
+            'The registry_puller fires every 12h on a deterministic offset '
+            '(or hit <code>POST /api/registry/pull-now</code> to force it).'
+            '</div></div>'
+        )
+        return HTMLResponse(_layout("Discover", "/discover", body))
+
+    def _card(r):
+        u = r["username"]
+        state = known.get(u)
+        if state is True:
+            btn = (f'<button class="ghost" disabled '
+                  f'style="font-size:12px;padding:6px 12px">✓ subscribed</button>')
+        else:
+            btn = (f'<button data-uname="{html.escape(u)}" '
+                  f'onclick="tgDiscoverSubscribe(this)" '
+                  f'style="font-size:12px;padding:6px 12px">+ Subscribe</button>')
+        members = (f"{r['members_count']/1000:.1f}K".replace(".0K", "K")
+                  if r['members_count'] and r['members_count'] >= 1000
+                  else str(r['members_count'] or '-'))
+        verified_pill = ('<span class="pill ok">✓ verified</span>'
+                       if r["verified"] else '')
+        return (
+            f'<div class="dl-item">'
+            f'<div class="icon">📡</div>'
+            f'<div class="info">'
+            f'<div class="name">@{html.escape(u)}'
+            f'{" — " + html.escape(r["title"]) if r["title"] else ""}</div>'
+            f'<div class="meta">'
+            f'{verified_pill}'
+            f'<span class="pill accent">👥 {members}</span>'
+            f'<span class="pill muted">{r["media_count"] or 0} media</span>'
+            f'<span class="pill muted">{r["audience"]}</span>'
+            f'<span>· seen by {r["distinct_contributors"] or 1} instances</span>'
+            f'</div></div>'
+            f'<div class="right">{btn}</div>'
+            f'</div>'
+        )
+
+    body = (
+        f'<h2 class="section">Discover <span class="count">'
+        f'{len(rows)} of {total} from registry.tgarr.me</span>'
+        + (f'<span class="extra" style="color:var(--muted);font-size:12px">'
+           f'last pull {_fmt_time(last_pull)}</span>'
+           if last_pull else '')
+        + '</h2>'
+        '<div style="margin-bottom:18px;display:flex;gap:8px">'
+        '  <form method="POST" action="/api/registry/pull-now">'
+        '    <button type="submit" class="ghost" style="font-size:13px">↻ Pull now</button>'
+        '  </form>'
+        '</div>'
+        f'<div class="dl-list">{"".join(_card(r) for r in rows)}</div>'
+        '<script>'
+        '(() => {'
+        '  window.tgDiscoverSubscribe = async function(btn) {'
+        '    const u = btn.dataset.uname;'
+        '    btn.disabled = true; btn.textContent = "...";'
+        '    try {'
+        '      const r = await fetch("/api/channel/subscribe", {method:"POST", '
+        '          headers:{"Content-Type":"application/x-www-form-urlencoded"}, '
+        '          body: "username=" + encodeURIComponent(u)});'
+        '      const j = await r.json();'
+        '      if (j.status === "queued" || j.status === "ok") {'
+        '        btn.textContent = "✓ queued";'
+        '        btn.style.background = "var(--ok)"; btn.style.color = "#fff";'
+        '      } else { btn.textContent = "✗ " + (j.message || "error"); }'
+        '    } catch(e) { btn.textContent = "✗ network"; }'
+        '  };'
+        '})();'
+        '</script>'
+    )
+    return HTMLResponse(_layout("Discover", "/discover", body))
+
+
+@app.post("/api/registry/pull-now")
+async def api_registry_pull_now():
+    """Force the next registry_puller tick to fire immediately. Writes a
+    sentinel to the config table; the running puller polls for it every 60s.
+    303 See Other so the form-POST → GET-redirect follows correctly.
+    """
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('registry_pull_force', $1)
+               ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""",
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    return RedirectResponse("/discover", status_code=303)
 
 
 # ════════════════════════════════════════════════════════════════════

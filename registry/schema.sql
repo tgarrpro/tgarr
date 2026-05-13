@@ -63,3 +63,13 @@ CREATE TABLE IF NOT EXISTS registry_suspicion (
     last_flagged_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_suspicion_score ON registry_suspicion (score DESC);
+
+-- One row per GET /api/v1/registry call. Used to enforce per-IP-hash
+-- daily pull cap. Pruned weekly (NOW() - 7 days) by the puller cleanup.
+CREATE TABLE IF NOT EXISTS registry_pulls (
+    id            BIGSERIAL PRIMARY KEY,
+    ip_hash       TEXT NOT NULL,
+    api_key_set   BOOLEAN NOT NULL DEFAULT FALSE,
+    pulled_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pulls_ip_at ON registry_pulls (ip_hash, pulled_at DESC);

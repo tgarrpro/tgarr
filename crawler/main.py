@@ -737,11 +737,30 @@ async def registry_puller() -> None:
                       % REGISTRY_PULL_INTERVAL_SEC)
     log.info("[pull] registry puller — initial offset %ds (deterministic from UUID),"
              " then every %ds", initial_offset, REGISTRY_PULL_INTERVAL_SEC)
-    await asyncio.sleep(min(initial_offset, 3600))  # cap initial wait so dev/test boots fast
+    # Wait initial offset but wake every 30s to honor /api/registry/pull-now
+    # force-trigger (otherwise admin would need to wait up to 1h).
+    initial_wait = min(initial_offset, 3600)
+    waited = 0
+    while waited < initial_wait:
+        await asyncio.sleep(min(30, initial_wait - waited))
+        waited += 30
+        async with db_pool.acquire() as conn:
+            if await conn.fetchval(
+                "SELECT value FROM config WHERE key='registry_pull_force'"):
+                log.info("[pull] force-trigger received during initial wait")
+                break
 
     while True:
         try:
+            # Check for manual force-pull trigger from /api/registry/pull-now
             async with db_pool.acquire() as conn:
+                forced = await conn.fetchval(
+                    "SELECT value FROM config WHERE key='registry_pull_force'")
+                if forced:
+                    # Clear so we don't loop on it
+                    await conn.execute(
+                        "DELETE FROM config WHERE key='registry_pull_force'")
+                    log.info("[pull] force-trigger received, pulling now")
                 last_pulled = await conn.fetchval(
                     "SELECT max(last_pulled_at) FROM discovered")
             params = {"audience": "sfw", "only_verified": "1", "limit": "5000"}
@@ -796,7 +815,13 @@ async def registry_puller() -> None:
 
             log.info("[pull] registry sync: %d new, %d updated (of %d returned)",
                      inserted, updated, len(channels))
-            await asyncio.sleep(REGISTRY_PULL_INTERVAL_SEC)
+            # Sleep but wake up every 60s to check for force-pull trigger
+            for _ in range(REGISTRY_PULL_INTERVAL_SEC // 60):
+                await asyncio.sleep(60)
+                async with db_pool.acquire() as conn:
+                    if await conn.fetchval(
+                        "SELECT value FROM config WHERE key='registry_pull_force'"):
+                        break
         except Exception as e:
             log.exception("[pull] outer: %s", e)
             await asyncio.sleep(600)
