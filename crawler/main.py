@@ -949,7 +949,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.3.7 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.0 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1065,7 +1065,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.3.6",
+                "tgarr_version": "0.4.0",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1080,7 +1080,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.3.6 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.0 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
