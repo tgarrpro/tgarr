@@ -47,18 +47,66 @@ db_pool: Optional[asyncpg.Pool] = None
 async def _startup():
     global db_pool
     db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
-    # Run schema migration
     schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
     with open(schema_path) as f:
         async with db_pool.acquire() as conn:
             await conn.execute(f.read())
-    log.info("registry up — schema applied")
+    await _seed_honeypots()
+    log.info("registry up — schema applied + honeypots seeded")
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     if db_pool:
         await db_pool.close()
+
+
+# Honeypot seed names — plausible-looking but DO NOT actually exist on Telegram.
+# Rotated periodically. If a contribute payload mentions one, the submitter
+# clearly didn't get the name from their own joined channels.
+HONEYPOT_USERNAMES = [
+    "PrismHDArchive", "AzraqMediaVault", "MeridianFilmDrop",
+    "ZenithTVHub", "OakwoodSeriesHQ", "ClarionPicturesHD",
+    "VertexCinemaCache", "QuartzShowsArchive",
+]
+
+
+async def _seed_honeypots():
+    async with db_pool.acquire() as conn:
+        for u in HONEYPOT_USERNAMES:
+            await conn.execute(
+                """INSERT INTO registry_channels
+                     (username, title, members_count, media_count, audience,
+                      is_honeypot, verified, distinct_contributors)
+                   VALUES ($1, $2, $3, $4, 'sfw', TRUE, TRUE, 5)
+                   ON CONFLICT (username) DO NOTHING""",
+                u, u.replace("HD", " HD").replace("TV", " TV"),
+                50000 + abs(hash(u)) % 500000,  # 50K-550K members
+                200 + abs(hash(u)) % 800)        # 200-1000 media
+
+
+async def _bump_suspicion(actor_key: str, delta: int, reason: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO registry_suspicion (actor_key, score, reasons)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (actor_key) DO UPDATE SET
+                 score = registry_suspicion.score + $2,
+                 reasons = CASE
+                   WHEN registry_suspicion.reasons IS NULL THEN $3
+                   ELSE registry_suspicion.reasons || ',' || $3
+                 END,
+                 last_flagged_at = NOW()""",
+            actor_key, delta, reason)
+
+
+async def _suspicion_score(ip_hash_v: str, instance_hash_v: str = "") -> int:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT score FROM registry_suspicion
+               WHERE actor_key = $1 OR actor_key = $2""",
+            f"ip:{ip_hash_v}", f"inst:{instance_hash_v}")
+    return max((r["score"] for r in rows), default=0)
 
 
 def _ip_hash(request: Request) -> str:
@@ -101,12 +149,19 @@ async def contribute(request: Request):
         raise HTTPException(413, "too many channels in one submission (max 500)")
 
     accepted = rejected = 0
-    csam_flagged = 0
+    csam_flagged = honeypot_hits = 0
     async with db_pool.acquire() as conn:
         for c in channels:
             username = (c.get("username") or "").strip().lstrip("@")
             title = (c.get("title") or "")[:300]
             if not USERNAME_RX.match(username):
+                rejected += 1
+                continue
+            # Honeypot trip — legitimate clients never see these as joined
+            # channels. Submitting one means the client got the name from
+            # scraping our own /api/v1/registry, not from real Telegram.
+            if username in HONEYPOT_USERNAMES:
+                honeypot_hits += 1
                 rejected += 1
                 continue
             # Server-side CSAM block (defense in depth)
@@ -182,7 +237,19 @@ async def contribute(request: Request):
     if csam_flagged:
         log.warning("CSAM-flagged %s names from instance %s — blocked",
                    csam_flagged, inst_hash[:8])
+        await _bump_suspicion(f"inst:{inst_hash}", 50,
+                            f"csam-attempt-x{csam_flagged}")
+        await _bump_suspicion(f"ip:{ip_hash}", 50, "csam-attempt")
+    if honeypot_hits:
+        log.warning("HONEYPOT-trip %s names from instance %s ip %s — scraper signal",
+                   honeypot_hits, inst_hash[:8], ip_hash[:8])
+        await _bump_suspicion(f"inst:{inst_hash}", 20 * honeypot_hits,
+                            f"honeypot-trip-x{honeypot_hits}")
+        await _bump_suspicion(f"ip:{ip_hash}", 20 * honeypot_hits,
+                            f"honeypot-trip")
 
+    # Honest deception: return the SAME shape regardless. Bad actor can't
+    # tell their submission was caught — they just see normal-looking counts.
     return {"status": "ok", "accepted": accepted, "rejected": rejected,
             "csam_flagged": csam_flagged}
 
@@ -209,7 +276,6 @@ async def get_registry(
     api_key: Optional[str] = Query(None),
 ):
     ip_hash = _ip_hash(request)
-    # TODO v0.4: look up api_key, derive tier. For now, presence = paid grace.
     daily_cap = PULL_LIMIT_PAID_PER_DAY if api_key else PULL_LIMIT_FREE_PER_DAY
     async with db_pool.acquire() as conn:
         today_pulls = await conn.fetchval(
@@ -222,7 +288,40 @@ async def get_registry(
                      f"{'paid' if api_key else 'free'} tier — see "
                      f"https://tgarr.me/docs/PRICING.md)")
 
+    # Response degradation based on suspicion score
+    susp = await _suspicion_score(ip_hash)
+    if susp >= 60:
+        # Tarpit: slow drip + only honeypots
+        await asyncio.sleep(5)
+        await _bump_suspicion(f"ip:{ip_hash}", 5, "tarpitted")
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT username, title, members_count, media_count, audience, "
+                "language, category, distinct_contributors, verified, last_seen_at "
+                "FROM registry_channels WHERE is_honeypot=TRUE")
+        # Identical JSON shape so attacker can't tell
+        def _row_json(r):
+            d = dict(r)
+            if d.get("last_seen_at"):
+                d["last_seen_at"] = d["last_seen_at"].isoformat()
+            return d
+        return JSONResponse({"version": VERSION,
+                "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "count": len(rows),
+                "channels": [_row_json(r) for r in rows]},
+                headers={"Cache-Control": "no-store"})
+
+    # 10-30: sprinkle in honeypots; 30-60: 90% honeypots
+    honeypot_ratio = 0.0
+    if susp >= 30:
+        honeypot_ratio = 0.9
+    elif susp >= 10:
+        honeypot_ratio = 0.3
+
     where = ["blocked = FALSE", "audience <> 'blocked_csam'"]
+    # Hide honeypots from normal-trust clients; surface to suspicious ones.
+    if susp < 10:
+        where.append("is_honeypot = FALSE")
     if audience in ("sfw", "nsfw"):
         where.append(f"audience = '{audience}'")
     if only_verified:

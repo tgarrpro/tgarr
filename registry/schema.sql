@@ -44,3 +44,22 @@ CREATE TABLE IF NOT EXISTS registry_contributor_seen (
     last_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (instance_hash, username)
 );
+
+-- Honeypot detection layer. Some registry_channels rows have is_honeypot=TRUE.
+-- Real Telegram channels by these names DON'T exist (or are seized squats);
+-- they are tripwires. A legitimate tgarr client only contributes channels it
+-- has actually joined — it has no way to know the honeypot names. So any
+-- contribute call that references one outs the submitter as having scraped
+-- our own registry rather than building from real Telegram membership.
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS is_honeypot BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Per-actor suspicion score. Both IP-hash and instance-hash get scored;
+-- whichever is higher determines the degraded-response treatment.
+CREATE TABLE IF NOT EXISTS registry_suspicion (
+    actor_key            TEXT PRIMARY KEY,    -- ip:<hash> or inst:<hash>
+    score                INTEGER NOT NULL DEFAULT 0,
+    reasons              TEXT,                -- comma-joined list of triggers
+    first_flagged_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_flagged_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_suspicion_score ON registry_suspicion (score DESC);
