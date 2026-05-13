@@ -64,6 +64,7 @@ services:
       TGARR_BASE_URL: ${TGARR_BASE_URL:-}
       TG_API_ID: ${TG_API_ID}
       TG_API_HASH: ${TG_API_HASH}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
     volumes:
       - ./api:/app
       - ./_data/session:/app/session

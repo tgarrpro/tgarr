@@ -9,7 +9,9 @@ Sonarr search → newznab feed.
 Sonarr grab → SAB `addurl` → row in `downloads` table → crawler's worker fetches
 via MTProto → drops file in /downloads/tgarr/<release>/ → Sonarr's CDH imports.
 """
+import asyncio
 import html
+import logging
 import os
 import time
 from typing import Optional
@@ -19,9 +21,10 @@ from fastapi import FastAPI, Form, Header, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 import login  # local module
+import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.3.1"
+TGARR_VERSION = "0.3.2"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -32,6 +35,86 @@ db_pool: Optional[asyncpg.Pool] = None
 async def _startup():
     global db_pool
     db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
+    await _migrate_schema()
+    # Seed TMDB key from env into config table on first run only
+    env_key = os.environ.get("TMDB_API_KEY", "").strip()
+    if env_key:
+        async with db_pool.acquire() as conn:
+            existing = await conn.fetchval(
+                "SELECT value FROM config WHERE key='tmdb_api_key'")
+            if not existing:
+                await conn.execute(
+                    "INSERT INTO config (key, value) VALUES ('tmdb_api_key', $1) "
+                    "ON CONFLICT (key) DO NOTHING", env_key)
+    asyncio.create_task(_metadata_worker())
+
+
+async def _migrate_schema():
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS poster_url TEXT;
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS canonical_title TEXT;
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS overview TEXT;
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS metadata_source TEXT;
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS metadata_lookup_at TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_releases_meta_source ON releases (metadata_source);
+        """)
+
+
+async def _metadata_worker():
+    """Continuously enrich releases with TMDB (if key) or Wikipedia metadata.
+    Picks oldest-unfilled release, looks it up, persists. Sleeps 30s when no
+    work. Short delay between lookups to respect rate limits.
+    """
+    wlog = logging.getLogger("tgarr.metaworker")
+    wlog.info("metadata worker started")
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                tmdb_key = await conn.fetchval(
+                    "SELECT value FROM config WHERE key='tmdb_api_key'")
+                row = await conn.fetchrow("""
+                    SELECT id, category,
+                           COALESCE(NULLIF(series_title,''), NULLIF(movie_title,''), name) AS title,
+                           movie_year
+                    FROM releases
+                    WHERE metadata_source IS NULL
+                    ORDER BY posted_at DESC NULLS LAST
+                    LIMIT 1
+                """)
+            if not row:
+                await asyncio.sleep(30)
+                continue
+            result = await md.lookup(
+                row["category"] or "movie",
+                row["title"] or "",
+                row["movie_year"],
+                tmdb_key=tmdb_key,
+            )
+            async with db_pool.acquire() as conn:
+                if result:
+                    await conn.execute("""
+                        UPDATE releases SET
+                          poster_url=$1, canonical_title=$2, overview=$3,
+                          metadata_source=$4, metadata_lookup_at=NOW()
+                        WHERE id=$5
+                    """, result.get("poster_url"), result.get("canonical_title"),
+                         result.get("overview"), result.get("source"), row["id"])
+                else:
+                    await conn.execute("""
+                        UPDATE releases SET metadata_source='miss',
+                          metadata_lookup_at=NOW()
+                        WHERE id=$1
+                    """, row["id"])
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            wlog.exception("metadata worker error: %s", e)
+            await asyncio.sleep(5)
 
 
 @app.on_event("shutdown")
@@ -243,6 +326,29 @@ async def api_login_sms_verify(code: str = Form(...), password: Optional[str] = 
 @app.post("/api/login/logout")
 async def api_login_logout():
     return login.logout()
+
+
+@app.post("/api/settings/tmdb_key")
+async def settings_tmdb_key(value: str = Form("")):
+    value = value.strip()
+    # Masked echo ("abcdef…1234") — user didn't change it
+    if "…" in value or value.count("*") >= 4:
+        return RedirectResponse("/settings", status_code=302)
+    async with db_pool.acquire() as conn:
+        if not value:
+            await conn.execute("DELETE FROM config WHERE key='tmdb_api_key'")
+        else:
+            await conn.execute("""
+                INSERT INTO config (key, value) VALUES ('tmdb_api_key', $1)
+                ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()
+            """, value)
+        # Reset wikipedia/miss results so the next worker pass retries with new key
+        await conn.execute("""
+            UPDATE releases SET metadata_source=NULL, poster_url=NULL,
+                   canonical_title=NULL, overview=NULL, metadata_lookup_at=NULL
+            WHERE metadata_source IN ('miss', 'wikipedia')
+        """)
+    return RedirectResponse("/settings", status_code=302)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -611,9 +717,9 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None, limi
     if cat in ("movie", "tv"):
         where.append(f"category = '{cat}'")
     sql = (f"SELECT id, guid, name, category, season, episode, quality, "
-          f"size_bytes, posted_at, parse_score FROM releases WHERE "
-          f"{' AND '.join(where)} ORDER BY posted_at DESC NULLS LAST "
-          f"LIMIT {max(1, min(limit, 500))}")
+          f"size_bytes, posted_at, parse_score, poster_url, canonical_title "
+          f"FROM releases WHERE {' AND '.join(where)} "
+          f"ORDER BY posted_at DESC NULLS LAST LIMIT {max(1, min(limit, 500))}")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
@@ -630,13 +736,27 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None, limi
               f'{_chip("","all")}{_chip("movie","movies")}{_chip("tv","tv")}'
               f'</div>')
 
+    def _poster(url: str | None) -> str:
+        if url:
+            return (f'<img src="{html.escape(url)}" loading="lazy" '
+                   f'style="width:44px;height:64px;object-fit:cover;'
+                   f'border-radius:3px;display:block;background:#f1f5f9" />')
+        return ('<div style="width:44px;height:64px;background:#f1f5f9;'
+               'border:1px solid var(--border);border-radius:3px;'
+               'display:flex;align-items:center;justify-content:center;'
+               'font-size:18px;color:#cbd5e1">🎬</div>')
+
     if not rows:
         body_html = ('<div class="empty-state"><div class="icon">🎬</div>'
                     '<div>No releases match this filter.</div></div>')
     else:
         body_rows = "".join(
             f'<tr>'
-            f'<td class="name">{html.escape(r["name"])}</td>'
+            f'<td style="width:60px;padding:8px 12px">{_poster(r["poster_url"])}</td>'
+            f'<td class="name">'
+            f'{html.escape(r["canonical_title"]) + "<br>" if r["canonical_title"] and r["canonical_title"] != r["name"] else ""}'
+            f'<span style="color:var(--muted);font-weight:400;font-size:13px">{html.escape(r["name"])}</span>'
+            f'</td>'
             f'<td><span class="pill {"accent" if r["category"]=="movie" else "ok" if r["category"]=="tv" else "muted"}">{r["category"]}</span></td>'
             f'<td>{("S%02dE%02d" % (r["season"], r["episode"])) if r["season"] and r["episode"] else ""}</td>'
             f'<td>{r["quality"] or ""}</td>'
@@ -647,7 +767,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None, limi
             for r in rows
         )
         body_html = (f'<table><thead><tr>'
-                    f'<th>name</th><th>category</th><th>S/E</th><th>quality</th>'
+                    f'<th></th><th>name</th><th>category</th><th>S/E</th><th>quality</th>'
                     f'<th>size</th><th>posted</th><th>score</th>'
                     f'</tr></thead><tbody>{body_rows}</tbody></table>')
 
@@ -787,6 +907,18 @@ async def page_search(q: Optional[str] = None):
 async def page_settings():
     authed = login.session_exists()
     user = login.state.user_info or {}
+    async with db_pool.acquire() as conn:
+        tmdb_raw = await conn.fetchval(
+            "SELECT value FROM config WHERE key='tmdb_api_key'")
+        meta_stats = await conn.fetchrow("""
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE metadata_source='tmdb') AS tmdb,
+                   count(*) FILTER (WHERE metadata_source='wikipedia') AS wiki,
+                   count(*) FILTER (WHERE metadata_source='miss') AS missed,
+                   count(*) FILTER (WHERE metadata_source IS NULL) AS pending
+            FROM releases
+        """)
+    tmdb_masked = (tmdb_raw[:6] + "…" + tmdb_raw[-4:]) if tmdb_raw else ""
     user_html = (
         f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
         f'<span class="pill ok">signed in</span></div>'
@@ -845,6 +977,34 @@ async def page_settings():
     <div class="info"><div class="name">SABnzbd URL base</div>
       <div class="meta">Paste into Sonarr / Radarr → Download Clients → ➕ SABnzbd → URL Base</div></div>
     <div class="right"><code>/sabnzbd</code></div>
+  </div>
+</div>
+
+<h2 class="section">Metadata sources</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🔑</div>
+    <div class="info">
+      <div class="name">TMDB API key <span class="pill {('ok' if tmdb_raw else 'muted')}">{('configured' if tmdb_raw else 'not set — using Wikipedia fallback')}</span></div>
+      <div class="meta">Posters &amp; canonical titles from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a> (free, personal use). If empty, tgarr falls back to free Wikipedia REST — lower coverage but no key needed.</div>
+      <form method="POST" action="/api/settings/tmdb_key" style="margin-top:12px;display:flex;gap:10px;max-width:600px">
+        <input type="text" name="value" placeholder="paste your TMDB API key (or leave blank to clear)" value="{html.escape(tmdb_masked)}" style="flex:1" />
+        <button type="submit">Save</button>
+      </form>
+    </div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">📊</div>
+    <div class="info">
+      <div class="name">Enrichment progress</div>
+      <div class="meta">
+        <span class="pill accent">TMDB {meta_stats['tmdb']:,}</span>
+        <span class="pill ok">Wikipedia {meta_stats['wiki']:,}</span>
+        <span class="pill warn">Not found {meta_stats['missed']:,}</span>
+        <span class="pill muted">Pending {meta_stats['pending']:,}</span>
+        / total {meta_stats['total']:,}
+      </div>
+    </div>
   </div>
 </div>
 
