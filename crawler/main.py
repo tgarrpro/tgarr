@@ -8,6 +8,7 @@ Responsibilities:
   drop completed file into /downloads/tgarr/<release-name>/.
 """
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -351,10 +352,31 @@ async def thumb_downloader() -> None:
                 if not msg or not msg.photo:
                     raise RuntimeError("no photo on message")
                 await app.download_media(msg.photo, file_name=target)
+                # MD5 of the downloaded bytes → dedup across channels
+                with open(target, "rb") as f:
+                    md5 = hashlib.md5(f.read()).hexdigest()
                 async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET thumb_path=$1 WHERE id=$2",
-                        fname, row["id"])
+                    existing = await conn.fetchval(
+                        """SELECT thumb_path FROM messages
+                           WHERE thumb_md5 = $1
+                             AND thumb_path IS NOT NULL
+                             AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                             AND id <> $2
+                           LIMIT 1""", md5, row["id"])
+                    if existing and existing != fname:
+                        # Duplicate content — discard our copy, point at canonical
+                        try:
+                            os.remove(target)
+                        except Exception:
+                            pass
+                        await conn.execute(
+                            "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
+                            existing, md5, row["id"])
+                        log.info("[thumbs] dedup id=%s → %s", row["id"], existing)
+                    else:
+                        await conn.execute(
+                            "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
+                            fname, md5, row["id"])
             except Exception as e:
                 log.warning("[thumbs] failed id=%s: %s", row["id"], e)
                 async with db_pool.acquire() as conn:
@@ -367,6 +389,56 @@ async def thumb_downloader() -> None:
             await asyncio.sleep(10)
 
 
+async def thumb_hash_backfill() -> None:
+    """One-off-ish: compute MD5 for thumbs saved before MD5 tracking landed.
+    Walks rows with thumb_path set + thumb_md5 NULL, hashes file, dedupes."""
+    log.info("[hash] backfill task started")
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT id, thumb_path FROM messages
+                       WHERE thumb_path IS NOT NULL
+                         AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                         AND thumb_md5 IS NULL
+                       LIMIT 1""")
+            if not row:
+                await asyncio.sleep(120)
+                continue
+            path = os.path.join(THUMBS_ROOT, row["thumb_path"])
+            if not os.path.exists(path):
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
+                        row["id"])
+                continue
+            with open(path, "rb") as f:
+                md5 = hashlib.md5(f.read()).hexdigest()
+            async with db_pool.acquire() as conn:
+                existing = await conn.fetchval(
+                    """SELECT thumb_path FROM messages
+                       WHERE thumb_md5 = $1
+                         AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                         AND id <> $2
+                       ORDER BY id LIMIT 1""", md5, row["id"])
+                if existing and existing != row["thumb_path"]:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                    await conn.execute(
+                        "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
+                        existing, md5, row["id"])
+                else:
+                    await conn.execute(
+                        "UPDATE messages SET thumb_md5=$1 WHERE id=$2",
+                        md5, row["id"])
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            log.exception("[hash] error: %s", e)
+            await asyncio.sleep(5)
+
+
 async def main() -> None:
     await init_db()
     await wait_for_session()
@@ -376,6 +448,7 @@ async def main() -> None:
 
     asyncio.create_task(download_worker())
     asyncio.create_task(thumb_downloader())
+    asyncio.create_task(thumb_hash_backfill())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()

@@ -65,8 +65,10 @@ async def _migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_releases_meta_source ON releases (metadata_source);
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_path TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_md5 TEXT;
             CREATE INDEX IF NOT EXISTS idx_messages_media_type ON messages (media_type);
             CREATE INDEX IF NOT EXISTS idx_messages_thumb ON messages (thumb_path) WHERE thumb_path IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_messages_md5 ON messages (thumb_md5) WHERE thumb_md5 IS NOT NULL;
         """)
 
 
@@ -354,11 +356,13 @@ async def api_login_logout():
 
 @app.post("/api/photo/{msg_id}/delete")
 async def api_photo_delete(msg_id: int):
-    """Mark a cached photo as deleted; remove the file. Thumb downloader
-    skips `__deleted__` so it won't reappear — unless redownload forced."""
+    """Delete the cached file + mark all rows sharing the MD5 as deleted.
+    Cascading by md5 prevents 404s in gallery when one viral image was
+    referenced by many channel rows. Worker skips `__deleted__` so it won't
+    reappear — unless POST /api/photo/<id>/redownload is called."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT thumb_path FROM messages WHERE id=$1", msg_id)
+            "SELECT thumb_path, thumb_md5 FROM messages WHERE id=$1", msg_id)
         if not row:
             return JSONResponse({"status": "not_found"}, status_code=404)
         if row["thumb_path"] and not row["thumb_path"].startswith("__"):
@@ -368,9 +372,17 @@ async def api_photo_delete(msg_id: int):
                     os.remove(path)
             except Exception:
                 pass
-        await conn.execute(
-            "UPDATE messages SET thumb_path='__deleted__' WHERE id=$1", msg_id)
-    return {"status": "deleted"}
+        if row["thumb_md5"]:
+            n = await conn.fetchval(
+                """UPDATE messages SET thumb_path='__deleted__'
+                   WHERE thumb_md5 = $1
+                   RETURNING (SELECT count(*) FROM messages WHERE thumb_md5=$1)""",
+                row["thumb_md5"])
+        else:
+            await conn.execute(
+                "UPDATE messages SET thumb_path='__deleted__' WHERE id=$1", msg_id)
+            n = 1
+    return {"status": "deleted", "rows_marked": n or 1}
 
 
 @app.post("/api/photo/{msg_id}/redownload")
@@ -554,6 +566,7 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .gallery .item:hover .meta { opacity:1; }
 .gallery .item .meta .ch { font-weight:700; }
 .gallery .item .meta .cap { margin-top:4px; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.gallery .item .dup-badge { position:absolute; top:8px; right:8px; padding:3px 10px; border-radius:11px; background:rgba(34,158,217,0.92); color:#fff; font-size:11px; font-weight:800; letter-spacing:0.5px; backdrop-filter:blur(4px); }
 
 /* ── Lightbox + slideshow ─────────────────── */
 .lightbox { position:fixed; inset:0; background:rgba(15,23,42,0.96); display:none; align-items:center; justify-content:center; z-index:9999; padding:20px; overflow:hidden; }
@@ -896,19 +909,33 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
             "SELECT count(*) FROM messages WHERE thumb_path IS NOT NULL "
-            "AND thumb_path <> '__failed__'")
+            "AND thumb_path NOT LIKE '__%'")
+        unique_total = await conn.fetchval(
+            "SELECT count(DISTINCT thumb_md5) FROM messages "
+            "WHERE thumb_path IS NOT NULL AND thumb_path NOT LIKE '__%' "
+            "AND thumb_md5 IS NOT NULL")
         pending = await conn.fetchval(
             """SELECT count(*) FROM messages
                WHERE thumb_path IS NULL AND (media_type='photo' OR
                      (media_type IS NULL AND file_name IS NULL
                       AND COALESCE(mime_type,'')='' AND file_unique_id IS NOT NULL))""")
+        # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
+        # (legacy thumbs not yet hashed) fall through with NULL bucket; that
+        # group will be deduped to one row, which is OK for now and the hash
+        # backfill task fills them in.
         rows = await conn.fetch(f"""
-            SELECT m.id, m.thumb_path, m.caption, m.posted_at,
-                   c.title AS ch_title, c.username AS ch_user
-            FROM messages m
-            JOIN channels c ON c.id = m.channel_id
-            WHERE {' AND '.join(where)}
-            ORDER BY m.posted_at DESC NULLS LAST
+            SELECT * FROM (
+              SELECT DISTINCT ON (COALESCE(m.thumb_md5, 'id-' || m.id::text))
+                     m.id, m.thumb_path, m.thumb_md5, m.caption, m.posted_at,
+                     c.title AS ch_title, c.username AS ch_user,
+                     (SELECT count(*) FROM messages m2
+                       WHERE m2.thumb_md5 = m.thumb_md5 AND m2.thumb_md5 IS NOT NULL) AS dup_count
+              FROM messages m
+              JOIN channels c ON c.id = m.channel_id
+              WHERE {' AND '.join(where)}
+              ORDER BY COALESCE(m.thumb_md5, 'id-' || m.id::text), m.posted_at DESC NULLS LAST
+            ) sub
+            ORDER BY posted_at DESC NULLS LAST
             LIMIT {max(1, min(limit, 500))}
         """, *params)
 
@@ -930,7 +957,9 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
         f'data-cap="{html.escape((r["caption"] or "")[:300])}" '
         f'data-ch="{html.escape(r["ch_title"] or r["ch_user"] or "")}">'
         f'<img src="/thumbs/{html.escape(r["thumb_path"])}" loading="lazy" />'
-        f'<figcaption class="meta">'
+        + (f'<div class="dup-badge" title="shared across {r["dup_count"]} channels">×{r["dup_count"]}</div>'
+           if r.get("dup_count") and r["dup_count"] > 1 else '')
+        + f'<figcaption class="meta">'
         f'<div class="ch">{html.escape(r["ch_title"] or "")}</div>'
         f'<div class="cap">{html.escape((r["caption"] or "")[:200])}</div>'
         f'</figcaption>'
@@ -938,10 +967,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
         for r in rows
     )
 
+    dup_saved = max(0, total - unique_total) if unique_total else 0
     body = (
-        f'<h2 class="section">Gallery <span class="count">{len(rows)} of {total:,} cached</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending:,} pending</span>'
-           if pending else '')
+        f'<h2 class="section">Gallery <span class="count">{len(rows)} unique · {unique_total:,} total dedup</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{dup_saved:,} dup'
+           f'{f" · {pending:,} pending" if pending else ""}</span>'
+           if dup_saved or pending else '')
         + ' <span class="extra" style="color:var(--muted);font-size:13px">'
         '← → arrows · Space pause · Del delete · Esc close</span></h2>'
         f'<div class="gallery">{items}</div>'
