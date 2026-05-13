@@ -13,6 +13,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -70,6 +71,10 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS meta_updated_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS audience TEXT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS audience_manual BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribed BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS subscribe_error TEXT;
+            CREATE INDEX IF NOT EXISTS idx_channels_subscribed ON channels (subscribed, last_polled_at) WHERE subscribed;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
@@ -955,6 +960,54 @@ def classify_audience(title: str, username: str) -> str:
             pass
         return "blocked_csam"
     return "nsfw" if NSFW_RX.search(blob) else "sfw"
+
+
+@app.post("/api/channel/subscribe")
+async def api_channel_subscribe(username: str = Form(...)):
+    """Subscribe to a public Telegram channel WITHOUT joining it.
+
+    The crawler's subscription_poller resolves the username, validates it,
+    and starts a get_chat_history backfill. The user's Telegram account stays
+    small (no mass-join ban risk), and we can index thousands of public
+    channels limited only by Telegram rate limits.
+    """
+    u = username.strip().lstrip("@")
+    if not re.match(r"^[A-Za-z][A-Za-z0-9_]{4,31}$", u):
+        return JSONResponse({"status": "error",
+                            "message": "invalid telegram username format"}, 400)
+    async with db_pool.acquire() as conn:
+        # Insert with a placeholder negative chat_id; poller will replace it
+        # with the real one after get_chat resolves the username.
+        existing = await conn.fetchval(
+            "SELECT id FROM channels WHERE username ILIKE $1", u)
+        if existing:
+            await conn.execute(
+                """UPDATE channels SET subscribed=TRUE,
+                   last_polled_at=NULL, subscribe_error=NULL
+                   WHERE id=$1""", existing)
+            return {"status": "ok", "message": f"already known — re-queued @{u}",
+                    "channel_id": existing}
+        # Synthesize a placeholder tg_chat_id below the legal range to avoid
+        # collision; poller fixes it on first scan.
+        placeholder = -abs(hash(u)) // 1000 - 1_000_000_000_000
+        new_id = await conn.fetchval(
+            """INSERT INTO channels (tg_chat_id, username, title,
+                                     subscribed, backfilled)
+               VALUES ($1, $2, $3, TRUE, FALSE)
+               ON CONFLICT (tg_chat_id) DO NOTHING
+               RETURNING id""",
+            placeholder, u, f"@{u} (resolving…)")
+    return {"status": "queued", "message": f"@{u} queued for first scan",
+            "channel_id": new_id}
+
+
+@app.post("/api/channel/unsubscribe/{tg_chat_id}")
+async def api_channel_unsubscribe(tg_chat_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE channels SET subscribed=FALSE WHERE tg_chat_id=$1
+               AND subscribed=TRUE""", tg_chat_id)
+    return {"status": "ok"}
 
 
 @app.post("/api/channel/{tg_chat_id}/audience")

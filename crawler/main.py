@@ -588,6 +588,120 @@ async def local_media_downloader() -> None:
             await asyncio.sleep(10)
 
 
+SUBSCRIBE_POLL_INTERVAL = int(os.environ.get("TG_SUBSCRIBE_POLL_INTERVAL", "1800"))  # 30m
+SUBSCRIBE_BACKFILL_LIMIT = int(os.environ.get("TG_SUBSCRIBE_BACKFILL_LIMIT", "1000"))
+
+
+async def subscription_poller() -> None:
+    """Poll public channels the user has subscribed to (without joining).
+
+    Pyrogram's get_chat + get_chat_history both work on public channels by
+    @username without a join, so we can index thousands of channels while
+    keeping the user's TG account small (no mass-join ban risk).
+
+    For each subscribed channel:
+      1. Resolve @username → real tg_chat_id, update row (was placeholder)
+      2. Backfill recent N messages via get_chat_history
+      3. Re-poll every SUBSCRIBE_POLL_INTERVAL seconds (default 30m)
+
+    on_message live updates don't fire for non-joined channels, so polling is
+    the only way to catch new posts. 30m is a reasonable trade-off vs flood.
+    """
+    log.info("[subscribe] poller started, interval=%ds", SUBSCRIBE_POLL_INTERVAL)
+    await asyncio.sleep(15)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT id, tg_chat_id, username, title, backfilled
+                       FROM channels
+                       WHERE subscribed = TRUE
+                         AND (last_polled_at IS NULL
+                              OR last_polled_at < NOW() - $1 * INTERVAL '1 second')
+                       ORDER BY last_polled_at NULLS FIRST
+                       LIMIT 1""",
+                    SUBSCRIBE_POLL_INTERVAL)
+            if not row:
+                await asyncio.sleep(60)
+                continue
+
+            uname = row["username"]
+            log.info("[subscribe] poll @%s (backfilled=%s)", uname, row["backfilled"])
+            try:
+                chat = await app.get_chat(uname)
+                real_chat_id = chat.id
+                title = chat.title or uname
+                members = getattr(chat, "members_count", None)
+            except FloodWait as fw:
+                log.warning("[subscribe] flood-wait %ds on @%s", fw.value, uname)
+                await asyncio.sleep(min(fw.value + 2, 600))
+                continue
+            except Exception as e:
+                log.warning("[subscribe] resolve fail @%s: %s", uname, e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels SET subscribed=FALSE,
+                           subscribe_error=$1, last_polled_at=NOW()
+                           WHERE id=$2""", str(e)[:200], row["id"])
+                continue
+
+            # If we resolved a real chat_id different from placeholder, replace it
+            if real_chat_id != row["tg_chat_id"]:
+                async with db_pool.acquire() as conn:
+                    existing = await conn.fetchval(
+                        "SELECT id FROM channels WHERE tg_chat_id=$1", real_chat_id)
+                    if existing and existing != row["id"]:
+                        # Real chat already in table (joined or pre-subscribed),
+                        # merge by deleting placeholder row
+                        await conn.execute("DELETE FROM channels WHERE id=$1", row["id"])
+                        await conn.execute(
+                            """UPDATE channels SET subscribed=TRUE, username=$1,
+                               last_polled_at=NOW() WHERE id=$2""",
+                            uname, existing)
+                        row = await conn.fetchrow(
+                            "SELECT id, tg_chat_id, username, title, backfilled "
+                            "FROM channels WHERE id=$1", existing)
+                    else:
+                        await conn.execute(
+                            """UPDATE channels SET tg_chat_id=$1, title=$2,
+                               members_count=$3, last_polled_at=NOW()
+                               WHERE id=$4""",
+                            real_chat_id, title, members, row["id"])
+                        row = dict(row)
+                        row["tg_chat_id"] = real_chat_id
+
+            # Backfill on first poll, then incremental on later polls.
+            limit = SUBSCRIBE_BACKFILL_LIMIT if not row["backfilled"] else 200
+            count = media_count = 0
+            try:
+                async for msg in app.get_chat_history(real_chat_id, limit=limit):
+                    try:
+                        inserted = await ingest_message(msg)
+                        count += 1
+                        if inserted and (msg.video or msg.document or msg.audio):
+                            media_count += 1
+                    except Exception as e:
+                        log.warning("[subscribe] ingest err: %s", e)
+            except FloodWait as fw:
+                log.warning("[subscribe] flood-wait %ds mid-backfill @%s",
+                          fw.value, uname)
+                await asyncio.sleep(min(fw.value + 2, 600))
+                continue
+            except Exception as e:
+                log.warning("[subscribe] history err @%s: %s", uname, e)
+
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE channels SET backfilled=TRUE, last_polled_at=NOW(),
+                       subscribe_error=NULL WHERE id=$1""", row["id"])
+            log.info("[subscribe] @%s done: %d scanned, %d media",
+                   uname, count, media_count)
+            await asyncio.sleep(3)
+        except Exception as e:
+            log.exception("[subscribe] outer: %s", e)
+            await asyncio.sleep(60)
+
+
 async def contribute_to_registry() -> None:
     """Federation: push our eligible channels to registry.tgarr.me periodically.
 
@@ -692,6 +806,8 @@ async def main() -> None:
     asyncio.create_task(thumb_hash_backfill())
     asyncio.create_task(local_media_downloader())
     asyncio.create_task(channel_meta_refresher())
+    asyncio.create_task(subscription_poller())
+    asyncio.create_task(contribute_to_registry())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()
