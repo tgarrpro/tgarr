@@ -43,12 +43,34 @@ services:
       DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
       MEILI_URL: http://meili:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      TG_DOWNLOAD_ROOT: /downloads/tgarr
+      TG_PARSE_SCORE_MIN: "0.30"
     volumes:
       - ./_data/session:/app/session
+      - ./_data/downloads:/downloads
+      - ./tools:/app/tools:ro
     networks:
       - tgarr-net
     # First time login (interactive SMS code):
     #   docker compose run --rm crawler python login.py
+
+  api:
+    build: ./api
+    container_name: tgarr-api
+    restart: unless-stopped
+    depends_on: [db]
+    environment:
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      TGARR_BASE_URL: ${TGARR_BASE_URL:-}
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+    volumes:
+      - ./api:/app
+      - ./_data/session:/app/session
+    ports:
+      - "${TGARR_PORT:-8765}:8088"
+    networks:
+      - tgarr-net
 
 networks:
   tgarr-net:

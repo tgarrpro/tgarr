@@ -1,34 +1,36 @@
-"""tgarr crawler — Pyrogram MTProto channel/group/supergroup listener + back-filler.
+"""tgarr crawler — Pyrogram MTProto channel/group listener + back-filler + download worker.
 
-v0.1.0 MVP:
-- On startup, back-fill all historical messages from every joined channel/group
-  (skipping channels we've already back-filled in a prior run).
-- Listen for new incoming messages continuously.
-- Every message that has media metadata (file_name + size) is indexed.
-
-Persistence: channels.backfilled flag in Postgres marks completion so restarts
-do not re-fetch entire histories.
+Responsibilities:
+- On startup, back-fill historical messages from every joined channel/group/supergroup.
+- Listen for new incoming messages continuously, indexing media metadata.
+- Run filename parser on each new message → create release row if score ≥ threshold.
+- Background download worker: poll `downloads` table, fetch media via MTProto,
+  drop completed file into /downloads/tgarr/<release-name>/.
 """
 import asyncio
 import logging
 import os
+import re
 
 import asyncpg
 from pyrogram import Client
 from pyrogram.types import Message
+
+from parser import parse_filename, to_release_name
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 log = logging.getLogger("tgarr")
-# quiet pyrogram noise — keep our [tgarr] logs prominent
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 DB_DSN = os.environ["DB_DSN"]
-BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))  # per channel cap
+BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
+PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
+DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 
 app = Client(
     name="tgarr",
@@ -39,6 +41,8 @@ app = Client(
 
 db_pool: asyncpg.Pool = None
 
+SAFE_NAME = re.compile(r"[^\w\-._]+")
+
 
 async def init_db() -> None:
     global db_pool
@@ -46,8 +50,42 @@ async def init_db() -> None:
     log.info("postgres pool ready")
 
 
+async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at):
+    """Parse filename + insert release row if score is high enough."""
+    parsed = parse_filename(file_name or "")
+    score = parsed.get("score", 0.0)
+    if score < PARSE_SCORE_MIN:
+        return None
+    rname = to_release_name(parsed, fallback=file_name or "")
+    if not rname:
+        return None
+    type_ = parsed.get("type", "unknown")
+    await conn.execute(
+        """INSERT INTO releases
+             (name, category, series_title, season, episode,
+              movie_title, movie_year, quality, source, codec,
+              size_bytes, posted_at, primary_msg_id, parse_score)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+        rname,
+        type_,
+        parsed.get("title") if type_ == "tv" else None,
+        parsed.get("season"),
+        parsed.get("episode"),
+        parsed.get("title") if type_ == "movie" else None,
+        parsed.get("year") if type_ == "movie" else None,
+        parsed.get("quality"),
+        parsed.get("source"),
+        parsed.get("codec"),
+        file_size,
+        posted_at,
+        msg_row_id,
+        score,
+    )
+    return rname
+
+
 async def ingest_message(msg: Message) -> bool:
-    """Persist one message to Postgres. Returns True if it was a new row."""
+    """Persist one message + maybe create release. Returns True if new row."""
     chat_type = msg.chat.type.name
     if chat_type in ("PRIVATE", "BOT"):
         return False
@@ -82,28 +120,28 @@ async def ingest_message(msg: Message) -> bool:
             msg.chat.title or "",
             chat_type.lower(),
         )
-        result = await conn.execute(
+        new_msg_id = await conn.fetchval(
             """INSERT INTO messages
                  (channel_id, tg_message_id, tg_chat_id,
                   file_unique_id, file_name, caption, file_size, mime_type, posted_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-               ON CONFLICT (channel_id, tg_message_id) DO NOTHING""",
-            ch_id,
-            msg_id,
-            chat_id,
-            file_unique_id,
-            file_name,
-            caption[:8000],
-            file_size,
-            mime_type,
-            msg.date,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+               ON CONFLICT (channel_id, tg_message_id) DO NOTHING
+               RETURNING id""",
+            ch_id, msg_id, chat_id, file_unique_id, file_name,
+            caption[:8000], file_size, mime_type, msg.date,
         )
-        return "INSERT 0 1" in result
+
+        if new_msg_id and file_name:
+            try:
+                await maybe_create_release(conn, new_msg_id, file_name, file_size, msg.date)
+            except Exception as e:
+                log.warning("[parse] failed msg_id=%s file=%s err=%s", new_msg_id, file_name, e)
+
+        return bool(new_msg_id)
 
 
 @app.on_message()
 async def on_new_message(client: Client, msg: Message) -> None:
-    """Live handler — every new incoming message from any chat we're in."""
     inserted = await ingest_message(msg)
     if inserted and msg.chat.type.name != "PRIVATE":
         media = msg.video or msg.document or msg.audio or msg.photo
@@ -114,7 +152,6 @@ async def on_new_message(client: Client, msg: Message) -> None:
 
 
 async def backfill_channel(chat_id: int, title: str) -> int:
-    """Fetch historical messages for a channel up to BACKFILL_LIMIT."""
     log.info("[backfill] start chat_id=%s title=%s limit=%s",
              chat_id, title, BACKFILL_LIMIT)
     count = 0
@@ -132,16 +169,13 @@ async def backfill_channel(chat_id: int, title: str) -> int:
 
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE channels SET backfilled = TRUE WHERE tg_chat_id = $1",
-            chat_id,
-        )
+            "UPDATE channels SET backfilled = TRUE WHERE tg_chat_id = $1", chat_id)
     log.info("[backfill] done chat_id=%s scanned=%s media_rows=%s",
              chat_id, count, media_count)
     return count
 
 
 async def backfill_all() -> None:
-    """Walk every joined channel/group and back-fill if not already done."""
     async with db_pool.acquire() as conn:
         backfilled = {
             r["tg_chat_id"]
@@ -151,13 +185,11 @@ async def backfill_all() -> None:
     async for dialog in app.get_dialogs():
         ctype = dialog.chat.type.name
         if ctype in ("PRIVATE", "BOT"):
-            log.info("[backfill] skip %s chat_id=%s title=%s",
-                     ctype.lower(), dialog.chat.id, dialog.chat.title or "(dm)")
             continue
         chat_id = dialog.chat.id
         title = dialog.chat.title or ""
         if chat_id in backfilled:
-            log.info("[backfill] skip already done chat_id=%s title=%s", chat_id, title)
+            log.info("[backfill] skip already-done chat_id=%s title=%s", chat_id, title)
             continue
         try:
             await backfill_channel(chat_id, title)
@@ -165,12 +197,92 @@ async def backfill_all() -> None:
             log.error("[backfill] failed chat_id=%s: %s", chat_id, e)
 
 
+async def download_worker() -> None:
+    """Background loop: pick up pending downloads + fetch media via MTProto."""
+    log.info("[worker] download worker started; root=%s", DOWNLOAD_ROOT)
+    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT d.id AS dl_id, d.release_id, r.name AS rel_name,
+                              m.tg_chat_id, m.tg_message_id
+                       FROM downloads d
+                       JOIN releases r ON r.id = d.release_id
+                       JOIN messages m ON m.id = r.primary_msg_id
+                       WHERE d.status = 'pending'
+                       ORDER BY d.requested_at
+                       LIMIT 1""")
+            if not row:
+                await asyncio.sleep(5)
+                continue
+
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE downloads SET status='downloading' WHERE id=$1", row["dl_id"])
+
+            safe_name = SAFE_NAME.sub("_", row["rel_name"])[:160]
+            target_dir = os.path.join(DOWNLOAD_ROOT, safe_name)
+            os.makedirs(target_dir, exist_ok=True)
+            log.info("[worker] downloading id=%s release=%s → %s",
+                     row["dl_id"], row["rel_name"], target_dir)
+
+            try:
+                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                if not msg or not (msg.video or msg.document or msg.audio):
+                    raise RuntimeError("media missing on source message")
+                local_path = await app.download_media(
+                    msg, file_name=f"{target_dir}/")
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE downloads
+                           SET status='completed', finished_at=NOW(), local_path=$1
+                           WHERE id=$2""",
+                        str(local_path), row["dl_id"])
+                log.info("[worker] completed id=%s path=%s", row["dl_id"], local_path)
+            except Exception as e:
+                log.exception("[worker] failed id=%s: %s", row["dl_id"], e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE downloads
+                           SET status='failed', finished_at=NOW(), error_message=$1
+                           WHERE id=$2""",
+                        str(e)[:500], row["dl_id"])
+        except Exception as e:
+            log.exception("[worker] outer-loop error: %s", e)
+            await asyncio.sleep(10)
+
+
+SESSION_PATH = "/app/session/tgarr.session"
+
+
+async def wait_for_session() -> None:
+    """First-run: block until the api container's login flow writes a session.
+
+    The api service serves /login (web QR / SMS wizard). When a user signs in
+    there, Pyrogram persists tgarr.session in the shared volume. We poll.
+    """
+    if os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0:
+        return
+    log.info("[startup] no Telegram session yet — open http://<host>:8765/login")
+    log.info("[startup] waiting for session file at %s …", SESSION_PATH)
+    while not (os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0):
+        await asyncio.sleep(5)
+    # Small grace period in case file is still being written by api.
+    await asyncio.sleep(2)
+    log.info("[startup] session detected, continuing")
+
+
 async def main() -> None:
     await init_db()
+    await wait_for_session()
     await app.start()
     me = await app.get_me()
     log.info("connected as @%s (id=%s)", me.username or "-", me.id)
-    log.info("starting backfill of all joined dialogs (limit %s each)...", BACKFILL_LIMIT)
+
+    asyncio.create_task(download_worker())
+
+    log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()
     log.info("backfill complete, switching to live listen mode")
     await asyncio.Event().wait()
