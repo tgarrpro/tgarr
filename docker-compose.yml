@@ -45,6 +45,7 @@ services:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       TG_DOWNLOAD_ROOT: /downloads/tgarr
       TGARR_SEED_VALIDATOR: ${TGARR_SEED_VALIDATOR:-false}
+      TGARR_SEED_VALIDATOR_INTERVAL: ${TGARR_SEED_VALIDATOR_INTERVAL:-30}
       TG_PARSE_SCORE_MIN: "0.30"
     volumes:
       - ./_data/session:/app/session
