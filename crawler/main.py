@@ -108,8 +108,20 @@ async def ingest_message(msg: Message) -> bool:
     file_size = None
     mime_type = None
     file_unique_id = None
+    media_type = None
 
-    media = msg.video or msg.document or msg.audio or msg.photo
+    # Identify the media kind explicitly so /gallery can find photos cleanly.
+    if msg.video:
+        media, media_type = msg.video, "video"
+    elif msg.document:
+        media, media_type = msg.document, "document"
+    elif msg.audio:
+        media, media_type = msg.audio, "audio"
+    elif msg.photo:
+        media, media_type = msg.photo, "photo"
+    else:
+        media = None
+
     if media:
         file_name = getattr(media, "file_name", None)
         file_size = getattr(media, "file_size", None)
@@ -134,12 +146,13 @@ async def ingest_message(msg: Message) -> bool:
         new_msg_id = await conn.fetchval(
             """INSERT INTO messages
                  (channel_id, tg_message_id, tg_chat_id,
-                  file_unique_id, file_name, caption, file_size, mime_type, posted_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                  file_unique_id, file_name, caption, file_size, mime_type,
+                  media_type, posted_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
-            caption[:8000], file_size, mime_type, msg.date,
+            caption[:8000], file_size, mime_type, media_type, msg.date,
         )
 
         if new_msg_id and file_name:
@@ -265,6 +278,7 @@ async def download_worker() -> None:
 
 
 SESSION_PATH = "/app/session/tgarr.session"
+THUMBS_ROOT = "/downloads/thumbs"
 
 
 def _session_authed() -> bool:
@@ -301,6 +315,58 @@ async def wait_for_session() -> None:
     log.info("[startup] session detected, continuing")
 
 
+async def thumb_downloader() -> None:
+    """Background: fetch one photo at a time via MTProto + save to disk.
+
+    Identifies eligible messages by media_type='photo' or — for legacy rows
+    indexed before the column existed — by the (file_name NULL + mime_type NULL
+    + file_unique_id NOT NULL) signature that Pyrogram photo objects produce.
+    Marks failed lookups with thumb_path='__failed__' so they don't churn.
+    """
+    log.info("[thumbs] downloader started; root=%s", THUMBS_ROOT)
+    os.makedirs(THUMBS_ROOT, exist_ok=True)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT m.id, m.tg_chat_id, m.tg_message_id, m.file_unique_id
+                       FROM messages m
+                       WHERE m.thumb_path IS NULL
+                         AND (m.media_type = 'photo'
+                              OR (m.media_type IS NULL
+                                  AND m.file_name IS NULL
+                                  AND COALESCE(m.mime_type,'') = ''
+                                  AND m.file_unique_id IS NOT NULL))
+                       ORDER BY m.posted_at DESC NULLS LAST
+                       LIMIT 1""")
+            if not row:
+                await asyncio.sleep(60)
+                continue
+
+            safe_uid = SAFE_NAME.sub("_", row["file_unique_id"] or str(row["id"]))[:80]
+            fname = f"{safe_uid}.jpg"
+            target = os.path.join(THUMBS_ROOT, fname)
+            try:
+                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                if not msg or not msg.photo:
+                    raise RuntimeError("no photo on message")
+                await app.download_media(msg.photo, file_name=target)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET thumb_path=$1 WHERE id=$2",
+                        fname, row["id"])
+            except Exception as e:
+                log.warning("[thumbs] failed id=%s: %s", row["id"], e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
+                        row["id"])
+            await asyncio.sleep(0.8)
+        except Exception as e:
+            log.exception("[thumbs] outer loop: %s", e)
+            await asyncio.sleep(10)
+
+
 async def main() -> None:
     await init_db()
     await wait_for_session()
@@ -309,6 +375,7 @@ async def main() -> None:
     log.info("connected as @%s (id=%s)", me.username or "-", me.id)
 
     asyncio.create_task(download_worker())
+    asyncio.create_task(thumb_downloader())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()

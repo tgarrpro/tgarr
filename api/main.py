@@ -24,7 +24,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.3.2"
+TGARR_VERSION = "0.3.3"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -63,6 +63,10 @@ async def _migrate_schema():
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS metadata_source TEXT;
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS metadata_lookup_at TIMESTAMPTZ;
             CREATE INDEX IF NOT EXISTS idx_releases_meta_source ON releases (metadata_source);
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_path TEXT;
+            CREATE INDEX IF NOT EXISTS idx_messages_media_type ON messages (media_type);
+            CREATE INDEX IF NOT EXISTS idx_messages_thumb ON messages (thumb_path) WHERE thumb_path IS NOT NULL;
         """)
 
 
@@ -138,6 +142,26 @@ FAVICON_SVG = (
 @app.get("/favicon.ico")  # browsers auto-request this; serve same SVG payload
 async def favicon():
     return Response(FAVICON_SVG, media_type="image/svg+xml")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Thumb serving — crawler writes /downloads/thumbs/<uid>.jpg
+# ════════════════════════════════════════════════════════════════════
+import re as _re
+from fastapi.responses import FileResponse
+THUMBS_DIR = "/downloads/thumbs"
+_THUMB_SAFE = _re.compile(r"^[A-Za-z0-9_\-]+\.jpg$")
+
+
+@app.get("/thumbs/{fname}")
+async def serve_thumb(fname: str):
+    if not _THUMB_SAFE.match(fname):
+        return Response("bad name", status_code=400)
+    path = os.path.join(THUMBS_DIR, fname)
+    if not os.path.exists(path):
+        return Response("not found", status_code=404)
+    return FileResponse(path, media_type="image/jpeg",
+                       headers={"Cache-Control": "public, max-age=604800"})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -328,6 +352,31 @@ async def api_login_logout():
     return login.logout()
 
 
+@app.post("/api/grab/{guid}")
+async def api_grab(guid: str):
+    """User clicks Grab in tgarr UI → queue download directly. Avoids the
+    Newznab `t=get` path that returns an .nzb file (only useful to Sonarr).
+    """
+    async with db_pool.acquire() as conn:
+        rel = await conn.fetchrow(
+            "SELECT id, name FROM releases WHERE guid = $1", guid)
+        if not rel:
+            return JSONResponse({"status": "error", "message": "release not found"},
+                              status_code=404)
+        # Don't double-queue
+        existing = await conn.fetchval(
+            """SELECT status FROM downloads
+               WHERE release_id = $1
+                 AND status IN ('pending','downloading','completed')
+               LIMIT 1""", rel["id"])
+        if existing:
+            return {"status": "exists", "existing_status": existing, "name": rel["name"]}
+        await conn.execute(
+            "INSERT INTO downloads (release_id, status) VALUES ($1, 'pending')",
+            rel["id"])
+    return {"status": "queued", "name": rel["name"]}
+
+
 @app.post("/api/settings/tmdb_key")
 async def settings_tmdb_key(value: str = Form("")):
     value = value.strip()
@@ -464,12 +513,32 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .view-toggle { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
 .view-toggle a { padding:6px 14px; color:var(--muted); text-decoration:none; font-size:13px; font-weight:600; }
 .view-toggle a.active { background:var(--accent); color:#fff; }
+
+/* ── Image gallery ─────────────────── */
+.gallery { columns:5 240px; column-gap:14px; }
+.gallery .item { break-inside:avoid; margin-bottom:14px; position:relative; border-radius:8px; overflow:hidden; cursor:zoom-in; box-shadow:var(--shadow); }
+.gallery .item img { width:100%; display:block; background:#f1f5f9; transition:transform 0.15s; }
+.gallery .item:hover img { transform:scale(1.02); }
+.gallery .item .meta { position:absolute; left:0; right:0; bottom:0; padding:18px 12px 8px; background:linear-gradient(transparent, rgba(0,0,0,0.78)); color:#fff; font-size:12px; opacity:0; transition:opacity 0.15s; }
+.gallery .item:hover .meta { opacity:1; }
+.gallery .item .meta .ch { font-weight:700; }
+.gallery .item .meta .cap { margin-top:4px; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+
+/* ── Lightbox ─────────────────── */
+.lightbox { position:fixed; inset:0; background:rgba(15,23,42,0.92); display:none; align-items:center; justify-content:center; z-index:9999; cursor:zoom-out; padding:20px; }
+.lightbox.open { display:flex; }
+.lightbox img { max-width:96vw; max-height:88vh; border-radius:4px; box-shadow:0 12px 40px rgba(0,0,0,0.4); }
+.lightbox .lb-meta { position:absolute; left:24px; right:24px; bottom:24px; color:#fff; font-size:14px; line-height:1.5; max-width:600px; }
+.lightbox .lb-meta .ch { color:var(--accent-hi); font-weight:700; font-size:13px; }
+.lightbox .lb-close { position:absolute; top:18px; right:24px; color:#fff; font-size:32px; cursor:pointer; opacity:0.7; }
+.lightbox .lb-close:hover { opacity:1; }
 """
 
 NAV_ITEMS = [
     ("/",          "Dashboard", "M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"),
     ("/channels",  "Channels",  "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z"),
     ("/releases",  "Releases",  "M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"),
+    ("/gallery",   "Gallery",   "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
     ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
     ("/settings",  "Settings",  "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94 0 .31.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"),
@@ -548,6 +617,51 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
   </header>
   <div class="content">{body_html}</div>
 </main>
+<script>
+function tgLightboxOpen(item) {{
+  const lb = document.querySelector('.lightbox');
+  if (!lb) return;
+  document.getElementById('lbImg').src = item.dataset.src;
+  document.getElementById('lbCh').textContent = item.dataset.ch || '';
+  document.getElementById('lbCap').textContent = item.dataset.cap || '';
+  lb.classList.add('open');
+}}
+function tgLightboxClose(e) {{
+  if (e) e.stopPropagation();
+  document.querySelector('.lightbox')?.classList.remove('open');
+}}
+document.addEventListener('DOMContentLoaded', () => {{
+  document.querySelectorAll('.gallery .item').forEach(item => {{
+    item.addEventListener('click', () => tgLightboxOpen(item));
+  }});
+  document.addEventListener('keydown', e => {{ if (e.key === 'Escape') tgLightboxClose(); }});
+}});
+async function tgGrab(btn) {{
+  const guid = btn.dataset.guid;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {{
+    const r = await fetch('/api/grab/' + guid, {{method: 'POST'}});
+    const j = await r.json();
+    if (j.status === 'queued') {{
+      btn.textContent = '✓ Queued';
+      btn.style.background = 'var(--ok)';
+    }} else if (j.status === 'exists') {{
+      btn.textContent = '· already ' + j.existing_status;
+      btn.style.background = 'var(--muted)';
+    }} else {{
+      btn.textContent = '✗ ' + (j.message || 'error');
+      btn.style.background = 'var(--bad)';
+      setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
+    }}
+  }} catch (e) {{
+    btn.textContent = '✗ network';
+    btn.style.background = 'var(--bad)';
+    setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
+  }}
+}}
+</script>
 </body></html>"""
 
 
@@ -719,6 +833,83 @@ async def page_channels():
 
 
 # ════════════════════════════════════════════════════════════════════
+# Page: Gallery (Telegram-shared photos)
+# ════════════════════════════════════════════════════════════════════
+@app.get("/gallery", response_class=HTMLResponse)
+async def page_gallery(channel: Optional[str] = None, limit: int = 240):
+    if not login.session_exists():
+        # Skip redirect if we have data — crawler may be authed in-memory
+        async with db_pool.acquire() as conn:
+            n = await conn.fetchval("SELECT count(*) FROM channels")
+        if not n:
+            return RedirectResponse("/login")
+
+    where = ["m.thumb_path IS NOT NULL", "m.thumb_path <> '__failed__'"]
+    params = []
+    if channel:
+        params.append(channel)
+        where.append(f"c.username = ${len(params)}")
+
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT count(*) FROM messages WHERE thumb_path IS NOT NULL "
+            "AND thumb_path <> '__failed__'")
+        pending = await conn.fetchval(
+            """SELECT count(*) FROM messages
+               WHERE thumb_path IS NULL AND (media_type='photo' OR
+                     (media_type IS NULL AND file_name IS NULL
+                      AND COALESCE(mime_type,'')='' AND file_unique_id IS NOT NULL))""")
+        rows = await conn.fetch(f"""
+            SELECT m.id, m.thumb_path, m.caption, m.posted_at,
+                   c.title AS ch_title, c.username AS ch_user
+            FROM messages m
+            JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where)}
+            ORDER BY m.posted_at DESC NULLS LAST
+            LIMIT {max(1, min(limit, 500))}
+        """, *params)
+
+    if not rows:
+        body = (
+            '<h2 class="section">Gallery <span class="count">0</span></h2>'
+            '<div class="empty-state">'
+            '<div class="icon">🖼</div>'
+            '<div>No photos cached yet.</div>'
+            f'<div style="margin-top:8px;font-size:13px">{pending:,} photo messages indexed — '
+            'crawler is downloading thumbnails in the background. Refresh in a minute.</div>'
+            '</div>'
+        )
+        return HTMLResponse(_layout("Gallery", "/gallery", body))
+
+    items = "".join(
+        f'<figure class="item" data-src="/thumbs/{html.escape(r["thumb_path"])}" '
+        f'data-cap="{html.escape((r["caption"] or "")[:300])}" '
+        f'data-ch="{html.escape(r["ch_title"] or r["ch_user"] or "")}">'
+        f'<img src="/thumbs/{html.escape(r["thumb_path"])}" loading="lazy" />'
+        f'<figcaption class="meta">'
+        f'<div class="ch">{html.escape(r["ch_title"] or "")}</div>'
+        f'<div class="cap">{html.escape((r["caption"] or "")[:200])}</div>'
+        f'</figcaption>'
+        f'</figure>'
+        for r in rows
+    )
+
+    body = (
+        f'<h2 class="section">Gallery <span class="count">{len(rows)} of {total:,} cached</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{pending:,} pending download</span>'
+           if pending else '')
+        + '</h2>'
+        f'<div class="gallery">{items}</div>'
+        '<div class="lightbox" onclick="tgLightboxClose(event)">'
+        '  <span class="lb-close" onclick="tgLightboxClose(event)">×</span>'
+        '  <img id="lbImg" />'
+        '  <div class="lb-meta"><div class="ch" id="lbCh"></div><div id="lbCap"></div></div>'
+        '</div>'
+    )
+    return HTMLResponse(_layout("Gallery", "/gallery", body))
+
+
+# ════════════════════════════════════════════════════════════════════
 # Page: Releases
 # ════════════════════════════════════════════════════════════════════
 def _release_card(r) -> str:
@@ -751,7 +942,7 @@ def _release_card(r) -> str:
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
         f'</div>'
         f'<div class="grab-row">'
-        f'<a class="btn" href="/newznab/api?t=get&id={r["guid"]}&apikey=tgarr">⬇ Grab</a>'
+        f'<button class="btn grab-btn" data-guid="{r["guid"]}" onclick="tgGrab(this)">⬇ Grab</button>'
         f'</div>'
         f'</div>'
     )
@@ -759,7 +950,8 @@ def _release_card(r) -> str:
 
 @app.get("/releases", response_class=HTMLResponse)
 async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
-                        view: str = "grid", limit: int = 120):
+                        view: str = "grid", limit: int = 120,
+                        min_mb: int = 100):
     if not login.session_exists():
         return RedirectResponse("/login")
     where = ["1=1"]
@@ -770,6 +962,10 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
             where.append(f"name ILIKE ${len(params)}")
     if cat in ("movie", "tv"):
         where.append(f"category = '{cat}'")
+    # Hide trailers / samples / IMG-junk by default — Tom asked.
+    # Pass min_mb=0 to see everything (debugging).
+    if min_mb and min_mb > 0:
+        where.append(f"COALESCE(size_bytes,0) >= {min_mb * 1024 * 1024}")
     sql = (f"SELECT id, guid, name, category, season, episode, quality, "
           f"size_bytes, posted_at, parse_score, poster_url, canonical_title "
           f"FROM releases WHERE {' AND '.join(where)} "
