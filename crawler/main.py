@@ -365,7 +365,7 @@ CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
 
-# Federation swarm validator (v0.4.3+): client pulls seed candidates from
+# Federation swarm validator (v0.4.4+): client pulls seed candidates from
 # central, validates on this client's TG account, pushes back via /contribute.
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
@@ -517,9 +517,22 @@ async def thumb_downloader() -> None:
             target = os.path.join(THUMBS_ROOT, fname)
             try:
                 msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
-                if not msg or not msg.photo:
-                    raise RuntimeError("no photo on message")
-                await app.download_media(msg.photo, file_name=target)
+                if not msg:
+                    raise RuntimeError("message gone")
+                # Resolve the best available thumbnail source:
+                #   photo message → full photo (largest PhotoSize)
+                #   video message → embedded video thumbnail (last in thumbs list)
+                #   document message → embedded document thumbnail
+                thumb_media = None
+                if msg.photo:
+                    thumb_media = msg.photo
+                elif msg.video and getattr(msg.video, "thumbs", None):
+                    thumb_media = msg.video.thumbs[-1]
+                elif msg.document and getattr(msg.document, "thumbs", None):
+                    thumb_media = msg.document.thumbs[-1]
+                if not thumb_media:
+                    raise RuntimeError("no thumbnail available on message")
+                await app.download_media(thumb_media, file_name=target)
                 # MD5 of the downloaded bytes → dedup across channels
                 with open(target, "rb") as f:
                     md5 = hashlib.md5(f.read()).hexdigest()
@@ -1086,7 +1099,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.3 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.4 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1202,7 +1215,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.3",
+                "tgarr_version": "0.4.4",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1217,7 +1230,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.3 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.4 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1266,7 +1279,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.3 (+https://tgarr.me)"})
+                    "User-Agent": "tgarr/0.4.4 (+https://tgarr.me)"})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -1347,14 +1360,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.3",
+                        "tgarr_version": "0.4.4",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.3 (+https://tgarr.me)"},
+                                 "User-Agent": "tgarr/0.4.4 (+https://tgarr.me)"},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
