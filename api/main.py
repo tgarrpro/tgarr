@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.4"
+TGARR_VERSION = "0.4.5"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -1338,13 +1338,39 @@ async def page_discover(audience: str = "sfw"):
            if last_pull else '')
         + '</h2>'
         '<div style="margin-bottom:18px;display:flex;gap:8px">'
-        '  <form method="POST" action="/api/registry/pull-now">'
-        '    <button type="submit" class="ghost" style="font-size:13px">↻ Pull now</button>'
-        '  </form>'
+        '  <button type="button" class="ghost" id="tgPullBtn" style="font-size:13px" onclick="tgRegistryPull(this)">↻ Pull now</button>'
+        '  <span id="tgPullToast" style="font-size:13px;color:var(--muted);align-self:center;display:none"></span>'
         '</div>'
         f'<div class="dl-list">{"".join(_card(r) for r in rows)}</div>'
         '<script>'
         '(() => {'
+        '  window.tgRegistryPull = async function(btn) {'
+        '    const toast = document.getElementById("tgPullToast");'
+        '    btn.disabled = true; btn.textContent = "Pulling…";'
+        '    toast.style.display = "inline";'
+        '    toast.textContent = "waiting for crawler (up to 70s)…";'
+        '    toast.style.color = "var(--muted)";'
+        '    try {'
+        '      const r = await fetch("/api/registry/pull-now", {method:"POST"});'
+        '      const j = await r.json();'
+        '      if (j.status === "ok") {'
+        '        toast.textContent = `\u2713 pull complete \u2014 ${j.affected} channel(s) updated`;'
+        '        toast.style.color = "var(--ok)";'
+        '        if (j.affected > 0) setTimeout(() => location.reload(), 1200);'
+        '      } else if (j.status === "queued") {'
+        '        toast.textContent = "\u23F3 queued \u2014 crawler busy, will run soon";'
+        '        toast.style.color = "var(--warn)";'
+        '      } else {'
+        '        toast.textContent = "\u2717 " + (j.message || "error");'
+        '        toast.style.color = "var(--err)";'
+        '      }'
+        '    } catch (e) {'
+        '      toast.textContent = "\u2717 network error";'
+        '      toast.style.color = "var(--err)";'
+        '    } finally {'
+        '      btn.disabled = false; btn.textContent = "\u21BB Pull now";'
+        '    }'
+        '  };'
         '  window.tgDiscoverSubscribe = async function(btn) {'
         '    const u = btn.dataset.uname;'
         '    btn.disabled = true; btn.textContent = "...";'
@@ -1367,16 +1393,41 @@ async def page_discover(audience: str = "sfw"):
 
 @app.post("/api/registry/pull-now")
 async def api_registry_pull_now():
-    """Force the next registry_puller tick to fire immediately. Writes a
-    sentinel to the config table; the running puller polls for it every 60s.
-    303 See Other so the form-POST → GET-redirect follows correctly.
+    """Force the next registry_puller tick to fire immediately and block until
+    it consumes the sentinel (up to ~70s — crawler polls config every 60s).
+    Returns JSON with how many discovered rows changed so the UI can show a
+    real result toast instead of silent redirect.
     """
+    import asyncio
     async with db_pool.acquire() as conn:
+        before_max = await conn.fetchval(
+            "SELECT MAX(last_pulled_at) FROM discovered")
         await conn.execute(
             """INSERT INTO config (key, value) VALUES ('registry_pull_force', $1)
                ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""",
             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    return RedirectResponse("/discover", status_code=303)
+
+    # Poll for sentinel deletion (crawler consumed it = pull completed).
+    for _ in range(140):  # 140 * 0.5s = 70s
+        await asyncio.sleep(0.5)
+        async with db_pool.acquire() as conn:
+            sentinel = await conn.fetchval(
+                "SELECT value FROM config WHERE key='registry_pull_force'")
+        if sentinel is None:
+            async with db_pool.acquire() as conn:
+                if before_max:
+                    affected = await conn.fetchval(
+                        "SELECT COUNT(*) FROM discovered WHERE last_pulled_at > $1",
+                        before_max)
+                else:
+                    affected = await conn.fetchval(
+                        "SELECT COUNT(*) FROM discovered WHERE last_pulled_at IS NOT NULL")
+            return JSONResponse({"status": "ok", "affected": int(affected or 0)})
+
+    return JSONResponse(
+        {"status": "queued",
+         "message": "crawler didn\'t pick up sentinel within 70s; pull will run in background"},
+        status_code=202)
 
 
 # ════════════════════════════════════════════════════════════════════
