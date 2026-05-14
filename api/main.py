@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.45"
+TGARR_VERSION = "0.4.46"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -86,6 +86,7 @@ async def _startup():
                     "ON CONFLICT (key) DO NOTHING", env_key)
     asyncio.create_task(_metadata_worker())
     asyncio.create_task(_audio_metadata_worker())
+    asyncio.create_task(_stats_snapshot_worker())
     asyncio.create_task(_ebook_queue_restore())
 
 
@@ -138,6 +139,14 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_dc INTEGER;
+            CREATE TABLE IF NOT EXISTS stats_history (
+              snapshot_at TIMESTAMPTZ NOT NULL,
+              metric TEXT NOT NULL,
+              value BIGINT NOT NULL,
+              PRIMARY KEY (snapshot_at, metric)
+            );
+            CREATE INDEX IF NOT EXISTS idx_stats_hist_metric_time
+                ON stats_history (metric, snapshot_at DESC);
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_canonical_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_album TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_year INTEGER;
@@ -241,6 +250,65 @@ async def _audio_metadata_worker():
         except Exception as e:
             wlog.exception("[audio-meta] outer: %s", e)
             await asyncio.sleep(30)
+
+
+async def _stats_snapshot_worker():
+    """Hourly snapshot of dashboard metrics into stats_history.
+
+    On first run, also backfills historical messages-by-day from posted_at
+    so the line chart shows real history immediately (not 1 dot).
+    """
+    import asyncio
+    log = logging.getLogger("tgarr.stats_snap")
+    METRICS_SQL = {
+        "channels":  "SELECT count(*) FROM channels",
+        "messages":  "SELECT count(*) FROM messages",
+        "releases":  "SELECT count(*) FROM releases",
+        "photos":    "SELECT count(*) FROM messages WHERE media_type='photo'",
+        "audio":     "SELECT count(*) FROM messages WHERE media_type='audio'",
+        "books":     ("SELECT count(*) FROM messages WHERE media_type='document'"
+                      " AND file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"),
+        "completed": "SELECT count(*) FROM downloads WHERE status='completed'",
+    }
+    await asyncio.sleep(60)  # let startup settle
+    # Backfill messages history from posted_at — one-shot, only if empty
+    async with db_pool.acquire() as conn:
+        has_hist = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM stats_history WHERE metric='messages')")
+        if not has_hist:
+            log.info("[stats] backfilling messages history from posted_at")
+            try:
+                await conn.execute("""
+                    INSERT INTO stats_history (snapshot_at, metric, value)
+                    SELECT date_trunc('day', posted_at) + INTERVAL '23 hours 59 minutes',
+                           'messages',
+                           sum(count(*)) OVER (ORDER BY date_trunc('day', posted_at))
+                    FROM messages
+                    WHERE posted_at IS NOT NULL
+                      AND posted_at >= NOW() - INTERVAL '90 days'
+                    GROUP BY date_trunc('day', posted_at)
+                    ON CONFLICT DO NOTHING
+                """)
+            except Exception as e:
+                log.warning("[stats] backfill failed: %s", e)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                for metric, sql in METRICS_SQL.items():
+                    try:
+                        val = await conn.fetchval(sql)
+                        await conn.execute(
+                            "INSERT INTO stats_history (snapshot_at, metric, value) "
+                            "VALUES (date_trunc('hour', NOW()), $1, $2) "
+                            "ON CONFLICT (snapshot_at, metric) DO UPDATE SET value = EXCLUDED.value",
+                            metric, val or 0)
+                    except Exception as e:
+                        log.warning("[stats] %s failed: %s", metric, e)
+            log.info("[stats] snapshot complete")
+        except Exception:
+            log.exception("[stats] outer loop")
+        # Sleep 1h
+        await asyncio.sleep(3600)
 
 
 async def _metadata_worker():
@@ -1927,6 +1995,33 @@ async function tgGrab(btn) {{
 # ════════════════════════════════════════════════════════════════════
 # Page: Dashboard
 # ════════════════════════════════════════════════════════════════════
+@app.get("/api/stats/history")
+async def stats_history(metric: str, days: int = 7):
+    """Time-series for one metric. Daily resolution. Returns [{at, value}]."""
+    if metric not in ("channels", "messages", "releases", "photos",
+                      "audio", "books", "completed"):
+        return JSONResponse({"error": "unknown metric"}, status_code=400)
+    days = max(1, min(days, 365))
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT date_trunc('day', snapshot_at) AS day, max(value) AS value "
+            "FROM stats_history "
+            "WHERE metric = $1 AND snapshot_at >= NOW() - ($2 || ' days')::INTERVAL "
+            "GROUP BY day ORDER BY day", metric, str(days))
+    return {"metric": metric, "days": days,
+            "points": [{"at": r["day"].isoformat(), "value": r["value"]} for r in rows]}
+
+
+@app.get("/api/stats/distribution")
+async def stats_distribution():
+    """Current snapshot of media_type distribution for pie chart."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT COALESCE(media_type, 'other') AS k, count(*) AS v "
+            "FROM messages GROUP BY media_type ORDER BY count(*) DESC")
+    return {"slices": [{"label": r["k"], "value": r["v"]} for r in rows]}
+
+
 @app.get("/")
 async def root(accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
@@ -1934,6 +2029,13 @@ async def root(accept: Optional[str] = Header(None)):
             """SELECT (SELECT count(*) FROM channels)                AS channels,
                       (SELECT count(*) FROM messages)                AS messages,
                       (SELECT count(*) FROM releases)                AS releases,
+                      (SELECT count(*) FROM messages
+                         WHERE media_type='photo')                   AS photos,
+                      (SELECT count(*) FROM messages
+                         WHERE media_type='audio')                   AS audio,
+                      (SELECT count(*) FROM messages
+                         WHERE media_type='document'
+                           AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$') AS books,
                       (SELECT count(*) FROM downloads
                          WHERE status='pending')                     AS pending,
                       (SELECT count(*) FROM downloads
@@ -1968,11 +2070,116 @@ async def root(accept: Optional[str] = Header(None)):
             (s["channels"], "channels"),
             (s["messages"], "messages indexed"),
             (s["releases"], "parsed releases"),
+            (s["photos"], "photos"),
+            (s["audio"], "audio"),
+            (s["books"], "books"),
             (s["pending"], "pending"),
             (s["downloading"], "downloading"),
             (s["completed"], "completed"),
         ]
     )
+    charts_html = """
+<section class="dashboard-charts">
+  <div class="chart-card chart-line">
+    <header>
+      <h3>Growth</h3>
+      <div class="chart-controls">
+        <select id="growthMetric">
+          <option value="messages" selected>messages</option>
+          <option value="releases">releases</option>
+          <option value="channels">channels</option>
+          <option value="photos">photos</option>
+          <option value="books">books</option>
+        </select>
+        <select id="growthDays">
+          <option value="7" selected>7d</option>
+          <option value="30">30d</option>
+          <option value="90">90d</option>
+        </select>
+      </div>
+    </header>
+    <canvas id="growthChart" height="160"></canvas>
+  </div>
+  <div class="chart-card chart-pie">
+    <header><h3>Media mix</h3></header>
+    <canvas id="distChart" height="160"></canvas>
+  </div>
+</section>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+(function() {
+  let growth = null, dist = null;
+  function fmtDate(iso) { return iso.slice(5, 10); }
+  function color(i) {
+    const c = ['#5eb6e5','#94d2bd','#e9c46a','#f4a261','#e76f51','#a8dadc','#bdb2ff'];
+    return c[i % c.length];
+  }
+  async function loadGrowth() {
+    const metric = document.getElementById('growthMetric').value;
+    const days   = document.getElementById('growthDays').value;
+    const r = await fetch(`/api/stats/history?metric=${metric}&days=${days}`);
+    const j = await r.json();
+    const labels = (j.points || []).map(p => fmtDate(p.at));
+    const data   = (j.points || []).map(p => p.value);
+    const ctx = document.getElementById('growthChart').getContext('2d');
+    if (growth) growth.destroy();
+    growth = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{
+        label: metric, data,
+        fill: true, backgroundColor: 'rgba(94,182,229,0.12)',
+        borderColor: '#5eb6e5', borderWidth: 2, tension: 0.35,
+        pointRadius: 3, pointHoverRadius: 5
+      }]},
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: false, ticks: { color: '#94a3b8' } },
+                  x: { ticks: { color: '#94a3b8' } } }
+      }
+    });
+  }
+  async function loadDist() {
+    const r = await fetch('/api/stats/distribution');
+    const j = await r.json();
+    const labels = (j.slices || []).map(s => s.label);
+    const data   = (j.slices || []).map(s => s.value);
+    const ctx = document.getElementById('distChart').getContext('2d');
+    if (dist) dist.destroy();
+    dist = new Chart(ctx, {
+      type: 'doughnut',
+      data: { labels, datasets: [{ data,
+        backgroundColor: labels.map((_, i) => color(i)),
+        borderColor: '#0f172a', borderWidth: 2
+      }]},
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'right',
+          labels: { color: '#e2e8f0', boxWidth: 14, padding: 8, font: { size: 12 } } } }
+      }
+    });
+  }
+  document.getElementById('growthMetric').addEventListener('change', loadGrowth);
+  document.getElementById('growthDays').addEventListener('change', loadGrowth);
+  loadGrowth();
+  loadDist();
+})();
+</script>
+<style>
+.dashboard-charts { display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
+  margin: 20px 0; }
+.dashboard-charts .chart-card { background: #1e293b; border: 1px solid #334155;
+  border-radius: 8px; padding: 14px 16px; }
+.dashboard-charts .chart-card header { display: flex; align-items: center;
+  justify-content: space-between; margin-bottom: 8px; }
+.dashboard-charts .chart-card h3 { margin: 0; font-size: 14px; font-weight: 600;
+  color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+.dashboard-charts .chart-controls select { background: #0f172a; color: #e2e8f0;
+  border: 1px solid #334155; padding: 4px 8px; border-radius: 4px;
+  font-size: 12px; margin-left: 6px; }
+@media (max-width: 900px) {
+  .dashboard-charts { grid-template-columns: 1fr; }
+}
+</style>
+"""
 
     if recent:
         items = []
@@ -2010,7 +2217,7 @@ async def root(accept: Optional[str] = Header(None)):
     base_url = os.environ.get("TGARR_BASE_URL") or "http://&lt;host&gt;:8765"
 
     body = f"""
-<div class="stats">{stats_html}</div>
+<div class="stats">{stats_html}</div>{charts_html}
 
 <h2 class="section">Recent activity <span class="extra"><a href="/downloads">view all →</a></span></h2>
 {recent_html}
