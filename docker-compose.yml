@@ -34,7 +34,8 @@ services:
   crawler:
     build: ./crawler
     container_name: tgarr-crawler
-    restart: unless-stopped
+    restart: "no"
+    profiles: [bootstrap]
     depends_on: [db, meili]
     environment:
       TG_API_ID: ${TG_API_ID}
@@ -86,6 +87,7 @@ services:
     restart: unless-stopped
     depends_on: [db]
     environment:
+      REGISTRY_MIN_CONSENSUS: "1"
       DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
     volumes:
       - ./registry:/app
