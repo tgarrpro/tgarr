@@ -238,10 +238,25 @@ async def _qr_poll_loop():
                 await _save_user_and_disconnect(r.authorization.user)
                 return
             if isinstance(r, LoginTokenMigrateTo):
-                # DC migration: switch DC + import token there
+                # DC migration: each DC has its own auth_key namespace.
+                # Must regenerate via DH handshake on new DC; reusing the old
+                # DC auth_key triggers AUTH_TOKEN_EXPIRED on ImportLoginToken.
+                from pyrogram.session import Auth, Session
                 try:
                     await client.session.stop()
                     await client.storage.dc_id(r.dc_id)
+                    new_auth_key = await Auth(
+                        client,
+                        await client.storage.dc_id(),
+                        await client.storage.test_mode(),
+                    ).create()
+                    await client.storage.auth_key(new_auth_key)
+                    client.session = Session(
+                        client,
+                        await client.storage.dc_id(),
+                        await client.storage.auth_key(),
+                        await client.storage.test_mode(),
+                    )
                     await client.session.start()
                     r2 = await client.invoke(ImportLoginToken(token=r.token))
                     if isinstance(r2, LoginTokenSuccess):

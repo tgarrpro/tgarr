@@ -158,6 +158,11 @@ async def ingest_message(msg: Message) -> bool:
             msg.chat.title or "",
             chat_type.lower(),
         )
+        # NOISE FILTER: skip persisting messages with no media attachment.
+        # text-only chatter has 0 resource value; discovery is handled via
+        # federation registry, not via parsing message text for mentions.
+        if media is None:
+            return False
         new_msg_id = await conn.fetchval(
             """INSERT INTO messages
                  (channel_id, tg_message_id, tg_chat_id,
@@ -193,20 +198,44 @@ async def on_new_message(client: Client, msg: Message) -> None:
 
 
 async def backfill_channel(chat_id: int, title: str) -> int:
+    """Backfill recent history with sample-then-decide noise filter.
+
+    After NOISE_SAMPLE_AT messages, if media density < NOISE_THRESHOLD_PCT,
+    mark channel as noise + abort remaining backfill. ~96% TG quota savings
+    on metaindex / chat channels.
+    """
+    NOISE_SAMPLE_AT = 200
+    NOISE_THRESHOLD_PCT = 5
     log.info("[backfill] start chat_id=%s title=%s limit=%s",
              chat_id, title, BACKFILL_LIMIT)
     count = 0
     media_count = 0
     async for msg in app.get_chat_history(chat_id, limit=BACKFILL_LIMIT):
+        has_media = bool(msg.video or msg.document or msg.audio or msg.photo)
         try:
-            inserted = await ingest_message(msg)
+            await ingest_message(msg)
             count += 1
-            if inserted and (msg.video or msg.document or msg.audio):
+            if has_media:
                 media_count += 1
             if count % 200 == 0:
-                log.info("[backfill] chat_id=%s progress=%s", chat_id, count)
+                log.info("[backfill] chat_id=%s progress=%s media=%s",
+                         chat_id, count, media_count)
+            if count == NOISE_SAMPLE_AT:
+                pct = media_count * 100 // count
+                if pct < NOISE_THRESHOLD_PCT:
+                    log.info("[backfill] NOISE chat_id=%s title=%s "
+                             "media=%d/%d (%d%% < %d%%) — disabling",
+                             chat_id, title, media_count, count,
+                             pct, NOISE_THRESHOLD_PCT)
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE channels SET enabled=FALSE,
+                               category='noise', backfilled=TRUE
+                               WHERE tg_chat_id=$1""", chat_id)
+                    return count
         except Exception as e:
-            log.warning("[backfill] err chat_id=%s msg_id=%s: %s", chat_id, msg.id, e)
+            log.warning("[backfill] err chat_id=%s msg_id=%s: %s",
+                        chat_id, msg.id, e)
 
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -223,11 +252,13 @@ async def backfill_all() -> None:
             for r in await conn.fetch("SELECT tg_chat_id FROM channels WHERE backfilled")
         }
 
+    current_dialog_ids: set[int] = set()
     async for dialog in app.get_dialogs():
         ctype = dialog.chat.type.name
         if ctype in ("PRIVATE", "BOT"):
             continue
         chat_id = dialog.chat.id
+        current_dialog_ids.add(chat_id)
         title = dialog.chat.title or ""
         if chat_id in backfilled:
             log.info("[backfill] skip already-done chat_id=%s title=%s", chat_id, title)
@@ -236,6 +267,36 @@ async def backfill_all() -> None:
             await backfill_channel(chat_id, title)
         except Exception as e:
             log.error("[backfill] failed chat_id=%s: %s", chat_id, e)
+
+    # Reconcile dialog-sourced rows against user's current TG dialog list.
+    # subscribed=TRUE rows are username-polled (don't need user membership),
+    # so we leave them alone. Only dialog-sourced rows get disabled when the
+    # user has left/archived them on their TG account. Noise-flagged channels
+    # are never re-enabled even if still in dialog list.
+    if current_dialog_ids:
+        ids_list = list(current_dialog_ids)
+        async with db_pool.acquire() as conn:
+            stale = await conn.fetch(
+                """UPDATE channels SET enabled = FALSE
+                   WHERE subscribed = FALSE
+                     AND enabled = TRUE
+                     AND tg_chat_id <> ALL($1::bigint[])
+                   RETURNING tg_chat_id, title""",
+                ids_list)
+            rejoined = await conn.fetch(
+                """UPDATE channels SET enabled = TRUE
+                   WHERE subscribed = FALSE
+                     AND enabled = FALSE
+                     AND COALESCE(category,'') <> 'noise'
+                     AND tg_chat_id = ANY($1::bigint[])
+                   RETURNING tg_chat_id, title""",
+                ids_list)
+        if stale:
+            log.info("[reconcile] disabled %d stale dialog channels: %s",
+                     len(stale), [(s["tg_chat_id"], (s["title"] or "")[:40]) for s in stale])
+        if rejoined:
+            log.info("[reconcile] re-enabled %d rejoined channels: %s",
+                     len(rejoined), [(s["tg_chat_id"], (s["title"] or "")[:40]) for s in rejoined])
 
 
 async def download_worker() -> None:
@@ -302,7 +363,7 @@ CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
 
-# Federation swarm validator (v0.4.0+): client pulls seed candidates from
+# Federation swarm validator (v0.4.1+): client pulls seed candidates from
 # central, validates on this client's TG account, pushes back via /contribute.
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
@@ -365,16 +426,13 @@ async def thumb_downloader() -> None:
     while True:
         try:
             async with db_pool.acquire() as conn:
+                # On-demand mode: only fetch when the UI flags
+                # thumb_path='__user_queued__'. No proactive scan.
                 row = await conn.fetchrow(
                     """SELECT m.id, m.tg_chat_id, m.tg_message_id, m.file_unique_id
                        FROM messages m
-                       WHERE m.thumb_path IS NULL
-                         AND (m.media_type = 'photo'
-                              OR (m.media_type IS NULL
-                                  AND m.file_name IS NULL
-                                  AND COALESCE(m.mime_type,'') = ''
-                                  AND m.file_unique_id IS NOT NULL))
-                       ORDER BY m.posted_at DESC NULLS LAST
+                       WHERE m.thumb_path = '__user_queued__'
+                       ORDER BY m.id ASC
                        LIMIT 1""")
             if not row:
                 await asyncio.sleep(60)
@@ -413,6 +471,11 @@ async def thumb_downloader() -> None:
                         await conn.execute(
                             "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
                             fname, md5, row["id"])
+            except FloodWait as fw:
+                wait = getattr(fw, "value", 60) + 5
+                log.warning("[thumbs] flood-wait %ds (id=%s) — pausing", wait, row["id"])
+                await asyncio.sleep(min(wait, 3600))
+                continue  # retry same row after cooldown; don't mark __failed__
             except Exception as e:
                 log.warning("[thumbs] failed id=%s: %s", row["id"], e)
                 async with db_pool.acquire() as conn:
@@ -439,7 +502,7 @@ async def channel_meta_refresher() -> None:
                 row = await conn.fetchrow(
                     """SELECT tg_chat_id FROM channels
                        WHERE meta_updated_at IS NULL
-                          OR meta_updated_at < NOW() - INTERVAL '24 hours'
+                          OR meta_updated_at < NOW() - INTERVAL '7 days'
                        ORDER BY meta_updated_at NULLS FIRST
                        LIMIT 1""")
             if not row:
@@ -949,7 +1012,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.0 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.1 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1065,7 +1128,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.0",
+                "tgarr_version": "0.4.1",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1080,7 +1143,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.0 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.1 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1129,7 +1192,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.0 (+https://tgarr.me)"})
+                    "User-Agent": "tgarr/0.4.1 (+https://tgarr.me)"})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -1210,14 +1273,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.0",
+                        "tgarr_version": "0.4.1",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.0 (+https://tgarr.me)"},
+                                 "User-Agent": "tgarr/0.4.1 (+https://tgarr.me)"},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1242,9 +1305,15 @@ async def main() -> None:
     log.info("connected as @%s (id=%s)", me.username or "-", me.id)
 
     asyncio.create_task(download_worker())
+    # On-demand mode 2026-05-14: thumb_downloader stays but only processes
+    # rows where /api/thumb/{id} UI hit has set thumb_path='__user_queued__'.
     asyncio.create_task(thumb_downloader())
-    asyncio.create_task(thumb_hash_backfill())
-    asyncio.create_task(local_media_downloader())
+    # thumb_hash_backfill is proactive (scans all thumbs for md5 dedup), so it's
+    # disabled to match the no-pre-download rule.
+    # asyncio.create_task(thumb_hash_backfill())
+    # local_media_downloader disabled 2026-05-14 — strict on-demand mode.
+    # Binary content fetches only via download_worker (POST /api/grab/{guid}).
+    # asyncio.create_task(local_media_downloader())
     asyncio.create_task(channel_meta_refresher())
     asyncio.create_task(subscription_poller())
     asyncio.create_task(contribute_to_registry())

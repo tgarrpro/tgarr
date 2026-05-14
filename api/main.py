@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.0"
+TGARR_VERSION = "0.4.1"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -197,6 +197,59 @@ async def serve_thumb(fname: str):
         return Response("not found", status_code=404)
     return FileResponse(path, media_type="image/jpeg",
                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+_TINY_TRANSPARENT_GIF = bytes.fromhex(
+    "47494638396101000100800000ffffff00000021f90401000000002c00000000"
+    "010001000002024401003b"
+)
+
+
+@app.get("/api/thumb/{msg_id}")
+async def lazy_thumb(msg_id: int):
+    """On-demand thumb materialization. Cached -> serve. Uncached -> mark
+    thumb_path='__user_queued__' so crawler thumb_downloader picks it up,
+    poll up to ~12s for the file to land, fallback to 202 + 1x1 GIF.
+    """
+    import asyncio
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT thumb_path FROM messages WHERE id=$1", msg_id)
+    if not row:
+        return Response("no msg", status_code=404)
+    tp = row["thumb_path"]
+    if tp and not tp.startswith("__"):
+        fpath = os.path.join(THUMBS_DIR, tp)
+        if os.path.exists(fpath):
+            return FileResponse(fpath, media_type="image/jpeg",
+                              headers={"Cache-Control": "public, max-age=604800"})
+    if tp in ("__failed__", "__deleted__"):
+        return Response(_TINY_TRANSPARENT_GIF, status_code=410,
+                       media_type="image/gif")
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET thumb_path = $$__user_queued__$$ "
+            "WHERE id = $1 AND (thumb_path IS NULL "
+            "OR thumb_path = $$__user_queued__$$)",
+            msg_id)
+    for _ in range(24):
+        await asyncio.sleep(0.5)
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT thumb_path FROM messages WHERE id=$1", msg_id)
+        if not row:
+            break
+        tp = row["thumb_path"]
+        if tp and not tp.startswith("__"):
+            fpath = os.path.join(THUMBS_DIR, tp)
+            if os.path.exists(fpath):
+                return FileResponse(fpath, media_type="image/jpeg",
+                                  headers={"Cache-Control": "public, max-age=604800"})
+        if tp in ("__failed__", "__deleted__"):
+            return Response(_TINY_TRANSPARENT_GIF, status_code=410,
+                           media_type="image/gif")
+    return Response(_TINY_TRANSPARENT_GIF, status_code=202,
+                   media_type="image/gif")
 
 
 @app.get("/media/{msg_id}")
@@ -1338,9 +1391,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
         if not n:
             return RedirectResponse("/login")
 
-    where = ["m.thumb_path IS NOT NULL",
-             "m.thumb_path <> '__failed__'",
-             "m.thumb_path <> '__deleted__'"]
+    where = ["(m.media_type = 'photo'"
+             " OR (m.media_type IS NULL AND m.file_name IS NULL"
+             "     AND COALESCE(m.mime_type,'') = ''"
+             "     AND m.file_unique_id IS NOT NULL))",
+             "COALESCE(m.thumb_path, '') <> '__failed__'",
+             "COALESCE(m.thumb_path, '') <> '__deleted__'"]
     params = []
     if channel:
         params.append(channel)
@@ -1398,10 +1454,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
 
     items = "".join(
         f'<figure class="item" data-id="{r["id"]}" '
-        f'data-src="/thumbs/{html.escape(r["thumb_path"])}" '
+        f'data-src="/api/thumb/{r["id"]}" '
         f'data-cap="{html.escape((r["caption"] or "")[:300])}" '
         f'data-ch="{html.escape(r["ch_title"] or r["ch_user"] or "")}">'
-        f'<img src="/thumbs/{html.escape(r["thumb_path"])}" loading="lazy" />'
+        f'<img src="/api/thumb/{r["id"]}" loading="lazy" data-mid="{r["id"]}" class="lazy-thumb" />'
         + (f'<div class="dup-badge" title="shared across {r["dup_count"]} channels">×{r["dup_count"]}</div>'
            if r.get("dup_count") and r["dup_count"] > 1 else '')
         + f'<figcaption class="meta">'
@@ -1436,6 +1492,18 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
         '</div>'
         '<script>'
         '(() => {'
+        '  function hookLazy(img) {'
+        '    if (img._tgHook) return; img._tgHook = true; img._tgTry = 0;'
+        '    img.addEventListener("load", () => {'
+        '      if (img.naturalWidth <= 1 && img._tgTry < 4) {'
+        '        img._tgTry++;'
+        '        const base = img.src.split("?")[0];'
+        '        const delay = 3000 + img._tgTry * 2000;'
+        '        setTimeout(() => { img.src = base + "?r=" + Date.now(); }, delay);'
+        '      }'
+        '    });'
+        '  }'
+        '  document.querySelectorAll("img.lazy-thumb").forEach(hookLazy);'
         '  const items = [...document.querySelectorAll(".gallery .item")];'
         '  const photos = items.map(el => ({el, id:el.dataset.id, src:el.dataset.src, cap:el.dataset.cap, ch:el.dataset.ch}));'
         '  if (!photos.length) return;'
@@ -1712,9 +1780,11 @@ async def page_library(limit: int = 200):
 # Page: Releases
 # ════════════════════════════════════════════════════════════════════
 def _release_card(r) -> str:
-    """Sonarr/Radarr-style poster card."""
+    """Sonarr/Radarr-style poster card with 3-tier fallback:
+    TMDB/Wiki poster_url -> TG msg thumb (/api/thumb/{pmid}) -> 🎬 emoji."""
     title_disp = r["canonical_title"] or r["name"].replace(".", " ")
     poster = r["poster_url"]
+    pmid = r["primary_msg_id"]
     se = ""
     if r["season"] and r["episode"]:
         se = f"S{r['season']:02}E{r['episode']:02}"
@@ -1724,9 +1794,15 @@ def _release_card(r) -> str:
     sub_bits = [b for b in (se, posted) if b]
     cat_pill = ("accent" if r["category"] == "movie"
                 else "ok" if r["category"] == "tv" else "muted")
-    poster_style = (f'style="background-image:url(\'{html.escape(poster)}\')"'
-                    if poster else '')
-    fallback = '<div class="fallback">🎬</div>' if not poster else ""
+    if poster:
+        poster_style = f'style="background-image:url(\'{html.escape(poster)}\')"'
+        fallback = ""
+    elif pmid:
+        poster_style = f'style="background-image:url(\'/api/thumb/{pmid}\')"'
+        fallback = ""
+    else:
+        poster_style = ""
+        fallback = '<div class="fallback">🎬</div>'
     quality_badge = (f'<div class="badge">{html.escape(r["quality"])}</div>'
                      if r["quality"] else "")
     return (
@@ -1766,7 +1842,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     if min_mb and min_mb > 0:
         where.append(f"COALESCE(size_bytes,0) >= {min_mb * 1024 * 1024}")
     sql = (f"SELECT id, guid, name, category, season, episode, quality, "
-          f"size_bytes, posted_at, parse_score, poster_url, canonical_title "
+          f"size_bytes, posted_at, parse_score, poster_url, canonical_title, primary_msg_id "
           f"FROM releases WHERE {' AND '.join(where)} "
           f"ORDER BY posted_at DESC NULLS LAST LIMIT {max(1, min(limit, 500))}")
     async with db_pool.acquire() as conn:
@@ -1802,7 +1878,9 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         body_html = ('<div class="empty-state"><div class="icon">🎬</div>'
                     '<div>No releases match this filter.</div></div>')
     elif view == "list":
-        def _row_thumb(url):
+        def _row_thumb(url, pmid=None):
+            if not url and pmid:
+                url = f'/api/thumb/{pmid}'
             if url:
                 return (f'<img src="{html.escape(url)}" loading="lazy" '
                        f'style="width:44px;height:64px;object-fit:cover;'
@@ -1813,7 +1891,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                    'font-size:18px;color:#cbd5e1">🎬</div>')
         body_rows = "".join(
             f'<tr>'
-            f'<td style="width:60px;padding:8px 12px">{_row_thumb(r["poster_url"])}</td>'
+            f'<td style="width:60px;padding:8px 12px">{_row_thumb(r["poster_url"], r["primary_msg_id"])}</td>'
             f'<td class="name">'
             f'{(html.escape(r["canonical_title"]) + "<br>") if r["canonical_title"] and r["canonical_title"] != r["name"] else ""}'
             f'<span style="color:var(--muted);font-weight:400;font-size:13px">{html.escape(r["name"])}</span>'
@@ -1921,7 +1999,7 @@ async def page_search(q: Optional[str] = None):
             params.append(f"%{w}%")
             where.append(f"name ILIKE ${len(params)}")
         sql = (f"SELECT id, guid, name, category, season, episode, quality, "
-              f"size_bytes, posted_at, parse_score, poster_url, canonical_title "
+              f"size_bytes, posted_at, parse_score, poster_url, canonical_title, primary_msg_id "
               f"FROM releases WHERE {' AND '.join(where)} "
               f"ORDER BY posted_at DESC NULLS LAST LIMIT 120")
         async with db_pool.acquire() as conn:
