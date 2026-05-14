@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.42"
+TGARR_VERSION = "0.4.43"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -526,6 +526,14 @@ def _epub_locate(msg_id, db_row):
     return p if os.path.exists(p) else None
 
 
+def _disk_free_gb(path: str) -> float:
+    import shutil
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except OSError:
+        return 0.0
+
+
 def _ebook_safe_to_convert(src: str, ext: str) -> bool:
     """Cheap safety check: reject zip-bombs + malformed archives before
     handing the file to calibre. Caps total uncompressed size at 500MB
@@ -553,6 +561,17 @@ def _ebook_safe_to_convert(src: str, ext: str) -> bool:
 
 
 _EBOOK_LOCKS: dict[int, "asyncio.Lock"] = {}
+_EBOOK_STATUS_RATE: dict = {}  # ip -> [timestamps within 60s window]
+
+def _ebook_rate_check(ip: str, limit_per_min: int = 60) -> bool:
+    import time as _t
+    now = _t.time()
+    window = _EBOOK_STATUS_RATE.setdefault(ip, [])
+    window[:] = [ts for ts in window if now - ts < 60]
+    if len(window) >= limit_per_min:
+        return False
+    window.append(now)
+    return True
 _EBOOK_BG_TASKS: set = set()
 _EBOOK_CONVERT_SEMAPHORE = None  # initialized lazily on first use
 
@@ -646,7 +665,10 @@ async def _ebook_cover(src: str, cover: str) -> bool:
 
 
 @app.get("/api/ebook-status/{msg_id}")
-async def ebook_status(msg_id: int):
+async def ebook_status(msg_id: int, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not _ebook_rate_check(client_ip):
+        return {"state": "failed", "reason": "rate limit (60 req/min/ip)"}
     """Return ebook conversion status + trigger background convert if needed.
     States: no_source | ready | converting | queued | failed.
     """
@@ -683,6 +705,10 @@ async def ebook_status(msg_id: int):
     if job and job.get("state") == "failed":
         return {"state": "failed", "reason": "conversion error — check api logs"}
     # Not started — fire background task. Lock prevents duplicate work.
+    free_gb = _disk_free_gb("/downloads")
+    if free_gb < 1.0:
+        return {"state": "failed",
+                "reason": f"insufficient disk space ({free_gb:.1f}GB free, need 1GB)"}
     _t = asyncio.create_task(_ebook_to_pdf(src, pdf, msg_id=msg_id))
     _EBOOK_BG_TASKS.add(_t)
     _t.add_done_callback(_EBOOK_BG_TASKS.discard)
