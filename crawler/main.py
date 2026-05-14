@@ -1512,6 +1512,92 @@ async def dc_backfill_worker() -> None:
             await asyncio.sleep(60)
 
 
+async def on_demand_media_downloader() -> None:
+    """Process messages marked local_path='__user_queued__' by API.
+
+    Strictly user-driven: scans only for the queue marker, no proactive
+    backlog work. Same stream_media() path as the disabled proactive
+    worker, with FloodWait + short-download detection.
+    """
+    log.info("[on-demand-media] started — processes __user_queued__ marker")
+    os.makedirs(AUDIO_ROOT, exist_ok=True)
+    os.makedirs(LIBRARY_ROOT, exist_ok=True)
+    os.makedirs(VIDEO_ROOT, exist_ok=True)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    SELECT m.id, m.tg_chat_id, m.tg_message_id, m.media_type,
+                           m.file_name, m.file_size
+                    FROM messages m
+                    WHERE m.local_path = '__user_queued__'
+                    ORDER BY m.id DESC
+                    LIMIT 1
+                """)
+            if not row:
+                await asyncio.sleep(2)
+                continue
+
+            mt = row["media_type"] or "document"
+            root = (AUDIO_ROOT if mt == "audio"
+                    else VIDEO_ROOT if mt == "video"
+                    else LIBRARY_ROOT)
+            base = (row["file_name"] or f"item-{row['id']}")
+            safe = SAFE_NAME.sub("_", base)[:180]
+            target = os.path.join(root, safe)
+            rel = os.path.relpath(target, "/downloads")
+
+            try:
+                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                if not msg:
+                    raise RuntimeError("msg gone")
+                media = (msg.audio if mt == "audio"
+                         else msg.video if mt == "video"
+                         else msg.document)
+                if not media:
+                    raise RuntimeError("no media obj")
+
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET local_path=$1 WHERE id=$2",
+                        rel, row["id"])
+                log.info("[on-demand-media] %s id=%s → %s", mt, row["id"], rel)
+
+                expected = row["file_size"] or 0
+                written = 0
+                with open(target, "wb") as f:
+                    async for chunk in app.stream_media(msg):
+                        f.write(chunk)
+                        written += len(chunk)
+
+                if expected and written < expected * 0.95:
+                    log.warning("[on-demand-media] short download id=%s wrote=%s expected=%s",
+                                row["id"], written, expected)
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE messages SET local_path='__failed__' WHERE id=$1",
+                            row["id"])
+                else:
+                    log.info("[on-demand-media] complete id=%s wrote=%s", row["id"], written)
+            except FloodWait as e:
+                wait_s = getattr(e, "value", 30)
+                log.warning("[on-demand-media] FloodWait %ss id=%s", wait_s, row["id"])
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET local_path='__user_queued__' WHERE id=$1",
+                        row["id"])
+                await asyncio.sleep(wait_s + 5)
+            except Exception as e:
+                log.exception("[on-demand-media] id=%s error: %s", row["id"], e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET local_path='__failed__' WHERE id=$1",
+                        row["id"])
+        except Exception:
+            log.exception("[on-demand-media] outer loop")
+            await asyncio.sleep(10)
+
+
 async def main() -> None:
     await init_db()
     await wait_for_session()
@@ -1521,6 +1607,7 @@ async def main() -> None:
     log.info("connected as @%s (id=%s)", me.username or "-", me.id)
 
     asyncio.create_task(download_worker())
+    asyncio.create_task(on_demand_media_downloader())
     # On-demand mode 2026-05-14: thumb_downloader stays but only processes
     # rows where /api/thumb/{id} UI hit has set thumb_path='__user_queued__'.
     asyncio.create_task(thumb_downloader())
