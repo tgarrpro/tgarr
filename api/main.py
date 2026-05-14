@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.43"
+TGARR_VERSION = "0.4.44"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -619,12 +619,12 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
         env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
         tmp = pdf + ".inprogress.pdf"
-        # preexec_fn sets RLIMIT_AS (virt mem) 3GB + RLIMIT_CPU 240s for the calibre child
+        # preexec_fn: RLIMIT_CPU 240s + RLIMIT_FSIZE 200MB; mem bound via container cgroup
         def _set_limits():
             import resource
-            resource.setrlimit(resource.RLIMIT_AS, (3 * 1024 * 1024 * 1024, 3 * 1024 * 1024 * 1024))
+            # RLIMIT_AS dropped: Chromium virt mem >> resident, container mem_limit is real bound
             resource.setrlimit(resource.RLIMIT_CPU, (240, 240))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (200 * 1024 * 1024, 200 * 1024 * 1024))
+            # RLIMIT_FSIZE dropped: calibre temp files can be >200MB
         proc = await asyncio.create_subprocess_exec(
             "ebook-convert", src, tmp,
             stdout=asyncio.subprocess.PIPE,
