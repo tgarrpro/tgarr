@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.39"
+TGARR_VERSION = "0.4.40"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -527,6 +527,8 @@ def _epub_locate(msg_id, db_row):
 
 
 _EBOOK_LOCKS: dict[int, "asyncio.Lock"] = {}
+_EBOOK_BG_TASKS: set = set()
+_EBOOK_JOBS: dict = {}  # msg_id -> {state, started_at}
 
 def _ebook_lock(msg_id: int):
     import asyncio
@@ -558,6 +560,8 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         # Re-check after acquiring lock — another coroutine may have just done it
         if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
             return True
+        import time as _t
+        _EBOOK_JOBS[msg_id] = {"state": "converting", "started_at": _t.time()}
         env = dict(os.environ)
         env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
         env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
@@ -577,9 +581,11 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
             print(f'[ebook-convert] rc={proc.returncode} stderr={stderr.decode(errors="replace")[-500:]!r}', flush=True)
         if proc.returncode == 0 and os.path.exists(tmp):
             os.rename(tmp, pdf)
+            _EBOOK_JOBS.pop(msg_id, None)
             return True
         if os.path.exists(tmp):
             os.unlink(tmp)
+        _EBOOK_JOBS[msg_id] = {"state": "failed", "started_at": _EBOOK_JOBS.get(msg_id, {}).get("started_at", 0)}
         return False
 
 
@@ -621,13 +627,18 @@ async def ebook_status(msg_id: int):
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
                 "size": os.path.getsize(pdf)}
-    tmp = pdf + ".inprogress.pdf"
-    if os.path.exists(tmp):
+    job = _EBOOK_JOBS.get(msg_id)
+    if job and job.get("state") == "converting":
+        import time as _t
         return {"state": "converting",
                 "src_size": os.path.getsize(src),
-                "out_size": os.path.getsize(tmp)}
+                "elapsed_s": int(_t.time() - job["started_at"])}
+    if job and job.get("state") == "failed":
+        return {"state": "failed", "reason": "conversion error — check api logs"}
     # Not started — fire background task. Lock prevents duplicate work.
-    asyncio.create_task(_ebook_to_pdf(src, pdf, msg_id=msg_id))
+    _t = asyncio.create_task(_ebook_to_pdf(src, pdf, msg_id=msg_id))
+    _EBOOK_BG_TASKS.add(_t)
+    _t.add_done_callback(_EBOOK_BG_TASKS.discard)
     return {"state": "queued", "src_size": os.path.getsize(src)}
 
 
