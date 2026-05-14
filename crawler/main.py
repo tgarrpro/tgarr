@@ -934,7 +934,23 @@ _CSAM_RX = re.compile(
     r"pre[\s_-]*teen|under[\s_-]*age|\bcp\d+|\bcp_)\b", re.IGNORECASE)
 _NSFW_RX = re.compile(
     r"(porn|xxx|nsfw|adult|18\+|hentai|erotic|nude|naked|onlyfan|"
-    r"sexy|sex\b|色情|成人|18禁|裸|淫|эротик|порно|секс|اباحي|سكس)",
+    r"sexy|sex\b|色情|成人|18禁|裸|淫|эротик|порно|секс|اباحي|سكس|"
+    # English slang
+    r"milf|dilf|bdsm|fetish|kink|bondage|gangbang|blowjob|anal|deepthroat|"
+    r"jav|jvid|escort|bbw|whore|slut|leaked[\s_-]*nude|"
+    r"sex[\s_-]*video|porn[\s_-]*hub|pornhub|brazzers|xvideos|xnxx|r[-]?18|"
+    # CJK slang
+    r"swag|p站|av女优|av男优|av影片|av资源|成人影片|成人电影|成人视频|"
+    r"反差|白虎|母狗|少妇|高潮|做爱|乱伦|约炮|包养|"
+    r"萝莉|熟女|巨乳|自慰|口交|肛交|内射|颜射|中出|群p|调教|偷拍|露出|"
+    r"黄色片|黄网|黄片|三级片|福利姬|大尺度|抠逼|操逼|大鸡巴|鸡巴|"
+    r"91av|av天堂|h漫|h动画|h小说|"
+    # JP/KR/AR/FA
+    r"エロ|ハメ撮り|アダルト|야동|성인영상|سکس|إباحي|"
+    # ES/PT
+    r"desnuda|"
+    # Emoji high-signal in TG channel names
+    r"🔞|🍆🍑|💦💦)",
     re.IGNORECASE)
 
 
