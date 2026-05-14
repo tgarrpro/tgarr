@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.30"
+TGARR_VERSION = "0.4.31"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -2405,7 +2405,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
         f'<div class="book-card">'
         + (f'<img class="book-cover" src="/epub/{r["id"]}/cover" alt="" '
            f'onerror="this.outerHTML=\'<div class=&quot;book-ico&quot;>{_ico(_ext(r["file_name"]))}</div>\'" />'
-           if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]).lower() in ("EPUB","MOBI","AZW","AZW3")
+           if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]) in ("EPUB","MOBI","AZW","AZW3")
            else f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>')
         + f'<div class="book-body">'
         f'<div class="book-title">{html.escape(r["file_name"] or "(untitled)")}</div>'
