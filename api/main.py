@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.36"
+TGARR_VERSION = "0.4.37"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -526,6 +526,112 @@ def _epub_locate(msg_id, db_row):
     return p if os.path.exists(p) else None
 
 
+_EBOOK_CONVERTIBLE = ("epub", "mobi", "azw", "azw3", "djvu", "fb2",
+                      "lit", "cbr", "cbz", "rtf", "lrf", "pdb")
+
+def _ebook_paths(local_path: str):
+    """Return (source_abs, pdf_abs, cover_abs) for a cached ebook."""
+    src = os.path.join("/downloads", local_path)
+    pdf = src + ".pdf"
+    cover = src + ".cover.jpg"
+    return src, pdf, cover
+
+
+async def _ebook_to_pdf(src: str, pdf: str) -> bool:
+    """Run calibre ebook-convert src → pdf. Returns True on success.
+    Idempotent: skip if pdf already exists and is newer than src.
+    """
+    import asyncio
+    if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
+        return True
+    env = dict(os.environ)
+    env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+    env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
+    tmp = pdf + ".tmp"
+    proc = await asyncio.create_subprocess_exec(
+        "ebook-convert", src, tmp,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env)
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return False
+    if proc.returncode == 0 and os.path.exists(tmp):
+        os.rename(tmp, pdf)
+        return True
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    return False
+
+
+async def _ebook_cover(src: str, cover: str) -> bool:
+    import asyncio
+    if os.path.exists(cover):
+        return True
+    proc = await asyncio.create_subprocess_exec(
+        "ebook-meta", src, f"--get-cover={cover}",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL)
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return False
+    return proc.returncode == 0 and os.path.exists(cover)
+
+
+@app.get("/ebook-pdf/{msg_id}")
+async def ebook_pdf(msg_id: int):
+    """Unified ebook viewer: PDF source served raw; everything else
+    converted to PDF via calibre on first hit + cached on disk.
+    Browser's native PDF reader handles rendering in an <iframe>.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+    if not row or not row["local_path"] or row["local_path"].startswith("__"):
+        return Response("not cached — open via /watch to trigger download",
+                        status_code=404)
+    ext = (row["file_name"] or "").rsplit(".", 1)[-1].lower()
+    src, pdf, _ = _ebook_paths(row["local_path"])
+    if not os.path.exists(src):
+        return Response("source file missing", status_code=410)
+    # .pdf source: serve directly, no conversion
+    if ext == "pdf":
+        return FileResponse(src, media_type="application/pdf",
+                            headers={"Content-Disposition": "inline",
+                                     "Cache-Control": "private, max-age=3600"})
+    if ext not in _EBOOK_CONVERTIBLE:
+        return Response(f"format .{ext} not supported by ebook-convert",
+                        status_code=415)
+    ok = await _ebook_to_pdf(src, pdf)
+    if not ok:
+        return Response("conversion failed", status_code=500)
+    return FileResponse(pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": "inline",
+                                 "Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/ebook-cover/{msg_id}")
+async def ebook_cover_unified(msg_id: int):
+    """Cover thumb from any cached ebook (epub/mobi/azw/azw3/pdf/...)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+    if not row or not row["local_path"] or row["local_path"].startswith("__"):
+        return Response("not cached", status_code=404)
+    src, _, cover = _ebook_paths(row["local_path"])
+    if not os.path.exists(src):
+        return Response("source missing", status_code=410)
+    ok = await _ebook_cover(src, cover)
+    if not ok:
+        return Response("no cover", status_code=404)
+    return FileResponse(cover, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/epub/{msg_id}", response_class=HTMLResponse)
 async def epub_render(msg_id: int):
     """Server-side epub renderer. Concatenates spine chapters into one
@@ -895,9 +1001,9 @@ function renderPlayer() {{
     main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
     return;
   }}
-  if (["epub","mobi","azw","azw3"].includes(ext)) {{
-    // Server-side reader at /epub/{{id}} — no JS library deps.
-    main.innerHTML = `<iframe src="/epub/${{MSG_ID}}" style="width:96vw;height:88vh;border:0;border-radius:6px;background:#fff"></iframe>`;
+  if (["epub","mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
+    // Calibre-converted PDF — same UX as native PDF.
+    main.innerHTML = `<iframe src="/ebook-pdf/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
     return;
   }}
   // fallback: try iframe but offer download as escape hatch
@@ -2511,7 +2617,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
 
     items = "".join(
         f'<div class="book-card">'
-        + (f'<img class="book-cover" src="/epub/{r["id"]}/cover" alt="" '
+        + (f'<img class="book-cover" src="/ebook-cover/{r["id"]}" alt="" '
            f'onerror="this.outerHTML=\'<div class=&quot;book-ico&quot;>{_ico(_ext(r["file_name"]))}</div>\'" />'
            if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]) in ("EPUB","MOBI","AZW","AZW3")
            else f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>')
