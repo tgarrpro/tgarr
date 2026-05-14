@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.18"
+TGARR_VERSION = "0.4.19"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -996,9 +996,9 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:18px; }
 .poster-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; overflow:hidden; box-shadow:var(--shadow); display:flex; flex-direction:column; transition:transform 0.12s, box-shadow 0.12s; }
 .poster-card:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,0.12); border-color:var(--accent); }
-.poster-card .poster { width:100%; height:0; padding-bottom:100%; background:#f1f5f9; background-size:cover; background-position:center; position:relative; }
-.poster-card .poster .fallback { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; z-index:1; }
-poster-card .poster .poster-img { position:absolute; top:0; left:0; width:100% !important; height:100% !important; object-fit:cover; z-index:2; background:#f1f5f9; display:block; }
+.poster-card .poster { height:200px; background:#f1f5f9; position:relative; overflow:hidden; }
+.poster-card .poster .fallback { display:flex; width:100%; height:100%; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; background:#f1f5f9; }
+poster-card 
 .poster-card .poster .badge { position:absolute; top:8px; right:8px; padding:3px 10px; border-radius:11px; background:rgba(15,23,42,0.78); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; backdrop-filter:blur(4px); }
 .poster-card .info { padding:10px 12px 4px; min-height:84px; flex:1; }
 .poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
