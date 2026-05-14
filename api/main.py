@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.21"
+TGARR_VERSION = "0.4.22"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -319,7 +319,11 @@ async def serve_media(msg_id: int, request: Request):
     range_header = request.headers.get("Range")
     if not range_header:
         if total_size and os.path.getsize(path) >= total_size:
-            disp = f'inline; filename="{fn or "file"}"'
+            from urllib.parse import quote
+            _fn = fn or "file"
+            ascii_fn = _fn.encode("ascii", "replace").decode("ascii")
+            disp = (f'inline; filename="{ascii_fn}"; '
+                    f"filename*=UTF-8''{quote(_fn)}")
             return FileResponse(path, media_type=mime,
                               headers={"Cache-Control": "private, max-age=3600",
                                        "Accept-Ranges": "bytes",
