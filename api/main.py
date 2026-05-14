@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.40"
+TGARR_VERSION = "0.4.42"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -526,8 +526,42 @@ def _epub_locate(msg_id, db_row):
     return p if os.path.exists(p) else None
 
 
+def _ebook_safe_to_convert(src: str, ext: str) -> bool:
+    """Cheap safety check: reject zip-bombs + malformed archives before
+    handing the file to calibre. Caps total uncompressed size at 500MB
+    and entry count at 20K. Non-zip formats pass through (calibre has
+    its own format-specific limits)."""
+    if ext not in ("epub", "cbz", "cbr"):
+        return True  # mobi/azw/djvu/etc. not zip-based; trust calibre
+    import zipfile
+    try:
+        with zipfile.ZipFile(src) as zf:
+            infos = zf.infolist()
+            if len(infos) > 20000:
+                return False
+            total = 0
+            for i in infos:
+                total += i.file_size
+                if total > 500 * 1024 * 1024:
+                    return False
+                # Per-entry sanity: compression ratio > 100:1 is suspicious
+                if i.compress_size > 0 and i.file_size / i.compress_size > 200:
+                    return False
+            return True
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
 _EBOOK_LOCKS: dict[int, "asyncio.Lock"] = {}
 _EBOOK_BG_TASKS: set = set()
+_EBOOK_CONVERT_SEMAPHORE = None  # initialized lazily on first use
+
+def _ebook_semaphore():
+    import asyncio
+    global _EBOOK_CONVERT_SEMAPHORE
+    if _EBOOK_CONVERT_SEMAPHORE is None:
+        _EBOOK_CONVERT_SEMAPHORE = asyncio.Semaphore(2)
+    return _EBOOK_CONVERT_SEMAPHORE
 _EBOOK_JOBS: dict = {}  # msg_id -> {state, started_at}
 
 def _ebook_lock(msg_id: int):
@@ -556,8 +590,8 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
     import asyncio
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return True
-    async with _ebook_lock(msg_id):
-        # Re-check after acquiring lock — another coroutine may have just done it
+    async with _ebook_semaphore():  # cap concurrent conversions
+      async with _ebook_lock(msg_id):
         if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
             return True
         import time as _t
@@ -566,13 +600,19 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
         env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
         tmp = pdf + ".inprogress.pdf"
+        # preexec_fn sets RLIMIT_AS (virt mem) 3GB + RLIMIT_CPU 240s for the calibre child
+        def _set_limits():
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (3 * 1024 * 1024 * 1024, 3 * 1024 * 1024 * 1024))
+            resource.setrlimit(resource.RLIMIT_CPU, (240, 240))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (200 * 1024 * 1024, 200 * 1024 * 1024))
         proc = await asyncio.create_subprocess_exec(
             "ebook-convert", src, tmp,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env)
+            env=env, preexec_fn=_set_limits)
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=240)
         except asyncio.TimeoutError:
             proc.kill()
             print(f'[ebook-convert] TIMEOUT src={src}', flush=True)
@@ -624,6 +664,13 @@ async def ebook_status(msg_id: int):
         return {"state": "ready", "url": f"/media/{msg_id}"}
     if ext not in _EBOOK_CONVERTIBLE:
         return {"state": "failed", "reason": f"unsupported format .{ext}"}
+    if os.path.getsize(src) > 50 * 1024 * 1024:
+        return {"state": "too_large",
+                "reason": "too large for in-browser PDF (>50MB)",
+                "src_size": os.path.getsize(src),
+                "download_url": f"/media/{msg_id}"}
+    if not _ebook_safe_to_convert(src, ext):
+        return {"state": "failed", "reason": "file rejected: zip-bomb or malformed"}
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
                 "size": os.path.getsize(pdf)}
@@ -666,6 +713,13 @@ async def ebook_pdf(msg_id: int):
     if ext not in _EBOOK_CONVERTIBLE:
         return Response(f"format .{ext} not supported by ebook-convert",
                         status_code=415)
+    if os.path.getsize(src) > 50 * 1024 * 1024:
+        return Response(
+            "ebook too large for in-browser PDF conversion (>50MB). "
+            f"download raw at /media/{msg_id} and open in Calibre/Foliate locally.",
+            status_code=413)
+    if not _ebook_safe_to_convert(src, ext):
+        return Response("file rejected: zip-bomb or malformed archive", status_code=422)
     ok = await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not ok:
         return Response("conversion failed", status_code=500)
@@ -1070,7 +1124,7 @@ function renderPlayer() {{
       '<div class="status" id="ebookStatus">checking…</div>' +
       '<div class="progress"><div id="ebookBar"></div></div>' +
       '<div class="hint">first open of a non-PDF ebook converts to PDF via calibre. ' +
-      'big books (>20MB) can take 30–60s on a single CPU core. ' +
+      'small books (<10MB): ~20s. medium: 1–2 min. large (40–50MB): 3–5 min. ' +
       'subsequent opens are instant.</div>' +
       '<div class="hint" id="ebookElapsed" style="margin-top:6px"></div>';
     main.innerHTML = "";
@@ -1094,6 +1148,14 @@ function renderPlayer() {{
         }}
         if (j.state === "no_source") {{
           document.getElementById("ebookStatus").textContent = "✗ source not cached";
+          return;
+        }}
+        if (j.state === "too_large") {{
+          main.innerHTML = '<div class="loader"><div class="ico">⚠️</div>' +
+            '<div class="status">book too large for in-browser PDF (' + fmtBytes(j.src_size) + ')</div>' +
+            '<div class="hint">calibre needs 5–10 min + 2 GB RAM for this size. ' +
+            'download raw + open in Calibre/Foliate desktop.</div>' +
+            '<div style="margin-top:18px"><a class="btn" href="' + j.download_url + '" download>⬇ download raw</a></div></div>';
           return;
         }}
         let msg = j.state === "queued" ? "queued for conversion…" : "converting…";
