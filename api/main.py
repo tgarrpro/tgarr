@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.33"
+TGARR_VERSION = "0.4.34"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -48,6 +48,7 @@ async def _startup():
                     "INSERT INTO config (key, value) VALUES ('tmdb_api_key', $1) "
                     "ON CONFLICT (key) DO NOTHING", env_key)
     asyncio.create_task(_metadata_worker())
+    asyncio.create_task(_audio_metadata_worker())
 
 
 async def _migrate_schema():
@@ -99,11 +100,109 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_dc INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_canonical_title TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_album TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_year INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_mbid TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_release_mbid TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_cover_url TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_metadata_source TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_metadata_lookup_at TIMESTAMPTZ;
             CREATE INDEX IF NOT EXISTS idx_messages_media_type ON messages (media_type);
             CREATE INDEX IF NOT EXISTS idx_messages_thumb ON messages (thumb_path) WHERE thumb_path IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_md5 ON messages (thumb_md5) WHERE thumb_md5 IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_local ON messages (local_path) WHERE local_path IS NOT NULL;
         """)
+
+
+async def _audio_metadata_worker():
+    """Enrich audio messages with MusicBrainz + Cover Art Archive metadata.
+    Polite rate (1.1s/req) matches MB acceptable use policy.
+    """
+    import urllib.request, urllib.parse, json
+    UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
+    wlog = logging.getLogger("tgarr.audio_meta")
+    wlog.info("audio metadata worker started")
+    await asyncio.sleep(45)  # let other startup tasks settle
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    SELECT id, audio_title, audio_performer, file_name
+                    FROM messages
+                    WHERE media_type='audio'
+                      AND audio_metadata_source IS NULL
+                      AND (audio_title IS NOT NULL OR file_name IS NOT NULL)
+                    ORDER BY id DESC
+                    LIMIT 1
+                """)
+            if not row:
+                await asyncio.sleep(120)
+                continue
+
+            raw_title = row["audio_title"] or (
+                row["file_name"].rsplit(".", 1)[0] if row["file_name"] else "")
+            raw_title = raw_title.strip()
+            artist = (row["audio_performer"] or "").strip()
+            if not raw_title:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET audio_metadata_source='none', "
+                        "audio_metadata_lookup_at=NOW() WHERE id=$1", row["id"])
+                continue
+
+            q_parts = [f'recording:"{raw_title}"']
+            if artist:
+                q_parts.append(f'artist:"{artist}"')
+            q = " AND ".join(q_parts)
+            url = ("https://musicbrainz.org/ws/2/recording/?fmt=json&limit=1&query="
+                   + urllib.parse.quote(q))
+
+            rec = None
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": UA, "Accept": "application/json"})
+                body = await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(req, timeout=15).read())
+                data = json.loads(body.decode())
+                if data.get("recordings"):
+                    rec = data["recordings"][0]
+            except Exception as e:
+                wlog.warning("[audio-meta] MB query failed for id=%s: %s",
+                             row["id"], e)
+
+            canonical = album = year = mbid = release_mbid = cover_url = None
+            if rec:
+                mbid = rec.get("id")
+                canonical = rec.get("title")
+                releases = rec.get("releases") or []
+                if releases:
+                    r = releases[0]
+                    album = r.get("title")
+                    if r.get("release-group"):
+                        release_mbid = r["release-group"].get("id")
+                    date = r.get("date") or ""
+                    if date[:4].isdigit():
+                        year = int(date[:4])
+                if release_mbid:
+                    cover_url = f"https://coverartarchive.org/release-group/{release_mbid}/front-250"
+
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE messages SET
+                        audio_canonical_title=$1, audio_album=$2, audio_year=$3,
+                        audio_mbid=$4, audio_release_mbid=$5, audio_cover_url=$6,
+                        audio_metadata_source=$7, audio_metadata_lookup_at=NOW()
+                    WHERE id=$8
+                """, canonical, album, year, mbid, release_mbid, cover_url,
+                    "musicbrainz" if rec else "none", row["id"])
+            if rec:
+                wlog.info("[audio-meta] id=%s → %s · %s · %s",
+                          row["id"], canonical, album or "-", year or "-")
+            await asyncio.sleep(1.1)
+        except Exception as e:
+            wlog.exception("[audio-meta] outer: %s", e)
+            await asyncio.sleep(30)
 
 
 async def _metadata_worker():
@@ -2248,6 +2347,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None):
     if not login.session_exists() and not n:
         return RedirectResponse("/login")
 
+    _music_my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         cached_n = await conn.fetchval(
             """SELECT count(*) FROM messages
@@ -2258,7 +2358,9 @@ async def page_music(limit: int = 200, q: Optional[str] = None):
         q_pat = f"%{q}%" if q else None
         rows = await conn.fetch(f"""
             SELECT m.id, m.audio_title, m.audio_performer, m.audio_duration_sec,
-                   m.file_name, m.file_size, m.posted_at,
+                   m.file_name, m.file_size, m.posted_at, m.file_dc,
+                   m.audio_canonical_title, m.audio_album, m.audio_year,
+                   m.audio_cover_url, m.local_path,
                    c.title AS ch_title, c.username AS ch_user
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
@@ -2277,7 +2379,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None):
             '<div class="empty-state">'
             '<div class="icon">🎵</div>'
             '<div>No audio cached yet.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio messages indexed — crawler is downloading in the background (capped to recent 300 tracks).</div>'
+            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio indexed — click to fetch (capped to recent 300 tracks).</div>'
             '</div>'
         )
         return HTMLResponse(_layout("Music", "/music", body))
@@ -2286,8 +2388,8 @@ async def page_music(limit: int = 200, q: Optional[str] = None):
         f'<tr data-id="{r["id"]}" onclick="tgMusicPlay(this)">'
         f'<td class="play-cell"><div class="play-ico">▶</div></td>'
         f'<td class="title-cell">'
-        f'<div class="t">{html.escape(r["audio_title"] or r["file_name"] or "(untitled)")}</div>'
-        f'<div class="a">{html.escape((r["audio_performer"] or "") + (" · " + r["ch_title"] if r["ch_title"] else ""))}</div>'
+        f'<div class="t">{html.escape(r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)")}</div>'
+        f'<div class="a">{_dc_badge(r.get("file_dc"), _music_my_dc)} {html.escape((r["audio_performer"] or "") + ((" · " + (r["audio_album"] or r["ch_title"])) if (r["audio_album"] or r["ch_title"]) else ""))}{(" · " + str(r["audio_year"])) if r.get("audio_year") else ""}</div>'
         f'</td>'
         f'<td class="num">{_fmt_dur(r["audio_duration_sec"])}</td>'
         f'<td class="num">{_fmt_size(r["file_size"])}</td>'
@@ -2396,7 +2498,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
             '<div class="empty-state">'
             '<div class="icon">📚</div>'
             '<div>No ebooks cached yet.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook messages indexed — crawler is downloading in the background.</div>'
+            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook indexed — click to fetch.</div>'
             '</div>'
         )
         return HTMLResponse(_layout("Library", "/library", body))
