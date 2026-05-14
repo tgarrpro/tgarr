@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.32"
+TGARR_VERSION = "0.4.33"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -2122,7 +2122,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     body = (
         f'<h2 class="section">Gallery <span class="count">{len(rows)} unique · {unique_total:,} total dedup</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{dup_saved:,} dup'
-           f'{f" · {pending:,} pending" if pending else ""}</span>'
+           f'{f" · {pending:,} indexed (click to fetch)" if pending else ""}</span>'
            if dup_saved or pending else '')
         + ' <span class="extra" style="color:var(--muted);font-size:13px">'
         '← → arrows · Space pause · Del delete · Esc close</span></h2>'
