@@ -2098,11 +2098,11 @@ async def root(accept: Optional[str] = Header(None)):
         </select>
       </div>
     </header>
-    <canvas id="growthChart" height="160"></canvas>
+    <div class="chart-canvas-wrap"><canvas id="growthChart"></canvas></div>
   </div>
   <div class="chart-card chart-pie">
     <header><h3>Media mix</h3></header>
-    <canvas id="distChart" height="160"></canvas>
+    <div class="chart-canvas-wrap"><canvas id="distChart"></canvas></div>
   </div>
 </section>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
@@ -2127,14 +2127,15 @@ async def root(accept: Optional[str] = Header(None)):
       type: 'line',
       data: { labels, datasets: [{
         label: metric, data,
-        fill: true, backgroundColor: 'rgba(94,182,229,0.12)',
-        borderColor: '#5eb6e5', borderWidth: 2, tension: 0.35,
+        fill: true, backgroundColor: 'rgba(59,130,246,0.10)',
+        borderColor: '#3b82f6', borderWidth: 2, tension: 0.35,
         pointRadius: 3, pointHoverRadius: 5
       }]},
       options: { responsive: true, maintainAspectRatio: false,
         plugins: { legend: { display: false } },
-        scales: { y: { beginAtZero: false, ticks: { color: '#94a3b8' } },
-                  x: { ticks: { color: '#94a3b8' } } }
+        scales: {
+          y: { beginAtZero: false, ticks: { color: '#475569' }, grid: { color: '#e2e8f0' } },
+          x: { ticks: { color: '#475569' }, grid: { color: '#f1f5f9' } } }
       }
     });
   }
@@ -2149,11 +2150,11 @@ async def root(accept: Optional[str] = Header(None)):
       type: 'doughnut',
       data: { labels, datasets: [{ data,
         backgroundColor: labels.map((_, i) => color(i)),
-        borderColor: '#0f172a', borderWidth: 2
+        borderColor: '#ffffff', borderWidth: 2
       }]},
       options: { responsive: true, maintainAspectRatio: false,
         plugins: { legend: { position: 'right',
-          labels: { color: '#e2e8f0', boxWidth: 14, padding: 8, font: { size: 12 } } } }
+          labels: { color: '#334155', boxWidth: 14, padding: 8, font: { size: 12 } } } }
       }
     });
   }
@@ -2166,15 +2167,18 @@ async def root(accept: Optional[str] = Header(None)):
 <style>
 .dashboard-charts { display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
   margin: 20px 0; }
-.dashboard-charts .chart-card { background: #1e293b; border: 1px solid #334155;
+.dashboard-charts .chart-card { background: var(--surface, #fff);
+  border: 1px solid var(--border, #e2e8f0);
   border-radius: 8px; padding: 14px 16px; }
 .dashboard-charts .chart-card header { display: flex; align-items: center;
   justify-content: space-between; margin-bottom: 8px; }
-.dashboard-charts .chart-card h3 { margin: 0; font-size: 14px; font-weight: 600;
-  color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
-.dashboard-charts .chart-controls select { background: #0f172a; color: #e2e8f0;
-  border: 1px solid #334155; padding: 4px 8px; border-radius: 4px;
+.dashboard-charts .chart-card h3 { margin: 0; font-size: 12px; font-weight: 600;
+  color: #64748b; text-transform: uppercase; letter-spacing: 0.06em; }
+.dashboard-charts .chart-controls select { background: #fff; color: #1e293b;
+  border: 1px solid var(--border, #e2e8f0); padding: 4px 8px; border-radius: 4px;
   font-size: 12px; margin-left: 6px; }
+.dashboard-charts .chart-canvas-wrap { position: relative; height: 240px; width: 100%; }
+.dashboard-charts canvas { width: 100% !important; height: 100% !important; }
 @media (max-width: 900px) {
   .dashboard-charts { grid-template-columns: 1fr; }
 }
