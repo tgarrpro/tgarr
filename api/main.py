@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.15"
+TGARR_VERSION = "0.4.16"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -997,15 +997,13 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; overflow:hidden; box-shadow:var(--shadow); display:flex; flex-direction:column; transition:transform 0.12s, box-shadow 0.12s; }
 .poster-card:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,0.12); border-color:var(--accent); }
 .poster-card .poster { aspect-ratio:1/1; background:#f1f5f9; background-size:cover; background-position:center; position:relative; }
-.poster-card .poster .fallback { position:absolute; inset:0; display:none; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; z-index:1; }
-poster-card .poster:not(:has(.poster-img)) .fallback { display:flex; }
-poster-card .poster.no-thumb .fallback { display:flex; }
+.poster-card .poster .fallback { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; z-index:1; }
 poster-card .poster .poster-img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; z-index:2; background:#f1f5f9; }
 .poster-card .poster .badge { position:absolute; top:8px; right:8px; padding:3px 10px; border-radius:11px; background:rgba(15,23,42,0.78); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; backdrop-filter:blur(4px); }
-.poster-card .info { padding:12px 14px 8px; flex:1; }
+.poster-card .info { padding:10px 12px 4px; min-height:64px; max-height:64px; overflow:hidden; flex:1; }
 .poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
 .poster-card .info .sub { font-size:13px; color:var(--muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.poster-card .pills { padding:0 14px 10px; display:flex; gap:5px; flex-wrap:wrap; }
+.poster-card .pills { padding:0 12px 8px; display:flex; gap:4px; flex-wrap:nowrap; overflow:hidden; min-height:24px; }
 .poster-card .grab-row { padding:8px 14px 12px; border-top:1px solid var(--border); margin-top:auto; background:var(--surface2); }
 .poster-card .grab-row .btn { width:100%; text-align:center; padding:8px; font-size:13px; }
 .view-toggle { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
@@ -2217,7 +2215,6 @@ def _release_card(r, my_dc=None) -> str:
     # cover it. If the img 404s/410s the browser onerror hides the img and
     # the emoji shows through. CSS .poster .fallback is absolute-positioned;
     # .poster-img is z-index:2 stacked on top.
-    fallback = '<div class="fallback">🎬</div>'
     if poster:
         img_src = html.escape(poster)
     elif pmid:
@@ -2226,10 +2223,13 @@ def _release_card(r, my_dc=None) -> str:
         img_src = ""
     poster_style = ""
     if img_src:
-        poster_img = (f'<img class="poster-img" src="{img_src}" loading="lazy" '
-                      f'alt="" onerror="this.style.display=\'none\';this.parentNode.classList.add(\'no-thumb\')" />')
+        # onerror swaps the <img> for a fallback emoji div (no CSS :has() needed)
+        poster_img = (f'<img class="poster-img" src="{img_src}" loading="lazy" alt="" '
+                      f'onerror="this.outerHTML=\'&lt;div class=&quot;fallback&quot;&gt;\🎬&lt;/div&gt;\'" />')
+        fallback = ""
     else:
         poster_img = ""
+        fallback = '<div class="fallback">\U0001F3AC</div>'
     quality_badge = (f'<div class="badge">{html.escape(r["quality"])}</div>'
                      if r["quality"] else "")
     return (
