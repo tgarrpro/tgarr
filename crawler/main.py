@@ -365,7 +365,7 @@ CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
 
-# Federation swarm validator (v0.4.7+): client pulls seed candidates from
+# Federation swarm validator (v0.4.8+): client pulls seed candidates from
 # central, validates on this client's TG account, pushes back via /contribute.
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
@@ -375,6 +375,7 @@ SEEDS_INTERVAL_SEC = int(os.environ.get("TGARR_SEEDS_INTERVAL_SEC", "3600"))  # 
 PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/seed -> 1/min resolveUsername
 AUDIO_ROOT = "/downloads/audio"
 LIBRARY_ROOT = "/downloads/library"
+VIDEO_ROOT = "/downloads/video"
 MAX_AUDIO_BYTES = int(os.environ.get("TG_MAX_AUDIO_BYTES", str(150 * 1024 * 1024)))
 MAX_BOOK_BYTES = int(os.environ.get("TG_MAX_BOOK_BYTES", str(80 * 1024 * 1024)))
 MAX_AUDIO_COUNT = int(os.environ.get("TG_MAX_AUDIO_COUNT", "300"))
@@ -673,9 +674,11 @@ async def thumb_hash_backfill() -> None:
 async def local_media_downloader() -> None:
     """Background: cache recent audio + ebook documents to disk so /music and
     /library can serve them with Range support. Bounded by env limits."""
-    log.info("[media-dl] audio root=%s library root=%s", AUDIO_ROOT, LIBRARY_ROOT)
+    log.info("[media-dl] audio=%s library=%s video=%s",
+             AUDIO_ROOT, LIBRARY_ROOT, VIDEO_ROOT)
     os.makedirs(AUDIO_ROOT, exist_ok=True)
     os.makedirs(LIBRARY_ROOT, exist_ok=True)
+    os.makedirs(VIDEO_ROOT, exist_ok=True)
     while True:
         try:
             async with db_pool.acquire() as conn:
@@ -711,10 +714,15 @@ async def local_media_downloader() -> None:
                     LIMIT 1
                 """)
             if not row:
-                await asyncio.sleep(90)
+                # Short sleep when queue empty so user-clicks see worker wake
+                # within ~5s rather than waiting up to 90s.
+                await asyncio.sleep(5)
                 continue
 
-            root = AUDIO_ROOT if row["media_type"] == "audio" else LIBRARY_ROOT
+            mt = row["media_type"]
+            root = (AUDIO_ROOT if mt == "audio"
+                    else VIDEO_ROOT if mt == "video"
+                    else LIBRARY_ROOT)
             base = (row["file_name"] or f"item-{row['id']}")
             safe = SAFE_NAME.sub("_", base)[:180]
             target = os.path.join(root, safe)
@@ -722,7 +730,12 @@ async def local_media_downloader() -> None:
                 msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
                 if not msg:
                     raise RuntimeError("message gone")
-                media = msg.audio if row["media_type"] == "audio" else msg.document
+                if mt == "audio":
+                    media = msg.audio
+                elif mt == "video":
+                    media = msg.video
+                else:
+                    media = msg.document
                 if not media:
                     raise RuntimeError("no media on message")
                 path = await app.download_media(media, file_name=target)
@@ -1099,7 +1112,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.7 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.8 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1215,7 +1228,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.7",
+                "tgarr_version": "0.4.8",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1230,7 +1243,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.7 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.8 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1279,7 +1292,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.7 (+https://tgarr.me)"})
+                    "User-Agent": "tgarr/0.4.8 (+https://tgarr.me)"})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -1360,14 +1373,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.7",
+                        "tgarr_version": "0.4.8",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.7 (+https://tgarr.me)"},
+                                 "User-Agent": "tgarr/0.4.8 (+https://tgarr.me)"},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())

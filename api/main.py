@@ -18,14 +18,14 @@ import time
 from typing import Optional
 
 import asyncpg
-from fastapi import FastAPI, Form, Header, Query, Response
+from fastapi import FastAPI, Form, Header, Query, Response, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.7"
+TGARR_VERSION = "0.4.8"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -183,7 +183,7 @@ async def favicon():
 # Thumb serving — crawler writes /downloads/thumbs/<uid>.jpg
 # ════════════════════════════════════════════════════════════════════
 import re as _re
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 THUMBS_DIR = "/downloads/thumbs"
 _THUMB_SAFE = _re.compile(r"^[A-Za-z0-9_\-]+\.jpg$")
 
@@ -1872,7 +1872,8 @@ def _release_card(r) -> str:
         f'<span class="pill {cat_pill}">{r["category"]}</span>'
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
         f'</div>'
-        f'<div class="grab-row">'
+        f'<div class="grab-row" style="display:flex;gap:6px">'
+        f'<button class="btn play-btn" onclick="window.open(\'/media/{r["primary_msg_id"]}\', \'_blank\')">▶ Play</button>'
         f'<button class="btn grab-btn" data-guid="{r["guid"]}" onclick="tgGrab(this)">⬇ Grab</button>'
         f'</div>'
         f'</div>'
