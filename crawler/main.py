@@ -19,6 +19,8 @@ import uuid as uuidlib
 
 import asyncpg
 from pyrogram import Client
+from pyrogram.handlers import RawUpdateHandler
+from pyrogram.raw.types import UpdateChannel
 from pyrogram.errors import (
     FloodWait, UsernameNotOccupied, UsernameInvalid,
     ChannelInvalid, ChannelPrivate,
@@ -363,7 +365,7 @@ CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
 
-# Federation swarm validator (v0.4.2+): client pulls seed candidates from
+# Federation swarm validator (v0.4.3+): client pulls seed candidates from
 # central, validates on this client's TG account, pushes back via /contribute.
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
@@ -411,6 +413,33 @@ async def wait_for_session() -> None:
         await asyncio.sleep(5)
     await asyncio.sleep(2)  # let api flush
     log.info("[startup] session detected, continuing")
+
+
+async def on_raw_update(client, update, users, chats) -> None:
+    """Pyrogram RawUpdateHandler: catch UpdateChannel for instant
+    new-channel detection. MTProto pushes this when the user joins a
+    channel/supergroup, so we trigger backfill_channel within seconds
+    instead of waiting for the 30s polling watcher.
+    """
+    if not isinstance(update, UpdateChannel):
+        return
+    raw_id = getattr(update, "channel_id", None)
+    if not raw_id:
+        return
+    # Pyrogram peer-ID convention: -100<channel_id> for channels/supergroups
+    chat_id = -1000000000000 - raw_id
+    try:
+        async with db_pool.acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM channels WHERE tg_chat_id=$1", chat_id)
+        if exists:
+            return  # already known (could be a meta-update, not a join)
+        chat_obj = chats.get(raw_id) if chats else None
+        title = getattr(chat_obj, "title", "") or ""
+        log.info("[live-join] new channel chat_id=%s title=%s", chat_id, title)
+        asyncio.create_task(backfill_channel(chat_id, title))
+    except Exception as e:
+        log.exception("[live-join] error: %s", e)
 
 
 async def new_dialog_watcher() -> None:
@@ -1057,7 +1086,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.2 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.3 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1173,7 +1202,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.2",
+                "tgarr_version": "0.4.3",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1188,7 +1217,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.2 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.3 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1237,7 +1266,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.2 (+https://tgarr.me)"})
+                    "User-Agent": "tgarr/0.4.3 (+https://tgarr.me)"})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -1318,14 +1347,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.2",
+                        "tgarr_version": "0.4.3",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.2 (+https://tgarr.me)"},
+                                 "User-Agent": "tgarr/0.4.3 (+https://tgarr.me)"},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1346,6 +1375,7 @@ async def main() -> None:
     await init_db()
     await wait_for_session()
     await app.start()
+    app.add_handler(RawUpdateHandler(on_raw_update))
     me = await app.get_me()
     log.info("connected as @%s (id=%s)", me.username or "-", me.id)
 
