@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.26"
+TGARR_VERSION = "0.4.27"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -553,9 +553,10 @@ function renderPlayer() {{
             try {{
               const book = ePub(buf);
               const rendition = book.renderTo("epub-area", {{
-                manager: "continuous",
                 flow: "scrolled-doc",
                 width: "100%",
+                height: "100%",
+                allowScriptedContent: true,
               }});
               rendition.display();
               // Themes: dark-ish text on white container so Chinese reads well
