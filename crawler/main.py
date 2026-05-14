@@ -365,7 +365,7 @@ CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
 
-# Federation swarm validator (v0.4.11+): client pulls seed candidates from
+# Federation swarm validator (v0.4.12+): client pulls seed candidates from
 # central, validates on this client's TG account, pushes back via /contribute.
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
@@ -750,10 +750,32 @@ async def local_media_downloader() -> None:
                 log.info("[media-dl] %s id=%s streaming → %s",
                          row["media_type"], row["id"], rel)
                 written = 0
-                with open(target, "wb") as f:
-                    async for chunk in app.stream_media(media):
-                        f.write(chunk)
-                        written += len(chunk)
+                stream_floodwait = None
+                try:
+                    with open(target, "wb") as f:
+                        async for chunk in app.stream_media(media):
+                            f.write(chunk)
+                            written += len(chunk)
+                except FloodWait as fw:
+                    stream_floodwait = getattr(fw, "value", 60)
+                    log.warning("[media-dl] FloodWait %ds id=%s mid-stream "
+                                "(partial=%d bytes)",
+                                stream_floodwait, row["id"], written)
+                except Exception as se:
+                    log.warning("[media-dl] stream error id=%s: %s",
+                                row["id"], se)
+                expected = row["file_size"] or 0
+                if stream_floodwait or (expected and written < expected * 0.95):
+                    log.warning("[media-dl] %s id=%s short/failed: "
+                                "written=%d expected=%d — marking __failed__",
+                                row["media_type"], row["id"], written, expected)
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE messages SET local_path = $$__failed__$$ "
+                            "WHERE id=$1", row["id"])
+                    if stream_floodwait:
+                        await asyncio.sleep(min(stream_floodwait + 5, 1800))
+                    continue
                 log.info("[media-dl] %s id=%s done → %s (%s bytes)",
                          row["media_type"], row["id"], rel, written)
             except FloodWait as fw:
@@ -1123,7 +1145,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.11 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.12 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1239,7 +1261,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.11",
+                "tgarr_version": "0.4.12",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1254,7 +1276,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.11 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.12 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1303,7 +1325,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.11 (+https://tgarr.me)"})
+                    "User-Agent": "tgarr/0.4.12 (+https://tgarr.me)"})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -1384,14 +1406,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.11",
+                        "tgarr_version": "0.4.12",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.11 (+https://tgarr.me)"},
+                                 "User-Agent": "tgarr/0.4.12 (+https://tgarr.me)"},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
