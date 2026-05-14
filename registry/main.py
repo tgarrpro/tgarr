@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("tgarr-registry")
 
 DB_DSN = os.environ["DB_DSN"]
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 USERNAME_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 # Same as client — defense in depth
 CSAM_RX = re.compile(

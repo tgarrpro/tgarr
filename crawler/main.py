@@ -363,7 +363,7 @@ CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
 
-# Federation swarm validator (v0.4.1+): client pulls seed candidates from
+# Federation swarm validator (v0.4.2+): client pulls seed candidates from
 # central, validates on this client's TG account, pushes back via /contribute.
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
@@ -411,6 +411,51 @@ async def wait_for_session() -> None:
         await asyncio.sleep(5)
     await asyncio.sleep(2)  # let api flush
     log.info("[startup] session detected, continuing")
+
+
+async def new_dialog_watcher() -> None:
+    """Detect newly-joined channels in near-real-time without crawler restart.
+
+    Polls the user's top-N recent dialogs every NEW_DIALOG_INTERVAL seconds,
+    compares against the channels table, and triggers backfill_channel for
+    any new entries. New channel posts then start flowing via on_message
+    immediately, while history backfills in the background.
+    """
+    NEW_DIALOG_INTERVAL = 30
+    NEW_DIALOG_SCAN_LIMIT = 30
+    log.info("[new-dialog] watcher started, interval=%ds limit=%d",
+             NEW_DIALOG_INTERVAL, NEW_DIALOG_SCAN_LIMIT)
+    await asyncio.sleep(45)  # give startup backfill_all a head start
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                known = {r["tg_chat_id"] for r in await conn.fetch(
+                    "SELECT tg_chat_id FROM channels")}
+            new_dialogs = []
+            async for dialog in app.get_dialogs(limit=NEW_DIALOG_SCAN_LIMIT):
+                ctype = dialog.chat.type.name
+                if ctype in ("PRIVATE", "BOT"):
+                    continue
+                if dialog.chat.id not in known:
+                    new_dialogs.append(
+                        (dialog.chat.id, dialog.chat.title or ""))
+            for chat_id, title in new_dialogs:
+                log.info("[new-dialog] discovered chat_id=%s title=%s",
+                         chat_id, title)
+                try:
+                    await backfill_channel(chat_id, title)
+                except Exception as e:
+                    log.error("[new-dialog] backfill failed chat_id=%s: %s",
+                              chat_id, e)
+        except FloodWait as fw:
+            wait = getattr(fw, "value", 60) + 5
+            log.warning("[new-dialog] flood-wait %ds", wait)
+            await asyncio.sleep(min(wait, 600))
+            continue
+        except Exception as e:
+            log.exception("[new-dialog] outer: %s", e)
+            await asyncio.sleep(120)
+        await asyncio.sleep(NEW_DIALOG_INTERVAL)
 
 
 async def thumb_downloader() -> None:
@@ -1012,7 +1057,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.1 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.2 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1128,7 +1173,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.1",
+                "tgarr_version": "0.4.2",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1143,7 +1188,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.1 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.2 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1192,7 +1237,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.1 (+https://tgarr.me)"})
+                    "User-Agent": "tgarr/0.4.2 (+https://tgarr.me)"})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -1273,14 +1318,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.1",
+                        "tgarr_version": "0.4.2",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.1 (+https://tgarr.me)"},
+                                 "User-Agent": "tgarr/0.4.2 (+https://tgarr.me)"},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1315,6 +1360,7 @@ async def main() -> None:
     # Binary content fetches only via download_worker (POST /api/grab/{guid}).
     # asyncio.create_task(local_media_downloader())
     asyncio.create_task(channel_meta_refresher())
+    asyncio.create_task(new_dialog_watcher())
     asyncio.create_task(subscription_poller())
     asyncio.create_task(contribute_to_registry())
     asyncio.create_task(federation_validator())
