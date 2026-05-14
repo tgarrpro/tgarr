@@ -532,35 +532,43 @@ function renderPlayer() {{
     // Embed epub.js reader (works best with .epub; mobi/azw partial support)
     main.innerHTML = `<div id="epub-area" style="width:1200px;max-width:96vw;height:85vh;background:#fff;color:#111;border-radius:6px"></div>
       <div style="margin-top:12px;color:#94a3b8;font-size:13px">← → arrow keys to flip pages · <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
+    // Chain loads so the script execution order is guaranteed:
+    //   JSZip (required by epub.js archive mode) → epub.js → fetch+render
+    const showErr = msg => {{
+      document.getElementById("epub-area").innerHTML =
+        `<div style="padding:30px;color:#dc2626">${{msg}}. <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
+    }};
     const jz = document.createElement("script");
     jz.src = "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js";
-    document.head.appendChild(jz);
-    const s = document.createElement("script");
-    s.src = "https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js";
-    s.onload = () => {{
-      // Force ARCHIVE mode by fetching binary first; passing a URL without
-      // .epub suffix puts epub.js into path-prefix mode where it tries to
-      // GET /media/META-INF/container.xml etc.
-      fetch(`/media/${{MSG_ID}}`).then(r => r.arrayBuffer()).then(buf => {{
-        try {{
-          const book = ePub(buf);
-          const rendition = book.renderTo("epub-area", {{flow: "paginated", width: "100%", height: "100%"}});
-          rendition.display();
-          document.addEventListener("keydown", e => {{
-            if (e.target.tagName === "INPUT") return;
-            if (e.key === "ArrowLeft") rendition.prev();
-            else if (e.key === "ArrowRight") rendition.next();
-          }});
-        }} catch(e) {{
-          document.getElementById("epub-area").innerHTML =
-            `<div style="padding:30px;color:#dc2626">EPUB reader failed: ${{e.message}}. <a href="/media/${{MSG_ID}}" download>Download raw file</a></div>`;
-        }}
-      }}).catch(err => {{
-        document.getElementById("epub-area").innerHTML =
-          `<div style="padding:30px;color:#dc2626">Could not load EPUB bytes: ${{err.message}}. <a href="/media/${{MSG_ID}}" download>Download raw file</a></div>`;
-      }})
+    jz.onerror = () => showErr("JSZip CDN unreachable");
+    jz.onload = () => {{
+      const eb = document.createElement("script");
+      eb.src = "https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js";
+      eb.onerror = () => showErr("epub.js CDN unreachable");
+      eb.onload = () => {{
+        // Pass an ArrayBuffer so epub.js enters archive mode (not path mode).
+        fetch(`/media/${{MSG_ID}}`)
+          .then(r => r.ok ? r.arrayBuffer() : Promise.reject("HTTP " + r.status))
+          .then(buf => {{
+            try {{
+              const book = ePub(buf);
+              const rendition = book.renderTo("epub-area",
+                {{flow: "paginated", width: "100%", height: "100%"}});
+              rendition.display();
+              document.addEventListener("keydown", e => {{
+                if (e.target.tagName === "INPUT") return;
+                if (e.key === "ArrowLeft") rendition.prev();
+                else if (e.key === "ArrowRight") rendition.next();
+              }});
+            }} catch (e) {{
+              showErr("EPUB reader failed: " + e.message);
+            }}
+          }})
+          .catch(err => showErr("Could not load EPUB bytes: " + err));
+      }};
+      document.head.appendChild(eb);
     }};
-    document.body.appendChild(s);
+    document.head.appendChild(jz);
     return;
   }}
   // fallback: try iframe but offer download as escape hatch
@@ -1013,7 +1021,7 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-card:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,0.12); border-color:var(--accent); }
 .poster-card .poster { height:200px; background:#f1f5f9; position:relative; overflow:hidden; }
 .poster-card .poster .fallback { display:flex; width:100%; height:100%; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; background:#f1f5f9; }
-poster-card 
+.poster-card .poster .poster-img { display:block; width:100%; height:100%; object-fit:cover; background:#f1f5f9; }
 .poster-card .poster .badge { position:absolute; top:8px; right:8px; padding:3px 10px; border-radius:11px; background:rgba(15,23,42,0.78); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; backdrop-filter:blur(4px); }
 .poster-card .info { padding:10px 12px 4px; min-height:84px; flex:1; }
 .poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
