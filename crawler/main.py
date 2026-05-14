@@ -738,13 +738,24 @@ async def local_media_downloader() -> None:
                     media = msg.document
                 if not media:
                     raise RuntimeError("no media on message")
-                path = await app.download_media(media, file_name=target)
-                rel = os.path.relpath(str(path), "/downloads")
+                # Stream the media in place at `target` so the API endpoint
+                # can serve partial bytes as they\'re written (Pyrogram\'s
+                # download_media uses a .temp file + rename, breaking partial
+                # serving). Pre-UPDATE local_path before the stream begins.
+                rel = os.path.relpath(target, "/downloads")
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE messages SET local_path=$1 WHERE id=$2",
                         rel, row["id"])
-                log.info("[media-dl] %s id=%s → %s", row["media_type"], row["id"], rel)
+                log.info("[media-dl] %s id=%s streaming → %s",
+                         row["media_type"], row["id"], rel)
+                written = 0
+                with open(target, "wb") as f:
+                    async for chunk in app.stream_media(media):
+                        f.write(chunk)
+                        written += len(chunk)
+                log.info("[media-dl] %s id=%s done → %s (%s bytes)",
+                         row["media_type"], row["id"], rel, written)
             except FloodWait as fw:
                 # Cross-DC auth.ExportAuthorization rate-limits us. Respect the
                 # server-supplied wait verbatim; don't mark the row failed.
