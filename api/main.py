@@ -252,24 +252,119 @@ async def lazy_thumb(msg_id: int):
                    media_type="image/gif")
 
 
+def _mime_for(media_type, mime):
+    if mime:
+        return mime
+    return ("audio/mpeg" if media_type == "audio"
+            else "video/mp4" if media_type == "video"
+            else "application/octet-stream")
+
+
 @app.get("/media/{msg_id}")
-async def serve_media(msg_id: int):
-    """Serve a cached audio/document. FileResponse handles HTTP Range so audio
-    players can seek mid-stream."""
+async def serve_media(msg_id: int, request: Request):
+    """Lazy on-demand download + HTTP Range progressive streaming.
+
+    First click marks local_path='__user_queued__' to trigger the crawler\'s
+    local_media_downloader. Waits ~90s for the file to start being written
+    by Pyrogram. Once partial bytes are on disk, streams them via Range
+    response, blocking at EOF when the browser asks for bytes still
+    downloading; gives up after 5min stalled.
+    """
+    import asyncio, re as _re
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT local_path, file_name, mime_type, media_type
+            """SELECT local_path, file_name, file_size, mime_type, media_type
                FROM messages WHERE id=$1""", msg_id)
-    if not row or not row["local_path"] or row["local_path"].startswith("__"):
-        return Response("not cached", status_code=404)
+    if not row:
+        return Response("no msg", status_code=404)
+    if row["local_path"] == "__failed__":
+        return Response("download failed", status_code=410)
+
+    if not row["local_path"] or row["local_path"] == "__user_queued__":
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path = $$__user_queued__$$ "
+                "WHERE id = $1 AND (local_path IS NULL "
+                "OR local_path = $$__user_queued__$$)",
+                msg_id)
+        for _ in range(180):
+            await asyncio.sleep(0.5)
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT local_path, file_name, file_size, mime_type, media_type
+                       FROM messages WHERE id=$1""", msg_id)
+            if not row:
+                return Response("no msg", status_code=404)
+            lp = row["local_path"]
+            if lp and not lp.startswith("__"):
+                break
+            if lp == "__failed__":
+                return Response("download failed", status_code=410)
+        else:
+            return Response("still downloading — retry in a moment", status_code=202)
+
     path = os.path.join("/downloads", row["local_path"])
-    if not os.path.exists(path):
-        return Response("file missing", status_code=404)
-    mime = row["mime_type"] or (
-        "audio/mpeg" if row["media_type"] == "audio" else "application/octet-stream")
-    headers = {"Cache-Control": "private, max-age=3600"}
+    mime = _mime_for(row["media_type"], row["mime_type"])
     fn = row["file_name"]
-    return FileResponse(path, media_type=mime, filename=fn, headers=headers)
+    total_size = row["file_size"] or 0
+
+    for _ in range(60):
+        if os.path.exists(path):
+            break
+        await asyncio.sleep(0.5)
+    else:
+        return Response("file vanished", status_code=410)
+
+    range_header = request.headers.get("Range")
+    if not range_header:
+        if total_size and os.path.getsize(path) >= total_size:
+            return FileResponse(path, media_type=mime, filename=fn,
+                              headers={"Cache-Control": "private, max-age=3600",
+                                       "Accept-Ranges": "bytes"})
+        start, end = 0, (total_size - 1) if total_size else None
+    else:
+        m = _re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if not m:
+            return Response("bad range", status_code=416)
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else (
+            total_size - 1 if total_size else None)
+
+    if end is None:
+        end = os.path.getsize(path) - 1
+
+    async def stream_range():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            stuck = 0
+            while remaining > 0:
+                current = os.path.getsize(path)
+                pos = f.tell()
+                if current <= pos:
+                    stuck += 1
+                    if stuck > 600:
+                        return
+                    await asyncio.sleep(0.5)
+                    continue
+                stuck = 0
+                csz = min(65536, remaining, current - pos)
+                chunk = f.read(csz)
+                if not chunk:
+                    await asyncio.sleep(0.2)
+                    continue
+                yield chunk
+                remaining -= len(chunk)
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+        "Cache-Control": "private, max-age=3600",
+    }
+    if total_size:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+    return StreamingResponse(stream_range(), status_code=206,
+                           media_type=mime, headers=headers)
 
 
 # ════════════════════════════════════════════════════════════════════
