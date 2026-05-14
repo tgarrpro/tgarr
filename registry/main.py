@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("tgarr-registry")
 
 DB_DSN = os.environ["DB_DSN"]
-VERSION = "0.4.31"
+VERSION = "0.4.32"
 USERNAME_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 # Same as client — defense in depth
 CSAM_RX = re.compile(
@@ -758,7 +758,7 @@ PROTOCOL_BREAK_AT = os.environ.get("PROTOCOL_BREAK_AT", "")
 
 
 def _semver_tuple(v):
-    """0.4.31 / 0.4.31-pre -> (0, 4, 2). Tolerates suffixes + missing parts."""
+    """0.4.32 / 0.4.32-pre -> (0, 4, 2). Tolerates suffixes + missing parts."""
     if not v:
         return (0, 0, 0)
     base = str(v).split("-")[0].split("+")[0]

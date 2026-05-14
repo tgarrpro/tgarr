@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.31"
+TGARR_VERSION = "0.4.32"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -2298,7 +2298,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None):
 
     body = (
         f'<h2 class="section">Music <span class="count">{len(rows)} cached</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} pending</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
         '<table class="music-list">'
@@ -2426,7 +2426,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
 
     body = (
         f'<h2 class="section">Library <span class="count">{len(rows)} cached</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} pending</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
         f'<div class="book-grid">{items}</div>'
