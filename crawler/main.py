@@ -368,7 +368,7 @@ CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
 INSTANCE_UUID_ROTATE_DAYS = 7
 
-# Federation swarm validator (v0.4.13+): client pulls seed candidates from
+# Federation swarm validator (v0.4.14+): client pulls seed candidates from
 # central, validates on this client's TG account, pushes back via /contribute.
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
@@ -1148,7 +1148,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.13 (+https://tgarr.me)",
+                    headers={"User-Agent": "tgarr/0.4.14 (+https://tgarr.me)",
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -1264,7 +1264,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.13",
+                "tgarr_version": "0.4.14",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1279,7 +1279,7 @@ async def contribute_to_registry() -> None:
                     REGISTRY_URL + "/api/v1/contribute",
                     data=json.dumps(payload).encode(),
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.13 (+https://tgarr.me)"},
+                             "User-Agent": "tgarr/0.4.14 (+https://tgarr.me)"},
                     method="POST")
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1328,7 +1328,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.13 (+https://tgarr.me)"})
+                    "User-Agent": "tgarr/0.4.14 (+https://tgarr.me)"})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -1409,14 +1409,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.13",
+                        "tgarr_version": "0.4.14",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.13 (+https://tgarr.me)"},
+                                 "User-Agent": "tgarr/0.4.14 (+https://tgarr.me)"},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -1431,6 +1431,62 @@ async def federation_validator() -> None:
         except Exception as e:
             log.exception("[fed-validator] outer: %s", e)
             await asyncio.sleep(600)
+
+
+async def dc_backfill_worker() -> None:
+    """One-shot-ish background filler: walks messages that are referenced
+    as releases.primary_msg_id but have NULL file_dc, fetches each via
+    get_messages, extracts media.dc_id, UPDATEs. Slow rate to avoid
+    FloodWait. Sleeps 1h when no work, exits silently on hard errors.
+    """
+    log.info("[dc-backfill] worker started, 1 row/sec")
+    await asyncio.sleep(60)  # let startup settle
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT m.id, m.tg_chat_id, m.tg_message_id
+                       FROM messages m
+                       WHERE m.file_dc IS NULL
+                         AND m.id IN (SELECT primary_msg_id FROM releases
+                                      WHERE primary_msg_id IS NOT NULL)
+                       LIMIT 1""")
+            if not row:
+                # No releases pending; check non-release media (lower priority)
+                async with db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """SELECT id, tg_chat_id, tg_message_id
+                           FROM messages
+                           WHERE file_dc IS NULL
+                             AND media_type IN ('audio','video','document','photo')
+                           ORDER BY id DESC
+                           LIMIT 1""")
+            if not row:
+                await asyncio.sleep(3600)
+                continue
+            try:
+                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+            except FloodWait as fw:
+                wait = getattr(fw, "value", 60) + 5
+                log.warning("[dc-backfill] FloodWait %ds", wait)
+                await asyncio.sleep(min(wait, 1800))
+                continue
+            except Exception as e:
+                # Mark with sentinel so we don't retry forever
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET file_dc = 0 WHERE id=$1", row["id"])
+                continue
+            media = (msg and (msg.video or msg.audio or msg.document or msg.photo))
+            dc = getattr(media, "dc_id", None) if media else None
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET file_dc=$1 WHERE id=$2",
+                    dc or 0, row["id"])
+            await asyncio.sleep(1)
+        except Exception as e:
+            log.exception("[dc-backfill] outer: %s", e)
+            await asyncio.sleep(60)
 
 
 async def main() -> None:
@@ -1453,6 +1509,7 @@ async def main() -> None:
     # asyncio.create_task(local_media_downloader())
     asyncio.create_task(channel_meta_refresher())
     asyncio.create_task(new_dialog_watcher())
+    asyncio.create_task(dc_backfill_worker())
     asyncio.create_task(subscription_poller())
     asyncio.create_task(contribute_to_registry())
     asyncio.create_task(federation_validator())

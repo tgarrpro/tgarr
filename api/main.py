@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.13"
+TGARR_VERSION = "0.4.14"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -996,9 +996,11 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:18px; }
 .poster-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; overflow:hidden; box-shadow:var(--shadow); display:flex; flex-direction:column; transition:transform 0.12s, box-shadow 0.12s; }
 .poster-card:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,0.12); border-color:var(--accent); }
-.poster-card .poster { aspect-ratio:3/4; background:#f1f5f9; background-size:cover; background-position:center; position:relative; }
-.poster-card .poster .fallback { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; z-index:1; }
-poster-card .poster .poster-img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; z-index:2; }
+.poster-card .poster { aspect-ratio:1/1; background:#f1f5f9; background-size:cover; background-position:center; position:relative; }
+.poster-card .poster .fallback { position:absolute; inset:0; display:none; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; z-index:1; }
+poster-card .poster:not(:has(.poster-img)) .fallback { display:flex; }
+poster-card .poster.no-thumb .fallback { display:flex; }
+poster-card .poster .poster-img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; z-index:2; background:#f1f5f9; }
 .poster-card .poster .badge { position:absolute; top:8px; right:8px; padding:3px 10px; border-radius:11px; background:rgba(15,23,42,0.78); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; backdrop-filter:blur(4px); }
 .poster-card .info { padding:12px 14px 8px; flex:1; }
 .poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
@@ -2177,9 +2179,28 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
 # ════════════════════════════════════════════════════════════════════
 # Page: Releases
 # ════════════════════════════════════════════════════════════════════
-def _release_card(r) -> str:
-    """Sonarr/Radarr-style poster card with 3-tier fallback:
-    TMDB/Wiki poster_url -> TG msg thumb (/api/thumb/{pmid}) -> 🎬 emoji."""
+def _audience_badge(audience) -> str:
+    """SFW/NSFW indicator. blocked_csam was already filtered out earlier."""
+    if not audience or audience == "sfw":
+        return '<span class="pill ok" style="font-size:11px" title="safe for work">SFW</span>'
+    if audience == "nsfw":
+        return '<span class="pill warn" style="font-size:11px" title="adult content">NSFW</span>'
+    return ""
+
+
+def _dc_badge(file_dc, my_dc) -> str:
+    """Tiny DC indicator: 🟢 same DC (fast), 🟡 cross-DC (may hit FloodWait),
+    ⚪ unknown (file_dc not yet recorded — backfills on first click)."""
+    if not file_dc:
+        return '<span class="pill muted" title="DC unknown — backfills on first click" style="font-size:11px">⚪</span>'
+    if not my_dc or file_dc == my_dc:
+        return f'<span class="pill ok" title="same DC {file_dc} — fast" style="font-size:11px">🟢 DC{file_dc}</span>'
+    return f'<span class="pill warn" title="cross-DC ({file_dc} vs your {my_dc}) — may hit FloodWait" style="font-size:11px">🟡 DC{file_dc}</span>'
+
+
+def _release_card(r, my_dc=None) -> str:
+    """Sonarr/Radarr-style poster card with 3-tier fallback +
+    DC badge (so users can pick same-DC items without clicking)."""
     title_disp = r["canonical_title"] or r["name"].replace(".", " ")
     poster = r["poster_url"]
     pmid = r["primary_msg_id"]
@@ -2206,7 +2227,7 @@ def _release_card(r) -> str:
     poster_style = ""
     if img_src:
         poster_img = (f'<img class="poster-img" src="{img_src}" loading="lazy" '
-                      f'alt="" onerror="this.style.display=\'none\'" />')
+                      f'alt="" onerror="this.style.display=\'none\';this.parentNode.classList.add(\'no-thumb\')" />')
     else:
         poster_img = ""
     quality_badge = (f'<div class="badge">{html.escape(r["quality"])}</div>'
@@ -2219,6 +2240,8 @@ def _release_card(r) -> str:
         f'<div class="sub">{" · ".join(html.escape(x) for x in sub_bits)}</div>'
         f'</div>'
         f'<div class="pills">'
+        f'{_dc_badge(r.get("file_dc") if hasattr(r,"get") else r["file_dc"], my_dc)}'
+        f'{_audience_badge(r.get("audience") if hasattr(r,"get") else None)}'
         f'<span class="pill {cat_pill}">{r["category"]}</span>'
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
         f'</div>'
@@ -2248,10 +2271,18 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     # Pass min_mb=0 to see everything (debugging).
     if min_mb and min_mb > 0:
         where.append(f"COALESCE(size_bytes,0) >= {min_mb * 1024 * 1024}")
-    sql = (f"SELECT id, guid, name, category, season, episode, quality, "
-          f"size_bytes, posted_at, parse_score, poster_url, canonical_title, primary_msg_id "
-          f"FROM releases WHERE {' AND '.join(where)} "
-          f"ORDER BY posted_at DESC NULLS LAST LIMIT {max(1, min(limit, 500))}")
+    def _qual(w):
+        return (w.replace("name ILIKE", "r.name ILIKE")
+                 .replace("category =", "r.category =")
+                 .replace("COALESCE(size_bytes", "COALESCE(r.size_bytes"))
+    sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
+          f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
+          f"r.primary_msg_id, m.file_dc, c.audience "
+          f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
+          f"LEFT JOIN channels c ON c.id = m.channel_id "
+          f"WHERE {' AND '.join([_qual(w) for w in where])} "
+          f"ORDER BY r.posted_at DESC NULLS LAST LIMIT {max(1, min(limit, 500))}")
+    _release_my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
@@ -2317,7 +2348,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                     f'</tr></thead><tbody>{body_rows}</tbody></table>')
     else:
         body_html = (f'<div class="poster-grid">'
-                    f'{"".join(_release_card(r) for r in rows)}'
+                    f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
                     f'</div>')
 
     body = (f'<h2 class="section">Parsed releases <span class="count">{len(rows)} shown</span></h2>'
@@ -2405,10 +2436,12 @@ async def page_search(q: Optional[str] = None):
         for w in q.split():
             params.append(f"%{w}%")
             where.append(f"name ILIKE ${len(params)}")
-        sql = (f"SELECT id, guid, name, category, season, episode, quality, "
-              f"size_bytes, posted_at, parse_score, poster_url, canonical_title, primary_msg_id "
-              f"FROM releases WHERE {' AND '.join(where)} "
-              f"ORDER BY posted_at DESC NULLS LAST LIMIT 120")
+        sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
+              f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
+              f"r.primary_msg_id, m.file_dc "
+              f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
+              f"WHERE {' AND '.join([w.replace('name ILIKE','r.name ILIKE').replace('category =','r.category =').replace('size_bytes','r.size_bytes') for w in where])} "
+              f"ORDER BY r.posted_at DESC NULLS LAST LIMIT 120")
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
 
@@ -2422,7 +2455,7 @@ async def page_search(q: Optional[str] = None):
             results_html = (
                 f'<h2 class="section">Results <span class="count">{len(rows)}</span></h2>'
                 f'<div class="poster-grid">'
-                f'{"".join(_release_card(r) for r in rows)}'
+                f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
                 f'</div>'
             )
 
@@ -2626,6 +2659,7 @@ async def list_releases(limit: int = 50, q: Optional[str] = None):
     sql = (f"SELECT id, guid, name, category, season, episode, quality, "
           f"size_bytes, posted_at, parse_score FROM releases {where} "
           f"ORDER BY posted_at DESC NULLS LAST LIMIT {max(1, min(limit, 500))}")
+    _release_my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
     return [dict(r) for r in rows]
@@ -2771,6 +2805,7 @@ async def newznab_api(
           f"source, codec, size_bytes, posted_at FROM releases WHERE "
           f"{' AND '.join(where_parts)} ORDER BY posted_at DESC NULLS LAST "
           f"LIMIT {limit_val} OFFSET {max(0, offset)}")
+    _release_my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
