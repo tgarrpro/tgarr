@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.6"
+TGARR_VERSION = "0.4.7"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -1664,8 +1664,6 @@ async def page_music(limit: int = 200):
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
             WHERE m.media_type = 'audio'
-              AND m.local_path IS NOT NULL
-              AND m.local_path NOT LIKE '\\_\\_%' ESCAPE '\\'
             ORDER BY m.posted_at DESC NULLS LAST
             LIMIT {max(1, min(limit, 500))}
         """)
@@ -1774,8 +1772,6 @@ async def page_library(limit: int = 200):
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
             WHERE m.media_type = 'document'
-              AND m.local_path IS NOT NULL
-              AND m.local_path NOT LIKE '\\_\\_%' ESCAPE '\\'
               AND m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'
             ORDER BY m.posted_at DESC NULLS LAST
             LIMIT {max(1, min(limit, 500))}
