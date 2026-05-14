@@ -506,15 +506,20 @@ async def get_seeds(
     """
     ip_hash = _ip_hash(request)
 
+    # Allowlist bypass (same as /api/v1/registry showcase test-mode)
+    _test_ips = [s.strip() for s in (os.getenv("TGARR_TEST_SHOWCASE_IPS") or "").split(",") if s.strip()]
+    _bypass_rate_limit = ip_hash in _test_ips
+
     async with db_pool.acquire() as conn:
-        # Rate limit: same registry_pulls counter as /api/v1/registry
-        today_pulls = await conn.fetchval(
-            """SELECT count(*) FROM registry_pulls
-               WHERE ip_hash = $1
-                 AND pulled_at > NOW() - INTERVAL '24 hours'""", ip_hash)
-        if today_pulls and today_pulls >= PULL_LIMIT_FREE_PER_DAY:
-            raise HTTPException(
-                429, f"daily seeds-pull limit exceeded ({PULL_LIMIT_FREE_PER_DAY}/day free)")
+        if not _bypass_rate_limit:
+            # Rate limit: same registry_pulls counter as /api/v1/registry
+            today_pulls = await conn.fetchval(
+                """SELECT count(*) FROM registry_pulls
+                   WHERE ip_hash = $1
+                     AND pulled_at > NOW() - INTERVAL '24 hours'""", ip_hash)
+            if today_pulls and today_pulls >= PULL_LIMIT_FREE_PER_DAY:
+                raise HTTPException(
+                    429, f"daily seeds-pull limit exceeded ({PULL_LIMIT_FREE_PER_DAY}/day free)")
 
         # Apply suspicion gate (same as /registry)
         susp = await _suspicion_score(ip_hash)
