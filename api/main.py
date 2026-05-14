@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.14"
+TGARR_VERSION = "0.4.15"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -2241,7 +2241,6 @@ def _release_card(r, my_dc=None) -> str:
         f'</div>'
         f'<div class="pills">'
         f'{_dc_badge(r.get("file_dc") if hasattr(r,"get") else r["file_dc"], my_dc)}'
-        f'{_audience_badge(r.get("audience") if hasattr(r,"get") else None)}'
         f'<span class="pill {cat_pill}">{r["category"]}</span>'
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
         f'</div>'
@@ -2256,7 +2255,7 @@ def _release_card(r, my_dc=None) -> str:
 @app.get("/releases", response_class=HTMLResponse)
 async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         view: str = "grid", limit: int = 120,
-                        min_mb: int = 100):
+                        min_mb: int = 100, aud: str = "sfw"):
     if not login.session_exists():
         return RedirectResponse("/login")
     where = ["1=1"]
@@ -2271,7 +2270,17 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     # Pass min_mb=0 to see everything (debugging).
     if min_mb and min_mb > 0:
         where.append(f"COALESCE(size_bytes,0) >= {min_mb * 1024 * 1024}")
+    # CSAM is always hidden. SFW/NSFW chip filter — default sfw.
+    where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
+    if aud == "sfw":
+        where.append("COALESCE(c.audience, 'sfw') = 'sfw'")
+    elif aud == "nsfw":
+        where.append("c.audience = 'nsfw'")
+    # aud == "any" or anything else → no audience filter beyond csam
     def _qual(w):
+        # audience refs already use c. prefix — pass through
+        if "c.audience" in w:
+            return w
         return (w.replace("name ILIKE", "r.name ILIKE")
                  .replace("category =", "r.category =")
                  .replace("COALESCE(size_bytes", "COALESCE(r.size_bytes"))
@@ -2301,11 +2310,22 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         return (f'<a class="btn ghost" href="{href}" '
                f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
 
+    def _aud_chip(val: str, label: str) -> str:
+        active = aud == val or (val == "sfw" and not aud)
+        href = f"/releases{_qs(aud=val if val != 'sfw' else None)}"
+        bg = "rgba(245,158,11,0.18)" if val == "nsfw" and active else "rgba(94,182,229,0.15)"
+        fg = "var(--warn)" if val == "nsfw" else "var(--accent-hi)"
+        style = (f'background:{bg};color:{fg};border-color:{fg};') if active else ''
+        return (f'<a class="btn ghost" href="{href}" '
+               f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
+
     grid_active = "active" if view != "list" else ""
     list_active = "active" if view == "list" else ""
     toolbar = (
         f'<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
         f'{_chip("","all")}{_chip("movie","movies")}{_chip("tv","tv")}'
+        f'<span style="color:var(--muted);font-size:12px;margin:0 4px">·</span>'
+        f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","NSFW")}{_aud_chip("any","all")}'
         f'<div style="margin-left:auto" class="view-toggle">'
         f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ Grid</a>'
         f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ List</a>'
