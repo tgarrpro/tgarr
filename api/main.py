@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.22"
+TGARR_VERSION = "0.4.23"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -535,19 +535,27 @@ function renderPlayer() {{
     const s = document.createElement("script");
     s.src = "https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js";
     s.onload = () => {{
-      try {{
-        const book = ePub(`/media/${{MSG_ID}}`);
-        const rendition = book.renderTo("epub-area", {{flow: "paginated", width: "100%", height: "100%"}});
-        rendition.display();
-        document.addEventListener("keydown", e => {{
-          if (e.target.tagName === "INPUT") return;
-          if (e.key === "ArrowLeft") rendition.prev();
-          else if (e.key === "ArrowRight") rendition.next();
-        }});
-      }} catch(e) {{
+      // Force ARCHIVE mode by fetching binary first; passing a URL without
+      // .epub suffix puts epub.js into path-prefix mode where it tries to
+      // GET /media/META-INF/container.xml etc.
+      fetch(`/media/${{MSG_ID}}`).then(r => r.arrayBuffer()).then(buf => {{
+        try {{
+          const book = ePub(buf);
+          const rendition = book.renderTo("epub-area", {{flow: "paginated", width: "100%", height: "100%"}});
+          rendition.display();
+          document.addEventListener("keydown", e => {{
+            if (e.target.tagName === "INPUT") return;
+            if (e.key === "ArrowLeft") rendition.prev();
+            else if (e.key === "ArrowRight") rendition.next();
+          }});
+        }} catch(e) {{
+          document.getElementById("epub-area").innerHTML =
+            `<div style="padding:30px;color:#dc2626">EPUB reader failed: ${{e.message}}. <a href="/media/${{MSG_ID}}" download>Download raw file</a></div>`;
+        }}
+      }}).catch(err => {{
         document.getElementById("epub-area").innerHTML =
-          `<div style="padding:30px;color:#dc2626">EPUB reader failed: ${{e.message}}. <a href="/media/${{MSG_ID}}" download>Download raw file</a></div>`;
-      }}
+          `<div style="padding:30px;color:#dc2626">Could not load EPUB bytes: ${{err.message}}. <a href="/media/${{MSG_ID}}" download>Download raw file</a></div>`;
+      }})
     }};
     document.body.appendChild(s);
     return;
