@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.29"
+TGARR_VERSION = "0.4.30"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -555,6 +555,101 @@ async def epub_render(msg_id: int):
             f"<h1>EPUB render failed</h1><pre>{html.escape(str(e))}</pre>"
             f"<p><a href='/media/{msg_id}' download>Download raw .epub</a></p>",
             status_code=500)
+
+
+@app.get("/epub/{msg_id}/cover")
+async def epub_cover(msg_id: int):
+    """Extract + serve the cover image from an .epub. Tries:
+       1. manifest item with properties='cover-image' (EPUB3)
+       2. manifest item id='cover' or referenced by <meta name='cover'> (EPUB2)
+       3. first image inside titlepage chapter
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path FROM messages WHERE id=$1", msg_id)
+    epub_path = _epub_locate(msg_id, row)
+    if not epub_path:
+        return Response("not cached", status_code=404)
+    try:
+        with _zipfile.ZipFile(epub_path) as zf:
+            from xml.etree import ElementTree as _ET
+            container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+            ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+            opf_path = _ET.fromstring(container).find(".//c:rootfile", ns_c).attrib["full-path"]
+            opf_dir = os.path.dirname(opf_path).replace("\\", "/")
+            opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+            ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
+            manifest = {item.attrib["id"]: item
+                        for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf)}
+
+            cover_href = None
+            # 1. EPUB3 — properties="cover-image"
+            for item in manifest.values():
+                if "cover-image" in (item.attrib.get("properties") or ""):
+                    cover_href = item.attrib.get("href")
+                    break
+            # 2. EPUB2 — <meta name="cover" content="id">
+            if not cover_href:
+                for meta in opf_root.findall(".//opf:metadata/opf:meta", ns_opf):
+                    if meta.attrib.get("name") == "cover":
+                        cid = meta.attrib.get("content")
+                        if cid in manifest:
+                            cover_href = manifest[cid].attrib.get("href")
+                            break
+            # 3. manifest id="cover"
+            if not cover_href and "cover" in manifest:
+                cover_href = manifest["cover"].attrib.get("href")
+            # 4. first image in titlepage / first spine chapter
+            if not cover_href:
+                spine_first = opf_root.find(".//opf:spine/opf:itemref", ns_opf)
+                if spine_first is not None:
+                    idref = spine_first.attrib.get("idref")
+                    chapter_item = manifest.get(idref)
+                    if chapter_item is not None:
+                        chapter_href = _uq(chapter_item.attrib["href"])
+                        chapter_path = (opf_dir + "/" + chapter_href).lstrip("/") if opf_dir else chapter_href
+                        try:
+                            chap = zf.read(chapter_path).decode("utf-8", "replace")
+                            m = _re.search(r"(?:xlink:)?href=[\"\']([^\"\']+\.(?:jpg|jpeg|png|webp|gif))[\"\']",
+                                          chap, _re.IGNORECASE)
+                            if not m:
+                                m = _re.search(r"<img[^>]*\bsrc=[\"\']([^\"\']+)[\"\']",
+                                              chap, _re.IGNORECASE)
+                            if m:
+                                ref = _uq(m.group(1))
+                                cover_href = os.path.normpath(
+                                    os.path.join(os.path.dirname(chapter_path), ref)).replace("\\", "/")
+                        except Exception:
+                            pass
+            if not cover_href:
+                return Response("no cover", status_code=404)
+
+            cover_path = cover_href
+            # If from manifest, resolve relative to opf_dir
+            if "/" not in cover_path or not cover_path.startswith(opf_dir or ""):
+                if opf_dir and not cover_path.startswith(opf_dir):
+                    cover_path = (opf_dir + "/" + cover_href).lstrip("/")
+            cover_path = _re.sub(r"/+", "/", cover_path)
+            try:
+                data = zf.read(cover_path)
+            except KeyError:
+                # try common locations
+                for guess in [cover_href, "OEBPS/" + cover_href, "OPS/" + cover_href]:
+                    try:
+                        data = zf.read(guess)
+                        break
+                    except KeyError:
+                        continue
+                else:
+                    return Response("cover file missing", status_code=404)
+
+            ext = cover_path.rsplit(".", 1)[-1].lower() if "." in cover_path else "jpg"
+            return Response(
+                content=data,
+                media_type=_EPUB_MIME.get(ext, "image/jpeg"),
+                headers={"Cache-Control": "public, max-age=86400"})
+    except Exception as e:
+        return Response(f"cover error: {e}", status_code=500)
 
 
 @app.get("/epub/{msg_id}/asset/{asset_path:path}")
@@ -1239,7 +1334,8 @@ body:has(.player-bar) .content { padding-bottom:110px; }
 .book-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(380px, 1fr)); gap:16px; }
 .book-card { display:flex; gap:16px; padding:18px 20px; background:var(--surface); border:1px solid var(--border); border-radius:8px; box-shadow:var(--shadow); align-items:center; transition:transform 0.1s, box-shadow 0.1s; }
 .book-card:hover { transform:translateY(-2px); box-shadow:0 8px 20px rgba(15,23,42,0.10); }
-.book-card .book-ico { font-size:48px; flex-shrink:0; line-height:1; }
+.book-card .book-ico { font-size:48px; flex-shrink:0; line-height:1; width:60px; height:80px; display:flex; align-items:center; justify-content:center; }
+.book-card .book-cover { width:60px; height:80px; object-fit:cover; border-radius:3px; flex-shrink:0; box-shadow:0 1px 4px rgba(0,0,0,0.15); }
 .book-card .book-body { flex:1; min-width:0; }
 .book-card .book-title { font-weight:700; font-size:15px; line-height:1.35; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .book-card .book-meta { margin-top:8px; font-size:13px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -2264,6 +2360,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
     if not login.session_exists() and not n:
         return RedirectResponse("/login")
 
+    _lib_my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         cached_n = await conn.fetchval(
             r"""SELECT count(*) FROM messages
@@ -2275,6 +2372,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
                  AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'""")
         rows = await conn.fetch(f"""
             SELECT m.id, m.file_name, m.file_size, m.mime_type, m.caption, m.posted_at,
+                   m.local_path, m.file_dc,
                    c.title AS ch_title, c.username AS ch_user
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
@@ -2305,10 +2403,14 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
 
     items = "".join(
         f'<div class="book-card">'
-        f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>'
-        f'<div class="book-body">'
+        + (f'<img class="book-cover" src="/epub/{r["id"]}/cover" alt="" '
+           f'onerror="this.outerHTML=\'<div class=&quot;book-ico&quot;>{_ico(_ext(r["file_name"]))}</div>\'" />'
+           if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]).lower() in ("EPUB","MOBI","AZW","AZW3")
+           else f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>')
+        + f'<div class="book-body">'
         f'<div class="book-title">{html.escape(r["file_name"] or "(untitled)")}</div>'
         f'<div class="book-meta">'
+        f'{_dc_badge(r.get("file_dc"), _lib_my_dc)}'
         f'<span class="pill accent">{_ext(r["file_name"])}</span>'
         f'<span class="pill muted">{_fmt_size(r["file_size"])}</span>'
         f'<span>· {html.escape(r["ch_title"] or "")}</span>'
