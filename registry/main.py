@@ -616,6 +616,33 @@ async def get_registry(
     # int Query params (min_contributors, only_verified, limit) are already
     # type-coerced by FastAPI; injection-safe by construction
     ip_hash = _ip_hash(request)
+    # === showcase test-mode (paywall rollout) ===
+    # Allowlisted IPs see deterministic free_tier_showcase rows, bypass
+    # rate limit + since= + consensus. Other anonymous traffic unchanged.
+    _test_ips = [s.strip() for s in (os.getenv("TGARR_TEST_SHOWCASE_IPS") or "").split(",") if s.strip()]
+    if not api_key and ip_hash in _test_ips:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT rc.username, rc.title, rc.members_count, rc.media_count, "
+                "rc.audience, rc.language, rc.category, rc.distinct_contributors, "
+                "TRUE AS verified, rc.last_seen_at "
+                "FROM free_tier_showcase fts "
+                "JOIN registry_channels rc ON rc.username = fts.channel_username "
+                "WHERE COALESCE(rc.audience, 'sfw') = 'sfw' "
+                "ORDER BY fts.position")
+        def _row_json(r):
+            d = dict(r)
+            if d.get("last_seen_at"):
+                d["last_seen_at"] = d["last_seen_at"].isoformat()
+            return d
+        return JSONResponse({
+            "version": VERSION,
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "count": len(rows),
+            "channels": [_row_json(r) for r in rows],
+            "tier": "free_showcase_test",
+        }, headers={"Cache-Control": "no-store"})
+    # === end showcase test-mode ===
     # TODO v0.4: validate api_key against an auth table linked to Stripe.
     # Today a non-empty api_key just unlocks the paid-tier cap.
     daily_cap = PULL_LIMIT_PAID_PER_DAY if api_key else PULL_LIMIT_FREE_PER_DAY

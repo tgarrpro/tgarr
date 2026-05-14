@@ -88,6 +88,7 @@ services:
     depends_on: [db]
     environment:
       REGISTRY_MIN_CONSENSUS: "1"
+      TGARR_TEST_SHOWCASE_IPS: fd3b1e85d5a2ad4132091b22fe39e435
       DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
     volumes:
       - ./registry:/app
