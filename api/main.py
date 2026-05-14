@@ -25,11 +25,48 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.44"
+TGARR_VERSION = "0.4.45"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
 db_pool: Optional[asyncpg.Pool] = None
+
+
+async def _ebook_queue_restore() -> None:
+    """On boot, scan /downloads/library for .queue markers and re-queue.
+    Survives container restart so user's request from hours ago still completes.
+    """
+    import asyncio, glob
+    log = logging.getLogger("tgarr.ebook_restore")
+    await asyncio.sleep(20)  # let DB pool + other startup tasks settle
+    # Best-effort scan; if /downloads is unavailable just exit
+    if not os.path.isdir("/downloads/library"):
+        return
+    markers = glob.glob("/downloads/library/*.queue")
+    if not markers:
+        log.info("[ebook-restore] no queued conversions to restore")
+        return
+    log.info("[ebook-restore] found %d queue markers", len(markers))
+    for marker in markers:
+        try:
+            with open(marker) as f:
+                mid = int(f.read().strip())
+            src = marker[:-len(".queue")]
+            pdf = src + ".pdf"
+            # If PDF already exists + newer than src, cleanup stale marker
+            if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
+                os.unlink(marker)
+                continue
+            if not os.path.exists(src):
+                os.unlink(marker)
+                continue
+            # Re-queue
+            _t_task = asyncio.create_task(_ebook_to_pdf(src, pdf, msg_id=mid))
+            _EBOOK_BG_TASKS.add(_t_task)
+            _t_task.add_done_callback(_EBOOK_BG_TASKS.discard)
+            log.info("[ebook-restore] re-queued msg_id=%s src=%s", mid, src)
+        except Exception as e:
+            log.warning("[ebook-restore] skip %s: %s", marker, e)
 
 
 @app.on_event("startup")
@@ -49,6 +86,7 @@ async def _startup():
                     "ON CONFLICT (key) DO NOTHING", env_key)
     asyncio.create_task(_metadata_worker())
     asyncio.create_task(_audio_metadata_worker())
+    asyncio.create_task(_ebook_queue_restore())
 
 
 async def _migrate_schema():
@@ -609,11 +647,21 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
     import asyncio
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return True
+    import time as _t
+    # Mark queued + write disk marker for restart persistence
+    if msg_id not in _EBOOK_JOBS or _EBOOK_JOBS[msg_id].get("state") == "failed":
+        _EBOOK_JOBS[msg_id] = {"state": "queued", "queued_at": _t.time()}
+    try:
+        open(src + ".queue", "w").write(str(msg_id))
+    except OSError:
+        pass
     async with _ebook_semaphore():  # cap concurrent conversions
       async with _ebook_lock(msg_id):
         if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
+            _EBOOK_JOBS.pop(msg_id, None)
+            try: os.unlink(src + ".queue")
+            except OSError: pass
             return True
-        import time as _t
         _EBOOK_JOBS[msg_id] = {"state": "converting", "started_at": _t.time()}
         env = dict(os.environ)
         env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
@@ -623,7 +671,7 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         def _set_limits():
             import resource
             # RLIMIT_AS dropped: Chromium virt mem >> resident, container mem_limit is real bound
-            resource.setrlimit(resource.RLIMIT_CPU, (240, 240))
+            resource.setrlimit(resource.RLIMIT_CPU, (1800, 1800))  # 30 min CPU cap
             # RLIMIT_FSIZE dropped: calibre temp files can be >200MB
         proc = await asyncio.create_subprocess_exec(
             "ebook-convert", src, tmp,
@@ -631,7 +679,7 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
             stderr=asyncio.subprocess.PIPE,
             env=env, preexec_fn=_set_limits)
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=240)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
         except asyncio.TimeoutError:
             proc.kill()
             print(f'[ebook-convert] TIMEOUT src={src}', flush=True)
@@ -641,10 +689,13 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         if proc.returncode == 0 and os.path.exists(tmp):
             os.rename(tmp, pdf)
             _EBOOK_JOBS.pop(msg_id, None)
+            try: os.unlink(src + ".queue")
+            except OSError: pass
             return True
         if os.path.exists(tmp):
             os.unlink(tmp)
         _EBOOK_JOBS[msg_id] = {"state": "failed", "started_at": _EBOOK_JOBS.get(msg_id, {}).get("started_at", 0)}
+        # Keep .queue marker so restart will retry
         return False
 
 
@@ -686,11 +737,6 @@ async def ebook_status(msg_id: int, request: Request):
         return {"state": "ready", "url": f"/media/{msg_id}"}
     if ext not in _EBOOK_CONVERTIBLE:
         return {"state": "failed", "reason": f"unsupported format .{ext}"}
-    if os.path.getsize(src) > 50 * 1024 * 1024:
-        return {"state": "too_large",
-                "reason": "too large for in-browser PDF (>50MB)",
-                "src_size": os.path.getsize(src),
-                "download_url": f"/media/{msg_id}"}
     if not _ebook_safe_to_convert(src, ext):
         return {"state": "failed", "reason": "file rejected: zip-bomb or malformed"}
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
@@ -702,6 +748,19 @@ async def ebook_status(msg_id: int, request: Request):
         return {"state": "converting",
                 "src_size": os.path.getsize(src),
                 "elapsed_s": int(_t.time() - job["started_at"])}
+    if job and job.get("state") == "queued":
+        import time as _t
+        # Position = how many queued/converting jobs queued BEFORE this one
+        ahead = sum(1 for mid, j in _EBOOK_JOBS.items()
+                    if mid != msg_id
+                    and j.get("state") in ("queued", "converting")
+                    and j.get("queued_at", 0) < job.get("queued_at", _t.time()))
+        src_mb = os.path.getsize(src) / (1024 * 1024)
+        return {"state": "queued",
+                "position": ahead + 1,
+                "src_size": os.path.getsize(src),
+                "eta_s": int(60 + ahead * 90 + src_mb * 2),
+                "waited_s": int(_t.time() - job["queued_at"])}
     if job and job.get("state") == "failed":
         return {"state": "failed", "reason": "conversion error — check api logs"}
     # Not started — fire background task. Lock prevents duplicate work.
@@ -739,11 +798,6 @@ async def ebook_pdf(msg_id: int):
     if ext not in _EBOOK_CONVERTIBLE:
         return Response(f"format .{ext} not supported by ebook-convert",
                         status_code=415)
-    if os.path.getsize(src) > 50 * 1024 * 1024:
-        return Response(
-            "ebook too large for in-browser PDF conversion (>50MB). "
-            f"download raw at /media/{msg_id} and open in Calibre/Foliate locally.",
-            status_code=413)
     if not _ebook_safe_to_convert(src, ext):
         return Response("file rejected: zip-bomb or malformed archive", status_code=422)
     ok = await _ebook_to_pdf(src, pdf, msg_id=msg_id)
@@ -1150,7 +1204,7 @@ function renderPlayer() {{
       '<div class="status" id="ebookStatus">checking…</div>' +
       '<div class="progress"><div id="ebookBar"></div></div>' +
       '<div class="hint">first open of a non-PDF ebook converts to PDF via calibre. ' +
-      'small books (<10MB): ~20s. medium: 1–2 min. large (40–50MB): 3–5 min. ' +
+      'small books (<10MB): ~20s. medium: 1–2 min. big books (50MB+) queue automatically — leave the page, conversion continues in background, come back later (a few minutes to hours for very large books). ' +
       'subsequent opens are instant.</div>' +
       '<div class="hint" id="ebookElapsed" style="margin-top:6px"></div>';
     main.innerHTML = "";
@@ -1176,15 +1230,14 @@ function renderPlayer() {{
           document.getElementById("ebookStatus").textContent = "✗ source not cached";
           return;
         }}
-        if (j.state === "too_large") {{
-          main.innerHTML = '<div class="loader"><div class="ico">⚠️</div>' +
-            '<div class="status">book too large for in-browser PDF (' + fmtBytes(j.src_size) + ')</div>' +
-            '<div class="hint">calibre needs 5–10 min + 2 GB RAM for this size. ' +
-            'download raw + open in Calibre/Foliate desktop.</div>' +
-            '<div style="margin-top:18px"><a class="btn" href="' + j.download_url + '" download>⬇ download raw</a></div></div>';
-          return;
+
+        let msg;
+        if (j.state === "queued") {{
+          msg = `queued — position ${{j.position}} in line`;
+          if (j.eta_s) msg += ` · est wait ~${{Math.ceil(j.eta_s/60)}} min`;
+        }} else {{
+          msg = "converting…";
         }}
-        let msg = j.state === "queued" ? "queued for conversion…" : "converting…";
         if (j.src_size) msg += ` (source ${{fmtBytes(j.src_size)}})`;
         document.getElementById("ebookStatus").textContent = msg;
         if (j.out_size && j.out_size !== lastSize) {{
