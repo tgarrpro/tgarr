@@ -600,7 +600,7 @@ async def _ebook_cover(src: str, cover: str) -> bool:
 
 
 @app.get("/api/ebook-status/{msg_id}")
-async def ebook_status(msg_id: int, background_tasks: BackgroundTasks):
+async def ebook_status(msg_id: int):
     """Return ebook conversion status + trigger background convert if needed.
     States: no_source | ready | converting | queued | failed.
     """
