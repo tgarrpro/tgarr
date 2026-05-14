@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.23"
+TGARR_VERSION = "0.4.24"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -532,6 +532,9 @@ function renderPlayer() {{
     // Embed epub.js reader (works best with .epub; mobi/azw partial support)
     main.innerHTML = `<div id="epub-area" style="width:1200px;max-width:96vw;height:85vh;background:#fff;color:#111;border-radius:6px"></div>
       <div style="margin-top:12px;color:#94a3b8;font-size:13px">← → arrow keys to flip pages · <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
+    const jz = document.createElement("script");
+    jz.src = "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js";
+    document.head.appendChild(jz);
     const s = document.createElement("script");
     s.src = "https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js";
     s.onload = () => {{
