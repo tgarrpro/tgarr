@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.5"
+TGARR_VERSION = "0.4.6"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -668,7 +668,8 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; overflow:hidden; box-shadow:var(--shadow); display:flex; flex-direction:column; transition:transform 0.12s, box-shadow 0.12s; }
 .poster-card:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,0.12); border-color:var(--accent); }
 .poster-card .poster { aspect-ratio:2/3; background:#f1f5f9; background-size:cover; background-position:center; position:relative; }
-.poster-card .poster .fallback { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; }
+.poster-card .poster .fallback { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:56px; color:#cbd5e1; z-index:1; }
+poster-card .poster .poster-img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; z-index:2; }
 .poster-card .poster .badge { position:absolute; top:8px; right:8px; padding:3px 10px; border-radius:11px; background:rgba(15,23,42,0.78); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; backdrop-filter:blur(4px); }
 .poster-card .info { padding:12px 14px 8px; flex:1; }
 .poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
@@ -1845,20 +1846,28 @@ def _release_card(r) -> str:
     sub_bits = [b for b in (se, posted) if b]
     cat_pill = ("accent" if r["category"] == "movie"
                 else "ok" if r["category"] == "tv" else "muted")
+    # Always render the emoji fallback in the DOM and let the <img> overlay
+    # cover it. If the img 404s/410s the browser onerror hides the img and
+    # the emoji shows through. CSS .poster .fallback is absolute-positioned;
+    # .poster-img is z-index:2 stacked on top.
+    fallback = '<div class="fallback">🎬</div>'
     if poster:
-        poster_style = f'style="background-image:url(\'{html.escape(poster)}\')"'
-        fallback = ""
+        img_src = html.escape(poster)
     elif pmid:
-        poster_style = f'style="background-image:url(\'/api/thumb/{pmid}\')"'
-        fallback = ""
+        img_src = f"/api/thumb/{pmid}"
     else:
-        poster_style = ""
-        fallback = '<div class="fallback">🎬</div>'
+        img_src = ""
+    poster_style = ""
+    if img_src:
+        poster_img = (f'<img class="poster-img" src="{img_src}" loading="lazy" '
+                      f'alt="" onerror="this.style.display=\'none\'" />')
+    else:
+        poster_img = ""
     quality_badge = (f'<div class="badge">{html.escape(r["quality"])}</div>'
                      if r["quality"] else "")
     return (
         f'<div class="poster-card">'
-        f'<div class="poster" {poster_style}>{fallback}{quality_badge}</div>'
+        f'<div class="poster" {poster_style}>{fallback}{poster_img}{quality_badge}</div>'
         f'<div class="info">'
         f'<div class="title">{html.escape(title_disp)}</div>'
         f'<div class="sub">{" · ".join(html.escape(x) for x in sub_bits)}</div>'
