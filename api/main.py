@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.37"
+TGARR_VERSION = "0.4.38"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -547,7 +547,7 @@ async def _ebook_to_pdf(src: str, pdf: str) -> bool:
     env = dict(os.environ)
     env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
     env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
-    tmp = pdf + ".tmp"
+    tmp = pdf + ".inprogress.pdf"
     proc = await asyncio.create_subprocess_exec(
         "ebook-convert", src, tmp,
         stdout=asyncio.subprocess.PIPE,
