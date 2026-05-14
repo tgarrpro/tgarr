@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.28"
+TGARR_VERSION = "0.4.29"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -488,12 +488,24 @@ async def epub_render(msg_id: int):
 
                 body_html = _re.sub(r"<img[^>]*\bsrc=[\"\']([^\"\']+)[\"\']",
                                    lambda mm: fix_ref(mm, "src"), body_html)
+                # SVG covers use <image xlink:href="..."> or <image href="...">
+                body_html = _re.sub(r"<image[^>]*\b(?:xlink:)?href=[\"\']([^\"\']+)[\"\']",
+                                   lambda mm: fix_ref(mm, "href"), body_html)
+                # Strip <link rel=stylesheet> — chapter CSS would leak into reader
+                body_html = _re.sub(r"<link[^>]*\brel=[\"\']stylesheet[\"\'][^>]*/?>", "",
+                                   body_html, flags=_re.IGNORECASE)
                 # Strip <script> blocks (no JS in our reader)
                 body_html = _re.sub(r"<script[^>]*>.*?</script>", "",
                                    body_html, flags=_re.DOTALL | _re.IGNORECASE)
                 # Strip inline event handlers (onclick="...")
                 body_html = _re.sub(r"\son[a-z]+\s*=\s*[\"\'][^\"\']*[\"\']", "",
                                    body_html, flags=_re.IGNORECASE)
+                # Clamp SVG: epubs embed cover as <svg width="100%" height="100%">
+                # which expands to whole viewport. Strip width/height so our CSS wins.
+                body_html = _re.sub(r"(<svg[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
+                                   r"\1", body_html, count=2, flags=_re.IGNORECASE)
+                body_html = _re.sub(r"(<image[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
+                                   r"\1", body_html, count=2, flags=_re.IGNORECASE)
 
                 chapters_html.append(body_html)
 
@@ -520,6 +532,8 @@ async def epub_render(msg_id: int):
             ".book p{margin:1em 0;text-indent:2em}"
             ".book img{max-width:100%;height:auto;display:block;margin:1.8em auto;"
             "border-radius:4px}"
+            ".book svg{max-width:420px;width:100%;height:auto;display:block;margin:0 auto 2em}"
+            ".book svg image{width:100%;height:auto}"
             ".book a{color:#3b82f6;text-decoration:none}"
             ".book a:hover{text-decoration:underline}"
             ".book blockquote{margin:1.4em 0;padding:0.4em 1.4em;border-left:4px solid #93c5fd;"
