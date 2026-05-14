@@ -33,6 +33,66 @@ RX_LANG = re.compile(
     r"\b(Hindi|Tamil|Telugu|Malayalam|Kannada|Bengali|Punjabi|English|Russian|Persian|Farsi|Arabic|Chinese|Mandarin|Cantonese|Japanese|Korean|Vietnamese|Indonesian|Thai|Spanish|Castellano|Portuguese|Brazilian|French|German|Italian|Turkish|Urdu|Marathi|Gujarati|Polish|Dutch|Greek|Hebrew|Multi|Dual[-_. ]?Audio|Eng[-_. ]?Sub|Eng[-_. ]?Subs?)\b",
     re.IGNORECASE,
 )
+
+# === regional extensions ===
+
+# CJK/full-width brackets: 【】「」『』 + half-width 〔〕
+RX_CJK_BRACKETS = re.compile(r"[【「『〔][^】」』〕]*[】」』〕]")
+
+# Chinese audio/subtitle/source descriptors → map to standard fields
+RX_CN_QUALITY = re.compile(r"(蓝光原盘|蓝光|藍光|超清|高清|原盘|原碟|国英双语|国粤双语|国语|粤语|英语|双语|中字|简繁字幕|繁字|内嵌字幕|外挂字幕|内封字幕|HD国语|4K高清|4K HDR|HDR10\+?)", re.IGNORECASE)
+_CN_QUALITY_MAP = {
+    "蓝光": ("source", "BluRay"), "藍光": ("source", "BluRay"),
+    "蓝光原盘": ("source", "BluRay"), "原盘": ("source", "BluRay"),
+    "原碟": ("source", "BluRay"),
+    "超清": ("quality", "1080p"), "高清": ("quality", "720p"),
+    "4K高清": ("quality", "2160p"), "4K HDR": ("quality", "2160p"),
+    "HD国语": ("quality", "720p"),
+    "国语": ("language", "Mandarin"), "粤语": ("language", "Cantonese"),
+    "国英双语": ("language", "Mandarin"), "国粤双语": ("language", "Mandarin"),
+    "双语": ("language", "Dual"), "英语": ("language", "English"),
+    "中字": ("subtitle", "ChsSub"), "繁字": ("subtitle", "ChtSub"),
+    "简繁字幕": ("subtitle", "ChsCht"), "内嵌字幕": ("subtitle", "Hardcoded"),
+    "外挂字幕": ("subtitle", "Softsub"), "内封字幕": ("subtitle", "Embedded"),
+    "HDR10": ("hdr", "HDR10"), "HDR10+": ("hdr", "HDR10+"),
+}
+
+# Chinese season/episode: 第N季 / 第N集 / 第N话 / 第N期 / EP12 / 12集
+RX_CN_SEASON = re.compile(r"第\s*(\d{1,3})\s*[季部]")
+RX_CN_EPISODE = re.compile(r"(?:第\s*)?(\d{1,3})\s*(?:集|话|話|期|话)")
+RX_CN_EPISODE_RANGE = re.compile(r"(\d{1,3})\s*[-—~]\s*(\d{1,3})\s*集")
+
+# Arabic language/release tags
+RX_AR_LANG = re.compile(r"(العربية|مدبلج|مترجم|دبلجة|ترجمة)")
+# Persian/Farsi
+RX_FA_LANG = re.compile(r"(فارسی|دوبله|زیرنویس|دانلود)")
+# Korean
+RX_KR_LANG = re.compile(r"(한국어|자막|더빙)")
+# Japanese
+RX_JP_LANG = re.compile(r"(日本語|字幕|吹替|生放送|RAW)\b", re.IGNORECASE)
+# Russian
+RX_RU_LANG = re.compile(r"(Русский|Дубляж|субтитры)", re.IGNORECASE)
+# Spanish / Brazilian Portuguese variants
+RX_ES_PT_LANG = re.compile(r"\b(Castellano|Latino|Español|Dublado|Legendado|Brazilian|BR-PT|ES-LA|ES-ES)\b", re.IGNORECASE)
+# Turkish
+RX_TR_LANG = re.compile(r"\b(Türkçe|TR-DUB|TR-SUB)\b", re.IGNORECASE)
+
+# Extended release groups by region (boosts group detection beyond Latin-letter-only RX_GROUP)
+# CN: CMCT, WiKi, FRDS, HDS, HDChina, TLF, HDH, NTb, MTeam, Yuanma, Mp4Ba, DBTV
+# AR: KILLERS, EgyDead, ArabSeed, FaridT
+# IN: TG, RZRBX, SaiKrishna, GalaxyRG, ESub
+# TR: SAMETMAC, TRG
+# Anime: SubsPlease, Erai-raws, Judas, ASW
+RX_REGIONAL_GROUP = re.compile(
+    r"[-\.\[]"
+    r"(CMCT|WiKi|FRDS|HDS|HDChina|TLF|HDH|NTb|MTeam|Yuanma|Mp4Ba|DBTV|"
+    r"KILLERS|EgyDead|ArabSeed|FaridT|"
+    r"TG|RZRBX|SaiKrishna|GalaxyRG|ESub|"
+    r"SAMETMAC|TRG|"
+    r"SubsPlease|Erai-raws|Judas|ASW|HorribleSubs|Anime[-_. ]?Time)"
+    r"\b",
+    re.IGNORECASE,
+)
 RX_GROUP = re.compile(r"[-\.]([A-Z0-9][A-Z0-9._-]{2,15})$")
 RX_AT_HANDLE = re.compile(r"[@\[\(]\w[\w_]{2,30}[\]\)]?", re.IGNORECASE)
 RX_BRACKETS = re.compile(r"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}")
@@ -138,6 +198,64 @@ def parse_filename(name: str) -> dict:
             out["all_languages"] = langs
     strip(RX_LANG)
 
+    # === Regional language extractors (boost language detection) ===
+    if (m := RX_AR_LANG.search(work)):
+        out["language"] = out.get("language") or "Arabic"
+    if (m := RX_FA_LANG.search(work)):
+        out["language"] = out.get("language") or "Persian"
+    if (m := RX_KR_LANG.search(work)):
+        out["language"] = out.get("language") or "Korean"
+    if (m := RX_JP_LANG.search(work)):
+        out["language"] = out.get("language") or "Japanese"
+    if (m := RX_RU_LANG.search(work)):
+        out["language"] = out.get("language") or "Russian"
+    if (m := RX_ES_PT_LANG.search(work)):
+        out["language"] = out.get("language") or m.group(1).title()
+    if (m := RX_TR_LANG.search(work)):
+        out["language"] = out.get("language") or "Turkish"
+    # Strip them so they don't pollute the title
+    work = RX_AR_LANG.sub(" ", work)
+    work = RX_FA_LANG.sub(" ", work)
+    work = RX_KR_LANG.sub(" ", work)
+    work = RX_JP_LANG.sub(" ", work)
+    work = RX_RU_LANG.sub(" ", work)
+    work = RX_ES_PT_LANG.sub(" ", work)
+    work = RX_TR_LANG.sub(" ", work)
+
+    # === CN quality/source/audio/subtitle extraction ===
+    for m_ in RX_CN_QUALITY.finditer(work):
+        kw = m_.group(1)
+        if kw in _CN_QUALITY_MAP:
+            field, value = _CN_QUALITY_MAP[kw]
+            out.setdefault(field, value)
+    work = RX_CN_QUALITY.sub(" ", work)
+
+    # === CN season/episode (only if not already set by English regex) ===
+    if "season" not in out:
+        if (m_ := RX_CN_SEASON.search(work)):
+            out["season"] = int(m_.group(1))
+            out["type"] = "tv"
+            work = work[:m_.start()] + " " + work[m_.end():]
+    if "episode" not in out:
+        if (m_ := RX_CN_EPISODE_RANGE.search(work)):
+            out["episode"] = int(m_.group(1))
+            out["episode_end"] = int(m_.group(2))
+            out["type"] = "tv"
+            work = work[:m_.start()] + " " + work[m_.end():]
+        elif (m_ := RX_CN_EPISODE.search(work)):
+            ep_val = int(m_.group(1))
+            # Avoid catching years like "2024集" misfire — require small num
+            if ep_val <= 999:
+                out["episode"] = ep_val
+                out["type"] = "tv"
+                work = work[:m_.start()] + " " + work[m_.end():]
+
+    # === Regional release groups (extend Latin-letter RX_GROUP coverage) ===
+    if "group" not in out:
+        if (m_ := RX_REGIONAL_GROUP.search(work)):
+            out["group"] = m_.group(1)
+            work = work[:m_.start()]
+
     if (m := RX_GROUP.search(work)):
         # Heuristic: group must be at very end and not a common false-positive
         cand = m.group(1)
@@ -148,6 +266,7 @@ def parse_filename(name: str) -> dict:
     # Strip @channel handles and bracketed annotations.
     work = RX_AT_HANDLE.sub(" ", work)
     work = RX_BRACKETS.sub(" ", work)
+    work = RX_CJK_BRACKETS.sub(" ", work)
 
     # Cut at year if present (title is everything before the year).
     if "year" in out:
@@ -191,6 +310,10 @@ def parse_filename(name: str) -> dict:
         s += 0.05
     if out.get("group"):
         s += 0.05
+    if out.get("subtitle"):
+        s += 0.03
+    if out.get("language"):
+        s += 0.02
     out["score"] = round(min(s, 1.0), 2)
 
     return out
@@ -225,6 +348,28 @@ def to_release_name(parsed: dict, fallback: str = "") -> str:
 
 if __name__ == "__main__":
     TESTS = [
+        # CN
+        "霸王别姬.1993.4K.HDR.x265-CMCT.mkv",
+        "【4K高清】流浪地球2.2023.国语中字-FRDS.mkv",
+        "甄嬛传.第3季.第15集.1080p.WEB-DL.x264-HDH.mkv",
+        "[BluRay]肖申克的救赎.1994.蓝光原盘.内嵌字幕-WiKi.mkv",
+        # AR
+        "Loki.S02E03.1080p.WEB-DL.مترجم.x264-EgyDead.mkv",
+        # FA
+        "Avatar.2022.1080p.BluRay.دوبله.فارسی.x265.mkv",
+        # IN
+        "[Hindi+Tamil+Telugu] RRR.2022.1080p.BluRay.DD5.1.x264.mkv",
+        "Pathaan.2023.1080p.WEB-DL.HQ.Hindi.x264-RZRBX.mkv",
+        # JP/anime
+        "[SubsPlease] Frieren - 28 (1080p).mkv",
+        "進撃の巨人.S04E28.1080p.WEB.RAW.mkv",
+        # KR
+        "오징어게임.S01E01.1080p.NF.WEB-DL.한국어.자막.x264.mkv",
+        # ES/PT
+        "Casa.de.Papel.S05E10.1080p.Latino.Castellano.mkv",
+        # TR
+        "Diriliş.Ertuğrul.S05E150.1080p.WEB-DL.Türkçe.x264-SAMETMAC.mkv",
+        # English baseline
         "Avengers.Endgame.2019.1080p.BluRay.x264-AMIABLE.mkv",
         "Game.of.Thrones.S08E06.1080p.WEB-DL.x265.mkv",
         "Soni.2019.720p.@HindiHDCinema.mkv",

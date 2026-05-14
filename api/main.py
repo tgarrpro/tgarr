@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.46"
+TGARR_VERSION = "0.4.47"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -264,6 +264,7 @@ async def _stats_snapshot_worker():
         "channels":  "SELECT count(*) FROM channels",
         "messages":  "SELECT count(*) FROM messages",
         "releases":  "SELECT count(*) FROM releases",
+        "videos":    "SELECT count(*) FROM messages WHERE media_type='video'",
         "photos":    "SELECT count(*) FROM messages WHERE media_type='photo'",
         "audio":     "SELECT count(*) FROM messages WHERE media_type='audio'",
         "books":     ("SELECT count(*) FROM messages WHERE media_type='document'"
@@ -1998,7 +1999,7 @@ async function tgGrab(btn) {{
 @app.get("/api/stats/history")
 async def stats_history(metric: str, days: int = 7):
     """Time-series for one metric. Daily resolution. Returns [{at, value}]."""
-    if metric not in ("channels", "messages", "releases", "photos",
+    if metric not in ("channels", "messages", "releases", "videos", "photos",
                       "audio", "books", "completed"):
         return JSONResponse({"error": "unknown metric"}, status_code=400)
     days = max(1, min(days, 365))
@@ -2029,6 +2030,8 @@ async def root(accept: Optional[str] = Header(None)):
             """SELECT (SELECT count(*) FROM channels)                AS channels,
                       (SELECT count(*) FROM messages)                AS messages,
                       (SELECT count(*) FROM releases)                AS releases,
+                      (SELECT count(*) FROM messages
+                         WHERE media_type='video')                   AS videos,
                       (SELECT count(*) FROM messages
                          WHERE media_type='photo')                   AS photos,
                       (SELECT count(*) FROM messages
@@ -2070,6 +2073,7 @@ async def root(accept: Optional[str] = Header(None)):
             (s["channels"], "channels"),
             (s["messages"], "messages indexed"),
             (s["releases"], "parsed releases"),
+            (s["videos"], "videos"),
             (s["photos"], "photos"),
             (s["audio"], "audio"),
             (s["books"], "books"),
@@ -2086,6 +2090,7 @@ async def root(accept: Optional[str] = Header(None)):
       <div class="chart-controls">
         <select id="growthMetric">
           <option value="messages" selected>messages</option>
+          <option value="videos">videos</option>
           <option value="releases">releases</option>
           <option value="channels">channels</option>
           <option value="photos">photos</option>
