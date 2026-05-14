@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.34"
+TGARR_VERSION = "0.4.35"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -2174,14 +2174,20 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         # group will be deduped to one row, which is OK for now and the hash
         # backfill task fills them in.
         rows = await conn.fetch(f"""
+            WITH dup_agg AS (
+              SELECT thumb_md5, count(*) AS dup_count
+              FROM messages
+              WHERE thumb_md5 IS NOT NULL
+              GROUP BY thumb_md5
+            )
             SELECT * FROM (
               SELECT DISTINCT ON (COALESCE(m.thumb_md5, 'id-' || m.id::text))
                      m.id, m.thumb_path, m.thumb_md5, m.caption, m.posted_at,
                      c.title AS ch_title, c.username AS ch_user,
-                     (SELECT count(*) FROM messages m2
-                       WHERE m2.thumb_md5 = m.thumb_md5 AND m2.thumb_md5 IS NOT NULL) AS dup_count
+                     COALESCE(d.dup_count, 0) AS dup_count
               FROM messages m
               JOIN channels c ON c.id = m.channel_id
+              LEFT JOIN dup_agg d ON d.thumb_md5 = m.thumb_md5
               WHERE {' AND '.join(where)}
               ORDER BY COALESCE(m.thumb_md5, 'id-' || m.id::text), m.posted_at DESC NULLS LAST
             ) sub
