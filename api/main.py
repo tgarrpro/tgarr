@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.27"
+TGARR_VERSION = "0.4.28"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -405,6 +405,165 @@ async def _get_my_dc() -> Optional[int]:
     return None
 
 
+
+import zipfile as _zipfile
+from urllib.parse import quote as _q, unquote as _uq
+import re as _re
+
+_EPUB_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp",
+    "css": "text/css", "html": "text/html", "xhtml": "application/xhtml+xml",
+    "js": "application/javascript", "ttf": "font/ttf", "otf": "font/otf",
+    "woff": "font/woff", "woff2": "font/woff2",
+}
+
+
+def _epub_locate(msg_id, db_row):
+    """Resolve disk path of the .epub or return None."""
+    if not db_row or not db_row["local_path"] or db_row["local_path"].startswith("__"):
+        return None
+    p = os.path.join("/downloads", db_row["local_path"])
+    return p if os.path.exists(p) else None
+
+
+@app.get("/epub/{msg_id}", response_class=HTMLResponse)
+async def epub_render(msg_id: int):
+    """Server-side epub renderer. Concatenates spine chapters into one
+    long HTML page, rewrites image refs, applies CJK-friendly typography.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+    epub_path = _epub_locate(msg_id, row)
+    if not epub_path:
+        return HTMLResponse("<h1>not cached</h1>", status_code=404)
+    title = row["file_name"] or f"book-{msg_id}"
+    try:
+        with _zipfile.ZipFile(epub_path) as zf:
+            # Find OPF via META-INF/container.xml
+            container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+            from xml.etree import ElementTree as _ET
+            ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+            opf_node = _ET.fromstring(container).find(".//c:rootfile", ns_c)
+            if opf_node is None:
+                raise RuntimeError("OPF not declared in container.xml")
+            opf_path = opf_node.attrib["full-path"]
+            opf_dir = os.path.dirname(opf_path).replace("\\", "/")
+            opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+            ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
+            manifest = {item.attrib["id"]: item.attrib["href"]
+                        for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf)}
+            spine_ids = [item.attrib["idref"]
+                         for item in opf_root.findall(".//opf:spine/opf:itemref", ns_opf)]
+
+            chapters_html = []
+            for idref in spine_ids:
+                href = manifest.get(idref)
+                if not href:
+                    continue
+                href = _uq(href)
+                chapter_path = (opf_dir + "/" + href).lstrip("/") if opf_dir else href
+                chapter_path = _re.sub(r"/+", "/", chapter_path)
+                try:
+                    raw = zf.read(chapter_path)
+                except KeyError:
+                    continue
+                raw_html = raw.decode("utf-8", errors="replace")
+                # Extract <body>
+                m = _re.search(r"<body[^>]*>(.*?)</body>", raw_html,
+                              _re.DOTALL | _re.IGNORECASE)
+                body_html = m.group(1) if m else raw_html
+
+                # Rewrite img/css refs to /epub/{id}/asset/<absolute-in-zip>
+                chapter_dir = os.path.dirname(chapter_path).replace("\\", "/")
+                def fix_ref(match, attr):
+                    src = _uq(match.group(1))
+                    if src.startswith(("http://", "https://", "data:", "/")):
+                        return match.group(0)
+                    abs_in_zip = os.path.normpath(
+                        os.path.join(chapter_dir, src)).replace("\\", "/")
+                    new_url = f"/epub/{msg_id}/asset/{_q(abs_in_zip)}"
+                    return match.group(0).replace(match.group(1), new_url)
+
+                body_html = _re.sub(r"<img[^>]*\bsrc=[\"\']([^\"\']+)[\"\']",
+                                   lambda mm: fix_ref(mm, "src"), body_html)
+                # Strip <script> blocks (no JS in our reader)
+                body_html = _re.sub(r"<script[^>]*>.*?</script>", "",
+                                   body_html, flags=_re.DOTALL | _re.IGNORECASE)
+                # Strip inline event handlers (onclick="...")
+                body_html = _re.sub(r"\son[a-z]+\s*=\s*[\"\'][^\"\']*[\"\']", "",
+                                   body_html, flags=_re.IGNORECASE)
+
+                chapters_html.append(body_html)
+
+        body = "<hr class='chap-sep'/>".join(chapters_html)
+        css = (
+            "html,body{margin:0;padding:0}"
+            "body{background:#f5f7fa;font-family:'PingFang SC','Microsoft YaHei',"
+            "'Noto Sans CJK SC','Hiragino Sans GB',system-ui,sans-serif}"
+            ".bar{position:sticky;top:0;background:#fff;padding:12px 20px;"
+            "border-bottom:1px solid #e2e8f0;z-index:10;display:flex;gap:14px;"
+            "align-items:center;box-shadow:0 1px 4px rgba(0,0,0,0.04)}"
+            ".bar a{color:#64748b;text-decoration:none;font-size:14px}"
+            ".bar a:hover{color:#0f172a}"
+            ".bar .title{font-weight:600;color:#0f172a;flex:1;overflow:hidden;"
+            "text-overflow:ellipsis;white-space:nowrap}"
+            ".book{max-width:760px;margin:30px auto;padding:50px 56px;"
+            "background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,0.08);"
+            "font-size:17px;line-height:1.9;color:#1f2937}"
+            ".book h1,.book h2,.book h3,.book h4{color:#0f172a;font-weight:600;"
+            "margin:1.8em 0 0.6em;line-height:1.4}"
+            ".book h1{font-size:1.6em;border-bottom:2px solid #e2e8f0;padding-bottom:0.4em}"
+            ".book h2{font-size:1.35em}"
+            ".book h3{font-size:1.15em}"
+            ".book p{margin:1em 0;text-indent:2em}"
+            ".book img{max-width:100%;height:auto;display:block;margin:1.8em auto;"
+            "border-radius:4px}"
+            ".book a{color:#3b82f6;text-decoration:none}"
+            ".book a:hover{text-decoration:underline}"
+            ".book blockquote{margin:1.4em 0;padding:0.4em 1.4em;border-left:4px solid #93c5fd;"
+            "color:#475569;background:#f1f5f9;border-radius:0 6px 6px 0}"
+            "hr.chap-sep{border:none;border-top:1px dashed #cbd5e1;margin:3em 0}"
+            "@media (max-width:768px){.book{margin:14px;padding:24px}}"
+        )
+        return HTMLResponse(
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>{html.escape(title)}</title>"
+            f"<style>{css}</style></head><body>"
+            f"<div class='bar'><a href='javascript:history.back()'>\u2190 back</a>"
+            f"<div class='title'>{html.escape(title)}</div>"
+            f"<a href='/media/{msg_id}' download>\u2b07 raw</a></div>"
+            f"<div class='book'>{body}</div></body></html>"
+        )
+    except Exception as e:
+        return HTMLResponse(
+            f"<h1>EPUB render failed</h1><pre>{html.escape(str(e))}</pre>"
+            f"<p><a href='/media/{msg_id}' download>Download raw .epub</a></p>",
+            status_code=500)
+
+
+@app.get("/epub/{msg_id}/asset/{asset_path:path}")
+async def epub_asset(msg_id: int, asset_path: str):
+    """Serve embedded asset (image / css / etc) from inside the .epub zip."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path FROM messages WHERE id=$1", msg_id)
+    epub_path = _epub_locate(msg_id, row)
+    if not epub_path:
+        return Response("not cached", status_code=404)
+    try:
+        with _zipfile.ZipFile(epub_path) as zf:
+            data = zf.read(_uq(asset_path))
+    except (KeyError, _zipfile.BadZipFile):
+        return Response("asset not found", status_code=404)
+    ext = asset_path.rsplit(".", 1)[-1].lower() if "." in asset_path else ""
+    return Response(
+        content=data,
+        media_type=_EPUB_MIME.get(ext, "application/octet-stream"),
+        headers={"Cache-Control": "public, max-age=3600"})
+
+
 @app.get("/api/media-status/{msg_id}")
 async def media_status(msg_id: int):
     """Lightweight status for /watch page polling.
@@ -529,53 +688,8 @@ function renderPlayer() {{
     return;
   }}
   if (["epub","mobi","azw","azw3"].includes(ext)) {{
-    // Embed epub.js reader (works best with .epub; mobi/azw partial support)
-    main.innerHTML = `<div id="epub-area" style="width:100%;max-width:1100px;background:#fff;color:#111;border-radius:6px;padding:0;min-height:60vh;margin:0 auto"></div>
-      <div style="margin-top:12px;color:#94a3b8;font-size:13px;text-align:center">scroll to read · <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
-    // Chain loads so the script execution order is guaranteed:
-    //   JSZip (required by epub.js archive mode) → epub.js → fetch+render
-    const showErr = msg => {{
-      document.getElementById("epub-area").innerHTML =
-        `<div style="padding:30px;color:#dc2626">${{msg}}. <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
-    }};
-    const jz = document.createElement("script");
-    jz.src = "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js";
-    jz.onerror = () => showErr("JSZip CDN unreachable");
-    jz.onload = () => {{
-      const eb = document.createElement("script");
-      eb.src = "https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js";
-      eb.onerror = () => showErr("epub.js CDN unreachable");
-      eb.onload = () => {{
-        // Pass an ArrayBuffer so epub.js enters archive mode (not path mode).
-        fetch(`/media/${{MSG_ID}}`)
-          .then(r => r.ok ? r.arrayBuffer() : Promise.reject("HTTP " + r.status))
-          .then(buf => {{
-            try {{
-              const book = ePub(buf);
-              const rendition = book.renderTo("epub-area", {{
-                flow: "scrolled-doc",
-                width: "100%",
-                height: "100%",
-                allowScriptedContent: true,
-              }});
-              rendition.display();
-              // Themes: dark-ish text on white container so Chinese reads well
-              rendition.themes.default({{
-                "body": {{ "padding": "20px", "max-width": "780px", "margin": "0 auto",
-                          "font-family": "system-ui, -apple-system, sans-serif",
-                          "line-height": "1.7", "color": "#1f2937" }},
-                "img": {{ "max-width": "100%", "height": "auto" }},
-              }});
-              // scrolled-doc — no arrow key nav needed
-            }} catch (e) {{
-              showErr("EPUB reader failed: " + e.message);
-            }}
-          }})
-          .catch(err => showErr("Could not load EPUB bytes: " + err));
-      }};
-      document.head.appendChild(eb);
-    }};
-    document.head.appendChild(jz);
+    // Server-side reader at /epub/{{id}} — no JS library deps.
+    main.innerHTML = `<iframe src="/epub/${{MSG_ID}}" style="width:96vw;height:88vh;border:0;border-radius:6px;background:#fff"></iframe>`;
     return;
   }}
   // fallback: try iframe but offer download as escape hatch
