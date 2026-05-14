@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.12"
+TGARR_VERSION = "0.4.13"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -98,6 +98,7 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_dc INTEGER;
             CREATE INDEX IF NOT EXISTS idx_messages_media_type ON messages (media_type);
             CREATE INDEX IF NOT EXISTS idx_messages_thumb ON messages (thumb_path) WHERE thumb_path IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_md5 ON messages (thumb_md5) WHERE thumb_md5 IS NOT NULL;
@@ -373,31 +374,65 @@ async def serve_media(msg_id: int, request: Request):
                            media_type=mime, headers=headers)
 
 
+_MY_DC_CACHE: Optional[int] = None
+
+
+async def _get_my_dc() -> Optional[int]:
+    """Read user\'s home DC from the Pyrogram session sqlite. Cached after
+    first read. Used by /api/media-status to flag cross-DC files."""
+    global _MY_DC_CACHE
+    if _MY_DC_CACHE is not None:
+        return _MY_DC_CACHE
+    import sqlite3
+    sp = os.path.join(login.SESSION_DIR, "tgarr.session")
+    if not os.path.exists(sp):
+        return None
+    try:
+        c = sqlite3.connect(f"file:{sp}?mode=ro", uri=True, timeout=2)
+        try:
+            r = c.execute("SELECT dc_id FROM sessions LIMIT 1").fetchone()
+        finally:
+            c.close()
+        if r and r[0]:
+            _MY_DC_CACHE = int(r[0])
+            return _MY_DC_CACHE
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/api/media-status/{msg_id}")
 async def media_status(msg_id: int):
     """Lightweight status for /watch page polling.
-    Returns {status: queued|downloading|ready|failed, bytes, total}."""
+    Returns {status, bytes, total, file_dc, my_dc, cross_dc}."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT local_path, file_size, file_name, media_type, mime_type
+            """SELECT local_path, file_size, file_name, media_type, mime_type, file_dc
                FROM messages WHERE id=$1""", msg_id)
     if not row:
         return JSONResponse({"status": "missing"}, status_code=404)
     lp = row["local_path"]
     total = row["file_size"] or 0
+    file_dc = row["file_dc"]
+    my_dc = await _get_my_dc()
+    cross_dc = bool(file_dc and my_dc and file_dc != my_dc)
     if lp == "__failed__":
-        return JSONResponse({"status": "failed"})
+        return JSONResponse({"status": "failed", "file_dc": file_dc,
+                            "my_dc": my_dc, "cross_dc": cross_dc})
     if not lp or lp == "__user_queued__":
-        return JSONResponse({"status": "queued", "bytes": 0, "total": total})
+        return JSONResponse({"status": "queued", "bytes": 0, "total": total,
+                            "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
     path = os.path.join("/downloads", lp)
     bytes_ = os.path.getsize(path) if os.path.exists(path) else 0
     if total and bytes_ >= total:
         return JSONResponse({"status": "ready", "bytes": bytes_, "total": total,
                             "mime": row["mime_type"], "media_type": row["media_type"],
-                            "file_name": row["file_name"]})
+                            "file_name": row["file_name"],
+                            "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
     return JSONResponse({"status": "downloading", "bytes": bytes_, "total": total,
                         "mime": row["mime_type"], "media_type": row["media_type"],
-                        "file_name": row["file_name"]})
+                        "file_name": row["file_name"],
+                        "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
 
 
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
@@ -458,6 +493,7 @@ audio {{ width:600px; max-width:96vw; }}
     <div class="status" id="status">requesting from Telegram CDN…</div>
     <div class="progress"><div id="progBar"></div></div>
     <div class="hint" id="hint">on-demand download — first chunk usually starts within seconds</div>
+    <div class="hint" id="dchint" style="margin-top:6px"></div>
   </div>
 </main>
 <script>
@@ -520,6 +556,16 @@ async function poll() {{
   try {{
     const r = await fetch(`/api/media-status/${{MSG_ID}}`);
     const j = await r.json();
+    if (j.file_dc) {{
+      const dh = document.getElementById("dchint");
+      if (dh && !dh.dataset.set) {{
+        dh.dataset.set = "1";
+        const sameDc = !j.cross_dc;
+        dh.innerHTML = sameDc
+          ? `<span style="color:#10b981">● file DC ${{j.file_dc}} = your DC ${{j.my_dc}} — fast path</span>`
+          : `<span style="color:#f59e0b">● file DC ${{j.file_dc}} ≠ your DC ${{j.my_dc}} — cross-DC, may hit FloodWait</span>`;
+      }}
+    }}
     if (j.status === "failed") {{
       document.getElementById("status").textContent = "✗ download failed";
       document.getElementById("hint").textContent = "Telegram channel may be invalid or banned";
