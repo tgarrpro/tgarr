@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.25"
+TGARR_VERSION = "0.4.26"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -530,8 +530,8 @@ function renderPlayer() {{
   }}
   if (["epub","mobi","azw","azw3"].includes(ext)) {{
     // Embed epub.js reader (works best with .epub; mobi/azw partial support)
-    main.innerHTML = `<div id="epub-area" style="width:1200px;max-width:96vw;height:85vh;background:#fff;color:#111;border-radius:6px"></div>
-      <div style="margin-top:12px;color:#94a3b8;font-size:13px">← → arrow keys to flip pages · <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
+    main.innerHTML = `<div id="epub-area" style="width:100%;max-width:1100px;background:#fff;color:#111;border-radius:6px;padding:0;min-height:60vh;margin:0 auto"></div>
+      <div style="margin-top:12px;color:#94a3b8;font-size:13px;text-align:center">scroll to read · <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
     // Chain loads so the script execution order is guaranteed:
     //   JSZip (required by epub.js archive mode) → epub.js → fetch+render
     const showErr = msg => {{
@@ -552,14 +552,20 @@ function renderPlayer() {{
           .then(buf => {{
             try {{
               const book = ePub(buf);
-              const rendition = book.renderTo("epub-area",
-                {{flow: "paginated", width: "100%", height: "100%"}});
-              rendition.display();
-              document.addEventListener("keydown", e => {{
-                if (e.target.tagName === "INPUT") return;
-                if (e.key === "ArrowLeft") rendition.prev();
-                else if (e.key === "ArrowRight") rendition.next();
+              const rendition = book.renderTo("epub-area", {{
+                manager: "continuous",
+                flow: "scrolled-doc",
+                width: "100%",
               }});
+              rendition.display();
+              // Themes: dark-ish text on white container so Chinese reads well
+              rendition.themes.default({{
+                "body": {{ "padding": "20px", "max-width": "780px", "margin": "0 auto",
+                          "font-family": "system-ui, -apple-system, sans-serif",
+                          "line-height": "1.7", "color": "#1f2937" }},
+                "img": {{ "max-width": "100%", "height": "auto" }},
+              }});
+              // scrolled-doc — no arrow key nav needed
             }} catch (e) {{
               showErr("EPUB reader failed: " + e.message);
             }}
