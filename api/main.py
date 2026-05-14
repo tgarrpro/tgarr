@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.10"
+TGARR_VERSION = "0.4.11"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -262,13 +262,9 @@ def _mime_for(media_type, mime):
 
 @app.get("/media/{msg_id}")
 async def serve_media(msg_id: int, request: Request):
-    """Lazy on-demand download + HTTP Range progressive streaming.
-
-    First click marks local_path='__user_queued__' to trigger the crawler\'s
-    local_media_downloader. Waits ~90s for the file to start being written
-    by Pyrogram. Once partial bytes are on disk, streams them via Range
-    response, blocking at EOF when the browser asks for bytes still
-    downloading; gives up after 5min stalled.
+    """Serve audio/video/document with on-demand materialization + progressive
+    range streaming. Supports HTTP Range header so video players can seek
+    and play while the underlying file is still being downloaded from TG.
     """
     import asyncio, re as _re
     async with db_pool.acquire() as conn:
@@ -280,6 +276,7 @@ async def serve_media(msg_id: int, request: Request):
     if row["local_path"] == "__failed__":
         return Response("download failed", status_code=410)
 
+    # Queue download if not already + wait for file to start appearing
     if not row["local_path"] or row["local_path"] == "__user_queued__":
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -287,7 +284,7 @@ async def serve_media(msg_id: int, request: Request):
                 "WHERE id = $1 AND (local_path IS NULL "
                 "OR local_path = $$__user_queued__$$)",
                 msg_id)
-        for _ in range(180):
+        for _ in range(180):  # wait up to 90s for download to start writing
             await asyncio.sleep(0.5)
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -306,21 +303,27 @@ async def serve_media(msg_id: int, request: Request):
     path = os.path.join("/downloads", row["local_path"])
     mime = _mime_for(row["media_type"], row["mime_type"])
     fn = row["file_name"]
-    total_size = row["file_size"] or 0
+    total_size = row["file_size"] or 0  # TG-reported final size
 
-    for _ in range(60):
+    # Wait for the file to actually exist on disk
+    for _ in range(60):  # 30s grace
         if os.path.exists(path):
             break
         await asyncio.sleep(0.5)
     else:
         return Response("file vanished", status_code=410)
 
+    # No Range header? Decide based on media size: if known small (audio/book),
+    # serve via FileResponse (waits until fully written if size mismatches).
     range_header = request.headers.get("Range")
     if not range_header:
         if total_size and os.path.getsize(path) >= total_size:
-            return FileResponse(path, media_type=mime, filename=fn,
+            disp = f'inline; filename="{fn or "file"}"'
+            return FileResponse(path, media_type=mime,
                               headers={"Cache-Control": "private, max-age=3600",
-                                       "Accept-Ranges": "bytes"})
+                                       "Accept-Ranges": "bytes",
+                                       "Content-Disposition": disp})
+        # Partial file or unknown size: fall through to progressive streamer
         start, end = 0, (total_size - 1) if total_size else None
     else:
         m = _re.match(r"bytes=(\d+)-(\d*)", range_header)
@@ -331,25 +334,28 @@ async def serve_media(msg_id: int, request: Request):
             total_size - 1 if total_size else None)
 
     if end is None:
+        # Without TG size, just serve whatever\'s in the file now
         end = os.path.getsize(path) - 1
 
     async def stream_range():
         with open(path, "rb") as f:
             f.seek(start)
             remaining = end - start + 1
-            stuck = 0
+            stuck_iters = 0
             while remaining > 0:
                 current = os.path.getsize(path)
-                pos = f.tell()
-                if current <= pos:
-                    stuck += 1
-                    if stuck > 600:
+                target_pos = f.tell()
+                if current <= target_pos:
+                    # Partial file caught up — wait for crawler to write more.
+                    # Abort if download appears stalled.
+                    stuck_iters += 1
+                    if stuck_iters > 600:  # 5 min no progress = give up
                         return
                     await asyncio.sleep(0.5)
                     continue
-                stuck = 0
-                csz = min(65536, remaining, current - pos)
-                chunk = f.read(csz)
+                stuck_iters = 0
+                chunk_size = min(65536, remaining, current - target_pos)
+                chunk = f.read(chunk_size)
                 if not chunk:
                     await asyncio.sleep(0.2)
                     continue
@@ -365,6 +371,188 @@ async def serve_media(msg_id: int, request: Request):
         headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
     return StreamingResponse(stream_range(), status_code=206,
                            media_type=mime, headers=headers)
+
+
+@app.get("/api/media-status/{msg_id}")
+async def media_status(msg_id: int):
+    """Lightweight status for /watch page polling.
+    Returns {status: queued|downloading|ready|failed, bytes, total}."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT local_path, file_size, file_name, media_type, mime_type
+               FROM messages WHERE id=$1""", msg_id)
+    if not row:
+        return JSONResponse({"status": "missing"}, status_code=404)
+    lp = row["local_path"]
+    total = row["file_size"] or 0
+    if lp == "__failed__":
+        return JSONResponse({"status": "failed"})
+    if not lp or lp == "__user_queued__":
+        return JSONResponse({"status": "queued", "bytes": 0, "total": total})
+    path = os.path.join("/downloads", lp)
+    bytes_ = os.path.getsize(path) if os.path.exists(path) else 0
+    if total and bytes_ >= total:
+        return JSONResponse({"status": "ready", "bytes": bytes_, "total": total,
+                            "mime": row["mime_type"], "media_type": row["media_type"],
+                            "file_name": row["file_name"]})
+    return JSONResponse({"status": "downloading", "bytes": bytes_, "total": total,
+                        "mime": row["mime_type"], "media_type": row["media_type"],
+                        "file_name": row["file_name"]})
+
+
+@app.get("/watch/{msg_id}", response_class=HTMLResponse)
+async def watch_page(msg_id: int):
+    """Loading-aware media viewer. Polls /api/media-status until enough bytes
+    are written to start playback, then renders <video>/<audio>/<iframe>."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT m.local_path, m.file_name, m.file_size, m.media_type,
+                      m.mime_type, c.title AS ch_title
+               FROM messages m LEFT JOIN channels c ON c.id=m.channel_id
+               WHERE m.id=$1""", msg_id)
+    if not row:
+        return HTMLResponse("<h1>404 — message not indexed</h1>", status_code=404)
+    title = row["file_name"] or f"msg-{msg_id}"
+    mt = row["media_type"] or "document"
+
+    # Trigger queueing immediately so the user doesn\'t wait for first poll.
+    if not row["local_path"]:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path = $$__user_queued__$$ "
+                "WHERE id = $1 AND local_path IS NULL",
+                msg_id)
+
+    body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{html.escape(title)} — tgarr</title>
+<style>
+body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif;
+       margin:0; padding:0; min-height:100vh; display:flex; flex-direction:column; }}
+.bar {{ background:#1e293b; padding:12px 20px; display:flex; align-items:center;
+       gap:12px; border-bottom:1px solid #334155; }}
+.bar .title {{ font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis;
+              white-space:nowrap; }}
+.bar a {{ color:#94a3b8; text-decoration:none; font-size:13px; }}
+.bar a:hover {{ color:#e2e8f0; }}
+main {{ flex:1; display:flex; align-items:center; justify-content:center;
+       padding:30px; }}
+.loader {{ text-align:center; max-width:480px; }}
+.loader .ico {{ font-size:72px; opacity:0.4; }}
+.loader .status {{ font-size:18px; margin:18px 0 10px; }}
+.loader .hint {{ color:#94a3b8; font-size:13px; margin-top:8px; }}
+.progress {{ width:100%; height:6px; background:#1e293b; border-radius:3px;
+            overflow:hidden; margin-top:14px; }}
+.progress > div {{ height:100%; background:#5eb6e5; width:0%; transition:width 0.4s; }}
+video, audio, iframe {{ max-width:96vw; max-height:80vh; }}
+video, iframe {{ width:1200px; max-width:96vw; }}
+audio {{ width:600px; max-width:96vw; }}
+</style></head><body>
+<div class="bar">
+  <a href="javascript:history.back()">← back</a>
+  <div class="title">{html.escape(title)}</div>
+  <a href="/media/{msg_id}" download>⬇ download raw</a>
+</div>
+<main id="main">
+  <div class="loader">
+    <div class="ico">⏳</div>
+    <div class="status" id="status">requesting from Telegram CDN…</div>
+    <div class="progress"><div id="progBar"></div></div>
+    <div class="hint" id="hint">on-demand download — first chunk usually starts within seconds</div>
+  </div>
+</main>
+<script>
+const MSG_ID = {msg_id};
+const MEDIA_TYPE = {repr(mt)};
+const MEDIA_FILE_NAME = {repr(row["file_name"] or "")};
+let started = false;
+function fmtBytes(b) {{
+  if (!b) return "0 B";
+  const u = ["B","KB","MB","GB"]; let i = 0; let v = b;
+  while (v >= 1024 && i < u.length-1) {{ v /= 1024; i++; }}
+  return v.toFixed(v < 10 ? 1 : 0) + " " + u[i];
+}}
+function renderPlayer() {{
+  if (started) return; started = true;
+  const main = document.getElementById("main");
+  if (MEDIA_TYPE === "video") {{
+    main.innerHTML = `<video controls autoplay src="/media/${{MSG_ID}}"></video>`;
+    return;
+  }}
+  if (MEDIA_TYPE === "audio") {{
+    main.innerHTML = `<audio controls autoplay src="/media/${{MSG_ID}}"></audio>`;
+    return;
+  }}
+  // document — pick by extension
+  const ext = (MEDIA_FILE_NAME || "").toLowerCase().split(".").pop();
+  if (ext === "pdf") {{
+    main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+    return;
+  }}
+  if (["epub","mobi","azw","azw3"].includes(ext)) {{
+    // Embed epub.js reader (works best with .epub; mobi/azw partial support)
+    main.innerHTML = `<div id="epub-area" style="width:1200px;max-width:96vw;height:85vh;background:#fff;color:#111;border-radius:6px"></div>
+      <div style="margin-top:12px;color:#94a3b8;font-size:13px">← → arrow keys to flip pages · <a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download raw</a></div>`;
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js";
+    s.onload = () => {{
+      try {{
+        const book = ePub(`/media/${{MSG_ID}}`);
+        const rendition = book.renderTo("epub-area", {{flow: "paginated", width: "100%", height: "100%"}});
+        rendition.display();
+        document.addEventListener("keydown", e => {{
+          if (e.target.tagName === "INPUT") return;
+          if (e.key === "ArrowLeft") rendition.prev();
+          else if (e.key === "ArrowRight") rendition.next();
+        }});
+      }} catch(e) {{
+        document.getElementById("epub-area").innerHTML =
+          `<div style="padding:30px;color:#dc2626">EPUB reader failed: ${{e.message}}. <a href="/media/${{MSG_ID}}" download>Download raw file</a></div>`;
+      }}
+    }};
+    document.body.appendChild(s);
+    return;
+  }}
+  // fallback: try iframe but offer download as escape hatch
+  main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:85vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>
+    <div style="margin-top:8px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5;font-size:13px">⬇ download raw</a></div>`;
+}}
+async function poll() {{
+  try {{
+    const r = await fetch(`/api/media-status/${{MSG_ID}}`);
+    const j = await r.json();
+    if (j.status === "failed") {{
+      document.getElementById("status").textContent = "✗ download failed";
+      document.getElementById("hint").textContent = "Telegram channel may be invalid or banned";
+      return;
+    }}
+    if (j.status === "ready") {{
+      document.getElementById("status").textContent = "✓ ready — opening player…";
+      renderPlayer();
+      return;
+    }}
+    if (j.status === "downloading") {{
+      const pct = j.total > 0 ? (j.bytes / j.total * 100) : 0;
+      document.getElementById("status").textContent =
+        `downloading ${{fmtBytes(j.bytes)}}${{j.total ? " / " + fmtBytes(j.total) : ""}} (${{pct.toFixed(0)}}%)`;
+      document.getElementById("progBar").style.width = pct + "%";
+      // Start the player as soon as ~2MB or 10% is on disk — progressive
+      // playback can then keep up with the download.
+      if (j.bytes > 2_000_000 || (j.total && pct > 10)) {{
+        renderPlayer();
+        return;
+      }}
+    }} else if (j.status === "queued") {{
+      document.getElementById("status").textContent = "queued — waiting for crawler…";
+    }}
+  }} catch(e) {{
+    document.getElementById("status").textContent = "network error — retrying…";
+  }}
+  setTimeout(poll, 1500);
+}}
+poll();
+</script>
+</body></html>"""
+    return HTMLResponse(body)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -911,10 +1099,20 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
         for path, name, svg in NAV_ITEMS
     )
     if top_actions_html is None:
+        cfg = {
+            "/gallery":   ("/gallery",  "Search photos…"),
+            "/discover":  ("/discover", "Search discovered channels…"),
+            "/music":     ("/music",    "Search music…"),
+            "/library":   ("/library",  "Search ebooks…"),
+            "/channels":  ("/channels", "Search channels…"),
+            "/downloads": ("/downloads","Search downloads…"),
+            "/releases":  ("/releases", "Search releases…"),
+        }
+        action, placeholder = cfg.get(active, ("/search", "Search…"))
         top_actions_html = (
-            '<form action="/search" method="GET" style="margin-left:auto">'
-            '<input type="text" name="q" class="search" placeholder="Search releases…" />'
-            '</form>'
+            f'<form action="{action}" method="GET" style="margin-left:auto">'
+            f'<input type="text" name="q" class="search" placeholder="{placeholder}" />'
+            f'</form>'
         )
     return f"""<!DOCTYPE html>
 <html><head>
@@ -1530,7 +1728,8 @@ async def api_registry_pull_now():
 # Page: Gallery (Telegram-shared photos)
 # ════════════════════════════════════════════════════════════════════
 @app.get("/gallery", response_class=HTMLResponse)
-async def page_gallery(channel: Optional[str] = None, limit: int = 240):
+async def page_gallery(channel: Optional[str] = None, limit: int = 240,
+                       q: Optional[str] = None):
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -1548,6 +1747,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240):
     if channel:
         params.append(channel)
         where.append(f"c.username = ${len(params)}")
+    if q:
+        for w in q.split():
+            params.append(f"%{w}%")
+            where.append(f"(m.caption ILIKE ${len(params)} OR m.file_name ILIKE ${len(params)})")
     # Gate NSFW unless user has explicitly opted in via /settings.
     if not await _is_nsfw_enabled():
         where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
@@ -1739,7 +1942,7 @@ def _fmt_dur(secs):
 
 
 @app.get("/music", response_class=HTMLResponse)
-async def page_music(limit: int = 200):
+async def page_music(limit: int = 200, q: Optional[str] = None):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -1752,6 +1955,7 @@ async def page_music(limit: int = 200):
                  AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'""")
         pending_n = await conn.fetchval(
             "SELECT count(*) FROM messages WHERE media_type='audio' AND local_path IS NULL")
+        q_pat = f"%{q}%" if q else None
         rows = await conn.fetch(f"""
             SELECT m.id, m.audio_title, m.audio_performer, m.audio_duration_sec,
                    m.file_name, m.file_size, m.posted_at,
@@ -1759,9 +1963,13 @@ async def page_music(limit: int = 200):
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
             WHERE m.media_type = 'audio'
+              AND ($1::text IS NULL OR
+                   m.audio_title ILIKE $1 OR
+                   m.audio_performer ILIKE $1 OR
+                   m.file_name ILIKE $1)
             ORDER BY m.posted_at DESC NULLS LAST
             LIMIT {max(1, min(limit, 500))}
-        """)
+        """, q_pat)
 
     if not rows:
         body = (
@@ -1846,7 +2054,7 @@ async def page_music(limit: int = 200):
 # Page: Library (ebooks)
 # ════════════════════════════════════════════════════════════════════
 @app.get("/library", response_class=HTMLResponse)
-async def page_library(limit: int = 200):
+async def page_library(limit: int = 200, q: Optional[str] = None):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -1868,9 +2076,10 @@ async def page_library(limit: int = 200):
             JOIN channels c ON c.id = m.channel_id
             WHERE m.media_type = 'document'
               AND m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'
+              AND ($1::text IS NULL OR m.file_name ILIKE $1)
             ORDER BY m.posted_at DESC NULLS LAST
             LIMIT {max(1, min(limit, 500))}
-        """)
+        """, f"%{q}%" if q else None)
 
     def _ext(fn):
         return (fn or "").rsplit(".", 1)[-1].upper() if "." in (fn or "") else "DOC"
@@ -1902,7 +2111,7 @@ async def page_library(limit: int = 200):
         f'</div>'
         f'</div>'
         f'<div class="book-actions">'
-        f'<a class="btn" href="/media/{r["id"]}" target="_blank">Open</a>'
+        f'<a class="btn" href="/watch/{r["id"]}" target="_blank">Open</a>'
         f'<a class="btn ghost" href="/media/{r["id"]}" download="{html.escape(r["file_name"] or "")}">Download</a>'
         f'</div>'
         f'</div>'
@@ -1968,7 +2177,7 @@ def _release_card(r) -> str:
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
         f'</div>'
         f'<div class="grab-row" style="display:flex;gap:6px">'
-        f'<button class="btn play-btn" onclick="window.open(\'/media/{r["primary_msg_id"]}\', \'_blank\')">▶ Play</button>'
+        f'<button class="btn play-btn" onclick="window.open(\'/watch/{r["primary_msg_id"]}\', \'_blank\')">▶ Play</button>'
         f'<button class="btn grab-btn" data-guid="{r["guid"]}" onclick="tgGrab(this)">⬇ Grab</button>'
         f'</div>'
         f'</div>'
