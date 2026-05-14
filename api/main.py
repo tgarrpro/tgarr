@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.38"
+TGARR_VERSION = "0.4.39"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -526,6 +526,15 @@ def _epub_locate(msg_id, db_row):
     return p if os.path.exists(p) else None
 
 
+_EBOOK_LOCKS: dict[int, "asyncio.Lock"] = {}
+
+def _ebook_lock(msg_id: int):
+    import asyncio
+    if msg_id not in _EBOOK_LOCKS:
+        _EBOOK_LOCKS[msg_id] = asyncio.Lock()
+    return _EBOOK_LOCKS[msg_id]
+
+
 _EBOOK_CONVERTIBLE = ("epub", "mobi", "azw", "azw3", "djvu", "fb2",
                       "lit", "cbr", "cbz", "rtf", "lrf", "pdb")
 
@@ -537,33 +546,41 @@ def _ebook_paths(local_path: str):
     return src, pdf, cover
 
 
-async def _ebook_to_pdf(src: str, pdf: str) -> bool:
+async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
     """Run calibre ebook-convert src → pdf. Returns True on success.
     Idempotent: skip if pdf already exists and is newer than src.
+    Serialized per msg_id so concurrent /ebook-pdf hits don't fork 2 calibres.
     """
     import asyncio
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return True
-    env = dict(os.environ)
-    env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
-    env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
-    tmp = pdf + ".inprogress.pdf"
-    proc = await asyncio.create_subprocess_exec(
-        "ebook-convert", src, tmp,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env)
-    try:
-        await asyncio.wait_for(proc.communicate(), timeout=300)
-    except asyncio.TimeoutError:
-        proc.kill()
+    async with _ebook_lock(msg_id):
+        # Re-check after acquiring lock — another coroutine may have just done it
+        if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
+            return True
+        env = dict(os.environ)
+        env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+        env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
+        tmp = pdf + ".inprogress.pdf"
+        proc = await asyncio.create_subprocess_exec(
+            "ebook-convert", src, tmp,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            proc.kill()
+            print(f'[ebook-convert] TIMEOUT src={src}', flush=True)
+            return False
+        if proc.returncode != 0:
+            print(f'[ebook-convert] rc={proc.returncode} stderr={stderr.decode(errors="replace")[-500:]!r}', flush=True)
+        if proc.returncode == 0 and os.path.exists(tmp):
+            os.rename(tmp, pdf)
+            return True
+        if os.path.exists(tmp):
+            os.unlink(tmp)
         return False
-    if proc.returncode == 0 and os.path.exists(tmp):
-        os.rename(tmp, pdf)
-        return True
-    if os.path.exists(tmp):
-        os.unlink(tmp)
-    return False
 
 
 async def _ebook_cover(src: str, cover: str) -> bool:
@@ -580,6 +597,38 @@ async def _ebook_cover(src: str, cover: str) -> bool:
         proc.kill()
         return False
     return proc.returncode == 0 and os.path.exists(cover)
+
+
+@app.get("/api/ebook-status/{msg_id}")
+async def ebook_status(msg_id: int, background_tasks: BackgroundTasks):
+    """Return ebook conversion status + trigger background convert if needed.
+    States: no_source | ready | converting | queued | failed.
+    """
+    import asyncio
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+    if not row or not row["local_path"] or row["local_path"].startswith("__"):
+        return {"state": "no_source"}
+    ext = (row["file_name"] or "").rsplit(".", 1)[-1].lower()
+    src, pdf, _ = _ebook_paths(row["local_path"])
+    if not os.path.exists(src):
+        return {"state": "no_source"}
+    if ext == "pdf":
+        return {"state": "ready", "url": f"/media/{msg_id}"}
+    if ext not in _EBOOK_CONVERTIBLE:
+        return {"state": "failed", "reason": f"unsupported format .{ext}"}
+    if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
+        return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
+                "size": os.path.getsize(pdf)}
+    tmp = pdf + ".inprogress.pdf"
+    if os.path.exists(tmp):
+        return {"state": "converting",
+                "src_size": os.path.getsize(src),
+                "out_size": os.path.getsize(tmp)}
+    # Not started — fire background task. Lock prevents duplicate work.
+    asyncio.create_task(_ebook_to_pdf(src, pdf, msg_id=msg_id))
+    return {"state": "queued", "src_size": os.path.getsize(src)}
 
 
 @app.get("/ebook-pdf/{msg_id}")
@@ -606,7 +655,7 @@ async def ebook_pdf(msg_id: int):
     if ext not in _EBOOK_CONVERTIBLE:
         return Response(f"format .{ext} not supported by ebook-convert",
                         status_code=415)
-    ok = await _ebook_to_pdf(src, pdf)
+    ok = await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not ok:
         return Response("conversion failed", status_code=500)
     return FileResponse(pdf, media_type="application/pdf",
@@ -1002,8 +1051,57 @@ function renderPlayer() {{
     return;
   }}
   if (["epub","mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
-    // Calibre-converted PDF — same UX as native PDF.
-    main.innerHTML = `<iframe src="/ebook-pdf/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+    // Calibre-converted PDF — poll status, swap to iframe on ready.
+    const loader = document.createElement("div");
+    loader.className = "loader";
+    loader.innerHTML =
+      '<div class="ico">📚</div>' +
+      '<div class="status" id="ebookStatus">checking…</div>' +
+      '<div class="progress"><div id="ebookBar"></div></div>' +
+      '<div class="hint">first open of a non-PDF ebook converts to PDF via calibre. ' +
+      'big books (>20MB) can take 30–60s on a single CPU core. ' +
+      'subsequent opens are instant.</div>' +
+      '<div class="hint" id="ebookElapsed" style="margin-top:6px"></div>';
+    main.innerHTML = "";
+    main.appendChild(loader);
+    const startedAt = Date.now();
+    let lastSize = 0;
+    async function tick() {{
+      try {{
+        const r = await fetch(`/api/ebook-status/${{MSG_ID}}`, {{cache: "no-store"}});
+        const j = await r.json();
+        const elapsed = ((Date.now()-startedAt)/1000).toFixed(0);
+        document.getElementById("ebookElapsed").textContent = `elapsed: ${{elapsed}}s`;
+        if (j.state === "ready") {{
+          main.innerHTML = `<iframe src="${{j.url}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+          return;
+        }}
+        if (j.state === "failed") {{
+          document.getElementById("ebookStatus").textContent =
+            "✗ conversion failed: " + (j.reason || "calibre error");
+          return;
+        }}
+        if (j.state === "no_source") {{
+          document.getElementById("ebookStatus").textContent = "✗ source not cached";
+          return;
+        }}
+        let msg = j.state === "queued" ? "queued for conversion…" : "converting…";
+        if (j.src_size) msg += ` (source ${{fmtBytes(j.src_size)}})`;
+        document.getElementById("ebookStatus").textContent = msg;
+        if (j.out_size && j.out_size !== lastSize) {{
+          lastSize = j.out_size;
+        }}
+        // Indeterminate-style progress: pulse the bar based on elapsed
+        const pct = Math.min(95, parseInt(elapsed) * 2);
+        document.getElementById("ebookBar").style.width = pct + "%";
+        setTimeout(tick, 2000);
+      }} catch (e) {{
+        document.getElementById("ebookStatus").textContent = "✗ status check failed";
+        setTimeout(tick, 5000);
+      }}
+    }}
+    tick();
+    return;
     return;
   }}
   // fallback: try iframe but offer download as escape hatch
