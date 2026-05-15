@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.48"
+TGARR_VERSION = "0.4.49"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -3195,6 +3195,7 @@ def _release_card(r, my_dc=None) -> str:
 @app.get("/releases", response_class=HTMLResponse)
 async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         view: str = "grid", limit: int = 120,
+                        offset: int = 0,
                         min_mb: int = 100, aud: str = "sfw"):
     if not login.session_exists():
         return RedirectResponse("/login")
@@ -3224,21 +3225,34 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         return (w.replace("name ILIKE", "r.name ILIKE")
                  .replace("category =", "r.category =")
                  .replace("COALESCE(size_bytes", "COALESCE(r.size_bytes"))
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
     sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
           f"r.primary_msg_id, m.file_dc, c.audience "
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
           f"LEFT JOIN channels c ON c.id = m.channel_id "
           f"WHERE {' AND '.join([_qual(w) for w in where])} "
-          f"ORDER BY r.posted_at DESC NULLS LAST LIMIT {max(1, min(limit, 500))}")
+          f"ORDER BY r.posted_at DESC NULLS LAST "
+          f"LIMIT {page_size} OFFSET {page_offset}")
+    count_sql = (f"SELECT count(*) FROM releases r "
+                 f"LEFT JOIN messages m ON m.id = r.primary_msg_id "
+                 f"LEFT JOIN channels c ON c.id = m.channel_id "
+                 f"WHERE {' AND '.join([_qual(w) for w in where])}")
     _release_my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
+        total_matched = await conn.fetchval(count_sql, *params)
 
     def _qs(**overrides) -> str:
+        defaults = {"q": q, "cat": cat, "view": view,
+                    "aud": aud if aud != "sfw" else None,
+                    "min_mb": min_mb if min_mb != 100 else None,
+                    "limit": limit if limit != 120 else None}
+        merged = {**defaults, **overrides}
         bits = []
-        for k, v in {"q": q, "cat": cat, "view": view, **overrides}.items():
-            if v:
+        for k, v in merged.items():
+            if v not in (None, "", 0, "sfw"):
                 bits.append(f"{k}={html.escape(str(v))}")
         return "?" + "&".join(bits) if bits else ""
 
@@ -3311,8 +3325,37 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                     f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
                     f'</div>')
 
-    body = (f'<h2 class="section">Parsed releases <span class="count">{len(rows)} shown</span></h2>'
-           f'{toolbar}{body_html}')
+    # Build pagination nav
+    start_idx = page_offset + 1 if rows else 0
+    end_idx = page_offset + len(rows)
+    filter_desc_parts = [f"aud={aud}"]
+    if min_mb > 0:
+        filter_desc_parts.append(f"≥{min_mb}MB")
+    if cat:
+        filter_desc_parts.append(f"cat={cat}")
+    if q:
+        filter_desc_parts.append(f'q="{html.escape(q)}"')
+    filter_desc = " · ".join(filter_desc_parts)
+    prev_offset = max(0, page_offset - page_size)
+    next_offset = page_offset + page_size
+    nav_links = []
+    if page_offset > 0:
+        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=prev_offset if prev_offset else None)}">← prev</a>')
+    if next_offset < (total_matched or 0):
+        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=next_offset)}">next →</a>')
+    pagination_html = (
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
+        f'<span style="color:var(--muted, #64748b);font-size:13px">'
+        f'showing {start_idx}–{end_idx} of {total_matched:,} '
+        f'<span style="opacity:0.7">({filter_desc})</span></span>'
+        f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div>'
+        f'</div>')
+    body = (f'<h2 class="section">Parsed releases '
+           f'<span class="count">{len(rows)} of {total_matched:,}</span>'
+           f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;'
+           f'margin-left:10px">{filter_desc}</span></h2>'
+           f'{toolbar}{body_html}{pagination_html}')
     actions = (f'<form action="/releases" method="GET" style="margin-left:auto">'
               f'<input type="text" name="q" class="search" placeholder="filter…" '
               f'value="{html.escape(q) if q else ""}" /></form>')
