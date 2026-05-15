@@ -73,7 +73,10 @@ async def _startup():
 #   absent from filter so clients keep pushing them to build consensus.
 # - Rebuilt every 5 min on a background task; served from in-memory bytes.
 # ════════════════════════════════════════════════════════════════════
-BLOOM_M_BITS = 64 * 1024 * 1024
+# Sized for ~33M consensus-met fuids at FP=0.001 (= 100M total federation
+# pool at typical 1/3 consensus rate). Bumps Bloom from 8→32 MiB; downstream
+# bandwidth handled by Cloudflare cache (Cache-Control: max-age=300).
+BLOOM_M_BITS = 256 * 1024 * 1024  # 32 MiB
 BLOOM_M_BYTES = BLOOM_M_BITS // 8
 BLOOM_K = 8
 BLOOM_REBUILD_INTERVAL_SEC = 300
