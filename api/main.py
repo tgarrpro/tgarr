@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.49"
+TGARR_VERSION = "0.4.50"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -1873,6 +1873,7 @@ NAV_ITEMS = [
     ("/discover",  "Discover",  "M12 10.9c-.61 0-1.1.49-1.1 1.1s.49 1.1 1.1 1.1c.61 0 1.1-.49 1.1-1.1s-.49-1.1-1.1-1.1zM12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm2.19 12.19L6 18l3.81-8.19L18 6l-3.81 8.19z"),
     ("/releases",  "Releases",  "M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"),
     ("/gallery",   "Gallery",   "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"),
+    ("/videos",    "Videos",    "M8 5v14l11-7z"),
     ("/music",     "Music",     "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"),
     ("/library",   "Library",   "M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 18H6V4h7v6l2-1 2 1V4h1v16z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
@@ -1925,6 +1926,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
     if top_actions_html is None:
         cfg = {
             "/gallery":   ("/gallery",  "Search photos…"),
+            "/videos":    ("/videos",   "Search videos…"),
             "/discover":  ("/discover", "Search discovered channels…"),
             "/music":     ("/music",    "Search music…"),
             "/library":   ("/library",  "Search ebooks…"),
@@ -3112,6 +3114,153 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
         f'<div class="book-grid">{items}</div>'
     )
     return HTMLResponse(_layout("Library", "/library", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Page: Videos (all video messages — incl. those that didn't parse)
+# ════════════════════════════════════════════════════════════════════
+@app.get("/videos", response_class=HTMLResponse)
+async def page_videos(q: Optional[str] = None, limit: int = 120,
+                      offset: int = 0, aud: str = "sfw",
+                      min_mb: int = 50):
+    if not login.session_exists():
+        async with db_pool.acquire() as conn:
+            n = await conn.fetchval("SELECT count(*) FROM channels")
+        if not n:
+            return RedirectResponse("/login")
+
+    where = ["m.media_type = 'video'",
+             "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
+    params = []
+    if q:
+        for w in q.split():
+            params.append(f"%{w}%")
+            where.append(f"(m.file_name ILIKE ${len(params)} OR m.caption ILIKE ${len(params)})")
+    if aud == "sfw":
+        where.append("COALESCE(c.audience, 'sfw') = 'sfw'")
+    elif aud == "nsfw":
+        where.append("c.audience = 'nsfw'")
+    if min_mb and min_mb > 0:
+        where.append(f"COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024}")
+
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
+    where_sql = " AND ".join(where)
+    _vid_my_dc = await _get_my_dc()
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            f"SELECT count(*) FROM messages m "
+            f"JOIN channels c ON c.id = m.channel_id "
+            f"WHERE {where_sql}", *params)
+        rows = await conn.fetch(
+            f"SELECT m.id, m.file_name, m.file_size, m.caption, m.posted_at, "
+            f"m.thumb_path, m.local_path, m.file_dc, "
+            f"c.title AS ch_title, c.username AS ch_user, c.audience, "
+            f"r.id AS release_id, r.canonical_title, r.quality "
+            f"FROM messages m "
+            f"JOIN channels c ON c.id = m.channel_id "
+            f"LEFT JOIN releases r ON r.primary_msg_id = m.id "
+            f"WHERE {where_sql} "
+            f"ORDER BY m.posted_at DESC NULLS LAST "
+            f"LIMIT {page_size} OFFSET {page_offset}",
+            *params)
+
+    def _qs(**overrides):
+        defaults = {"q": q,
+                    "aud": aud if aud != "sfw" else None,
+                    "min_mb": min_mb if min_mb != 50 else None,
+                    "limit": limit if limit != 120 else None}
+        merged = {**defaults, **overrides}
+        bits = []
+        for k, v in merged.items():
+            if v not in (None, "", 0, "sfw"):
+                bits.append(f"{k}={html.escape(str(v))}")
+        return "?" + "&".join(bits) if bits else ""
+
+    def _aud_chip(val, label):
+        active = aud == val or (val == "sfw" and not aud)
+        href = f"/videos{_qs(aud=val if val != 'sfw' else None)}"
+        bg = "rgba(245,158,11,0.18)" if val == "nsfw" and active else "rgba(94,182,229,0.15)"
+        fg = "var(--warn)" if val == "nsfw" else "var(--accent-hi)"
+        style = (f'background:{bg};color:{fg};border-color:{fg};') if active else ''
+        return (f'<a class="btn ghost" href="{href}" '
+                f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
+
+    toolbar = (
+        '<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
+        + _aud_chip("sfw", "SFW")
+        + _aud_chip("nsfw", "NSFW")
+        + _aud_chip("any", "all")
+        + '</div>'
+    )
+
+    def _card(r):
+        title = (r["canonical_title"] or r["file_name"]
+                 or (r["caption"] or "")[:80] or f"video-{r['id']}")
+        size = _fmt_size(r["file_size"]) if r["file_size"] else ""
+        date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
+        ch = r["ch_title"] or r["ch_user"] or ""
+        parsed_pill = ('<span class="pill ok" style="font-size:11px">parsed</span>'
+                       if r["release_id"] else
+                       '<span class="pill muted" style="font-size:11px">unparsed</span>')
+        return (
+            f'<div class="poster-card">'
+            f'<div class="poster">'
+            f'<img class="poster-img" src="/api/thumb/{r["id"]}" loading="lazy" alt="" '
+            f'onerror="this.outerHTML=\'<div class=&quot;fallback&quot;>🎬</div>\'" />'
+            f'</div>'
+            f'<div class="info">'
+            f'<div class="title">{html.escape(title)}</div>'
+            f'<div class="sub">{html.escape(ch)} · {date}</div>'
+            f'</div>'
+            f'<div class="pills">'
+            f'{_dc_badge(r.get("file_dc"), _vid_my_dc)}'
+            f'{parsed_pill}'
+            + (f'<span class="pill accent" style="font-size:11px">{html.escape(r["quality"])}</span>'
+               if r.get("quality") else '')
+            + f'<span class="pill muted" style="font-size:11px">{size}</span>'
+            f'</div>'
+            f'<div class="grab-row" style="margin-top:8px;display:flex;gap:6px">'
+            f'<a class="btn" href="/watch/{r["id"]}" target="_blank">▶ watch</a>'
+            f'<a class="btn ghost" href="/media/{r["id"]}" download>⬇</a>'
+            f'</div>'
+            f'</div>'
+        )
+
+    grid_html = ('<div class="poster-grid">'
+                 + ''.join(_card(r) for r in rows)
+                 + '</div>')
+    start_idx = page_offset + 1 if rows else 0
+    end_idx = page_offset + len(rows)
+    filter_parts = [f"aud={aud}"]
+    if min_mb > 0:
+        filter_parts.append(f"≥{min_mb}MB")
+    if q:
+        filter_parts.append(f'q="{html.escape(q)}"')
+    filter_desc = " · ".join(filter_parts)
+    prev_offset = max(0, page_offset - page_size)
+    next_offset = page_offset + page_size
+    nav_links = []
+    if page_offset > 0:
+        nav_links.append(
+            f'<a class="btn ghost" href="/videos{_qs(offset=prev_offset if prev_offset else None)}">← prev</a>')
+    if next_offset < (total or 0):
+        nav_links.append(
+            f'<a class="btn ghost" href="/videos{_qs(offset=next_offset)}">next →</a>')
+    pagination = (
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
+        f'<span style="color:var(--muted, #64748b);font-size:13px">'
+        f'showing {start_idx}–{end_idx} of {total:,} '
+        f'<span style="opacity:0.7">({filter_desc})</span></span>'
+        f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div></div>')
+    body = (
+        f'<h2 class="section">Videos '
+        f'<span class="count">{len(rows)} of {total:,}</span>'
+        f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;'
+        f'margin-left:10px">{filter_desc}</span></h2>'
+        f'{toolbar}{grid_html}{pagination}')
+    return HTMLResponse(_layout("Videos", "/videos", body))
 
 
 # ════════════════════════════════════════════════════════════════════
