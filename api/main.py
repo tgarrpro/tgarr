@@ -2745,9 +2745,12 @@ async def page_discover(audience: str = "sfw"):
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
         if not login.session_exists() and not n_channels:
             return RedirectResponse("/login")
-        # Auto-subscribed check
-        known = {r["username"]: r["subscribed"] for r in await conn.fetch(
-            "SELECT username, subscribed FROM channels WHERE username IS NOT NULL")}
+        # Auto-subscribed check — TG sometimes returns differently-cased username
+        # (eBookRoom vs ebookroom) so match case-insensitively.
+        known = {r["username"].lower(): r["subscribed"]
+                 for r in await conn.fetch(
+                     "SELECT username, subscribed FROM channels "
+                     "WHERE username IS NOT NULL")}
         where = ["dismissed = FALSE"]
         if audience in ("sfw", "nsfw"):
             where.append(f"audience = '{audience}'")
@@ -2781,7 +2784,7 @@ async def page_discover(audience: str = "sfw"):
 
     def _card(r):
         u = r["username"]
-        state = known.get(u)
+        state = known.get(u.lower())
         if state is True:
             btn = (f'<button class="ghost" disabled '
                   f'style="font-size:12px;padding:6px 12px">✓ subscribed</button>')
