@@ -707,11 +707,32 @@ async def channel_meta_refresher() -> None:
             try:
                 chat = await app.get_chat(row["tg_chat_id"])
                 members = getattr(chat, "members_count", None)
+                # Per-type remote counts via search_messages_count + MessagesFilter.
+                # Each is one cheap TG call returning the channel's total of that type.
+                from pyrogram import enums as _pf
+                remote_msgs = await app.get_chat_history_count(row["tg_chat_id"])
+                remote_photos = await app.search_messages_count(
+                    row["tg_chat_id"], filter=_pf.MessagesFilter.PHOTO)
+                remote_videos = await app.search_messages_count(
+                    row["tg_chat_id"], filter=_pf.MessagesFilter.VIDEO)
+                remote_audio = await app.search_messages_count(
+                    row["tg_chat_id"], filter=_pf.MessagesFilter.AUDIO)
+                remote_docs = await app.search_messages_count(
+                    row["tg_chat_id"], filter=_pf.MessagesFilter.DOCUMENT)
                 async with db_pool.acquire() as conn:
                     await conn.execute(
-                        """UPDATE channels SET members_count=$1, meta_updated_at=NOW()
-                           WHERE tg_chat_id=$2""", members, row["tg_chat_id"])
-                log.info("[meta] chat_id=%s members=%s", row["tg_chat_id"], members)
+                        """UPDATE channels SET members_count=$1,
+                             remote_msgs=$2, remote_photos=$3, remote_videos=$4,
+                             remote_audio=$5, remote_documents=$6,
+                             remote_counts_refreshed_at=NOW(),
+                             meta_updated_at=NOW()
+                           WHERE tg_chat_id=$7""",
+                        members, remote_msgs, remote_photos, remote_videos,
+                        remote_audio, remote_docs, row["tg_chat_id"])
+                log.info("[meta] chat_id=%s members=%s remote: msg=%s photo=%s "
+                         "video=%s audio=%s doc=%s",
+                         row["tg_chat_id"], members, remote_msgs, remote_photos,
+                         remote_videos, remote_audio, remote_docs)
             except FloodWait as fw:
                 wait = getattr(fw, "value", 60) + 5
                 log.warning("[meta] flood-wait %ds", wait)
@@ -1746,6 +1767,9 @@ async def on_demand_media_downloader() -> None:
 DEEP_BACKFILL_ENABLED = os.environ.get("TGARR_DEEP_BACKFILL", "true").lower() == "true"
 DEEP_BACKFILL_PAGE_SIZE = int(os.environ.get("TGARR_DEEP_BACKFILL_PAGE_SIZE", "200"))
 DEEP_BACKFILL_DELAY_SEC = int(os.environ.get("TGARR_DEEP_BACKFILL_DELAY_SEC", "10"))
+# Channels with fewer than this many TOTAL media items (TG-reported) are
+# skipped. Saves quota on pure-text/discussion channels.
+DEEP_BACKFILL_MIN_MEDIA = int(os.environ.get("TGARR_DEEP_BACKFILL_MIN_MEDIA", "100"))
 
 
 async def deep_backfill_worker() -> None:
@@ -1781,9 +1805,21 @@ async def deep_backfill_worker() -> None:
                       AND COALESCE(c.deep_backfilled, FALSE) = FALSE
                       AND c.tg_chat_id > -2000000000000  -- exclude placeholder ids
                       AND c.last_polled_at IS NOT NULL    -- only resolved channels
-                    ORDER BY COALESCE(c.deep_last_run_at, '1970-01-01'::timestamptz) ASC
+                      -- skip resource-poor channels (only if remote counts known)
+                      AND NOT (
+                        c.remote_counts_refreshed_at IS NOT NULL
+                        AND COALESCE(c.remote_photos, 0)
+                          + COALESCE(c.remote_videos, 0)
+                          + COALESCE(c.remote_audio, 0)
+                          + COALESCE(c.remote_documents, 0) < $1
+                      )
+                    -- prioritize channels with most remote media (biggest payoff first)
+                    ORDER BY
+                        COALESCE(c.remote_videos, 0) + COALESCE(c.remote_audio, 0)
+                        + COALESCE(c.remote_documents, 0) DESC NULLS LAST,
+                        COALESCE(c.deep_last_run_at, '1970-01-01'::timestamptz) ASC
                     LIMIT 1
-                """)
+                """, DEEP_BACKFILL_MIN_MEDIA)
             if not row:
                 await _heartbeat("deep_backfill_worker", "all channels deep-backfilled")
                 await asyncio.sleep(3600)  # all done, idle hourly

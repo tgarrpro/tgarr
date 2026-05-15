@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.52"
+TGARR_VERSION = "0.4.53"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -153,6 +153,12 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_total_pulled BIGINT NOT NULL DEFAULT 0;
             CREATE INDEX IF NOT EXISTS idx_channels_deep_backfilled ON channels (deep_backfilled);
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_msgs BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_photos BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_videos BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_audio BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_documents BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_counts_refreshed_at TIMESTAMPTZ;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -2128,18 +2134,38 @@ async def api_deep_backfill_progress():
         rows = await conn.fetch("""
             SELECT username, title, deep_backfilled, deep_oldest_tg_id,
                    deep_last_run_at, deep_total_pulled,
-                   (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id) AS msgs_local
+                   remote_msgs, remote_photos, remote_videos,
+                   remote_audio, remote_documents,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id) AS msgs_local,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='photo') AS local_photos,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='video') AS local_videos,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='audio') AS local_audio,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='document') AS local_documents
             FROM channels
             WHERE subscribed = TRUE
-            ORDER BY deep_backfilled ASC, deep_last_run_at DESC NULLS LAST
+            ORDER BY deep_backfilled ASC, COALESCE(remote_msgs, 0) DESC
         """)
+    def pct(local, remote):
+        if not remote or remote <= 0:
+            return None
+        return round(100.0 * (local or 0) / remote, 1)
     return {"channels": [
         {"username": r["username"], "title": r["title"],
          "done": r["deep_backfilled"],
          "oldest_id": r["deep_oldest_tg_id"],
          "last_run_at": r["deep_last_run_at"].isoformat() if r["deep_last_run_at"] else None,
          "pulled_deep": r["deep_total_pulled"],
-         "msgs_local": r["msgs_local"]}
+         "msgs_local": r["msgs_local"],
+         "remote_msgs": r["remote_msgs"],
+         "pct_msgs": pct(r["msgs_local"], r["remote_msgs"]),
+         "local_photos": r["local_photos"], "remote_photos": r["remote_photos"],
+         "pct_photos": pct(r["local_photos"], r["remote_photos"]),
+         "local_videos": r["local_videos"], "remote_videos": r["remote_videos"],
+         "pct_videos": pct(r["local_videos"], r["remote_videos"]),
+         "local_audio": r["local_audio"], "remote_audio": r["remote_audio"],
+         "pct_audio": pct(r["local_audio"], r["remote_audio"]),
+         "local_documents": r["local_documents"], "remote_documents": r["remote_documents"],
+         "pct_documents": pct(r["local_documents"], r["remote_documents"])}
         for r in rows]}
 
 
