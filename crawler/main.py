@@ -57,6 +57,11 @@ app = Client(
 
 db_pool: asyncpg.Pool = None
 
+# Set in main() after app.start() — the TG user id of the connected account.
+# Workers filter channel access by this so an account switch leaves the prior
+# account's channels untouched (not poll'd, not deep_backfill'd, etc.).
+CURRENT_USER_ID: int = 0
+
 
 # ════════════════════════════════════════════════════════════════════
 # Global MTProto rate limiter + circuit breaker
@@ -72,7 +77,7 @@ db_pool: asyncpg.Pool = None
 # per-method token buckets, observes FloodWait, and sets a global halt that
 # all subsequent calls (across all workers) honor.
 # ════════════════════════════════════════════════════════════════════
-_MTPROTO_GLOBAL_HALT_UNTIL = 0.0   # epoch sec; all MTProto blocked until this
+_MTPROTO_HALT_UNTIL: dict = {}  # method → epoch sec when that method's FloodWait clears
 _MTPROTO_LOCK = asyncio.Lock()
 _MTPROTO_BUDGETS = {
     # method → (max calls, window seconds). Tuned conservative to stay below
@@ -91,21 +96,21 @@ _MTPROTO_CALL_LOG: dict = {}  # method → list[float] of recent call timestamps
 
 
 async def _mtproto(method_name: str, coro_factory):
-    """Gate any Pyrogram call: enforce per-method rate, honor global halt,
-    handle FloodWait by setting global halt. `coro_factory` is a callable
-    returning a fresh awaitable each invocation (so we can retry).
+    """Gate Pyrogram calls: per-method rate limit + per-method halt + FloodWait observation.
+    Halt is per-method: TG flood-waits specific endpoints (e.g. resolveUsername)
+    rather than the whole session, so other methods stay unblocked.
     """
-    global _MTPROTO_GLOBAL_HALT_UNTIL
     while True:
-        # 1. Honor global halt (set by prior FloodWait observation).
+        # 1. Honor THIS method's halt (set by prior FloodWait on same method).
         now = time.time()
-        if _MTPROTO_GLOBAL_HALT_UNTIL > now:
-            remaining = _MTPROTO_GLOBAL_HALT_UNTIL - now
-            log.info("[mtproto-rl] global halt %s: %ds remaining → sleeping",
+        halt_until = _MTPROTO_HALT_UNTIL.get(method_name, 0)
+        if halt_until > now:
+            remaining = halt_until - now
+            log.info("[mtproto-rl] halt %s: %ds remaining → sleeping",
                      method_name, int(remaining))
             await asyncio.sleep(min(remaining + 1, 60))
             continue
-        # 2. Per-method bucket: wait until a slot opens.
+        # 2. Per-method token bucket.
         limit, window = _MTPROTO_BUDGETS.get(method_name,
                                             _MTPROTO_BUDGETS["default"])
         async with _MTPROTO_LOCK:
@@ -123,28 +128,31 @@ async def _mtproto(method_name: str, coro_factory):
             await asyncio.sleep(wait_s)
             continue
         break
-    # 3. Make the call. On FloodWait, set global halt.
+    # 3. Make call. FloodWait → halt JUST this method.
     try:
         return await coro_factory()
     except FloodWait as fw:
         fw_val = int(getattr(fw, "value", 60) or 60)
         until = time.time() + fw_val + 5
         async with _MTPROTO_LOCK:
-            if until > _MTPROTO_GLOBAL_HALT_UNTIL:
-                _MTPROTO_GLOBAL_HALT_UNTIL = until
-        log.warning("[mtproto-rl] %s FloodWait %ds → global halt set",
+            if until > _MTPROTO_HALT_UNTIL.get(method_name, 0):
+                _MTPROTO_HALT_UNTIL[method_name] = until
+        log.warning("[mtproto-rl] %s FloodWait %ds → halt this method only",
                     method_name, fw_val)
         raise
 
 
-async def _mtproto_wait_clearance():
-    """Block until any global halt expires. Use before async generators
-    (get_chat_history / get_dialogs) which can't be wrapped call-by-call."""
+async def _mtproto_wait_clearance(method_name: str = "get_chat_history"):
+    """Block until the given method's halt expires. Use before async generators
+    which can't be wrapped call-by-call. Default to get_chat_history.
+    """
     while True:
         now = time.time()
-        if _MTPROTO_GLOBAL_HALT_UNTIL > now:
-            remaining = _MTPROTO_GLOBAL_HALT_UNTIL - now
-            log.info("[mtproto-rl] halt %ds remaining → sleeping", int(remaining))
+        halt_until = _MTPROTO_HALT_UNTIL.get(method_name, 0)
+        if halt_until > now:
+            remaining = halt_until - now
+            log.info("[mtproto-rl] halt %s: %ds remaining → sleeping",
+                     method_name, int(remaining))
             await asyncio.sleep(min(remaining + 1, 60))
             continue
         return
@@ -160,18 +168,34 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
         return await _mtproto("get_messages",
                                lambda: app.get_messages(chat_id, msg_id))
     except ChannelInvalid:
-        # First try a refresh via get_chat_history (cheap, often fixes stale access_hash)
+        # First try a refresh via get_chat_history (cheap, often fixes stale
+        # access_hash). NOTE: get_chat_history is an async generator — can't
+        # be wrapped in `await coro()`. Use clearance gate + iterate directly.
         try:
-            async for _ in await _mtproto("get_chat_history",
-                                            lambda: app.get_chat_history(chat_id, limit=1)):
+            await _mtproto_wait_clearance("get_chat_history")
+            async for _ in app.get_chat_history(chat_id, limit=1):
                 break
             return await _mtproto("get_messages",
                                    lambda: app.get_messages(chat_id, msg_id))
         except ChannelInvalid:
             pass
-        # Last resort: actually join the channel
+        # Last resort: join the channel. join_chat(chat_id) only works if we
+        # have access_hash. For a new account that never resolved this peer,
+        # we need username lookup. Try chat_id first (cheap), fallback to
+        # username resolve (uses resolveUsername quota).
         log.info("[mtproto] auto-join %s after CHANNEL_INVALID", chat_id)
-        await _mtproto("join_chat", lambda: app.join_chat(chat_id))
+        try:
+            await _mtproto("join_chat", lambda: app.join_chat(chat_id))
+        except ChannelInvalid:
+            # No access_hash cached — resolve via username then join.
+            async with db_pool.acquire() as conn:
+                uname = await conn.fetchval(
+                    "SELECT username FROM channels WHERE tg_chat_id=$1", chat_id)
+            if not uname:
+                raise
+            log.info("[mtproto] join by username @%s (no access_hash for %s)",
+                     uname, chat_id)
+            await _mtproto("join_chat", lambda: app.join_chat(uname))
         return await _mtproto("get_messages",
                                lambda: app.get_messages(chat_id, msg_id))
 
@@ -659,16 +683,18 @@ async def ingest_message(msg: Message) -> bool:
         # even though the channel HAS a real public @username. Preserve the
         # known good value.
         ch_id = await conn.fetchval(
-            """INSERT INTO channels (tg_chat_id, username, title, category)
-               VALUES ($1, $2, $3, $4)
+            """INSERT INTO channels (tg_chat_id, username, title, category, account_user_id)
+               VALUES ($1, $2, $3, $4, $5)
                ON CONFLICT (tg_chat_id) DO UPDATE
                  SET username = COALESCE(NULLIF(EXCLUDED.username, ''), channels.username),
-                     title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title)
+                     title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title),
+                     account_user_id = EXCLUDED.account_user_id
                RETURNING id""",
             chat_id,
             msg.chat.username,
             msg.chat.title or "",
             chat_type.lower(),
+            CURRENT_USER_ID or None,
         )
         # === Caption-mention extraction (always; contribute gated separately) ===
         # Even text-only messages can contain @mention / invite links — those
@@ -870,101 +896,256 @@ async def backfill_all() -> None:
                      len(rejoined), [(s["tg_chat_id"], (s["title"] or "")[:40]) for s in rejoined])
 
 
-async def download_worker() -> None:
-    """Background loop: pick up pending downloads + fetch media.
+_arr_alias_cache: list = []  # (alias_text, canonical, season, kind)
+_arr_alias_loaded_at: float = 0.0
 
-    Tries HTTPS path (t.me/<ch>/<msg>?embed=1 video src) for video on public
-    channels — bypasses MTProto cross-DC FloodWait entirely. Falls back to
-    MTProto download_media() for non-video / private channel / scrape miss.
+
+async def _refresh_arr_aliases():
+    """Same series_aliases table the api side maintains via _arr_alias_sync_worker.
+    Cache in crawler for filename rewrites; reload every 60s."""
+    global _arr_alias_cache, _arr_alias_loaded_at
+    if time.time() - _arr_alias_loaded_at < 60:
+        return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT alias_text, canonical_title, season, kind FROM series_aliases "
+            "ORDER BY length(alias_text) DESC")
+    _arr_alias_cache = [(r["alias_text"], r["canonical_title"],
+                         r["season"], r["kind"]) for r in rows]
+    _arr_alias_loaded_at = time.time()
+
+
+async def _rename_for_arr(local_path: str, row) -> str:
+    """Rename a freshly downloaded file to a Sonarr/Radarr-parseable name.
+
+    Sonarr's parser can't extract series/season/episode from CJK filenames
+    like ``[唯电影]《舌尖上的中国第三季》第1集 器.mp4`` and refuses to import.
+    We rewrite to ``A Bite of China.S03E01.1080p.WEBRip-tgarr.mp4`` using the
+    same series_aliases table the newznab feed uses, so the on-disk name
+    matches what Sonarr's CDH was told to expect.
+
+    Returns the (possibly new) path. No-op if no alias matches.
     """
-    log.info("[worker] download worker started; root=%s", DOWNLOAD_ROOT)
-    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
-    while True:
+    if not local_path or not os.path.exists(local_path):
+        return local_path
+    await _refresh_arr_aliases()
+    raw = row["rel_name"] or ""
+    ext = os.path.splitext(local_path)[1] or ".mp4"
+    ep = row["episode"] or 1
+    seas_default = row["season"] or 1
+    qual = row["quality"] or "1080p"
+    new_name = None
+    for alias_text, canonical, season, kind in _arr_alias_cache:
+        if alias_text and alias_text in raw:
+            if kind == "movie":
+                yr = row["movie_year"] or ""
+                yr_suffix = f".{yr}" if yr else ""
+                new_name = f"{canonical}{yr_suffix}.{qual}.WEBRip-tgarr{ext}"
+            else:
+                seas = season if season is not None else seas_default
+                new_name = f"{canonical}.S{int(seas):02d}E{int(ep):02d}.{qual}.WEBRip-tgarr{ext}"
+            break
+    if not new_name:
+        return local_path
+    new_name = SAFE_NAME.sub("_", new_name)[:200]
+    new_path = os.path.join(os.path.dirname(local_path), new_name)
+    if new_path == local_path:
+        return local_path
+    try:
+        os.rename(local_path, new_path)
+        log.info("[worker] renamed for arr id=%s %s → %s",
+                 row["dl_id"], os.path.basename(local_path), new_name)
+        return new_path
+    except OSError as e:
+        log.warning("[worker] rename-for-arr failed id=%s: %s", row["dl_id"], e)
+        return local_path
+
+
+CURRENT_DC: int = 0  # populated in main() after app.start()
+_SAME_DC_SEM = asyncio.Semaphore(5)   # 5 parallel same-DC downloads
+_CROSS_DC_SEM = asyncio.Semaphore(1)  # 1 cross-DC at a time (auth.ExportAuthorization budget)
+
+
+async def _claim_pending(same_dc: bool):
+    """Atomically claim one pending download matching the DC predicate.
+    Two-step: FOR UPDATE SKIP LOCKED to safely pick + flip status, then a
+    second fetch of the full join. Race-free across dispatchers."""
+    async with db_pool.acquire() as conn:
+        if same_dc:
+            pred = "(m.file_dc = $1 OR m.file_dc IS NULL)"
+        else:
+            pred = "(m.file_dc <> $1)"
+        claimed = await conn.fetchval(f"""
+            WITH claim AS (
+              SELECT d.id
+              FROM downloads d
+              JOIN releases r ON r.id = d.release_id
+              JOIN messages m ON m.id = r.primary_msg_id
+              WHERE d.status = 'pending' AND {pred}
+              ORDER BY d.requested_at
+              FOR UPDATE OF d SKIP LOCKED
+              LIMIT 1
+            )
+            UPDATE downloads SET status='downloading'
+            WHERE id IN (SELECT id FROM claim)
+            RETURNING id;
+        """, CURRENT_DC)
+        if not claimed:
+            return None
+        rec = await conn.fetchrow("""
+            SELECT d.id AS dl_id, d.release_id, r.name AS rel_name,
+                   r.season, r.episode, r.quality,
+                   r.movie_year, r.category,
+                   m.tg_chat_id, m.tg_message_id, m.media_type,
+                   m.file_size, m.file_name, m.file_dc,
+                   c.username AS channel_username
+            FROM downloads d
+            JOIN releases r ON r.id = d.release_id
+            JOIN messages m ON m.id = r.primary_msg_id
+            JOIN channels c ON c.id = m.channel_id
+            WHERE d.id = $1;
+        """, claimed)
+        return dict(rec) if rec else None
+
+
+async def _process_one_download(row_payload: dict) -> None:
+    """The actual download + rename + chmod work for a single claimed row.
+    Extracted from download_worker so the dispatcher can spawn multiple of
+    these concurrently under a semaphore."""
+    row = row_payload  # dict, not asyncpg Record — same key access pattern
+    try:
+        safe_name = SAFE_NAME.sub("_", row["rel_name"])[:160]
+        target_dir = os.path.join(DOWNLOAD_ROOT, safe_name)
+        os.makedirs(target_dir, exist_ok=True)
+        same_dc = (row.get("file_dc") in (None, CURRENT_DC))
+        log.info("[worker] downloading id=%s release=%s media=%s dc=%s(%s) → %s",
+                 row["dl_id"], row["rel_name"], row["media_type"],
+                 row.get("file_dc"), "same" if same_dc else "cross", target_dir)
+
+        local_path = None
+        # ── Path 1: HTTPS for video on public channels (no MTProto burn). ──
+        if (row["media_type"] == "video" and row["channel_username"]):
+            try:
+                vurl = await _fetch_video_url_https(
+                    row["channel_username"], row["tg_message_id"])
+                if vurl:
+                    fname = row["file_name"] or f"{safe_name}.mp4"
+                    fname = SAFE_NAME.sub("_", fname)[:200]
+                    if not fname.lower().endswith((".mp4", ".mkv", ".webm", ".mov")):
+                        fname += ".mp4"
+                    target_path = os.path.join(target_dir, fname)
+                    written = await _download_video_https(
+                        vurl, target_path, row["file_size"],
+                        dl_id=row["dl_id"])
+                    local_path = target_path
+                    log.info("[worker] HTTPS video done id=%s bytes=%d",
+                             row["dl_id"], written)
+            except Exception as he:
+                log.warning("[worker] HTTPS video failed id=%s: %s — falling back to MTProto",
+                            row["dl_id"], he)
+
+        # ── Path 2: MTProto fallback. User doesn't see this distinction.
+        # Cross-DC ops are serialized by _CROSS_DC_SEM in the dispatcher.
+        if local_path is None:
+            if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
+                raise RuntimeError("THUMB_ONLY mode: MTProto download disabled")
+            msg = await _mtproto_get_messages_with_auto_join(
+                row["tg_chat_id"], row["tg_message_id"])
+            if not msg or not (msg.video or msg.document or msg.audio):
+                raise RuntimeError("media missing on source message")
+            dl_id = row["dl_id"]
+            progress_state = {"last_t": time.time(), "last_b": 0}
+            async def _progress(current, total):
+                now = time.time()
+                dt = now - progress_state["last_t"]
+                if dt < 5 and current < total:
+                    return
+                db = current - progress_state["last_b"]
+                kbps = int(db / 1024 / max(dt, 0.001))
+                progress_state["last_t"] = now
+                progress_state["last_b"] = current
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE downloads
+                               SET bytes_done = GREATEST(COALESCE(bytes_done,0), $1),
+                                   speed_kbps=$2, last_progress_at=NOW()
+                               WHERE id=$3""",
+                            int(current), kbps, dl_id)
+                except Exception:
+                    pass
+            local_path = await _mtproto("download_media",
+                lambda: app.download_media(msg, file_name=f"{target_dir}/",
+                                           progress=_progress))
+        local_path = await _rename_for_arr(str(local_path), row)
+        try:
+            os.chmod(local_path, 0o666)
+            os.chmod(target_dir, 0o777)
+        except OSError as e:
+            log.warning("[worker] chmod failed id=%s: %s", row["dl_id"], e)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE downloads
+                   SET status='completed', finished_at=NOW(), local_path=$1
+                   WHERE id=$2""",
+                str(local_path), row["dl_id"])
+        log.info("[worker] completed id=%s path=%s", row["dl_id"], local_path)
+    except Exception as e:
+        log.exception("[worker] failed id=%s: %s", row["dl_id"], e)
         try:
             async with db_pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """SELECT d.id AS dl_id, d.release_id, r.name AS rel_name,
-                              m.tg_chat_id, m.tg_message_id, m.media_type,
-                              m.file_size, m.file_name,
-                              c.username AS channel_username
-                       FROM downloads d
-                       JOIN releases r ON r.id = d.release_id
-                       JOIN messages m ON m.id = r.primary_msg_id
-                       JOIN channels c ON c.id = m.channel_id
-                       WHERE d.status = 'pending'
-                       ORDER BY d.requested_at
-                       LIMIT 1""")
-            if not row:
-                await asyncio.sleep(5)
-                continue
-
-            async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE downloads SET status='downloading' WHERE id=$1", row["dl_id"])
+                    """UPDATE downloads
+                       SET status='failed', finished_at=NOW(), error_message=$1
+                       WHERE id=$2""",
+                    str(e)[:500], row["dl_id"])
+        except Exception:
+            log.exception("[worker] failed to mark failed id=%s", row["dl_id"])
 
-            safe_name = SAFE_NAME.sub("_", row["rel_name"])[:160]
-            target_dir = os.path.join(DOWNLOAD_ROOT, safe_name)
-            os.makedirs(target_dir, exist_ok=True)
-            log.info("[worker] downloading id=%s release=%s media=%s → %s",
-                     row["dl_id"], row["rel_name"], row["media_type"], target_dir)
 
-            try:
-                local_path = None
-                # ── Path 1: HTTPS for video on public channels (no MTProto burn). ──
-                if (row["media_type"] == "video" and row["channel_username"]):
-                    try:
-                        vurl = await _fetch_video_url_https(
-                            row["channel_username"], row["tg_message_id"])
-                        if vurl:
-                            # Filename: prefer original m.file_name, else release_name.mp4
-                            fname = row["file_name"] or f"{safe_name}.mp4"
-                            fname = SAFE_NAME.sub("_", fname)[:200]
-                            if not fname.lower().endswith((".mp4", ".mkv", ".webm", ".mov")):
-                                fname += ".mp4"
-                            target_path = os.path.join(target_dir, fname)
-                            written = await _download_video_https(
-                                vurl, target_path, row["file_size"])
-                            local_path = target_path
-                            log.info("[worker] HTTPS video done id=%s bytes=%d", row["dl_id"], written)
-                    except Exception as he:
-                        log.warning("[worker] HTTPS video failed id=%s: %s — falling back to MTProto",
-                                    row["dl_id"], he)
-
-                # ── Path 2: MTProto fallback with auto-join. User doesn't
-                # see this distinction — just sees grab succeed or fail. The
-                # rate limiter + global halt prevents quota burn cascading
-                # across workers.
-                if local_path is None:
-                    if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
-                        raise RuntimeError("THUMB_ONLY mode: MTProto download disabled")
-                    msg = await _mtproto_get_messages_with_auto_join(
-                        row["tg_chat_id"], row["tg_message_id"])
-                    if not msg or not (msg.video or msg.document or msg.audio):
-                        raise RuntimeError("media missing on source message")
-                    local_path = await _mtproto("download_media",
-                        lambda: app.download_media(msg, file_name=f"{target_dir}/"))
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        """UPDATE downloads
-                           SET status='completed', finished_at=NOW(), local_path=$1
-                           WHERE id=$2""",
-                        str(local_path), row["dl_id"])
-                log.info("[worker] completed id=%s path=%s", row["dl_id"], local_path)
-            except Exception as e:
-                log.exception("[worker] failed id=%s: %s", row["dl_id"], e)
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        """UPDATE downloads
-                           SET status='failed', finished_at=NOW(), error_message=$1
-                           WHERE id=$2""",
-                        str(e)[:500], row["dl_id"])
-        except Exception as e:
-            log.exception("[worker] outer-loop error: %s", e)
+async def _download_dispatcher(same_dc: bool, sem: asyncio.Semaphore) -> None:
+    """One of two dispatcher loops. Acquires sem before claiming a row so
+    the in-flight count never exceeds the pool size. Released by the
+    spawned worker task on completion."""
+    pool_name = "same-dc" if same_dc else "cross-dc"
+    log.info("[worker] dispatcher started pool=%s cap=%s", pool_name, sem._value)
+    while True:
+        await sem.acquire()
+        try:
+            row = await _claim_pending(same_dc)
+        except Exception:
+            log.exception("[worker] claim error pool=%s", pool_name)
+            sem.release()
             await asyncio.sleep(10)
+            continue
+        if not row:
+            sem.release()
+            await asyncio.sleep(5)
+            continue
+        async def _task(r=row):
+            try:
+                await _process_one_download(r)
+            finally:
+                sem.release()
+        asyncio.create_task(_task())
+
+
+async def download_worker() -> None:
+    """Spawn two dispatcher loops: same-DC parallel (5), cross-DC serial (1).
+    Kept as a single entry point so main() doesn't change much; this just
+    fans out the two pools."""
+    log.info("[worker] download worker root=%s my_dc=%s",
+             DOWNLOAD_ROOT, CURRENT_DC)
+    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
+    await asyncio.gather(
+        _download_dispatcher(True, _SAME_DC_SEM),
+        _download_dispatcher(False, _CROSS_DC_SEM),
+    )
 
 
 SESSION_PATH = "/app/session/tgarr.session"
 THUMBS_ROOT = "/downloads/thumbs"
+PREVIEWS_ROOT = "/downloads/previews"
 
 REGISTRY_URL = os.environ.get("TGARR_REGISTRY_URL", "https://tgarr.me").rstrip("/")
 CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true"
@@ -1221,14 +1402,17 @@ async def _fetch_video_url_https(username: str, tg_message_id: int) -> str | Non
 
 
 async def _download_video_https(video_url: str, target_path: str,
-                                 expected_size: int | None = None) -> int:
+                                 expected_size: int | None = None,
+                                 dl_id: int | None = None) -> int:
     """Stream-download a video URL to disk. Returns bytes written.
     Raises on HTTP error or size mismatch (when expected_size given).
+    If dl_id given, updates downloads.bytes_done + speed_kbps every ~5s.
     """
+    progress_state = {"last_t": time.time(), "last_b": 0, "written": 0}
+
     def _dl():
         req = urllib.request.Request(
             video_url, headers={"User-Agent": "Mozilla/5.0"})
-        written = 0
         with urllib.request.urlopen(req, timeout=300) as r:
             with open(target_path, "wb") as f:
                 while True:
@@ -1236,14 +1420,79 @@ async def _download_video_https(video_url: str, target_path: str,
                     if not chunk:
                         break
                     f.write(chunk)
-                    written += len(chunk)
-        return written
+                    progress_state["written"] += len(chunk)
+        return progress_state["written"]
 
-    bytes_written = await asyncio.to_thread(_dl)
+    async def _progress_pump():
+        while True:
+            await asyncio.sleep(5)
+            now = time.time()
+            cur = progress_state["written"]
+            db = cur - progress_state["last_b"]
+            dt = now - progress_state["last_t"]
+            progress_state["last_b"] = cur
+            progress_state["last_t"] = now
+            if dl_id and db > 0:
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE downloads "
+                            "SET bytes_done = GREATEST(COALESCE(bytes_done,0), $1), "
+                            "    speed_kbps=$2, last_progress_at=NOW() WHERE id=$3",
+                            int(cur), int(db / 1024 / max(dt, 0.001)), dl_id)
+                except Exception:
+                    pass
+
+    pump = asyncio.create_task(_progress_pump()) if dl_id else None
+    try:
+        bytes_written = await asyncio.to_thread(_dl)
+    finally:
+        if pump:
+            pump.cancel()
     if expected_size and bytes_written != expected_size:
         raise RuntimeError(
             f"size mismatch: got {bytes_written} expected {expected_size}")
     return bytes_written
+
+
+_TME_PREVIEW_RX = re.compile(
+    r"https://cdn[0-9]+\.telesco\.pe/file/[A-Za-z0-9_\-]+\.jpg")
+
+
+async def _fetch_preview_https(username: str, tg_message_id: int) -> bytes | None:
+    """Gallery slideshow preview (~76KB 450px JPEG). Same t.me embed scrape
+    as thumb but takes the LAST cdn URL (background-image, bigger) instead
+    of the FIRST (link_preview, smaller). HTTPS — no MTProto, no FloodWait.
+    """
+    if not username:
+        return None
+    url = f"https://t.me/{username}/{tg_message_id}?embed=1&single"
+
+    def _scrape():
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                html = r.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
+        if ("tgme_widget_message_photo_wrap" not in html
+                and "tgme_widget_message_video_wrap" not in html):
+            return None
+        # ALL cdn jpg URLs in order; pick last = biggest available preview.
+        urls = _TME_PREVIEW_RX.findall(html)
+        if not urls:
+            return None
+        target = urls[-1] if len(urls) > 1 else urls[0]
+        try:
+            req2 = urllib.request.Request(
+                target, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req2, timeout=12) as r2:
+                return r2.read()
+        except Exception:
+            return None
+
+    return await asyncio.to_thread(_scrape)
 
 
 async def _fetch_thumb_https(username: str, tg_message_id: int) -> bytes | None:
@@ -1370,6 +1619,72 @@ async def _thumb_process_one(row) -> None:
                 row["id"])
 
 
+_PREVIEW_SEM = asyncio.Semaphore(5)  # concurrent HTTPS fetches
+
+
+async def _preview_process_one(row):
+    if not row["channel_username"]:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
+                row["id"])
+        return
+    try:
+        async with _PREVIEW_SEM:
+            blob = await _fetch_preview_https(
+                row["channel_username"], row["tg_message_id"])
+        if not blob:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
+                    row["id"])
+            return
+        safe_uid = SAFE_NAME.sub(
+            "_", row["file_unique_id"] or str(row["id"]))[:80]
+        fname = f"{safe_uid}.jpg"
+        target = os.path.join(PREVIEWS_ROOT, fname)
+        with open(target, "wb") as f:
+            f.write(blob)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET preview_path=$1 WHERE id=$2",
+                fname, row["id"])
+    except Exception as e:
+        log.warning("[preview] failed id=%s: %s", row["id"], e)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
+                row["id"])
+
+
+async def preview_downloader() -> None:
+    """450px+ JPEG preview fetcher — sem-capped 5 concurrent HTTPS scrapes.
+    LIFO batch (newest queued first) so user's just-opened slideshow is
+    prioritized over backlog. Same t.me embed source as thumb, takes the
+    larger CDN URL.
+    """
+    log.info("[preview] dispatcher started; root=%s conc=5", PREVIEWS_ROOT)
+    os.makedirs(PREVIEWS_ROOT, exist_ok=True)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """SELECT m.id, m.tg_message_id, m.file_unique_id,
+                              c.username AS channel_username
+                       FROM messages m JOIN channels c ON c.id = m.channel_id
+                       WHERE m.preview_path = '__user_queued__'
+                       ORDER BY m.id DESC LIMIT 20""")
+            if not rows:
+                await asyncio.sleep(30)
+                continue
+            await asyncio.gather(
+                *[_preview_process_one(r) for r in rows],
+                return_exceptions=True)
+        except Exception:
+            log.exception("[preview] outer loop")
+            await asyncio.sleep(10)
+
+
 async def thumb_downloader() -> None:
     """Concurrent thumb-fetch dispatcher.
 
@@ -1420,10 +1735,11 @@ async def channel_meta_refresher() -> None:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """SELECT tg_chat_id FROM channels
-                       WHERE meta_updated_at IS NULL
-                          OR meta_updated_at < NOW() - INTERVAL '7 days'
+                       WHERE (account_user_id = $1 OR account_user_id IS NULL)
+                         AND (meta_updated_at IS NULL
+                              OR meta_updated_at < NOW() - INTERVAL '7 days')
                        ORDER BY meta_updated_at NULLS FIRST
-                       LIMIT 1""")
+                       LIMIT 1""", CURRENT_USER_ID)
             if not row:
                 await asyncio.sleep(900)
                 continue
@@ -1686,11 +2002,12 @@ async def subscription_poller() -> None:
                     """SELECT id, tg_chat_id, username, title, backfilled
                        FROM channels
                        WHERE subscribed = TRUE
+                         AND (account_user_id = $2 OR account_user_id IS NULL)
                          AND (last_polled_at IS NULL
                               OR last_polled_at < NOW() - $1 * INTERVAL '1 second')
                        ORDER BY last_polled_at NULLS FIRST
                        LIMIT 1""",
-                    SUBSCRIBE_POLL_INTERVAL)
+                    SUBSCRIBE_POLL_INTERVAL, CURRENT_USER_ID)
             if not row:
                 await asyncio.sleep(60)
                 continue
@@ -2703,6 +3020,7 @@ async def deep_backfill_worker() -> None:
                     FROM channels c
                     WHERE COALESCE(c.deep_backfilled, FALSE) = FALSE
                       AND c.tg_chat_id > -2000000000000  -- exclude placeholder ids
+                      AND (c.account_user_id = $2 OR c.account_user_id IS NULL)
                       AND (
                         -- explicit tgarr subscription resolved via TG API
                         (c.subscribed = TRUE AND c.last_polled_at IS NOT NULL)
@@ -2724,7 +3042,7 @@ async def deep_backfill_worker() -> None:
                         + COALESCE(c.remote_documents, 0) DESC NULLS LAST,
                         COALESCE(c.deep_last_run_at, '1970-01-01'::timestamptz) ASC
                     LIMIT 1
-                """, DEEP_BACKFILL_MIN_MEDIA)
+                """, DEEP_BACKFILL_MIN_MEDIA, CURRENT_USER_ID)
             if not row:
                 await _heartbeat("deep_backfill_worker", "all channels deep-backfilled")
                 await asyncio.sleep(3600)  # all done, idle hourly
@@ -2969,13 +3287,64 @@ async def contribute_resources_worker() -> None:
             await asyncio.sleep(600)
 
 
+async def _session_change_watcher(boot_user_id: int):
+    """Detect when /login QR-changes the underlying session to a different
+    TG account. Crawler can't hot-swap Pyrogram client mid-flight; on change
+    we self-exit and let docker's restart policy bring us back fresh.
+    """
+    import sqlite3
+    await asyncio.sleep(60)  # initial settle
+    while True:
+        try:
+            if os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0:
+                con = sqlite3.connect(f"file:{SESSION_PATH}?mode=ro",
+                                      uri=True, timeout=2)
+                try:
+                    row = con.execute(
+                        "SELECT user_id FROM sessions LIMIT 1").fetchone()
+                finally:
+                    con.close()
+                if row and row[0] and row[0] != boot_user_id:
+                    log.warning(
+                        "[session-watch] user_id changed %s → %s — self-exiting "
+                        "for docker restart to pick up new account",
+                        boot_user_id, row[0])
+                    # Brief delay so log flushes
+                    await asyncio.sleep(2)
+                    os._exit(0)
+        except Exception as e:
+            log.debug("[session-watch] check err: %s", e)
+        await asyncio.sleep(30)
+
+
 async def main() -> None:
+    global CURRENT_USER_ID, CURRENT_DC
     await init_db()
     await wait_for_session()
     await app.start()
     app.add_handler(RawUpdateHandler(on_raw_update))
     me = await app.get_me()
-    log.info("connected as @%s (id=%s)", me.username or "-", me.id)
+    CURRENT_USER_ID = me.id
+    try:
+        CURRENT_DC = await app.storage.dc_id()
+    except Exception:
+        CURRENT_DC = 0
+    log.info("connected as @%s (id=%s) dc=%s",
+             me.username or "-", me.id, CURRENT_DC)
+    # Reset stale 'downloading' from previous crash/restart — worker is
+    # single-task serial, so only one can really be in flight at a time.
+    # Any leftover 'downloading' from a previous boot is dead state.
+    async with db_pool.acquire() as conn:
+        # Keep bytes_done so UI stays monotonic across crawler restart; new
+        # Pyrogram download will overwrite via GREATEST once it surpasses
+        # last-known. Only flip status + clear stale speed/timestamp.
+        reset = await conn.execute(
+            "UPDATE downloads SET status='pending', speed_kbps=0, "
+            "last_progress_at=NULL WHERE status='downloading'")
+        if reset and reset != "UPDATE 0":
+            log.info("[worker] %s stale downloading → pending on boot "
+                     "(bytes_done preserved)", reset)
+    asyncio.create_task(_session_change_watcher(me.id))
 
     # THUMB-ONLY MODE: emergency lockdown when MTProto cross-DC FloodWait is
     # escalating. Runs only HTTPS-safe workers (thumb_downloader uses t.me
@@ -2985,6 +3354,7 @@ async def main() -> None:
 
     asyncio.create_task(meili_sync_worker())   # HTTPS to local Meili — safe
     asyncio.create_task(thumb_downloader())    # HTTPS-first, MTProto fallback (gated by THUMB_ONLY)
+    asyncio.create_task(preview_downloader())  # HTTPS-only (450px slideshow preview)
     asyncio.create_task(download_worker())     # HTTPS-first for video, MTProto fallback (gated)
 
     if THUMB_ONLY_MODE:

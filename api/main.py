@@ -273,6 +273,27 @@ async def _migrate_schema():
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS grab_count INT NOT NULL DEFAULT 0;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS detected_lang TEXT;
             CREATE INDEX IF NOT EXISTS idx_messages_lang ON messages (detected_lang) WHERE detected_lang IS NOT NULL;
+            -- Per-download live progress (populated by Pyrogram callback in
+            -- download_worker). Refreshes every ~5s so UI can show MB/s + ETA
+            -- without per-byte DB hammering.
+            ALTER TABLE downloads ADD COLUMN IF NOT EXISTS bytes_done BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE downloads ADD COLUMN IF NOT EXISTS speed_kbps INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE downloads ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ;
+            -- 450px gallery preview (~76KB JPEG) — bigger than 12KB thumb for
+            -- lightbox/slideshow. Same lazy-fetch model: '__user_queued__'
+            -- marker triggers preview_downloader on next /api/photo-preview hit.
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview_path TEXT;
+            CREATE INDEX IF NOT EXISTS idx_messages_preview ON messages (preview_path) WHERE preview_path IS NOT NULL;
+            -- Per-account channel ownership: which TG account discovered/has-access
+            -- to this channel. Crawler workers filter by current account so an
+            -- account switch doesn't try to access channels it can't reach.
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS account_user_id BIGINT;
+            CREATE INDEX IF NOT EXISTS idx_channels_account ON channels (account_user_id);
+            -- One-shot backfill: existing rows discovered before per-account
+            -- tracking get assigned to @tjin09 (id=7506176065). Idempotent —
+            -- only fills NULL.
+            UPDATE channels SET account_user_id = 7506176065
+              WHERE account_user_id IS NULL;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -576,6 +597,7 @@ async def favicon():
 import re as _re
 from fastapi.responses import FileResponse, StreamingResponse
 THUMBS_DIR = "/downloads/thumbs"
+PREVIEWS_DIR = "/downloads/previews"
 _THUMB_SAFE = _re.compile(r"^[A-Za-z0-9_\-]+\.jpg$")
 
 
@@ -639,6 +661,56 @@ async def lazy_thumb(msg_id: int):
         if tp in ("__failed__", "__deleted__"):
             return Response(_TINY_TRANSPARENT_GIF, status_code=410,
                            media_type="image/gif")
+    return Response(_TINY_TRANSPARENT_GIF, status_code=202,
+                   media_type="image/gif")
+
+
+@app.get("/api/photo-preview/{msg_id}")
+async def lazy_preview(msg_id: int):
+    """On-demand 450px preview (~76KB JPEG) for gallery slideshow / lightbox.
+    Distinct from /api/thumb which serves the 12KB grid thumbnail. Same
+    lazy-queue pattern: cached → serve; missing → mark __user_queued__
+    so preview_downloader fetches via t.me embed's larger CDN URL.
+    Falls back to thumb if preview not yet available."""
+    import asyncio
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT preview_path, thumb_path FROM messages WHERE id=$1", msg_id)
+    if not row:
+        return Response("no msg", status_code=404)
+    pp = row["preview_path"]
+    if pp and not pp.startswith("__"):
+        fpath = os.path.join(PREVIEWS_DIR, pp)
+        if os.path.exists(fpath):
+            return FileResponse(fpath, media_type="image/jpeg",
+                              headers={"Cache-Control": "public, max-age=604800"})
+    # Queue preview fetch (worker picks up __user_queued__)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET preview_path='__user_queued__' "
+            "WHERE id=$1 AND (preview_path IS NULL OR preview_path='__user_queued__')",
+            msg_id)
+    # Brief poll — if it arrives within ~6s, serve fresh; else fall back to thumb
+    for _ in range(12):
+        await asyncio.sleep(0.5)
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT preview_path FROM messages WHERE id=$1", msg_id)
+        pp = row["preview_path"]
+        if pp and not pp.startswith("__"):
+            fpath = os.path.join(PREVIEWS_DIR, pp)
+            if os.path.exists(fpath):
+                return FileResponse(fpath, media_type="image/jpeg",
+                                  headers={"Cache-Control": "public, max-age=604800"})
+        if pp == "__failed__":
+            break
+    # Fall back to thumb if preview unavailable
+    tp = row.get("thumb_path") if hasattr(row, "get") else (row["thumb_path"] if "thumb_path" in (row.keys() if row else []) else None)
+    if tp and not tp.startswith("__"):
+        fpath = os.path.join(THUMBS_DIR, tp)
+        if os.path.exists(fpath):
+            return FileResponse(fpath, media_type="image/jpeg",
+                              headers={"Cache-Control": "public, max-age=604800"})
     return Response(_TINY_TRANSPARENT_GIF, status_code=202,
                    media_type="image/gif")
 
@@ -1940,6 +2012,10 @@ tbody td.name { font-weight:600; color:var(--fg); }
 .dl-item .info .meta { font-size:14px; color:var(--muted); margin-top:5px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 .dl-item .info .err { font-size:13px; color:var(--bad); margin-top:5px; font-family:ui-monospace,monospace; }
 .dl-item .right { text-align:right; font-size:14px; color:var(--muted); white-space:nowrap; }
+.dl-progress { margin-top:8px; }
+.dl-progress-bar { background:#e2e8f0; border-radius:4px; height:10px; overflow:hidden; }
+.dl-progress-fill { height:100%; background:linear-gradient(90deg, var(--accent), #5eb6e5); transition:width 1s linear; }
+.dl-progress-meta { font-size:12px; color:var(--muted); margin-top:3px; font-family:ui-monospace,monospace; }
 
 .empty-state { text-align:center; padding:56px 24px; color:var(--muted); background:var(--surface); border:1px dashed var(--border); border-radius:8px; font-size:16px; }
 .empty-state .icon { font-size:42px; opacity:0.4; margin-bottom:14px; }
@@ -1985,7 +2061,7 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 /* ── Lightbox + slideshow ─────────────────── */
 .lightbox { position:fixed; inset:0; background:rgba(15,23,42,0.96); display:none; align-items:center; justify-content:center; z-index:9999; padding:20px; overflow:hidden; }
 .lightbox.open { display:flex; }
-.lightbox img { max-width:94vw; max-height:88vh; border-radius:6px; box-shadow:0 16px 50px rgba(0,0,0,0.5); will-change:transform,opacity,filter; }
+.lightbox img { width:96vw; height:90vh; object-fit:contain; border-radius:6px; box-shadow:0 16px 50px rgba(0,0,0,0.5); will-change:transform,opacity,filter; image-rendering:auto; }
 .lightbox .lb-meta { position:absolute; left:32px; right:32px; bottom:80px; color:#fff; font-size:15px; line-height:1.55; max-width:660px; pointer-events:none; transition:opacity 0.3s; }
 .lightbox .lb-meta .ch { color:var(--accent-hi); font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
 .lightbox .lb-close { position:absolute; top:18px; right:24px; color:#fff; font-size:36px; cursor:pointer; opacity:0.6; line-height:1; padding:6px 12px; background:none; border:none; }
@@ -3391,7 +3467,26 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '    const p = photos[idx];'
         '    FX.forEach(c => img.classList.remove(c));'
         '    void img.offsetHeight;'
-        '    img.src = p.src;'
+        '    img.src = p.src;'  # instant 12KB thumb
+        '    /* async upgrade to 450px+ preview; retry with backoff while server queues */'
+        '    const previewBase = "/api/photo-preview/" + p.id;'
+        '    const myIdx = idx;'
+        '    let tries = 0;'
+        '    const tryUpgrade = () => {'
+        '      if (cur !== myIdx) return;'
+        '      const u = new Image();'
+        '      u.onload = () => {'
+        '        if (cur !== myIdx) return;'
+        '        if (u.naturalWidth > 1) {'
+        '          img.src = previewBase + "?v=" + Date.now();'
+        '        } else if (tries < 6) {'
+        '          tries++;'
+        '          setTimeout(tryUpgrade, 1500 + tries * 1000);'
+        '        }'
+        '      };'
+        '      u.src = previewBase + "?r=" + Date.now();'
+        '    };'
+        '    tryUpgrade();'
         '    let fx; do { fx = Math.floor(Math.random() * FX.length); } while (fx === lastFx && FX.length > 1);'
         '    lastFx = fx;'
         '    img.classList.add(FX[fx]);'
@@ -4244,16 +4339,24 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 async def page_downloads():
     if not login.session_exists():
         return RedirectResponse("/login")
+    _my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         active = await conn.fetch(
-            """SELECT d.id, d.status, d.requested_at, r.name, r.size_bytes
-               FROM downloads d JOIN releases r ON r.id = d.release_id
+            """SELECT d.id, d.status, d.requested_at, r.name, r.size_bytes,
+                      d.bytes_done, d.speed_kbps, d.last_progress_at,
+                      m.file_dc
+               FROM downloads d
+               JOIN releases r ON r.id = d.release_id
+               LEFT JOIN messages m ON m.id = r.primary_msg_id
                WHERE d.status IN ('pending','downloading')
                ORDER BY d.requested_at""")
         done = await conn.fetch(
             """SELECT d.id, d.status, d.local_path, d.requested_at, d.finished_at,
-                      d.error_message, r.name, r.size_bytes
-               FROM downloads d JOIN releases r ON r.id = d.release_id
+                      d.error_message, r.name, r.size_bytes,
+                      m.file_dc
+               FROM downloads d
+               JOIN releases r ON r.id = d.release_id
+               LEFT JOIN messages m ON m.id = r.primary_msg_id
                WHERE d.status IN ('completed','failed','cancelled')
                ORDER BY d.finished_at DESC NULLS LAST LIMIT 100""")
 
@@ -4276,6 +4379,39 @@ async def page_downloads():
             if show_finished and "local_path" in d.keys() and d["local_path"]:
                 local = " · " + html.escape(d["local_path"].rsplit("/", 1)[-1])
             finished = d["finished_at"] if "finished_at" in d.keys() else None
+            # Progress bar + speed + ETA for in-flight downloads.
+            progress_html = ""
+            if d["status"] == "downloading":
+                size_b = d["size_bytes"] or 0
+                done_b = (d["bytes_done"] if "bytes_done" in d.keys() else 0) or 0
+                kbps = (d["speed_kbps"] if "speed_kbps" in d.keys() else 0) or 0
+                pct = round(done_b * 100 / size_b, 1) if size_b else 0
+                left_b = max(0, size_b - done_b)
+                eta_sec = int(left_b / max(kbps * 1024, 1)) if kbps else 0
+                eta_str = (f"{eta_sec//3600}h{(eta_sec%3600)//60:02d}m"
+                           if eta_sec >= 3600 else
+                           f"{eta_sec//60}m{eta_sec%60:02d}s"
+                           if eta_sec >= 60 else f"{eta_sec}s")
+                speed_str = (f"{kbps/1024:.1f} MB/s" if kbps >= 1024
+                             else f"{kbps} KB/s")
+                progress_html = (
+                    f'<div class="dl-progress">'
+                    f'<div class="dl-progress-bar"><div class="dl-progress-fill" '
+                    f'style="width:{pct}%"></div></div>'
+                    f'<div class="dl-progress-meta">'
+                    f'{pct:.1f}% · {_fmt_size(done_b)} / {_fmt_size(size_b)} '
+                    f'· {speed_str} · ETA {eta_str}'
+                    f'</div></div>'
+                )
+            # DC badge: same-DC = fast direct download, cross-DC = slow
+            # + burns auth.ExportAuthorization quota. User can predict speed.
+            dc_html = ""
+            file_dc = d["file_dc"] if "file_dc" in d.keys() else None
+            if file_dc:
+                if _my_dc and file_dc == _my_dc:
+                    dc_html = f'<span class="pill ok" title="same DC — fast">DC{file_dc} ⚡</span>'
+                else:
+                    dc_html = f'<span class="pill warn" title="cross-DC — slower">DC{file_dc} ✗</span>'
             items.append(
                 f'<div class="dl-item">'
                 f'<div class="icon">{icon}</div>'
@@ -4283,19 +4419,25 @@ async def page_downloads():
                 f'<div class="name">{html.escape(d["name"])}</div>'
                 f'<div class="meta">'
                 f'<span class="pill {pill_cls}">{d["status"]}</span>'
+                f'{dc_html}'
                 f'<span>· {_fmt_size(d["size_bytes"])}</span>'
                 f'<span>· {_fmt_time(d["requested_at"])}{local}</span>'
-                f'</div>{err_html}'
+                f'</div>{progress_html}{err_html}'
                 f'</div>'
                 f'<div class="right">{_fmt_time(finished) if show_finished else ""}</div>'
                 f'</div>'
             )
         return f'<div class="dl-list">{"".join(items)}</div>'
 
+    # Auto-refresh while any download is in flight, so progress bar updates
+    # without manual reload. Stops refreshing when queue empties.
+    refresh_js = ('<script>setTimeout(()=>location.reload(),5000)</script>'
+                  if active else '')
     body = (f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
            f'{_render(active, show_finished=False)}'
            f'<h2 class="section">History <span class="count">last 100</span></h2>'
-           f'{_render(done, show_finished=True)}')
+           f'{_render(done, show_finished=True)}'
+           f'{refresh_js}')
     return HTMLResponse(_layout("Downloads", "/downloads", body))
 
 
@@ -4678,16 +4820,22 @@ async def _refresh_series_aliases():
     _series_aliases_loaded_at = time.time()
 
 
-def _rewrite_release_title_sync(r) -> str:
+def _rewrite_release_title_sync(r, my_dc=None) -> str:
     """Outbound rewrite (release → newznab feed). Substring match against
-    cached alias map. Falls through to raw name when no alias matches."""
+    cached alias map. DC tag included as release-group suffix so Sonarr sees
+    multi-DC variants as distinct candidates + can rank by quality/size."""
     raw = r["name"] or ""
+    file_dc = r["file_dc"] if hasattr(r, "__getitem__") and "file_dc" in (r.keys() if hasattr(r, "keys") else []) else None
+    dc_tag = f"-dc{file_dc}" if file_dc else ""
     for alias_text, canonical, season in _series_aliases_cache:
         if alias_text in raw:
             ep = r["episode"] or 1
             seas = season if season is not None else (r["season"] or 1)
             qual = r["quality"] or "1080p"
-            return f"{canonical}.S{int(seas):02d}E{int(ep):02d}.{qual}.WEBRip-tgarr"
+            return f"{canonical}.S{int(seas):02d}E{int(ep):02d}.{qual}.WEBRip-tgarr{dc_tag}"
+    # No alias match — append DC tag to raw name so multi-DC duplicates differ
+    if dc_tag and file_dc:
+        return f"{raw}.tgarr{dc_tag}"
     return raw
 
 
@@ -4771,7 +4919,7 @@ async def _arr_alias_sync_worker():
         await asyncio.sleep(3600)
 
 
-def _item_xml(r, base_url: str, apikey: str) -> str:
+def _item_xml(r, base_url: str, apikey: str, my_dc=None) -> str:
     guid = str(r["guid"])
     link = f"{base_url}/newznab/api?t=get&id={guid}&apikey={apikey}"
     # XML 1.0 requires & to be escaped as &amp; even inside element body —
@@ -4782,7 +4930,7 @@ def _item_xml(r, base_url: str, apikey: str) -> str:
                if r["posted_at"] else "")
     size = r["size_bytes"] or 0
     cat_id = _category_id(r)
-    title = html.escape(_rewrite_release_title_sync(r))
+    title = html.escape(_rewrite_release_title_sync(r, my_dc=my_dc))
     return (
         f"    <item>\n"
         f"      <title>{title}</title>\n"
@@ -4866,33 +5014,43 @@ async def newznab_api(
             and_parts = []
             for word in variant.split():
                 params.append(f"%{word}%")
-                and_parts.append(f"name ILIKE ${len(params)}")
+                and_parts.append(f"r.name ILIKE ${len(params)}")
             if and_parts:
                 or_groups.append("(" + " AND ".join(and_parts) + ")")
         if or_groups:
             where_parts.append("(" + " OR ".join(or_groups) + ")")
 
     if t == "tvsearch":
-        where_parts.append("category = 'tv'")
+        where_parts.append("r.category = 'tv'")
         if season is not None:
             params.append(season)
-            where_parts.append(f"season = ${len(params)}")
+            where_parts.append(f"r.season = ${len(params)}")
         if ep is not None:
             params.append(ep)
-            where_parts.append(f"episode = ${len(params)}")
+            where_parts.append(f"r.episode = ${len(params)}")
     elif t == "movie":
-        where_parts.append("category = 'movie'")
+        where_parts.append("r.category = 'movie'")
 
     limit_val = max(1, min(limit, 200))
-    sql = (f"SELECT id, guid, name, category, season, episode, quality, "
-          f"source, codec, size_bytes, posted_at FROM releases WHERE "
-          f"{' AND '.join(where_parts)} ORDER BY posted_at DESC NULLS LAST "
-          f"LIMIT {limit_val} OFFSET {max(0, offset)}")
     _release_my_dc = await _get_my_dc()
+    # JOIN messages to get file_dc; same-DC releases ranked higher so Sonarr's
+    # release picker prefers fast downloads. Same content uploaded to multiple
+    # channels/DCs naturally surfaces as multiple candidates (we don't dedup
+    # by file_unique_id — each is a valid alternative source).
+    sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, "
+          f"r.quality, r.source, r.codec, r.size_bytes, r.posted_at, "
+          f"m.file_dc "
+          f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
+          f"WHERE {' AND '.join(where_parts)} "
+          f"ORDER BY (CASE WHEN m.file_dc = ${len(params)+1} THEN 0 ELSE 1 END), "
+          f"  r.posted_at DESC NULLS LAST "
+          f"LIMIT {limit_val} OFFSET {max(0, offset)}")
+    params.append(_release_my_dc or -1)
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
-    items = "\n".join(_item_xml(r, base_url, apikey or "tgarr") for r in rows)
+    items = "\n".join(_item_xml(r, base_url, apikey or "tgarr",
+                                 my_dc=_release_my_dc) for r in rows)
     return Response(
         _feed_envelope(items, f"search t={t} q={q or ''}", base_url),
         media_type="application/xml",
@@ -5016,36 +5174,54 @@ async def sab_api(
 async def _sab_queue():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT d.id, d.status, r.name, r.size_bytes, r.guid
+            """SELECT d.id, d.status, r.name, r.size_bytes, r.guid,
+                      d.bytes_done, d.speed_kbps, d.last_progress_at
                FROM downloads d JOIN releases r ON r.id = d.release_id
                WHERE d.status IN ('pending','downloading')
                ORDER BY d.requested_at""")
     slots = []
-    for r in rows:
-        size_mb = (r["size_bytes"] or 0) / 1048576
+    total_kbps = 0
+    total_mbleft = 0.0
+    for i, r in enumerate(rows):
+        size_b = r["size_bytes"] or 0
+        done_b = r["bytes_done"] or 0
+        left_b = max(0, size_b - done_b)
+        kbps = r["speed_kbps"] or 0
+        pct = round(done_b * 100 / size_b, 1) if size_b else 0
+        # ETA = left_b / (kbps * 1024). Format as H:MM:SS.
+        eta_sec = int(left_b / max(kbps * 1024, 1)) if kbps else 0
+        eta_str = (f"{eta_sec//3600}:{(eta_sec%3600)//60:02d}:{eta_sec%60:02d}"
+                   if eta_sec < 86400*7 else "0:00:00")
         slots.append({
             "nzo_id": f"tgarr-{r['guid']}",
             "filename": r["name"],
             "cat": "tv",
             "status": "Downloading" if r["status"] == "downloading" else "Queued",
-            "mb": f"{size_mb:.1f}",
-            "mbleft": f"{size_mb:.1f}" if r["status"] != "downloading" else "0",
-            "percentage": "0",
-            "size": f"{size_mb:.1f} MB",
-            "sizeleft": f"{size_mb:.1f} MB",
-            "timeleft": "0:01:00",
+            "mb": f"{size_b/1048576:.1f}",
+            "mbleft": f"{left_b/1048576:.1f}",
+            "percentage": str(int(pct)),
+            "size": f"{size_b/1048576:.1f} MB",
+            "sizeleft": f"{left_b/1048576:.1f} MB",
+            "timeleft": eta_str,
             "priority": "Normal",
             "script": "None",
             "msgid": "",
-            "index": 0,
+            "index": i,
         })
+        if r["status"] == "downloading":
+            total_kbps += kbps
+            total_mbleft += left_b / 1048576
+    total_eta = (f"{int(total_mbleft*1024/max(total_kbps,1))//3600}:00:00"
+                 if total_kbps else "0:00:00")
     return {"queue": {
         "status": "Idle" if not slots else "Downloading",
         "version": "3.7.2", "paused": False,
         "noofslots_total": len(slots), "noofslots": len(slots),
         "slots": slots, "speedlimit": "", "speedlimit_abs": "",
-        "speed": "0 K", "kbpersec": "0",
-        "size": "0 MB", "sizeleft": "0 MB", "mb": "0", "mbleft": "0",
+        "speed": f"{total_kbps/1024:.1f} M" if total_kbps > 1024 else f"{total_kbps:.0f} K",
+        "kbpersec": str(total_kbps),
+        "size": f"{total_mbleft:.1f} MB", "sizeleft": f"{total_mbleft:.1f} MB",
+        "mb": f"{total_mbleft:.0f}", "mbleft": f"{total_mbleft:.0f}",
         "diskspace1": "1000", "diskspace2": "1000",
         "diskspace1_norm": "1 T", "diskspace2_norm": "1 T",
         "diskspacetotal1": "2000", "diskspacetotal2": "2000",
@@ -5055,19 +5231,32 @@ async def _sab_queue():
 
 async def _sab_history():
     async with db_pool.acquire() as conn:
+        # One row per release. Completed wins over Failed regardless of which
+        # is newer — once a release has been successfully downloaded, that's
+        # the authoritative state for CDH. Otherwise newer failure wins.
         rows = await conn.fetch(
-            """SELECT d.id, d.status, d.local_path, d.finished_at,
+            """SELECT DISTINCT ON (d.release_id)
+                      d.id, d.status, d.local_path, d.finished_at,
                       r.name, r.size_bytes, r.guid, d.error_message
                FROM downloads d JOIN releases r ON r.id = d.release_id
                WHERE d.status IN ('completed','failed')
-               ORDER BY d.finished_at DESC NULLS LAST LIMIT 200""")
+               ORDER BY d.release_id,
+                        CASE d.status WHEN 'completed' THEN 0 ELSE 1 END,
+                        d.id DESC NULLS LAST
+               LIMIT 200""")
     slots = []
     for r in rows:
         size_mb = (r["size_bytes"] or 0) / 1048576
+        # SAB API: storage is the COMPLETED DIRECTORY containing files (not the
+        # file itself). Sonarr's CDH scans this dir to find media to import.
+        if r["local_path"]:
+            storage = os.path.dirname(r["local_path"]) or r["local_path"]
+        else:
+            storage = "/downloads/tgarr"
         slots.append({
             "nzo_id": f"tgarr-{r['guid']}",
             "name": r["name"], "category": "tv",
-            "storage": r["local_path"] or "/downloads/tgarr",
+            "storage": storage,
             "status": "Completed" if r["status"] == "completed" else "Failed",
             "size": f"{size_mb:.1f} MB",
             "bytes": r["size_bytes"] or 0,
@@ -5102,7 +5291,8 @@ async def _sab_addurl(url: str, nzbname: Optional[str], cat: Optional[str]):
                SELECT $1, 'pending'
                WHERE NOT EXISTS (
                  SELECT 1 FROM downloads
-                 WHERE release_id = $1 AND status IN ('pending','downloading')
+                 WHERE release_id = $1
+                   AND status IN ('pending','downloading','completed')
                )""", rel["id"])
     return {"status": True, "nzo_ids": [f"tgarr-{guid}"]}
 
