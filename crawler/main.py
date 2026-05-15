@@ -1785,7 +1785,11 @@ async def main() -> None:
     asyncio.create_task(contribute_to_registry())
     asyncio.create_task(federation_validator())
     asyncio.create_task(registry_puller())
-    asyncio.create_task(seed_validator())
+    # seed_validator disabled on client: leftover from pre-federation split.
+    # Validation is central's role for its seed_candidates queue. Client uses
+    # federation_validator to pull seeds from central + validate locally.
+    # Running both = double-quota on the same @tjin09 TG account.
+    # asyncio.create_task(seed_validator())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()

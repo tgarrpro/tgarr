@@ -2040,13 +2040,14 @@ async def stats_distribution():
     return {"slices": [{"label": r["k"], "value": r["v"]} for r in rows]}
 
 
-# Expected workers — used to detect "should be running but isn't" cases
+# Expected workers — used to detect "should be running but isn't" cases.
+# expected_max_sec = max wall-clock between heartbeats during normal operation.
+# Health = healthy if age < 0.5×expected, idle if < 2×expected, else stale.
 _EXPECTED_WORKERS = {
-    "subscription_poller":        30 * 60,   # 30min poll, allow 35min stale
-    "federation_validator":       3600,      # 1h batch, allow 2h
-    "seed_validator":             3600,      # idle-after-queue-empty 1h
-    "deep_backfill_worker":       1800,      # 30min/page, allow longer between pages
-    "on_demand_media_downloader": 86400,     # only fires on user click; ok stale
+    "subscription_poller":        30 * 60,    # 30min poll cycle
+    "federation_validator":       3600 * 2,   # 20min batch + 1h sleep = ~80min between hb
+    "deep_backfill_worker":       300,        # 10s/page, heartbeats per page = frequent
+    "on_demand_media_downloader": 86400,      # only on user click, ok to be stale
 }
 
 
