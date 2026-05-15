@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.59"
+TGARR_VERSION = "0.4.60"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -3175,6 +3175,16 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                WHERE thumb_path IS NULL AND (media_type='photo' OR
                      (media_type IS NULL AND file_name IS NULL
                       AND COALESCE(mime_type,'')='' AND file_unique_id IS NOT NULL))""")
+        # Top channels by photo count for chip filter
+        top_channels = await conn.fetch(
+            """SELECT c.username, c.title, count(*) AS n
+               FROM messages m JOIN channels c ON c.id=m.channel_id
+               WHERE m.media_type='photo'
+                 AND c.username IS NOT NULL
+                 AND COALESCE(c.audience,'sfw') <> 'blocked_csam'
+               GROUP BY c.id, c.username, c.title
+               HAVING count(*) > 50
+               ORDER BY count(*) DESC LIMIT 12""")
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -3201,9 +3211,33 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             LIMIT {max(1, min(limit, 500))}
         """, *params)
 
+    # Channel filter chips
+    def _ch_chip(uname, title, n):
+        active = channel == uname
+        bg = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
+              "border-color:var(--accent);") if active else ""
+        label = title or f"@{uname}"
+        if len(label) > 18:
+            label = label[:16] + '…'
+        return (f'<a class="btn ghost" href="/gallery?channel={uname}" '
+                f'style="{bg}padding:5px 12px;font-size:12px">'
+                f'{html.escape(label)} <span style="opacity:0.6">{n:,}</span></a>')
+
+    ch_chips = (
+        '<a class="btn ghost" href="/gallery" style="' +
+        ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
+         'border-color:var(--accent);' if not channel else '') +
+        'padding:5px 12px;font-size:12px">all</a>' +
+        "".join(_ch_chip(r["username"], r["title"], r["n"]) for r in top_channels)
+    )
+    ch_chips_html = (
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">'
+        + ch_chips + '</div>')
+
     if not rows:
         body = (
             '<h2 class="section">Gallery <span class="count">0</span></h2>'
+            f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
             '<div>No photos cached yet.</div>'
@@ -3237,6 +3271,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
            if dup_saved or pending else '')
         + ' <span class="extra" style="color:var(--muted);font-size:13px">'
         '← → arrows · Space pause · Del delete · Esc close</span></h2>'
+        f'{ch_chips_html}'
         f'<div class="gallery">{items}</div>'
         '<div class="lightbox">'
         '  <div class="lb-progress"><div class="lb-progress-bar" id="lbProgress"></div></div>'
@@ -3353,45 +3388,113 @@ def _fmt_dur(secs):
 
 
 @app.get("/music", response_class=HTMLResponse)
-async def page_music(limit: int = 200, q: Optional[str] = None):
+async def page_music(limit: int = 200, q: Optional[str] = None,
+                     lang: Optional[str] = None, sort: str = "quality"):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
         return RedirectResponse("/login")
 
     _music_my_dc = await _get_my_dc()
+    # Composite quality: MB-canonical hit + has cover + duration > 1min
+    sort_clause = {
+        "quality": (
+            "(CASE WHEN m.audio_canonical_title IS NOT NULL THEN 1.5 ELSE 1.0 END "
+            " * CASE WHEN m.audio_cover_url IS NOT NULL THEN 1.2 ELSE 1.0 END "
+            " * CASE WHEN m.audio_duration_sec >= 60 THEN 1.0 "
+            "        WHEN m.audio_duration_sec >= 20 THEN 0.5 ELSE 0.2 END "
+            ") DESC NULLS LAST, m.posted_at DESC NULLS LAST"
+        ),
+        "recent":   "m.posted_at DESC NULLS LAST",
+        "longest":  "m.audio_duration_sec DESC NULLS LAST",
+        "size":     "m.file_size DESC NULLS LAST",
+    }.get(sort, "m.posted_at DESC NULLS LAST")
+
+    where_parts = ["m.media_type = 'audio'"]
+    params = []
+    if q:
+        params.append(f"%{q}%")
+        where_parts.append(
+            f"(m.audio_title ILIKE ${len(params)} OR "
+            f"m.audio_performer ILIKE ${len(params)} OR "
+            f"m.file_name ILIKE ${len(params)})")
+    if lang:
+        params.append(lang)
+        where_parts.append(f"m.detected_lang = ${len(params)}")
+
     async with db_pool.acquire() as conn:
-        cached_n = await conn.fetchval(
-            """SELECT count(*) FROM messages
-               WHERE media_type='audio' AND local_path IS NOT NULL
-                 AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'""")
         pending_n = await conn.fetchval(
             "SELECT count(*) FROM messages WHERE media_type='audio' AND local_path IS NULL")
-        q_pat = f"%{q}%" if q else None
+        lang_dist = await conn.fetch(
+            "SELECT COALESCE(detected_lang,'unknown') AS lang, count(*) AS n "
+            "FROM messages WHERE media_type='audio' "
+            "GROUP BY detected_lang ORDER BY count(*) DESC")
         rows = await conn.fetch(f"""
             SELECT m.id, m.audio_title, m.audio_performer, m.audio_duration_sec,
                    m.file_name, m.file_size, m.posted_at, m.file_dc,
                    m.audio_canonical_title, m.audio_album, m.audio_year,
-                   m.audio_cover_url, m.local_path,
+                   m.audio_cover_url, m.local_path, m.detected_lang,
                    c.title AS ch_title, c.username AS ch_user
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
-            WHERE m.media_type = 'audio'
-              AND ($1::text IS NULL OR
-                   m.audio_title ILIKE $1 OR
-                   m.audio_performer ILIKE $1 OR
-                   m.file_name ILIKE $1)
-            ORDER BY m.posted_at DESC NULLS LAST
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY {sort_clause}
             LIMIT {max(1, min(limit, 500))}
-        """, q_pat)
+        """, *params)
+
+    def _music_qs(**overrides):
+        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None}
+        merged = {**defaults, **overrides}
+        bits = []
+        for k, v in merged.items():
+            if v not in (None, "", 0):
+                bits.append(f"{k}={html.escape(str(v))}")
+        return "?" + "&".join(bits) if bits else ""
+
+    def _music_lang_chip(code, count):
+        label = _LANG_LABELS.get(code, f"❓ {code}")
+        active = lang == code
+        bg = "background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);" if active else ""
+        href = f"/music{_music_qs(lang=None if active else code)}"
+        return (f'<a class="btn ghost" href="{href}" '
+                f'style="{bg}padding:5px 12px;font-size:12px">'
+                f'{label} <span style="opacity:0.6">{count:,}</span></a>')
+
+    lang_chips_html = (
+        '<a class="btn ghost" href="/music" style="' +
+        ('background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);' if not lang else '') +
+        'padding:5px 12px;font-size:12px">all</a>' +
+        "".join(_music_lang_chip(r["lang"], r["n"]) for r in lang_dist if r["lang"] != 'unknown' and r["n"] > 0)
+    )
+
+    def _music_sort_chip(val, label):
+        active = sort == val
+        bg = "background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);" if active else ""
+        href = f"/music{_music_qs(sort=val if val != 'quality' else None)}"
+        return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
+
+    sort_chips_html = (
+        _music_sort_chip("quality", "★ Quality") +
+        _music_sort_chip("recent",  "Recent") +
+        _music_sort_chip("longest", "Longest") +
+        _music_sort_chip("size",    "Largest"))
+
+    toolbar = (
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
+        + lang_chips_html + '</div>'
+        '<div style="display:flex;gap:6px;margin-bottom:18px;align-items:center">'
+        '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>'
+        + sort_chips_html + '</div>'
+    )
 
     if not rows:
         body = (
-            f'<h2 class="section">Music <span class="count">0 cached</span></h2>'
+            f'<h2 class="section">Music <span class="count">0</span></h2>'
+            f'{toolbar}'
             '<div class="empty-state">'
             '<div class="icon">🎵</div>'
-            '<div>No audio cached yet.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio indexed — click to fetch (capped to recent 300 tracks).</div>'
+            '<div>No audio matches these filters.</div>'
+            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio indexed — click to fetch.</div>'
             '</div>'
         )
         return HTMLResponse(_layout("Music", "/music", body))
@@ -3411,10 +3514,11 @@ async def page_music(limit: int = 200, q: Optional[str] = None):
     )
 
     body = (
-        f'<h2 class="section">Music <span class="count">{len(rows)} cached</span>'
+        f'<h2 class="section">Music <span class="count">{len(rows)} of {sum(r["n"] for r in lang_dist):,}</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
+        f'{toolbar}'
         '<table class="music-list">'
         '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th><th>posted</th></tr></thead>'
         f'<tbody>{rows_html}</tbody></table>'
