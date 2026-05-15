@@ -217,12 +217,16 @@ async def ingest_message(msg: Message) -> bool:
     caption = msg.caption or msg.text or ""
 
     async with db_pool.acquire() as conn:
+        # Never overwrite a populated username/title with empty — Pyrogram
+        # sometimes returns msg.chat.username='' for forwarded/edited messages
+        # even though the channel HAS a real public @username. Preserve the
+        # known good value.
         ch_id = await conn.fetchval(
             """INSERT INTO channels (tg_chat_id, username, title, category)
                VALUES ($1, $2, $3, $4)
                ON CONFLICT (tg_chat_id) DO UPDATE
-                 SET username = EXCLUDED.username,
-                     title = EXCLUDED.title
+                 SET username = COALESCE(NULLIF(EXCLUDED.username, ''), channels.username),
+                     title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title)
                RETURNING id""",
             chat_id,
             msg.chat.username,
