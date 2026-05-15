@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.58"
+TGARR_VERSION = "0.4.59"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -234,6 +234,8 @@ async def _migrate_schema():
 
             -- grab_count for B (composite ranking) — derived from downloads table
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS grab_count INT NOT NULL DEFAULT 0;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS detected_lang TEXT;
+            CREATE INDEX IF NOT EXISTS idx_messages_lang ON messages (detected_lang) WHERE detected_lang IS NOT NULL;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -3465,35 +3467,81 @@ async def page_music(limit: int = 200, q: Optional[str] = None):
 # ════════════════════════════════════════════════════════════════════
 # Page: Library (ebooks)
 # ════════════════════════════════════════════════════════════════════
+_LANG_LABELS = {
+    'en': '🇬🇧 EN', 'zh': '🇨🇳 中文', 'ja': '🇯🇵 日本語',
+    'ko': '🇰🇷 한국어', 'ar': '🇸🇦 العربية', 'fa': '🇮🇷 فارسی',
+    'ru': '🇷🇺 Русский', 'hi': '🇮🇳 हिन्दी', 'he': '🇮🇱 עברית',
+    'th': '🇹🇭 ไทย',
+}
+
+
 @app.get("/library", response_class=HTMLResponse)
-async def page_library(limit: int = 200, q: Optional[str] = None):
+async def page_library(limit: int = 200, q: Optional[str] = None,
+                       lang: Optional[str] = None, sort: str = "quality",
+                       fmt: Optional[str] = None):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
         return RedirectResponse("/login")
 
     _lib_my_dc = await _get_my_dc()
+    # Composite book quality score:
+    # - format: epub=1.0 > mobi=0.9 > azw3=0.9 > azw=0.8 > pdf=0.6 > others=0.5
+    # - file_size sweet spot 100KB-50MB
+    # - has cached file = +0.2 (cover extracted, ready to read)
+    sort_clause = {
+        "quality": (
+            "(CASE WHEN m.file_name ~* '\\.epub$' THEN 1.0 "
+            "      WHEN m.file_name ~* '\\.mobi$' THEN 0.9 "
+            "      WHEN m.file_name ~* '\\.azw3?$' THEN 0.85 "
+            "      WHEN m.file_name ~* '\\.pdf$' THEN 0.6 "
+            "      ELSE 0.5 END "
+            " * CASE WHEN m.file_size BETWEEN 100000 AND 50000000 THEN 1.0 "
+            "        WHEN m.file_size BETWEEN 50000 AND 200000000 THEN 0.7 "
+            "        ELSE 0.4 END "
+            " * CASE WHEN m.local_path IS NOT NULL AND m.local_path NOT LIKE '__%' THEN 1.2 ELSE 1.0 END "
+            ") DESC NULLS LAST, m.posted_at DESC NULLS LAST"
+        ),
+        "recent": "m.posted_at DESC NULLS LAST",
+        "size":   "m.file_size DESC NULLS LAST",
+        "title":  "m.file_name ASC NULLS LAST",
+    }.get(sort, "m.posted_at DESC NULLS LAST")
+
+    where_parts = ["m.media_type = 'document'",
+                   "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"]
+    params = []
+    if q:
+        params.append(f"%{q}%")
+        where_parts.append(f"m.file_name ILIKE ${len(params)}")
+    if lang:
+        params.append(lang)
+        where_parts.append(f"m.detected_lang = ${len(params)}")
+    if fmt:
+        params.append(f".{fmt.lower()}$")
+        where_parts.append(f"m.file_name ~* ${len(params)}")
+
     async with db_pool.acquire() as conn:
-        cached_n = await conn.fetchval(
-            r"""SELECT count(*) FROM messages
-               WHERE media_type='document' AND local_path IS NOT NULL
-                 AND local_path NOT LIKE '\_\_%' ESCAPE '\'""")
         pending_n = await conn.fetchval(
             r"""SELECT count(*) FROM messages
                WHERE media_type='document' AND local_path IS NULL
                  AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'""")
+        # Language distribution chips
+        lang_dist = await conn.fetch(
+            r"""SELECT COALESCE(detected_lang,'unknown') AS lang, count(*) AS n
+               FROM messages
+               WHERE media_type='document'
+                 AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'
+               GROUP BY detected_lang ORDER BY count(*) DESC""")
         rows = await conn.fetch(f"""
-            SELECT m.id, m.file_name, m.file_size, m.mime_type, m.caption, m.posted_at,
-                   m.local_path, m.file_dc,
+            SELECT m.id, m.file_name, m.file_size, m.mime_type, m.posted_at,
+                   m.local_path, m.file_dc, m.detected_lang,
                    c.title AS ch_title, c.username AS ch_user
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
-            WHERE m.media_type = 'document'
-              AND m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'
-              AND ($1::text IS NULL OR m.file_name ILIKE $1)
-            ORDER BY m.posted_at DESC NULLS LAST
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY {sort_clause}
             LIMIT {max(1, min(limit, 500))}
-        """, f"%{q}%" if q else None)
+        """, *params)
 
     def _ext(fn):
         return (fn or "").rsplit(".", 1)[-1].upper() if "." in (fn or "") else "DOC"
@@ -3513,6 +3561,69 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
         )
         return HTMLResponse(_layout("Library", "/library", body))
 
+    def _qs(**overrides):
+        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None, "fmt": fmt}
+        merged = {**defaults, **overrides}
+        bits = []
+        for k, v in merged.items():
+            if v not in (None, "", 0):
+                bits.append(f"{k}={html.escape(str(v))}")
+        return "?" + "&".join(bits) if bits else ""
+
+    def _lang_chip(code, count):
+        label = _LANG_LABELS.get(code, f"❓ {code}")
+        active = lang == code
+        bg = "rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);" if active else ""
+        href = f"/library{_qs(lang=None if active else code)}"
+        return (f'<a class="btn ghost" href="{href}" '
+                f'style="{bg}padding:5px 12px;font-size:12px">'
+                f'{label} <span style="opacity:0.6">{count:,}</span></a>')
+
+    lang_chips = (
+        '<a class="btn ghost" href="/library" style="' +
+        ('background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);' if not lang else '') +
+        'padding:5px 12px;font-size:12px">all</a>' +
+        "".join(_lang_chip(r["lang"], r["n"]) for r in lang_dist if r["lang"] != 'unknown' and r["n"] > 0)
+    )
+
+    def _sort_chip(val, label):
+        active = sort == val
+        bg = "background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);" if active else ""
+        href = f"/library{_qs(sort=val if val != 'quality' else None)}"
+        return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
+
+    sort_chips = (
+        _sort_chip("quality", "★ Quality") +
+        _sort_chip("recent",  "Recent") +
+        _sort_chip("size",    "Largest") +
+        _sort_chip("title",   "Title"))
+
+    toolbar = (
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">' +
+        lang_chips + '</div>'
+        '<div style="display:flex;gap:6px;margin-bottom:18px;align-items:center">'
+        '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>' +
+        sort_chips + '</div>'
+    )
+
+    if not rows:
+        body = (
+            f'<h2 class="section">Library <span class="count">0</span></h2>'
+            f'{toolbar}'
+            '<div class="empty-state">'
+            '<div class="icon">📚</div>'
+            '<div>No ebooks match these filters.</div>'
+            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook indexed — click to fetch.</div>'
+            '</div>'
+        )
+        return HTMLResponse(_layout("Library", "/library", body))
+
+    def _lang_badge(code):
+        if not code or code == 'unknown':
+            return ''
+        label = _LANG_LABELS.get(code, code.upper())
+        return f'<span class="pill muted" style="font-size:11px">{label}</span>'
+
     items = "".join(
         f'<div class="book-card">'
         + (f'<img class="book-cover" src="/ebook-cover/{r["id"]}" alt="" '
@@ -3523,6 +3634,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
         f'<div class="book-title">{html.escape(r["file_name"] or "(untitled)")}</div>'
         f'<div class="book-meta">'
         f'{_dc_badge(r.get("file_dc"), _lib_my_dc)}'
+        f'{_lang_badge(r.get("detected_lang"))}'
         f'<span class="pill accent">{_ext(r["file_name"])}</span>'
         f'<span class="pill muted">{_fmt_size(r["file_size"])}</span>'
         f'<span>· {html.escape(r["ch_title"] or "")}</span>'
@@ -3537,10 +3649,11 @@ async def page_library(limit: int = 200, q: Optional[str] = None):
     )
 
     body = (
-        f'<h2 class="section">Library <span class="count">{len(rows)} cached</span>'
+        f'<h2 class="section">Library <span class="count">{len(rows)} of {sum(r["n"] for r in lang_dist):,}</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
+        f'{toolbar}'
         f'<div class="book-grid">{items}</div>'
     )
     return HTMLResponse(_layout("Library", "/library", body))

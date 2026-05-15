@@ -146,6 +146,40 @@ def _cutoff_days(category: str) -> int | None:
 _RES_RANK = {'2160p': 4, '1080p': 3, '720p': 2, '480p': 1, '360p': 0}
 
 
+def _detect_lang(text: str | None) -> str | None:
+    """Cheap Unicode-range language detection. Returns ISO 639-1-like code.
+    Used to populate messages.detected_lang for UI filters.
+    """
+    if not text or not text.strip():
+        return None
+    cjk = arabic = cyrillic = hangul = hiragana_kata = devanagari = hebrew = thai = latin = 0
+    for c in text:
+        cp = ord(c)
+        if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF: cjk += 1
+        elif 0x3040 <= cp <= 0x309F or 0x30A0 <= cp <= 0x30FF: hiragana_kata += 1
+        elif 0xAC00 <= cp <= 0xD7AF: hangul += 1
+        elif 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F: arabic += 1
+        elif 0x0400 <= cp <= 0x04FF: cyrillic += 1
+        elif 0x0900 <= cp <= 0x097F: devanagari += 1
+        elif 0x0590 <= cp <= 0x05FF: hebrew += 1
+        elif 0x0E00 <= cp <= 0x0E7F: thai += 1
+        elif 0x0041 <= cp <= 0x007A: latin += 1
+    if hangul > 2: return 'ko'
+    if hiragana_kata > 2: return 'ja'  # hiragana before cjk — JP can have kanji
+    if cjk > 3: return 'zh'
+    if hebrew > 2: return 'he'
+    if thai > 2: return 'th'
+    if devanagari > 2: return 'hi'
+    if cyrillic > 4: return 'ru'
+    if arabic > 4:
+        # Persian vs Arabic: chars 0x067E (پ), 0x0686 (چ), 0x0698 (ژ), 0x06AF (گ) are Persian-only
+        if any(c in text for c in 'پچژگکیی'):
+            return 'fa'
+        return 'ar'
+    if latin > 3: return 'en'
+    return None
+
+
 def _release_passes_profile(rel: dict, profile: dict) -> tuple[bool, str]:
     """Check if release matches quality profile rules."""
     size = rel.get('size_bytes') or 0
@@ -489,19 +523,21 @@ async def ingest_message(msg: Message) -> bool:
         # Raw caption discarded — we already extracted mention/invite signals
         # above into seed_candidates. Storing raw text wastes ~200B/msg with
         # near-zero re-extract value. Use the structured fields downstream.
+        # Detect language from file_name (caption already null) for UI filters.
+        detected_lang = _detect_lang(file_name) or _detect_lang(msg.chat.title or "")
         new_msg_id = await conn.fetchval(
             """INSERT INTO messages
                  (channel_id, tg_message_id, tg_chat_id,
                   file_unique_id, file_name, caption, file_size, mime_type,
                   media_type, audio_title, audio_performer, audio_duration_sec,
-                  posted_at, file_dc)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                  posted_at, file_dc, detected_lang)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
             None, file_size, mime_type, media_type,
             audio_title, audio_performer, audio_duration_sec, msg.date,
-            file_dc,
+            file_dc, detected_lang,
         )
 
         if new_msg_id and file_name:
