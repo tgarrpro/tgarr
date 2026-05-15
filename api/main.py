@@ -1863,6 +1863,53 @@ async def api_photo_redownload(msg_id: int):
     return {"status": "queued"}
 
 
+@app.post("/api/internal/arr-scan")
+async def api_internal_arr_scan(payload: dict):
+    """Crawler → api → Sonarr/Radarr push notification.
+
+    Crawler doesn't carry SONARR/RADARR creds; api does. After a download
+    finishes, crawler POSTs {"path": "...", "kind": "tv"|"movie"} here.
+    This calls DownloadedEpisodesScan / DownloadedMoviesScan so the file
+    is imported even when Sonarr's queue tracker dropped the downloadId
+    (which happens on any tgarr-api downtime — the failure mode that
+    orphaned bite-China episodes 2-8 today).
+    """
+    path = payload.get("path")
+    kind = payload.get("kind", "tv")
+    if not path:
+        return JSONResponse({"status": "error", "message": "path required"},
+                          status_code=400)
+    if kind == "movie":
+        url = os.environ.get("RADARR_URL", "")
+        key = os.environ.get("RADARR_API_KEY", "")
+        cmd = "DownloadedMoviesScan"
+    else:
+        url = os.environ.get("SONARR_URL", "")
+        key = os.environ.get("SONARR_API_KEY", "")
+        cmd = "DownloadedEpisodesScan"
+    if not (url and key):
+        return JSONResponse({"status": "skipped", "reason": "no key"},
+                          status_code=200)
+    # Map crawler-side path (/downloads/tgarr/...) to host-side path that
+    # Sonarr sees. Sonarr's remotePathMapping translates from host -> its
+    # localPath. We feed it host paths.
+    sonarr_path = path.replace("/downloads/tgarr/",
+                               "/DATA/Downloads/tgarr/tgarr/", 1)
+    body = _json.dumps({"name": cmd, "path": sonarr_path,
+                        "importMode": "move"}).encode()
+    req = urllib.request.Request(
+        f"{url}/api/v3/command", data=body,
+        headers={"X-Api-Key": key, "Content-Type": "application/json"},
+        method="POST")
+    try:
+        result = await asyncio.to_thread(
+            lambda: urllib.request.urlopen(req, timeout=10).read())
+        return {"status": "ok", "cmd": cmd, "path": sonarr_path}
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "message": str(e)[:200]}, status_code=500)
+
+
 @app.post("/api/grab/{guid}")
 async def api_grab(guid: str):
     """User clicks Grab in tgarr UI → queue download directly. Avoids the

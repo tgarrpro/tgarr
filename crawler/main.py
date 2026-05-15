@@ -947,7 +947,8 @@ async def _rename_for_arr(local_path: str, row) -> str:
             break
     if not new_name:
         return local_path
-    new_name = SAFE_NAME.sub("_", new_name)[:200]
+    # Filesystem-safe but keep spaces (Sonarr parses both, spaces look nicer)
+    new_name = re.sub(r'[\\/:*?"<>|]', '_', new_name)[:200]
     new_path = os.path.join(os.path.dirname(local_path), new_name)
     if new_path == local_path:
         return local_path
@@ -959,6 +960,34 @@ async def _rename_for_arr(local_path: str, row) -> str:
     except OSError as e:
         log.warning("[worker] rename-for-arr failed id=%s: %s", row["dl_id"], e)
         return local_path
+
+
+async def _notify_arr(local_path: str, row) -> None:
+    """Push Sonarr/Radarr to scan the output folder via tgarr-api internal
+    endpoint (api owns the SONARR/RADARR creds; crawler doesn't).
+
+    This makes import self-healing: even when Sonarr's queue tracker
+    dropped the downloadId (which happens on tgarr-api downtime — the
+    failure mode that orphaned bite-China E02-E08 today), the push-scan
+    command makes Sonarr's own DiskScanService walk the folder + import.
+
+    Fire-and-forget; failure here doesn't fail the download.
+    """
+    try:
+        kind = "movie" if (row.get("movie_year") and not row.get("episode")) else "tv"
+        body = json.dumps({"path": local_path, "kind": kind}).encode()
+        req = urllib.request.Request(
+            "http://tgarr-api:8765/api/internal/arr-scan",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        await asyncio.to_thread(
+            lambda: urllib.request.urlopen(req, timeout=10).read())
+        log.info("[worker] notified arr scan id=%s kind=%s path=%s",
+                 row["dl_id"], kind, local_path)
+    except Exception as e:
+        log.warning("[worker] arr-notify failed id=%s: %s",
+                    row["dl_id"], e)
 
 
 CURRENT_DC: int = 0  # populated in main() after app.start()
@@ -1090,6 +1119,9 @@ async def _process_one_download(row_payload: dict) -> None:
                    WHERE id=$2""",
                 str(local_path), row["dl_id"])
         log.info("[worker] completed id=%s path=%s", row["dl_id"], local_path)
+        # Push-notify Sonarr/Radarr to scan + import — self-heals when CDH
+        # queue tracking was dropped (tgarr-api downtime / restart race).
+        await _notify_arr(local_path, row)
     except Exception as e:
         log.exception("[worker] failed id=%s: %s", row["dl_id"], e)
         try:
