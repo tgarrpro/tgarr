@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.57"
+TGARR_VERSION = "0.4.58"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -170,6 +170,70 @@ async def _migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_messages_pending_contrib
                 ON messages (id)
                 WHERE file_unique_id IS NOT NULL AND contributed_at IS NULL;
+
+            -- A. Auto-grab pipeline (Sonarr/Radarr feature parity)
+            CREATE TABLE IF NOT EXISTS quality_profile (
+              id SERIAL PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              preferred_resolutions TEXT[],
+              preferred_codecs TEXT[],
+              preferred_sources TEXT[],
+              max_size_bytes BIGINT,
+              min_size_bytes BIGINT DEFAULT 100000000,
+              prefer_hdr BOOLEAN DEFAULT FALSE,
+              language_preference TEXT[]
+            );
+            -- seed default profile
+            INSERT INTO quality_profile (name, preferred_resolutions, preferred_codecs,
+                preferred_sources, max_size_bytes, min_size_bytes)
+              VALUES ('default-1080p',
+                      ARRAY['2160p','1080p','720p'],
+                      ARRAY['x265','x264'],
+                      ARRAY['BluRay','WEBDL','WEBRip','HDTV'],
+                      8000000000, 200000000)
+              ON CONFLICT (name) DO NOTHING;
+
+            CREATE TABLE IF NOT EXISTS monitored_series (
+              id SERIAL PRIMARY KEY,
+              tmdb_tv_id INT UNIQUE,
+              series_title TEXT NOT NULL,
+              quality_profile_id INT REFERENCES quality_profile(id),
+              monitored_from_season INT DEFAULT 1,
+              jellyfin_library_path TEXT,
+              status TEXT NOT NULL DEFAULT 'active',
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_monitored_series_title
+              ON monitored_series (LOWER(series_title));
+
+            CREATE TABLE IF NOT EXISTS monitored_movies (
+              id SERIAL PRIMARY KEY,
+              tmdb_movie_id INT UNIQUE,
+              title TEXT NOT NULL,
+              year INT,
+              quality_profile_id INT REFERENCES quality_profile(id),
+              jellyfin_library_path TEXT,
+              status TEXT NOT NULL DEFAULT 'wanted',
+              grabbed_release_id BIGINT REFERENCES releases(id),
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_monitored_movies_title
+              ON monitored_movies (LOWER(title), year);
+
+            CREATE TABLE IF NOT EXISTS auto_grab_log (
+              id BIGSERIAL PRIMARY KEY,
+              release_id BIGINT REFERENCES releases(id) ON DELETE CASCADE,
+              monitored_kind TEXT NOT NULL,
+              monitored_id INT NOT NULL,
+              action TEXT NOT NULL,
+              reason TEXT,
+              decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_auto_grab_log_recent
+              ON auto_grab_log (decided_at DESC);
+
+            -- grab_count for B (composite ranking) — derived from downloads table
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS grab_count INT NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -2158,6 +2222,68 @@ async def api_workers():
             "stale_or_never": [w["worker"] for w in stale_or_never]}
 
 
+@app.get("/api/monitored")
+async def api_monitored_list():
+    """List monitored series + movies + recent auto-grab log."""
+    async with db_pool.acquire() as conn:
+        series = await conn.fetch(
+            "SELECT ms.id, ms.series_title, ms.status, ms.monitored_from_season, "
+            "qp.name AS profile, ms.added_at "
+            "FROM monitored_series ms LEFT JOIN quality_profile qp ON qp.id=ms.quality_profile_id "
+            "ORDER BY ms.added_at DESC")
+        movies = await conn.fetch(
+            "SELECT mm.id, mm.title, mm.year, mm.status, mm.grabbed_release_id, "
+            "qp.name AS profile, mm.added_at "
+            "FROM monitored_movies mm LEFT JOIN quality_profile qp ON qp.id=mm.quality_profile_id "
+            "ORDER BY mm.added_at DESC")
+        log_rows = await conn.fetch(
+            "SELECT release_id, monitored_kind, monitored_id, action, reason, decided_at "
+            "FROM auto_grab_log ORDER BY decided_at DESC LIMIT 50")
+    return {
+        "series": [dict(r) | {"added_at": r["added_at"].isoformat()} for r in series],
+        "movies": [dict(r) | {"added_at": r["added_at"].isoformat()} for r in movies],
+        "recent_log": [dict(r) | {"decided_at": r["decided_at"].isoformat()} for r in log_rows],
+    }
+
+
+@app.post("/api/monitored/series")
+async def api_monitor_series(series_title: str = Form(...),
+                              profile_id: int = Form(1)):
+    """Add a TV series to auto-monitor list."""
+    async with db_pool.acquire() as conn:
+        row_id = await conn.fetchval(
+            "INSERT INTO monitored_series (series_title, quality_profile_id) "
+            "VALUES ($1, $2) RETURNING id",
+            series_title.strip(), profile_id)
+    return {"status": "ok", "id": row_id, "monitored": series_title}
+
+
+@app.post("/api/monitored/movie")
+async def api_monitor_movie(title: str = Form(...),
+                             year: int = Form(None),
+                             profile_id: int = Form(1)):
+    async with db_pool.acquire() as conn:
+        row_id = await conn.fetchval(
+            "INSERT INTO monitored_movies (title, year, quality_profile_id) "
+            "VALUES ($1, $2, $3) RETURNING id",
+            title.strip(), year, profile_id)
+    return {"status": "ok", "id": row_id, "monitored": title, "year": year}
+
+
+@app.delete("/api/monitored/series/{id}")
+async def api_unmonitor_series(id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM monitored_series WHERE id=$1", id)
+    return {"status": "ok"}
+
+
+@app.delete("/api/monitored/movie/{id}")
+async def api_unmonitor_movie(id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM monitored_movies WHERE id=$1", id)
+    return {"status": "ok"}
+
+
 @app.get("/api/channels/quality")
 async def api_channels_quality():
     """Per-channel quality scoreboard: media-ratio, release-style ratio, size median,
@@ -3680,13 +3806,21 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                  .replace("COALESCE(size_bytes", "COALESCE(r.size_bytes"))
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
+    # Composite quality score: parse confidence × tmdb verification × quality tier
+    # × grab popularity × recency. Show "best version of any content" first.
     sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
-          f"r.primary_msg_id, m.file_dc, c.audience "
+          f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, "
+          f"  (r.parse_score "
+          f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
+          f"   * (CASE r.quality WHEN '2160p' THEN 1.4 WHEN '1080p' THEN 1.2 WHEN '720p' THEN 1.0 ELSE 0.8 END) "
+          f"   * (1 + LEAST(LOG(r.grab_count + 1) / 3.0, 1.0)) "
+          f"   * (1.0 / (1 + EXTRACT(EPOCH FROM (NOW() - COALESCE(r.posted_at, NOW())))/86400 * 0.005)) "
+          f"  ) AS composite_score "
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
           f"LEFT JOIN channels c ON c.id = m.channel_id "
           f"WHERE {' AND '.join([_qual(w) for w in where])} "
-          f"ORDER BY r.posted_at DESC NULLS LAST "
+          f"ORDER BY composite_score DESC NULLS LAST, r.posted_at DESC NULLS LAST "
           f"LIMIT {page_size} OFFSET {page_offset}")
     count_sql = (f"SELECT count(*) FROM releases r "
                  f"LEFT JOIN messages m ON m.id = r.primary_msg_id "

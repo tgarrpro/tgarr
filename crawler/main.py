@@ -140,6 +140,125 @@ def _cutoff_days(category: str) -> int | None:
         return None
     return 3 * hl
 
+
+# === Auto-grab matcher (Sonarr/Radarr feature parity) ===
+# Resolution rank for quality preference comparison
+_RES_RANK = {'2160p': 4, '1080p': 3, '720p': 2, '480p': 1, '360p': 0}
+
+
+def _release_passes_profile(rel: dict, profile: dict) -> tuple[bool, str]:
+    """Check if release matches quality profile rules."""
+    size = rel.get('size_bytes') or 0
+    if profile.get('min_size_bytes') and size < profile['min_size_bytes']:
+        return False, f"below_min_size ({size} < {profile['min_size_bytes']})"
+    if profile.get('max_size_bytes') and size > profile['max_size_bytes']:
+        return False, f"above_max_size ({size} > {profile['max_size_bytes']})"
+    if profile.get('preferred_resolutions'):
+        q = rel.get('quality')
+        if q and q not in profile['preferred_resolutions']:
+            return False, f"resolution_not_preferred ({q})"
+    return True, "ok"
+
+
+async def maybe_auto_grab(conn, release_id: int, parsed: dict, file_size: int):
+    """Decide if a freshly-parsed release should be auto-grabbed.
+
+    Matches against monitored_series/monitored_movies; quality_profile filter;
+    INSERTs into downloads if approved. Logs decision to auto_grab_log.
+    """
+    rel = {
+        'id': release_id,
+        'title': parsed.get('title') or '',
+        'year': parsed.get('year'),
+        'season': parsed.get('season'),
+        'episode': parsed.get('episode'),
+        'quality': parsed.get('quality'),
+        'size_bytes': file_size,
+        'type': parsed.get('type'),
+    }
+    if rel['type'] == 'tv' and rel['title']:
+        mon = await conn.fetchrow(
+            """SELECT ms.id, ms.quality_profile_id, qp.preferred_resolutions,
+                      qp.preferred_codecs, qp.max_size_bytes, qp.min_size_bytes
+               FROM monitored_series ms
+               LEFT JOIN quality_profile qp ON qp.id = ms.quality_profile_id
+               WHERE ms.status = 'active'
+                 AND LOWER(ms.series_title) = LOWER($1)
+               LIMIT 1""", rel['title'])
+        if not mon:
+            return
+        ok, reason = _release_passes_profile(rel, dict(mon))
+        if not ok:
+            await conn.execute(
+                "INSERT INTO auto_grab_log (release_id, monitored_kind, monitored_id, action, reason) "
+                "VALUES ($1, 'series', $2, 'rejected', $3)",
+                release_id, mon['id'], reason)
+            return
+        # Check we don't already have this episode grabbed
+        already = await conn.fetchval(
+            """SELECT 1 FROM downloads d JOIN releases r ON r.id = d.release_id
+               WHERE r.category = 'tv'
+                 AND LOWER(r.series_title) = LOWER($1)
+                 AND r.season = $2 AND r.episode = $3
+                 AND d.status IN ('pending','downloading','completed')
+               LIMIT 1""", rel['title'], rel['season'], rel['episode'])
+        if already:
+            return
+        await conn.execute(
+            "INSERT INTO downloads (release_id, status, requested_at) VALUES ($1, 'pending', NOW())",
+            release_id)
+        await conn.execute(
+            "INSERT INTO auto_grab_log (release_id, monitored_kind, monitored_id, action, reason) "
+            "VALUES ($1, 'series', $2, 'grabbed', $3)",
+            release_id, mon['id'], reason)
+        log.info("[auto-grab] series @%s S%02dE%02d release_id=%s — queued",
+                 rel['title'], rel['season'] or 0, rel['episode'] or 0, release_id)
+    elif rel['type'] == 'movie' and rel['title']:
+        mon = await conn.fetchrow(
+            """SELECT mm.id, mm.quality_profile_id, mm.grabbed_release_id,
+                      qp.preferred_resolutions, qp.preferred_codecs,
+                      qp.max_size_bytes, qp.min_size_bytes
+               FROM monitored_movies mm
+               LEFT JOIN quality_profile qp ON qp.id = mm.quality_profile_id
+               WHERE mm.status IN ('wanted','grabbed')
+                 AND LOWER(mm.title) = LOWER($1)
+                 AND ($2::int IS NULL OR mm.year = $2)
+               LIMIT 1""", rel['title'], rel['year'])
+        if not mon:
+            return
+        ok, reason = _release_passes_profile(rel, dict(mon))
+        if not ok:
+            await conn.execute(
+                "INSERT INTO auto_grab_log (release_id, monitored_kind, monitored_id, action, reason) "
+                "VALUES ($1, 'movie', $2, 'rejected', $3)",
+                release_id, mon['id'], reason)
+            return
+        if mon['grabbed_release_id']:
+            # Already grabbed something — compare quality, upgrade if better
+            prev = await conn.fetchrow(
+                "SELECT quality, size_bytes FROM releases WHERE id=$1", mon['grabbed_release_id'])
+            if prev and _RES_RANK.get(rel['quality'], 0) <= _RES_RANK.get(prev['quality'], 0):
+                await conn.execute(
+                    "INSERT INTO auto_grab_log (release_id, monitored_kind, monitored_id, action, reason) "
+                    "VALUES ($1, 'movie', $2, 'rejected', 'not_upgrade')",
+                    release_id, mon['id'])
+                return
+            action = 'upgraded'
+        else:
+            action = 'grabbed'
+        await conn.execute(
+            "INSERT INTO downloads (release_id, status, requested_at) VALUES ($1, 'pending', NOW())",
+            release_id)
+        await conn.execute(
+            "UPDATE monitored_movies SET status='grabbed', grabbed_release_id=$1 WHERE id=$2",
+            release_id, mon['id'])
+        await conn.execute(
+            "INSERT INTO auto_grab_log (release_id, monitored_kind, monitored_id, action, reason) "
+            "VALUES ($1, 'movie', $2, $3, 'profile_match')",
+            release_id, mon['id'], action)
+        log.info("[auto-grab] movie %s (%s) release_id=%s — %s",
+                 rel['title'], rel['year'], release_id, action)
+
 # Caption-mention discovery: extract new channel hints from message text
 _MENTION_RX = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{4,31})\b")
 _INVITE_RX = re.compile(
@@ -229,12 +348,13 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
             return None
         if type_ == "tv" and file_size < MIN_TV_BYTES:
             return None
-    await conn.execute(
+    rel_id = await conn.fetchval(
         """INSERT INTO releases
              (name, category, series_title, season, episode,
               movie_title, movie_year, quality, source, codec,
               size_bytes, posted_at, primary_msg_id, parse_score)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+           RETURNING id""",
         rname,
         type_,
         parsed.get("title") if type_ == "tv" else None,
@@ -250,6 +370,14 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
         msg_row_id,
         score,
     )
+    # Auto-grab pipeline: if this release matches monitored series/movie + quality
+    # profile, enqueue download. Sonarr/Radarr feature parity. Best-effort,
+    # never let failure block the parse.
+    try:
+        if rel_id:
+            await maybe_auto_grab(conn, rel_id, parsed, file_size)
+    except Exception as e:
+        log.warning("[auto-grab] error rel_id=%s: %s", rel_id, e)
     return rname
 
 
