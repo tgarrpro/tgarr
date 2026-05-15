@@ -1863,6 +1863,51 @@ async def api_photo_redownload(msg_id: int):
     return {"status": "queued"}
 
 
+@app.post("/api/downloads/{dl_id}/pause")
+async def api_download_pause(dl_id: int):
+    """Flip row to 'paused'. Crawler's cancel-watcher will abort in-flight
+    download if currently 'downloading'. .temp file is left on disk so
+    /resume can pick up where we left off (Pyrogram redownloads from 0
+    but GREATEST keeps UI monotonic until new download passes the mark)."""
+    async with db_pool.acquire() as conn:
+        n = await conn.execute(
+            "UPDATE downloads SET status='paused', speed_kbps=0 "
+            "WHERE id=$1 AND status IN ('pending','downloading')",
+            dl_id)
+    return {"status": "ok", "affected": n}
+
+
+@app.post("/api/downloads/{dl_id}/resume")
+async def api_download_resume(dl_id: int):
+    """Flip 'paused' or 'failed' back to 'pending' so the dispatcher
+    picks it up again. Doesn't reset bytes_done (UI stays monotonic;
+    new attempt's progress will eventually pass the old high-water)."""
+    async with db_pool.acquire() as conn:
+        n = await conn.execute(
+            "UPDATE downloads SET status='pending', error_message=NULL "
+            "WHERE id=$1 AND status IN ('paused','failed')",
+            dl_id)
+    return {"status": "ok", "affected": n}
+
+
+@app.post("/api/downloads/{dl_id}/delete")
+async def api_download_delete(dl_id: int):
+    """Cancel/forget a download. For active rows: flip to 'cancelled' so
+    the crawler's watcher aborts + cleans .temp. For terminal rows:
+    drop the DB row entirely so it disappears from history."""
+    async with db_pool.acquire() as conn:
+        cur = await conn.fetchrow(
+            "SELECT status FROM downloads WHERE id=$1", dl_id)
+        if not cur:
+            return JSONResponse({"status": "missing"}, status_code=404)
+        if cur["status"] in ("pending", "downloading", "paused"):
+            await conn.execute(
+                "UPDATE downloads SET status='cancelled' WHERE id=$1", dl_id)
+        else:
+            await conn.execute("DELETE FROM downloads WHERE id=$1", dl_id)
+    return {"status": "ok", "prev": cur["status"]}
+
+
 @app.post("/api/internal/arr-scan")
 async def api_internal_arr_scan(payload: dict):
     """Crawler → api → Sonarr/Radarr push notification.
@@ -4395,7 +4440,7 @@ async def page_downloads():
                FROM downloads d
                JOIN releases r ON r.id = d.release_id
                LEFT JOIN messages m ON m.id = r.primary_msg_id
-               WHERE d.status IN ('pending','downloading')
+               WHERE d.status IN ('pending','downloading','paused')
                ORDER BY d.requested_at""")
         done = await conn.fetch(
             """SELECT d.id, d.status, d.local_path, d.requested_at, d.finished_at,
@@ -4414,9 +4459,11 @@ async def page_downloads():
         items = []
         for d in rows:
             icon = ({"pending": "⏳", "downloading": "⬇", "completed": "✓",
-                    "failed": "✗", "cancelled": "—"}).get(d["status"], "?")
+                    "failed": "✗", "cancelled": "—", "paused": "⏸"}
+                   ).get(d["status"], "?")
             pill_cls = ({"pending": "warn", "downloading": "accent",
-                        "completed": "ok", "failed": "bad", "cancelled": "muted"}
+                        "completed": "ok", "failed": "bad",
+                        "cancelled": "muted", "paused": "muted"}
                        ).get(d["status"], "muted")
             err_html = ""
             error_msg = d["error_message"] if "error_message" in d.keys() else None
@@ -4459,6 +4506,21 @@ async def page_downloads():
                     dc_html = f'<span class="pill ok" title="same DC — fast">DC{file_dc} ⚡</span>'
                 else:
                     dc_html = f'<span class="pill warn" title="cross-DC — slower">DC{file_dc} ✗</span>'
+            # Per-row controls. Buttons depend on status:
+            #   pending/downloading → Pause + Delete
+            #   paused/failed       → Resume + Delete
+            #   completed/cancelled → Delete (purges history row)
+            btns = []
+            st = d["status"]
+            if st in ("pending", "downloading"):
+                btns.append(f'<button class="dl-btn" '
+                           f'onclick="dlAct({d["id"]},\'pause\')">⏸ Pause</button>')
+            if st in ("paused", "failed"):
+                btns.append(f'<button class="dl-btn ok" '
+                           f'onclick="dlAct({d["id"]},\'resume\')">▶ Resume</button>')
+            btns.append(f'<button class="dl-btn bad" '
+                       f'onclick="dlAct({d["id"]},\'delete\')">✗</button>')
+            ctrls = f'<div class="dl-ctrls">{" ".join(btns)}</div>'
             items.append(
                 f'<div class="dl-item">'
                 f'<div class="icon">{icon}</div>'
@@ -4471,7 +4533,9 @@ async def page_downloads():
                 f'<span>· {_fmt_time(d["requested_at"])}{local}</span>'
                 f'</div>{progress_html}{err_html}'
                 f'</div>'
-                f'<div class="right">{_fmt_time(finished) if show_finished else ""}</div>'
+                f'<div class="right">{ctrls}'
+                f'<div class="dl-time">{_fmt_time(finished) if show_finished else ""}</div>'
+                f'</div>'
                 f'</div>'
             )
         return f'<div class="dl-list">{"".join(items)}</div>'
@@ -4480,10 +4544,30 @@ async def page_downloads():
     # without manual reload. Stops refreshing when queue empties.
     refresh_js = ('<script>setTimeout(()=>location.reload(),5000)</script>'
                   if active else '')
+    ctrl_js = '''<script>
+function dlAct(id, action){
+  if(action==='delete' && !confirm('Delete this download?')) return;
+  fetch('/api/downloads/'+id+'/'+action,{method:'POST'})
+    .then(r=>r.json())
+    .then(_=>location.reload())
+    .catch(e=>alert('failed: '+e));
+}
+</script>
+<style>
+.dl-ctrls{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;margin-bottom:4px}
+.dl-btn{font-size:11px;padding:4px 10px;border:1px solid #d1d5db;background:#f9fafb;border-radius:4px;cursor:pointer;color:#374151}
+.dl-btn:hover{background:#e5e7eb}
+.dl-btn.ok{color:#065f46;border-color:#a7f3d0;background:#ecfdf5}
+.dl-btn.ok:hover{background:#d1fae5}
+.dl-btn.bad{color:#991b1b;border-color:#fecaca;background:#fef2f2}
+.dl-btn.bad:hover{background:#fee2e2}
+.dl-time{font-size:11px;color:#888;text-align:right;margin-top:2px}
+</style>'''
     body = (f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
            f'{_render(active, show_finished=False)}'
            f'<h2 class="section">History <span class="count">last 100</span></h2>'
            f'{_render(done, show_finished=True)}'
+           f'{ctrl_js}'
            f'{refresh_js}')
     return HTMLResponse(_layout("Downloads", "/downloads", body))
 

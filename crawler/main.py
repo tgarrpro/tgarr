@@ -1037,11 +1037,42 @@ async def _claim_pending(same_dc: bool):
         return dict(rec) if rec else None
 
 
+_active_tasks: dict = {}  # dl_id -> asyncio.Task (live download workers only)
+
+
+async def _cancel_watcher() -> None:
+    """Poll DB every 5s for rows that the api marked 'paused' or 'cancelled'.
+    If a matching task is currently in _active_tasks, cancel it so the
+    in-flight download aborts. The worker's except CancelledError block
+    then leaves the row status alone (the api already set it) and skips
+    the 'failed' flip."""
+    while True:
+        try:
+            await asyncio.sleep(5)
+            if not _active_tasks:
+                continue
+            ids = list(_active_tasks.keys())
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, status FROM downloads "
+                    "WHERE id = ANY($1::bigint[]) "
+                    "AND status IN ('paused','cancelled')", ids)
+            for r in rows:
+                t = _active_tasks.get(r["id"])
+                if t and not t.done():
+                    log.info("[cancel-watch] aborting id=%s reason=%s",
+                             r["id"], r["status"])
+                    t.cancel()
+        except Exception:
+            log.exception("[cancel-watch] loop error")
+
+
 async def _process_one_download(row_payload: dict) -> None:
     """The actual download + rename + chmod work for a single claimed row.
     Extracted from download_worker so the dispatcher can spawn multiple of
     these concurrently under a semaphore."""
     row = row_payload  # dict, not asyncpg Record — same key access pattern
+    _active_tasks[row["dl_id"]] = asyncio.current_task()
     try:
         safe_name = SAFE_NAME.sub("_", row["rel_name"])[:160]
         target_dir = os.path.join(DOWNLOAD_ROOT, safe_name)
@@ -1122,6 +1153,27 @@ async def _process_one_download(row_payload: dict) -> None:
         # Push-notify Sonarr/Radarr to scan + import — self-heals when CDH
         # queue tracking was dropped (tgarr-api downtime / restart race).
         await _notify_arr(local_path, row)
+    except asyncio.CancelledError:
+        # User-initiated abort via /api/downloads/{id}/pause or /delete.
+        # The api already flipped the row status; don't overwrite. For
+        # 'cancelled' rows, sweep the partial folder so disk doesn't bloat.
+        try:
+            async with db_pool.acquire() as conn:
+                final_status = await conn.fetchval(
+                    "SELECT status FROM downloads WHERE id=$1", row["dl_id"])
+            log.info("[worker] aborted id=%s final_status=%s",
+                     row["dl_id"], final_status)
+            if final_status == "cancelled":
+                target_dir = os.path.join(
+                    DOWNLOAD_ROOT,
+                    SAFE_NAME.sub("_", row["rel_name"])[:160])
+                if os.path.isdir(target_dir):
+                    import shutil
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                    log.info("[worker] swept cancelled folder %s", target_dir)
+        except Exception:
+            log.exception("[worker] cancel cleanup id=%s", row["dl_id"])
+        raise  # propagate so the dispatcher's sem releases properly
     except Exception as e:
         log.exception("[worker] failed id=%s: %s", row["dl_id"], e)
         try:
@@ -1133,6 +1185,8 @@ async def _process_one_download(row_payload: dict) -> None:
                     str(e)[:500], row["dl_id"])
         except Exception:
             log.exception("[worker] failed to mark failed id=%s", row["dl_id"])
+    finally:
+        _active_tasks.pop(row["dl_id"], None)
 
 
 async def _download_dispatcher(same_dc: bool, sem: asyncio.Semaphore) -> None:
@@ -3377,6 +3431,7 @@ async def main() -> None:
             log.info("[worker] %s stale downloading → pending on boot "
                      "(bytes_done preserved)", reset)
     asyncio.create_task(_session_change_watcher(me.id))
+    asyncio.create_task(_cancel_watcher())
 
     # THUMB-ONLY MODE: emergency lockdown when MTProto cross-DC FloodWait is
     # escalating. Runs only HTTPS-safe workers (thumb_downloader uses t.me
