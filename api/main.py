@@ -17,6 +17,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -123,6 +124,7 @@ async def _startup():
     asyncio.create_task(_audio_metadata_worker())
     asyncio.create_task(_stats_snapshot_worker())
     asyncio.create_task(_ebook_queue_restore())
+    asyncio.create_task(_arr_alias_sync_worker())
 
 
 async def _migrate_schema():
@@ -291,6 +293,20 @@ async def _migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_seed_cand_pending_contrib
                 ON seed_candidates (added_at DESC)
                 WHERE source IN ('caption-mention','caption-invite') AND contributed_at IS NULL;
+            -- Series alias table: translates non-English release names from
+            -- tgarr's ingest to the canonical English title that Sonarr/Radarr
+            -- know. Populated from Sonarr/Radarr alternateTitles + manual.
+            -- Universal across languages — works for any non-English title.
+            CREATE TABLE IF NOT EXISTS series_aliases (
+              alias_text TEXT PRIMARY KEY,         -- e.g. "舌尖上的中国第三季", "東京喰種", "오징어 게임"
+              canonical_title TEXT NOT NULL,        -- e.g. "A Bite of China", "Tokyo Ghoul"
+              season INT,                           -- NULL if alias is series-wide; else season # baked into alias
+              kind TEXT NOT NULL DEFAULT 'tv',      -- 'tv' or 'movie'
+              source TEXT NOT NULL DEFAULT 'manual',-- 'manual' | 'sonarr' | 'radarr' | 'tmdb'
+              external_id BIGINT,                   -- tvdbId / tmdbId for traceability
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_alias_canon ON series_aliases (canonical_title);
             CREATE TABLE IF NOT EXISTS stats_history (
               snapshot_at TIMESTAMPTZ NOT NULL,
               metric TEXT NOT NULL,
@@ -4637,6 +4653,124 @@ def _category_id(rel) -> str:
     return "0"
 
 
+# Series alias map: rewrite non-English release names to the canonical
+# English title Sonarr/Radarr knows. Universal across languages — table is
+# populated from Sonarr/Radarr alternateTitles + manual fallbacks.
+#
+# `_series_aliases_cache` is loaded from DB on first use + refreshed every
+# 60s. Lookup is substring match against release.name; first hit wins.
+_series_aliases_cache: list = []  # list of (alias_text, canonical_title, season)
+_series_aliases_loaded_at: float = 0.0
+
+
+async def _refresh_series_aliases():
+    """Reload alias map from DB. Called lazily — once per minute is plenty
+    for newznab feed queries."""
+    global _series_aliases_cache, _series_aliases_loaded_at
+    if time.time() - _series_aliases_loaded_at < 60:
+        return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT alias_text, canonical_title, season FROM series_aliases "
+            "ORDER BY length(alias_text) DESC")  # longest first → specific beats general
+    _series_aliases_cache = [
+        (r["alias_text"], r["canonical_title"], r["season"]) for r in rows]
+    _series_aliases_loaded_at = time.time()
+
+
+def _rewrite_release_title_sync(r) -> str:
+    """Outbound rewrite (release → newznab feed). Substring match against
+    cached alias map. Falls through to raw name when no alias matches."""
+    raw = r["name"] or ""
+    for alias_text, canonical, season in _series_aliases_cache:
+        if alias_text in raw:
+            ep = r["episode"] or 1
+            seas = season if season is not None else (r["season"] or 1)
+            qual = r["quality"] or "1080p"
+            return f"{canonical}.S{int(seas):02d}E{int(ep):02d}.{qual}.WEBRip-tgarr"
+    return raw
+
+
+def _expand_inbound_query(q: str) -> list:
+    """Inbound: Sonarr searches 'A Bite of China'. Return all alias variants
+    so SQL ILIKE matches Chinese releases too. Always includes the original."""
+    variants = {q}
+    ql = q.lower()
+    for alias_text, canonical, _ in _series_aliases_cache:
+        if canonical.lower() in ql or ql in canonical.lower():
+            variants.add(alias_text)
+    return list(variants)
+
+
+async def _arr_alias_sync_worker():
+    """Pull Sonarr+Radarr series + alternateTitles, UPSERT into series_aliases.
+    Runs hourly. Endpoints + keys from env. Failures non-fatal — manual
+    aliases (source='manual') always remain in DB.
+    """
+    await asyncio.sleep(60)  # let startup settle
+    SONARR_URL = os.environ.get("SONARR_URL", "http://host.docker.internal:8989")
+    SONARR_KEY = os.environ.get("SONARR_API_KEY", "")
+    RADARR_URL = os.environ.get("RADARR_URL", "http://host.docker.internal:7878")
+    RADARR_KEY = os.environ.get("RADARR_API_KEY", "")
+    while True:
+        try:
+            inserted = 0
+            for app_name, url, key, endpoint, kind in (
+                ("sonarr", SONARR_URL, SONARR_KEY, "series", "tv"),
+                ("radarr", RADARR_URL, RADARR_KEY, "movie", "movie"),
+            ):
+                if not key:
+                    continue
+                def _fetch():
+                    req = urllib.request.Request(
+                        f"{url}/api/v3/{endpoint}",
+                        headers={"X-Api-Key": key})
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            return _json.loads(r.read())
+                    except Exception as e:
+                        logging.getLogger("tgarr.alias").warning(
+                            "%s fetch failed: %s", app_name, e)
+                        return []
+                items = await asyncio.to_thread(_fetch)
+                aliases = []
+                for it in items:
+                    canonical = it.get("title") or ""
+                    ext_id = it.get("tvdbId") or it.get("tmdbId") or 0
+                    if not canonical:
+                        continue
+                    # Sonarr/Radarr expose alternateTitles → list of {title, ...}
+                    for alt in it.get("alternateTitles", []):
+                        alias_text = (alt.get("title") or "").strip()
+                        if not alias_text or alias_text == canonical:
+                            continue
+                        season = alt.get("seasonNumber")
+                        if season is not None and season < 0:
+                            season = None
+                        aliases.append((alias_text, canonical, season, kind, app_name, ext_id))
+                if aliases:
+                    async with db_pool.acquire() as conn:
+                        await conn.executemany(
+                            """INSERT INTO series_aliases
+                                 (alias_text, canonical_title, season, kind, source, external_id)
+                               VALUES ($1,$2,$3,$4,$5,$6)
+                               ON CONFLICT (alias_text) DO UPDATE SET
+                                 canonical_title=EXCLUDED.canonical_title,
+                                 season=EXCLUDED.season,
+                                 source=CASE
+                                   WHEN series_aliases.source='manual' THEN 'manual'
+                                   ELSE EXCLUDED.source END,
+                                 external_id=EXCLUDED.external_id""",
+                            aliases)
+                    inserted += len(aliases)
+            if inserted:
+                logging.getLogger("tgarr.alias").info(
+                    "synced %d aliases from arr APIs", inserted)
+        except Exception as e:
+            logging.getLogger("tgarr.alias").warning("sync loop error: %s", e)
+        await asyncio.sleep(3600)
+
+
 def _item_xml(r, base_url: str, apikey: str) -> str:
     guid = str(r["guid"])
     link = f"{base_url}/newznab/api?t=get&id={guid}&apikey={apikey}"
@@ -4648,7 +4782,7 @@ def _item_xml(r, base_url: str, apikey: str) -> str:
                if r["posted_at"] else "")
     size = r["size_bytes"] or 0
     cat_id = _category_id(r)
-    title = html.escape(r["name"])
+    title = html.escape(_rewrite_release_title_sync(r))
     return (
         f"    <item>\n"
         f"      <title>{title}</title>\n"
@@ -4704,13 +4838,39 @@ async def newznab_api(
     if t == "get":
         return await _handle_grab(id)
 
+    # Refresh alias map (cached 60s) — used for both inbound query expansion
+    # and outbound release-name rewrite via _item_xml→_rewrite_release_title_sync.
+    await _refresh_series_aliases()
+
+    # If Sonarr/Radarr passed tvdbid/tmdbid (the canonical way they query),
+    # resolve to canonical_title via series_aliases.external_id then synthesize q.
+    if not q and (tvdbid or tmdbid):
+        ext_id = tvdbid or tmdbid
+        async with db_pool.acquire() as conn:
+            canonical = await conn.fetchval(
+                "SELECT canonical_title FROM series_aliases "
+                "WHERE external_id = $1 LIMIT 1", int(ext_id))
+        if canonical:
+            q = canonical
+
     where_parts = ["1=1"]
     params = []
 
     if q:
-        for word in q.split():
-            params.append(f"%{word}%")
-            where_parts.append(f"name ILIKE ${len(params)}")
+        # Inbound query expansion: Sonarr asks "A Bite of China" → also match
+        # any release containing aliased non-English title like "舌尖上的中国".
+        # Each variant becomes a separate OR group; words within a variant are AND.
+        variants = _expand_inbound_query(q)
+        or_groups = []
+        for variant in variants:
+            and_parts = []
+            for word in variant.split():
+                params.append(f"%{word}%")
+                and_parts.append(f"name ILIKE ${len(params)}")
+            if and_parts:
+                or_groups.append("(" + " AND ".join(and_parts) + ")")
+        if or_groups:
+            where_parts.append("(" + " OR ".join(or_groups) + ")")
 
     if t == "tvsearch":
         where_parts.append("category = 'tv'")
@@ -4766,10 +4926,18 @@ async def _handle_grab(guid: Optional[str]) -> Response:
         f"  </file>\n"
         f"</nzb>"
     )
+    # HTTP headers are latin-1 only; sanitize the filename (release name can
+    # contain CJK/Cyrillic/Arabic). Use ASCII-safe fallback + RFC 5987
+    # `filename*` for the original UTF-8 name.
+    raw_name = rel["name"]
+    safe_name = "".join(c if ord(c) < 128 else "_" for c in raw_name)[:120]
+    quoted_utf8 = urllib.parse.quote(raw_name, safe="")
     return Response(
         stub,
         media_type="application/x-nzb",
-        headers={"Content-Disposition": f'attachment; filename="{rel["name"]}.nzb"'},
+        headers={"Content-Disposition":
+                 f'attachment; filename="{safe_name}.nzb"; '
+                 f"filename*=UTF-8''{quoted_utf8}.nzb"},
     )
 
 
@@ -4778,7 +4946,10 @@ async def _handle_grab(guid: Optional[str]) -> Response:
 # ════════════════════════════════════════════════════════════════════
 @app.get("/sabnzbd/api")
 @app.get("/api")
+@app.post("/sabnzbd/api")  # Sonarr posts multipart for mode=addfile
+@app.post("/api")
 async def sab_api(
+    request: Request,
     mode: str = Query("queue"),
     name: Optional[str] = None,
     value: Optional[str] = None,
@@ -4787,6 +4958,33 @@ async def sab_api(
     apikey: Optional[str] = None,
     output: str = Query("json"),
 ):
+    # Sonarr mode=addfile sends the NZB content as multipart; we don't actually
+    # need to parse the NZB body — the release guid is in the nzb's <subject>
+    # but more reliably we encode it into the filename when generating the stub.
+    # For our purposes, extract the filename and grab via its guid.
+    if mode == "addfile" and request.method == "POST":
+        try:
+            form = await request.form()
+            file = form.get("nzbfile") or form.get("name")
+            # Read NZB body — our stub embeds `tgarr-<guid>` in <segment>.
+            # That's how we recover the original release identity even when
+            # Sonarr renamed the file via alias rewrite.
+            nzb_bytes = b""
+            if file and hasattr(file, "read"):
+                nzb_bytes = await file.read()
+            elif isinstance(file, str):
+                nzb_bytes = file.encode()
+            m = re.search(rb"tgarr-([0-9a-f-]{36})", nzb_bytes)
+            if m:
+                guid = m.group(1).decode()
+                fname = getattr(file, "filename", None) or ""
+                if fname.endswith(".nzb"):
+                    fname = fname[:-4]
+                return await _sab_addurl(guid, fname, cat)
+            return JSONResponse({"status": False,
+                                 "error": "no tgarr-guid found in NZB body"})
+        except Exception as e:
+            return JSONResponse({"status": False, "error": str(e)[:200]})
     if mode == "version":
         return {"version": "3.7.2"}
     if mode == "auth":
@@ -4890,6 +5088,9 @@ async def _sab_addurl(url: str, nzbname: Optional[str], cat: Optional[str]):
     guid = None
     if "id=" in url:
         guid = url.split("id=")[1].split("&")[0]
+    elif re.fullmatch(r"[0-9a-f-]{36}", url or ""):
+        # Caller passed bare guid (from addfile NZB-body parse path).
+        guid = url
     if not guid:
         return {"status": False, "error": "no guid in url"}
     async with db_pool.acquire() as conn:
