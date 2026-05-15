@@ -1863,6 +1863,57 @@ DEEP_BACKFILL_DELAY_SEC = int(os.environ.get("TGARR_DEEP_BACKFILL_DELAY_SEC", "1
 DEEP_BACKFILL_MIN_MEDIA = int(os.environ.get("TGARR_DEEP_BACKFILL_MIN_MEDIA", "100"))
 
 
+async def dialog_gc_worker() -> None:
+    """Auto-unsubscribe subscribed channels that have produced no new
+    messages in > TGARR_DIALOG_GC_DAYS (default 30) — they're effectively
+    dead. Frees subscription_poller quota for active channels.
+
+    No TG action needed since we never joined (subscribe = poll-only).
+    Just set channels.subscribed=FALSE; poller stops touching them.
+    """
+    GC_DAYS = int(os.environ.get("TGARR_DIALOG_GC_DAYS", "30"))
+    log.info("[dialog-gc] worker started — silent>%dd auto-unsubscribe, 6h cadence", GC_DAYS)
+    await asyncio.sleep(1800)  # let initial backfill settle
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                # last_post NULL → never had any message (likely failed-resolve / pending)
+                # last_post too-old → silent → drop
+                rows = await conn.fetch(f"""
+                    SELECT c.id, c.username,
+                           (SELECT max(posted_at) FROM messages m
+                             WHERE m.channel_id = c.id) AS last_post
+                    FROM channels c
+                    WHERE c.subscribed = TRUE
+                      AND c.last_polled_at < NOW() - INTERVAL '{GC_DAYS} days'
+                """)
+            dead = []
+            for r in rows:
+                lp = r["last_post"]
+                if lp is None:
+                    dead.append((r["id"], r["username"], None))
+                else:
+                    from datetime import datetime as _dt, timezone as _tz
+                    age = (_dt.now(_tz.utc) - lp).days
+                    if age > GC_DAYS:
+                        dead.append((r["id"], r["username"], age))
+            if dead:
+                ids = [d[0] for d in dead]
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET subscribed=FALSE, "
+                        "subscribe_error='auto-gc: silent >30d' "
+                        "WHERE id = ANY($1::bigint[])", ids)
+                for did, uname, age in dead:
+                    log.info("[dialog-gc] auto-unsubscribed @%s (last msg %s days ago)",
+                             uname, age if age is not None else "never")
+            await _heartbeat("dialog_gc_worker",
+                             f"swept {len(rows)} silent candidates, dropped {len(dead)}")
+        except Exception:
+            log.exception("[dialog-gc] outer")
+        await asyncio.sleep(21600)  # 6h
+
+
 async def decay_eviction_worker() -> None:
     """Periodic LRU-by-decay cleanup: drop messages whose value has decayed
     below pull cost. Same model as deep_backfill cutoff but operating on
@@ -2193,6 +2244,7 @@ async def main() -> None:
     asyncio.create_task(deep_backfill_worker())
     asyncio.create_task(contribute_resources_worker())
     asyncio.create_task(decay_eviction_worker())
+    asyncio.create_task(dialog_gc_worker())
     # On-demand mode 2026-05-14: thumb_downloader stays but only processes
     # rows where /api/thumb/{id} UI hit has set thumb_path='__user_queued__'.
     asyncio.create_task(thumb_downloader())

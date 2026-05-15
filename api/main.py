@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.56"
+TGARR_VERSION = "0.4.57"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -376,7 +376,7 @@ async def _metadata_worker():
                 tmdb_key = await conn.fetchval(
                     "SELECT value FROM config WHERE key='tmdb_api_key'")
                 row = await conn.fetchrow("""
-                    SELECT id, category,
+                    SELECT id, category, parse_score,
                            COALESCE(NULLIF(series_title,''), NULLIF(movie_title,''), name) AS title,
                            movie_year
                     FROM releases
@@ -393,21 +393,37 @@ async def _metadata_worker():
                 row["movie_year"],
                 tmdb_key=tmdb_key,
             )
+            current_score = float(row["parse_score"] or 0)
             async with db_pool.acquire() as conn:
                 if result:
+                    # TMDB hit — boost parse_score (this IS a real movie/show)
+                    new_score = min(1.0, current_score + 0.3)
                     await conn.execute("""
                         UPDATE releases SET
                           poster_url=$1, canonical_title=$2, overview=$3,
-                          metadata_source=$4, metadata_lookup_at=NOW()
-                        WHERE id=$5
+                          metadata_source=$4, metadata_lookup_at=NOW(),
+                          parse_score=$5
+                        WHERE id=$6
                     """, result.get("poster_url"), result.get("canonical_title"),
-                         result.get("overview"), result.get("source"), row["id"])
+                         result.get("overview"), result.get("source"),
+                         new_score, row["id"])
                 else:
-                    await conn.execute("""
-                        UPDATE releases SET metadata_source='miss',
-                          metadata_lookup_at=NOW()
-                        WHERE id=$1
-                    """, row["id"])
+                    # TMDB miss — title doesn't match any known movie/show.
+                    # Drop parse_score. If < 0.30 threshold → delete the release
+                    # (not a real release, just looked release-shaped).
+                    new_score = max(0.0, current_score - 0.3)
+                    if new_score < 0.30:
+                        await conn.execute(
+                            "DELETE FROM releases WHERE id=$1", row["id"])
+                        wlog.info("[meta] TMDB miss → deleted weak release id=%s '%s'",
+                                  row["id"], row["title"])
+                    else:
+                        await conn.execute("""
+                            UPDATE releases SET metadata_source='miss',
+                              metadata_lookup_at=NOW(),
+                              parse_score=$1
+                            WHERE id=$2
+                        """, new_score, row["id"])
             await asyncio.sleep(0.3)
         except Exception as e:
             wlog.exception("metadata worker error: %s", e)
@@ -2086,6 +2102,8 @@ _EXPECTED_WORKERS = {
     "deep_backfill_worker":       300,        # 10s/page, heartbeats per page = frequent
     "on_demand_media_downloader": 86400,      # only on user click, ok to be stale
     "contribute_resources_worker": 30 * 60,   # 30min interval
+    "decay_eviction_worker":      6 * 3600,   # 6h
+    "dialog_gc_worker":           6 * 3600,   # 6h
 }
 
 
@@ -2138,6 +2156,57 @@ async def api_workers():
     return {"workers": out,
             "all_healthy": len(stale_or_never) == 0,
             "stale_or_never": [w["worker"] for w in stale_or_never]}
+
+
+@app.get("/api/channels/quality")
+async def api_channels_quality():
+    """Per-channel quality scoreboard: media-ratio, release-style ratio, size median,
+    composite 0-5 star quality. Used by dashboard to dismiss low-value subs +
+    by federation v2 to prioritize task assignment to high-quality channels."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+              c.id, c.username, c.title, c.audience, c.content_category,
+              c.members_count, c.subscribed,
+              (SELECT count(*) FROM messages m WHERE m.channel_id=c.id) AS msgs_local,
+              (SELECT count(*) FROM messages m WHERE m.channel_id=c.id
+                 AND m.media_type IS NOT NULL) AS msgs_media,
+              (SELECT count(*) FROM messages m WHERE m.channel_id=c.id
+                 AND m.media_type='video') AS msgs_video,
+              (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY m.file_size)
+                 FROM messages m WHERE m.channel_id=c.id AND m.file_size > 0) AS size_median,
+              (SELECT count(*) FROM releases r
+                 JOIN messages m ON m.id = r.primary_msg_id
+                 WHERE m.channel_id = c.id) AS release_count
+            FROM channels c
+            WHERE c.subscribed = TRUE
+            ORDER BY msgs_local DESC NULLS LAST
+        """)
+    out = []
+    for r in rows:
+        msgs = r["msgs_local"] or 0
+        media = r["msgs_media"] or 0
+        rel = r["release_count"] or 0
+        median_b = int(r["size_median"] or 0)
+        media_ratio = (media / msgs) if msgs else 0.0
+        release_ratio = (rel / media) if media else 0.0
+        # Size signal: median > 50MB = movie/show territory
+        size_score = min(1.0, median_b / 50_000_000)
+        # Composite 0-5 star
+        stars = round(
+            (media_ratio * 0.30 + release_ratio * 0.50 + size_score * 0.20) * 5, 1)
+        out.append({
+            "username": r["username"], "title": r["title"],
+            "audience": r["audience"], "category": r["content_category"],
+            "members": r["members_count"],
+            "msgs_local": msgs, "msgs_media": media, "msgs_video": r["msgs_video"] or 0,
+            "release_count": rel,
+            "media_ratio": round(media_ratio, 2),
+            "release_ratio": round(release_ratio, 2),
+            "size_median_mb": round(median_b / 1024 / 1024, 1),
+            "quality_stars": stars,
+        })
+    return {"channels": out, "count": len(out)}
 
 
 @app.get("/api/deep-backfill-progress")
