@@ -11,10 +11,13 @@ via MTProto → drops file in /downloads/tgarr/<release>/ → Sonarr's CDH impor
 """
 import asyncio
 import html
+import json as _json
 import logging
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from typing import Optional
 
 import asyncpg
@@ -25,7 +28,39 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.60"
+MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
+MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
+TGARR_VERSION = "0.4.62"
+
+
+async def meili_search(index: str, q: str, *, limit: int = 60,
+                       offset: int = 0, filter_: Optional[str] = None,
+                       sort: Optional[list] = None) -> dict:
+    """Async wrapper around Meili HTTP search. Returns full response dict.
+    Empty/missing key → returns {hits:[],estimatedTotalHits:0} so callers degrade gracefully."""
+    if not MEILI_KEY:
+        return {"hits": [], "estimatedTotalHits": 0}
+    body = {"q": q or "", "limit": limit, "offset": offset}
+    if filter_:
+        body["filter"] = filter_
+    if sort:
+        body["sort"] = sort
+
+    def _call():
+        req = urllib.request.Request(
+            f"{MEILI_URL}/indexes/{index}/search",
+            data=_json.dumps(body).encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {MEILI_KEY}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return _json.loads(r.read())
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            logging.getLogger("tgarr.meili").warning("meili search failed: %s", e)
+            return {"hits": [], "estimatedTotalHits": 0}
+
+    return await asyncio.to_thread(_call)
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -2351,7 +2386,7 @@ async def api_deep_backfill_progress():
                    (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='audio') AS local_audio,
                    (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='document') AS local_documents
             FROM channels
-            WHERE subscribed = TRUE
+            WHERE subscribed = TRUE OR enabled = TRUE
             ORDER BY deep_backfilled ASC, COALESCE(remote_msgs, 0) DESC
         """)
     def pct(local, remote):
@@ -2424,17 +2459,37 @@ async function loadWorkers() {
 async function loadDeepBackfill() {
   const r = await fetch("/api/deep-backfill-progress");
   const j = await r.json();
-  const rows = (j.channels || []).map(c => `
+  const fmtPct = (v) => v == null ? "—" : (v >= 100 ? "100%" : v + "%");
+  const barColor = (v) => v == null ? "#cbd5e1" : (v >= 95 ? "#16a34a" : v >= 50 ? "#3b82f6" : v >= 10 ? "#f59e0b" : "#ef4444");
+  const bar = (pct) => {
+    if (pct == null) return '<span style="color:#94a3b8">—</span>';
+    const w = Math.max(2, Math.min(100, pct));
+    return `<div style="background:#e2e8f0;border-radius:3px;width:80px;height:8px;display:inline-block;overflow:hidden;vertical-align:middle"><div style="width:${w}%;height:100%;background:${barColor(pct)}"></div></div> <span style="font-size:11px;color:#475569">${fmtPct(pct)}</span>`;
+  };
+  const rows = (j.channels || []).map(c => {
+    const totalCell = c.remote_msgs
+      ? `${c.msgs_local.toLocaleString()} / ${c.remote_msgs.toLocaleString()}`
+      : c.msgs_local.toLocaleString();
+    return `
     <tr><td>${c.done?"✅":"🔄"} <b>@${c.username || "—"}</b></td>
-        <td>${(c.title || "").substring(0, 40)}</td>
-        <td style="text-align:right">${c.msgs_local.toLocaleString()}</td>
-        <td style="text-align:right;color:#64748b">+${(c.pulled_deep || 0).toLocaleString()}</td>
-        <td style="text-align:right;color:#64748b;font-size:12px">${fmtAgo(c.last_run_at)}</td></tr>`);
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(c.title || "").substring(0, 40)}</td>
+        <td style="text-align:right;font-size:13px">${totalCell}</td>
+        <td>${bar(c.pct_msgs)}</td>
+        <td style="text-align:right;font-size:11px;color:#475569">P ${fmtPct(c.pct_photos)}</td>
+        <td style="text-align:right;font-size:11px;color:#475569">V ${fmtPct(c.pct_videos)}</td>
+        <td style="text-align:right;font-size:11px;color:#475569">A ${fmtPct(c.pct_audio)}</td>
+        <td style="text-align:right;font-size:11px;color:#475569">D ${fmtPct(c.pct_documents)}</td>
+        <td style="text-align:right;color:#64748b;font-size:12px">${fmtAgo(c.last_run_at)}</td></tr>`;
+  });
   document.getElementById("deepBackfillTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
     <th>Status</th><th>Title</th>
-    <th style="text-align:right">Msgs local</th>
-    <th style="text-align:right">Pulled deep</th>
+    <th style="text-align:right">Msgs (local/remote)</th>
+    <th>Progress</th>
+    <th style="text-align:right">Photos</th>
+    <th style="text-align:right">Videos</th>
+    <th style="text-align:right">Audio</th>
+    <th style="text-align:right">Docs</th>
     <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 loadWorkers(); loadDeepBackfill();
@@ -4232,47 +4287,108 @@ async def page_downloads():
 # Page: Search
 # ════════════════════════════════════════════════════════════════════
 @app.get("/search", response_class=HTMLResponse)
-async def page_search(q: Optional[str] = None):
+async def page_search(q: Optional[str] = None,
+                      scope: Optional[str] = None):
     if not login.session_exists():
         return RedirectResponse("/login")
 
+    scope = scope or "releases"  # releases | messages | channels
     results_html = ""
+    elapsed_ms = 0
     if q:
-        where = ["1=1"]
-        params = []
-        for w in q.split():
-            params.append(f"%{w}%")
-            where.append(f"name ILIKE ${len(params)}")
-        sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
-              f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
-              f"r.primary_msg_id, m.file_dc "
-              f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
-              f"WHERE {' AND '.join([w.replace('name ILIKE','r.name ILIKE').replace('category =','r.category =').replace('size_bytes','r.size_bytes') for w in where])} "
-              f"ORDER BY r.posted_at DESC NULLS LAST LIMIT 120")
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(sql, *params)
-
-        if not rows:
-            results_html = ('<div class="empty-state">'
-                          '<div class="icon">🔍</div>'
-                          f'<div>No matches for <strong>{html.escape(q)}</strong></div>'
-                          '<div style="margin-top:8px;font-size:12px">Try fewer words or different spelling.</div>'
-                          '</div>')
-        else:
+        t0 = time.time()
+        if scope == "messages":
+            res = await meili_search("messages", q, limit=120)
+            ids = [h["id"] for h in res.get("hits", [])]
+            if ids:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(f"""
+                        SELECT m.id, m.file_name, m.media_type, m.file_size,
+                               m.posted_at, m.local_path, m.thumb_path,
+                               c.username AS channel_username, c.title AS channel_title
+                        FROM messages m JOIN channels c ON c.id=m.channel_id
+                        WHERE m.id = ANY($1::bigint[])
+                        ORDER BY array_position($1::bigint[], m.id)
+                    """, ids)
+                cards = []
+                for r in rows:
+                    fname = html.escape((r["file_name"] or "(no name)")[:120])
+                    sz = (r["file_size"] or 0) // 1024 // 1024
+                    ch = html.escape(r["channel_username"] or r["channel_title"] or "")
+                    cards.append(
+                        f'<div class="card" style="padding:12px"><div style="font-weight:600;font-size:13px">{fname}</div>'
+                        f'<div style="font-size:11px;color:#888;margin-top:4px">'
+                        f'{html.escape(r["media_type"] or "")} · {sz}MB · @{ch}</div></div>')
+                results_html = (
+                    f'<h2 class="section">Messages <span class="count">{res.get("estimatedTotalHits", len(ids))}</span></h2>'
+                    f'<div class="poster-grid">{"".join(cards)}</div>')
+        elif scope == "channels":
+            res = await meili_search("channels", q, limit=60)
+            hits = res.get("hits", [])
+            cards = []
+            for h in hits:
+                title = html.escape((h.get("title") or "")[:80])
+                un = html.escape(h.get("username") or "")
+                members = h.get("members_count", 0)
+                sub = "★" if h.get("subscribed") else ""
+                cards.append(
+                    f'<div class="card" style="padding:14px"><div style="font-weight:600">{title} {sub}</div>'
+                    f'<div style="font-size:12px;color:#888;margin-top:4px">@{un} · {members:,} members · {html.escape(h.get("content_category") or "")}</div></div>')
             results_html = (
-                f'<h2 class="section">Results <span class="count">{len(rows)}</span></h2>'
-                f'<div class="poster-grid">'
-                f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
-                f'</div>'
-            )
+                f'<h2 class="section">Channels <span class="count">{res.get("estimatedTotalHits", len(hits))}</span></h2>'
+                f'<div class="poster-grid">{"".join(cards)}</div>')
+        else:
+            res = await meili_search("releases", q, limit=120)
+            ids = [h["id"] for h in res.get("hits", [])]
+            rows = []
+            _release_my_dc = await _get_my_dc()
+            if ids:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch("""
+                        SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality,
+                               r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title,
+                               r.primary_msg_id, m.file_dc
+                        FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id
+                        WHERE r.id = ANY($1::bigint[])
+                        ORDER BY array_position($1::bigint[], r.id)
+                    """, ids)
+            if not rows:
+                results_html = ('<div class="empty-state">'
+                              '<div class="icon">🔍</div>'
+                              f'<div>No matches for <strong>{html.escape(q)}</strong></div>'
+                              '<div style="margin-top:8px;font-size:12px">Try fewer words or different spelling.</div>'
+                              '</div>')
+            else:
+                results_html = (
+                    f'<h2 class="section">Releases <span class="count">{res.get("estimatedTotalHits", len(rows))}</span></h2>'
+                    f'<div class="poster-grid">'
+                    f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
+                    f'</div>')
+        elapsed_ms = int((time.time() - t0) * 1000)
+
+    def tab(name, label):
+        active = (scope == name)
+        style = ("background:var(--accent);color:#fff;" if active
+                 else "background:var(--card);color:var(--fg);")
+        return (f'<a href="/search?q={html.escape(q or "")}&scope={name}" '
+                f'style="{style}padding:6px 14px;border-radius:6px;text-decoration:none;font-size:13px">{label}</a>')
+
+    timing = f'<span style="font-size:11px;color:#888;margin-left:10px">({elapsed_ms}ms · Meili)</span>' if q else ""
 
     body = f"""
-<form action="/search" method="GET" style="margin-bottom:24px;display:flex;gap:10px">
+<form action="/search" method="GET" style="margin-bottom:14px;display:flex;gap:10px">
   <input type="text" name="q" value="{html.escape(q) if q else ''}"
-         placeholder="Search parsed releases… (multi-word AND)"
+         placeholder="Search across releases, messages, channels…"
          style="flex:1;font-size:15px;padding:11px 16px" autofocus />
+  <input type="hidden" name="scope" value="{scope}">
   <button type="submit">Search</button>
 </form>
+<div style="display:flex;gap:8px;margin-bottom:18px;align-items:center">
+  {tab("releases","Releases")}
+  {tab("messages","Messages")}
+  {tab("channels","Channels")}
+  {timing}
+</div>
 {results_html}"""
     return HTMLResponse(_layout("Search", "/search", body, top_actions_html=""))
 

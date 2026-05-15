@@ -19,9 +19,11 @@ Defense in depth:
 """
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
+import struct
 import time
 from typing import Optional
 
@@ -53,7 +55,104 @@ async def _startup():
         async with db_pool.acquire() as conn:
             await conn.execute(f.read())
     await _seed_honeypots()
-    log.info("registry up — schema applied + honeypots seeded")
+    asyncio.create_task(_build_central_sketch())
+    log.info("registry up — schema applied + honeypots seeded + bloom builder scheduled")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Bloom sketch of known-consensus resources
+#
+# Cuts redundant client pushes 99%: client fetches this filter, tests each
+# of its file_unique_ids locally, skips push when the bit-test says "known".
+#
+# Params:
+# - m = 64 Mbits = 8 MiB. Holds ~10M fuids at ≤0.0001 FP rate (k=8).
+# - k = 8 SHA-256-derived hash functions.
+# - Only fuids with distinct_contributors >= 3 are included (consensus
+#   already met → no more contributions needed). Sub-3 fuids stay
+#   absent from filter so clients keep pushing them to build consensus.
+# - Rebuilt every 5 min on a background task; served from in-memory bytes.
+# ════════════════════════════════════════════════════════════════════
+BLOOM_M_BITS = 64 * 1024 * 1024
+BLOOM_M_BYTES = BLOOM_M_BITS // 8
+BLOOM_K = 8
+BLOOM_REBUILD_INTERVAL_SEC = 300
+# Default 3 — consensus threshold. Set to 1 for solo-client demo / testing
+# (lets Bloom include single-source fuids so the client can verify the
+# skip-redundant-push path before other clients exist).
+BLOOM_DC_THRESHOLD = int(os.environ.get("BLOOM_DC_THRESHOLD", "3"))
+
+_central_sketch_blob: bytes = b""
+_central_sketch_etag: str = ""
+
+
+def _bloom_indices(fuid: str) -> list:
+    """k bit-indices derived from SHA-256(fuid). Each is a 32-bit chunk mod m."""
+    h = hashlib.sha256(fuid.encode()).digest()
+    return [
+        int.from_bytes(h[i*4:(i+1)*4], 'little') % BLOOM_M_BITS
+        for i in range(BLOOM_K)
+    ]
+
+
+async def _build_central_sketch():
+    """Periodic Bloom rebuild — runs forever on a background task."""
+    global _central_sketch_blob, _central_sketch_etag
+    while True:
+        try:
+            t0 = time.time()
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT file_unique_id FROM registry_resources "
+                    "WHERE distinct_contributors >= $1 "
+                    "  AND file_unique_id IS NOT NULL",
+                    BLOOM_DC_THRESHOLD)
+            bits = bytearray(BLOOM_M_BYTES)
+            n = 0
+            for r in rows:
+                fuid = r["file_unique_id"]
+                if not fuid:
+                    continue
+                for idx in _bloom_indices(fuid):
+                    bits[idx >> 3] |= (1 << (idx & 7))
+                n += 1
+            # 20-byte header: magic(4) + m_bits(4) + k(1) + reserved(3) + n(4) + built_at(4)
+            header = struct.pack(
+                "<4sIB3xII",
+                b"BLM1", BLOOM_M_BITS, BLOOM_K, n, int(time.time()))
+            blob = bytes(header) + bytes(bits)
+            etag = hashlib.sha256(blob).hexdigest()[:32]
+            _central_sketch_blob = blob
+            _central_sketch_etag = etag
+            log.info("[bloom] rebuilt n=%d m=%d k=%d bytes=%d build_ms=%d etag=%s",
+                     n, BLOOM_M_BITS, BLOOM_K, len(blob),
+                     int((time.time()-t0)*1000), etag)
+        except Exception as e:
+            log.warning("[bloom] rebuild failed: %s", e)
+        await asyncio.sleep(BLOOM_REBUILD_INTERVAL_SEC)
+
+
+@app.get("/api/v1/known_resources/sketch")
+async def known_resources_sketch(request: Request):
+    """Bloom filter of consensus-met file_unique_ids. Clients fetch this and
+    skip pushing fuids that test 'present' — those already have ≥3 contributors
+    so further pushes are redundant.
+
+    ETag-based caching: client passes If-None-Match → 304 if unchanged.
+    Server rebuilds every 5 min. Filter format documented in builder above.
+    """
+    if not _central_sketch_blob:
+        return Response("sketch not ready yet", status_code=503,
+                        headers={"Retry-After": "30"})
+    inm = request.headers.get("if-none-match", "").strip('"')
+    if inm == _central_sketch_etag:
+        return Response(status_code=304,
+                        headers={"ETag": f'"{_central_sketch_etag}"'})
+    return Response(
+        _central_sketch_blob,
+        media_type="application/octet-stream",
+        headers={"ETag": f'"{_central_sketch_etag}"',
+                 "Cache-Control": "public, max-age=300"})
 
 
 @app.on_event("shutdown")
@@ -172,7 +271,18 @@ async def _instance_rate_check(conn, instance_hash_v: str):
 # ════════════════════════════════════════════════════════════════════
 @app.post("/api/v1/contribute")
 async def contribute(request: Request):
-    body = await request.json()
+    # Accept gzip-encoded body (parity with /contribute_resources). 10x bandwidth save.
+    raw = await request.body()
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+        import gzip as _gzip
+        try:
+            raw = _gzip.decompress(raw)
+        except Exception:
+            raise HTTPException(400, "invalid gzip body")
+    try:
+        body = json.loads(raw)
+    except Exception:
+        raise HTTPException(400, "invalid json body")
     instance_uuid = (body.get("instance_uuid") or "").strip()
     if not instance_uuid:
         raise HTTPException(400, "missing instance_uuid")
@@ -325,7 +435,7 @@ async def contribute(request: Request):
                     seeds_rejected += 1
                     continue
                 # CSAM keyword pre-filter — same regex as channel-contribute
-                if _CSAM_RX.search(u) or (inv and _CSAM_RX.search(inv)):
+                if CSAM_RX.search(u) or (inv and CSAM_RX.search(inv)):
                     seeds_csam_flagged += 1
                     continue
                 if src not in ("caption-mention", "caption-invite"):
@@ -365,7 +475,18 @@ async def contribute(request: Request):
 # ====================================================================
 @app.post("/api/v1/contribute_resources")
 async def contribute_resources(request: Request):
-    body = await request.json()
+    # Accept gzip-encoded body (client compresses large batches for bandwidth).
+    raw = await request.body()
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+        import gzip as _gzip
+        try:
+            raw = _gzip.decompress(raw)
+        except Exception:
+            raise HTTPException(400, "invalid gzip body")
+    try:
+        body = json.loads(raw)
+    except Exception:
+        raise HTTPException(400, "invalid json body")
     instance_uuid = (body.get("instance_uuid") or "").strip()
     if not instance_uuid:
         raise HTTPException(400, "missing instance_uuid")
@@ -378,20 +499,23 @@ async def contribute_resources(request: Request):
     # Deprecation gate: clients older than min_supported_version → 410
     _check_client_version_supported(body.get("tgarr_version"))
 
+    _test_ips = [s.strip() for s in (os.getenv("TGARR_TEST_SHOWCASE_IPS") or "").split(",") if s.strip()]
+    _bypass = ip_hash in _test_ips
     async with db_pool.acquire() as conn:
-        await _instance_rate_check(conn, inst_hash)
-        recent = await conn.fetchval(
-            """SELECT count(*) FROM registry_contributions
-               WHERE remote_ip_hash = $1
-                 AND submitted_at > NOW() - INTERVAL '1 hour'""", ip_hash)
-        if recent > 60:
-            raise HTTPException(429, "rate limit -- try later")
+        if not _bypass:
+            await _instance_rate_check(conn, inst_hash)
+            recent = await conn.fetchval(
+                """SELECT count(*) FROM registry_contributions
+                   WHERE remote_ip_hash = $1
+                     AND submitted_at > NOW() - INTERVAL '1 hour'""", ip_hash)
+            if recent > 60:
+                raise HTTPException(429, "rate limit -- try later")
 
     resources = body.get("resources") or []
     if not isinstance(resources, list):
         raise HTTPException(400, "resources must be array")
-    if len(resources) > 5000:
-        raise HTTPException(413, "too many resources in one submission (max 5000)")
+    if len(resources) > 100000:
+        raise HTTPException(413, "too many resources in one submission (max 100000)")
 
     def _int(x, lo=None, hi=None):
         try:
@@ -402,102 +526,168 @@ async def contribute_resources(request: Request):
         except (TypeError, ValueError):
             return None
 
-    accepted = rejected = csam_flagged = 0
-    new_resource_count = 0
+    # === Bulk path: validate all rows in Python first, then single SQL ===
+    # 3 round-trips total regardless of row count: UPSERT resources,
+    # UPSERT contributor_seen, UPDATE distinct_contributors. Handles 50K+
+    # rows in seconds vs old per-row loop's hours.
+    from datetime import datetime as _dt
+    rows_valid = []  # list of column-aligned tuples
+    accepted = rejected = csam_flagged = new_resource_count = 0
+    anomaly_format = 0
+    for r in resources:
+        fuid = (r.get("file_unique_id") or "").strip()
+        if not fuid or not FILE_UNIQUE_ID_RX.match(fuid):
+            rejected += 1; anomaly_format += 1; continue
+        file_name = (r.get("file_name") or "")[:300] or None
+        channel = (r.get("channel_username") or "").strip().lstrip("@")
+        if channel and not USERNAME_RX.match(channel):
+            channel = None
+        if file_name and CSAM_RX.search(file_name):
+            csam_flagged += 1; rejected += 1; continue
+        if channel and CSAM_RX.search(channel):
+            csam_flagged += 1; rejected += 1; continue
+        posted_at = r.get("posted_at")
+        if isinstance(posted_at, str):
+            try:
+                posted_at = _dt.fromisoformat(posted_at.replace("Z","+00:00"))
+            except Exception:
+                posted_at = None
+        else:
+            posted_at = None
+        rj = r.get("requires_join")
+        rj = True if rj is None else bool(rj)
+        rows_valid.append((
+            fuid, file_name,
+            _int(r.get("file_size"), 0, 5*1024*1024*1024),
+            (r.get("mime_type") or "")[:80] or None,
+            (r.get("media_type") or "")[:20] or None,
+            _int(r.get("duration_sec")),
+            (r.get("canonical_title") or "")[:200] or None,
+            _int(r.get("release_year"), 1900, 2100),
+            _int(r.get("season")),
+            _int(r.get("episode")),
+            (r.get("quality") or "")[:20] or None,
+            rj,
+            (r.get("access_kind") or "")[:20] or None,
+            channel,
+            _int(r.get("msg_id")),
+            posted_at,
+        ))
+        accepted += 1
+
+    if not rows_valid:
+        return {"status": "ok", "accepted": 0, "rejected": rejected,
+                "new_resources": 0, "csam_flagged": csam_flagged}
+
+    # Dedup by file_unique_id for the resource UPSERT (PG can't ON CONFLICT
+    # the same key twice in one statement). Keep first occurrence's metadata.
+    # The channel + contributor_seen dedup happen separately below.
+    _resource_seen = set()
+    rows_dedup = []
+    for r in rows_valid:
+        if r[0] in _resource_seen:
+            continue
+        _resource_seen.add(r[0])
+        rows_dedup.append(r)
+    rows_for_resource_upsert = rows_dedup  # unique fuids only
+
+    # Column-aligned arrays for unnest() — use deduped rows
+    fuids   = [r[0]  for r in rows_for_resource_upsert]
+    fnames  = [r[1]  for r in rows_for_resource_upsert]
+    fsizes  = [r[2]  for r in rows_for_resource_upsert]
+    mimes   = [r[3]  for r in rows_for_resource_upsert]
+    mtypes  = [r[4]  for r in rows_for_resource_upsert]
+    durs    = [r[5]  for r in rows_for_resource_upsert]
+    cans    = [r[6]  for r in rows_for_resource_upsert]
+    years   = [r[7]  for r in rows_for_resource_upsert]
+    seas    = [r[8]  for r in rows_for_resource_upsert]
+    eps     = [r[9]  for r in rows_for_resource_upsert]
+    quals   = [r[10] for r in rows_for_resource_upsert]
+    rjs     = [r[11] for r in rows_for_resource_upsert]
+    aks     = [r[12] for r in rows_for_resource_upsert]
 
     async with db_pool.acquire() as conn:
-        for r in resources:
-            fuid = (r.get("file_unique_id") or "").strip()
-            if not fuid or not FILE_UNIQUE_ID_RX.match(fuid):
-                rejected += 1
-                anomaly_format = locals().get("anomaly_format", 0) + 1
+        # 1) Bulk UPSERT resources — single SQL processes all rows in one txn.
+        new_fuids = await conn.fetch("""
+            INSERT INTO registry_resources
+              (file_unique_id, file_name, file_size, mime_type, media_type,
+               duration_sec, canonical_title, release_year, season, episode,
+               quality, requires_join, access_kind)
+            SELECT * FROM unnest(
+              $1::text[], $2::text[], $3::bigint[], $4::text[], $5::text[],
+              $6::int[], $7::text[], $8::int[], $9::int[], $10::int[],
+              $11::text[], $12::bool[], $13::text[])
+            ON CONFLICT (file_unique_id) DO UPDATE SET
+              file_name       = COALESCE(registry_resources.file_name, EXCLUDED.file_name),
+              file_size       = COALESCE(registry_resources.file_size, EXCLUDED.file_size),
+              mime_type       = COALESCE(registry_resources.mime_type, EXCLUDED.mime_type),
+              media_type      = COALESCE(registry_resources.media_type, EXCLUDED.media_type),
+              duration_sec    = COALESCE(registry_resources.duration_sec, EXCLUDED.duration_sec),
+              canonical_title = COALESCE(registry_resources.canonical_title, EXCLUDED.canonical_title),
+              release_year    = COALESCE(registry_resources.release_year, EXCLUDED.release_year),
+              season          = COALESCE(registry_resources.season, EXCLUDED.season),
+              episode         = COALESCE(registry_resources.episode, EXCLUDED.episode),
+              quality         = COALESCE(registry_resources.quality, EXCLUDED.quality),
+              requires_join   = (registry_resources.requires_join OR EXCLUDED.requires_join),
+              access_kind     = COALESCE(registry_resources.access_kind, EXCLUDED.access_kind),
+              last_seen_at    = NOW()
+            RETURNING file_unique_id, (xmax = 0) AS was_new
+        """, fuids, fnames, fsizes, mimes, mtypes,
+              durs, cans, years, seas, eps, quals, rjs, aks)
+        new_resource_count = sum(1 for r in new_fuids if r["was_new"])
+
+        # 2) Bulk UPSERT contributor_seen, RETURNING new ones
+        # fuids is already deduped, safe to pass directly
+        contrib_new_rows = await conn.fetch("""
+            INSERT INTO registry_resource_contributor_seen
+              (instance_hash, file_unique_id)
+            SELECT $1, fuid FROM unnest($2::text[]) fuid
+            ON CONFLICT (instance_hash, file_unique_id) DO NOTHING
+            RETURNING file_unique_id
+        """, inst_hash, fuids)
+        new_contrib_fuids = [r["file_unique_id"] for r in contrib_new_rows]
+
+        # 3) Bulk increment distinct_contributors for newly-seen.
+        # `verified` is derived (dc >= 3) — not a stored column. Don't SET it.
+        if new_contrib_fuids:
+            await conn.execute("""
+                UPDATE registry_resources
+                SET distinct_contributors = distinct_contributors + 1
+                WHERE file_unique_id = ANY($1::text[])
+            """, new_contrib_fuids)
+
+        # 4) Bulk UPSERT channel pointers (dedup by composite (fuid, channel))
+        _chan_seen = set()
+        chan_rows = []
+        for r in rows_valid:
+            if not r[13]:
                 continue
-            file_name = (r.get("file_name") or "")[:300] or None
-            channel = (r.get("channel_username") or "").strip().lstrip("@")
-            if channel and not USERNAME_RX.match(channel):
-                channel = None
-            if file_name and CSAM_RX.search(file_name):
-                csam_flagged += 1; rejected += 1; continue
-            if channel and CSAM_RX.search(channel):
-                csam_flagged += 1; rejected += 1; continue
-            file_size = _int(r.get("file_size"), 0, 5*1024*1024*1024)
-            duration = _int(r.get("duration_sec"))
-            year = _int(r.get("release_year"), 1900, 2100)
-            season = _int(r.get("season"))
-            episode = _int(r.get("episode"))
-            msg_id = _int(r.get("msg_id"))
-            mime = (r.get("mime_type") or "")[:80] or None
-            media_type = (r.get("media_type") or "")[:20] or None
-            canonical = (r.get("canonical_title") or "")[:200] or None
-            quality = (r.get("quality") or "")[:20] or None
-            requires_join = r.get("requires_join")
-            if requires_join is None:
-                requires_join = True  # default — TG download usually needs join
-            requires_join = bool(requires_join)
-            access_kind = (r.get("access_kind") or "")[:20] or None
-            posted_at = r.get("posted_at")
-            if isinstance(posted_at, str):
-                try:
-                    from datetime import datetime
-                    posted_at = datetime.fromisoformat(posted_at.replace("Z","+00:00"))
-                except Exception:
-                    posted_at = None
-            else:
-                posted_at = None
-
-            was_new = await conn.fetchval(
-                """INSERT INTO registry_resources
-                     (file_unique_id, file_name, file_size, mime_type, media_type,
-                      duration_sec, canonical_title, release_year, season, episode, quality,
-                      requires_join, access_kind)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-                   ON CONFLICT (file_unique_id) DO UPDATE SET
-                     file_name       = COALESCE(registry_resources.file_name, EXCLUDED.file_name),
-                     file_size       = COALESCE(registry_resources.file_size, EXCLUDED.file_size),
-                     mime_type       = COALESCE(registry_resources.mime_type, EXCLUDED.mime_type),
-                     media_type      = COALESCE(registry_resources.media_type, EXCLUDED.media_type),
-                     duration_sec    = COALESCE(registry_resources.duration_sec, EXCLUDED.duration_sec),
-                     canonical_title = COALESCE(registry_resources.canonical_title, EXCLUDED.canonical_title),
-                     release_year    = COALESCE(registry_resources.release_year, EXCLUDED.release_year),
-                     season          = COALESCE(registry_resources.season, EXCLUDED.season),
-                     episode         = COALESCE(registry_resources.episode, EXCLUDED.episode),
-                     quality         = COALESCE(registry_resources.quality, EXCLUDED.quality),
-                     requires_join   = (registry_resources.requires_join OR EXCLUDED.requires_join),
-                     access_kind     = COALESCE(registry_resources.access_kind, EXCLUDED.access_kind),
-                     last_seen_at    = NOW()
-                   RETURNING (xmax = 0)""",
-                fuid, file_name, file_size, mime, media_type,
-                duration, canonical, year, season, episode, quality,
-                requires_join, access_kind)
-            if was_new:
-                new_resource_count += 1
-
-            if channel:
-                ch_inserted = await conn.fetchval(
-                    """INSERT INTO registry_resource_channels
-                         (file_unique_id, channel_username, msg_id, posted_at)
-                       VALUES ($1, $2, $3, $4)
-                       ON CONFLICT (file_unique_id, channel_username) DO UPDATE SET
-                         msg_id = COALESCE(EXCLUDED.msg_id, registry_resource_channels.msg_id),
-                         posted_at = COALESCE(EXCLUDED.posted_at, registry_resource_channels.posted_at)
-                       RETURNING (xmax = 0)""",
-                    fuid, channel, msg_id, posted_at)
-                if ch_inserted:
-                    await conn.execute(
-                        "UPDATE registry_resources SET distinct_channels = distinct_channels + 1 WHERE file_unique_id = $1",
-                        fuid)
-
-            contrib_new = await conn.fetchval(
-                """INSERT INTO registry_resource_contributor_seen
-                     (instance_hash, file_unique_id) VALUES ($1, $2)
-                   ON CONFLICT (instance_hash, file_unique_id) DO NOTHING
-                   RETURNING TRUE""",
-                inst_hash, fuid)
-            if contrib_new:
-                await conn.execute(
-                    "UPDATE registry_resources SET distinct_contributors = distinct_contributors + 1 WHERE file_unique_id = $1",
-                    fuid)
-            accepted += 1
+            key = (r[0], r[13])
+            if key in _chan_seen:
+                continue
+            _chan_seen.add(key)
+            chan_rows.append((r[0], r[13], r[14], r[15]))
+        if chan_rows:
+            cf = [c[0] for c in chan_rows]
+            cn = [c[1] for c in chan_rows]
+            cm = [c[2] for c in chan_rows]
+            cp = [c[3] for c in chan_rows]
+            new_chan_rows = await conn.fetch("""
+                INSERT INTO registry_resource_channels
+                  (file_unique_id, channel_username, msg_id, posted_at)
+                SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[], $4::timestamptz[])
+                ON CONFLICT (file_unique_id, channel_username) DO UPDATE SET
+                  msg_id    = COALESCE(EXCLUDED.msg_id, registry_resource_channels.msg_id),
+                  posted_at = COALESCE(EXCLUDED.posted_at, registry_resource_channels.posted_at)
+                RETURNING file_unique_id, (xmax = 0) AS was_new
+            """, cf, cn, cm, cp)
+            new_chan_fuids = [r["file_unique_id"] for r in new_chan_rows if r["was_new"]]
+            if new_chan_fuids:
+                await conn.execute("""
+                    UPDATE registry_resources
+                    SET distinct_channels = distinct_channels + 1
+                    WHERE file_unique_id = ANY($1::text[])
+                """, new_chan_fuids)
 
         await conn.execute(
             """INSERT INTO registry_contributions

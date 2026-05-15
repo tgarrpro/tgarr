@@ -8,9 +8,13 @@ Responsibilities:
   drop completed file into /downloads/tgarr/<release-name>/.
 """
 import asyncio
+import gzip
 import hashlib
 import json
 import logging
+import random
+import struct
+import time
 import os
 import re
 import urllib.parse
@@ -52,6 +56,56 @@ app = Client(
 )
 
 db_pool: asyncpg.Pool = None
+
+MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
+MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
+_meili_queue: "asyncio.Queue[tuple[str, dict]] | None" = None
+
+
+def _meili_enqueue(index: str, doc: dict) -> None:
+    """Best-effort push to local queue. Drains in meili_sync_worker."""
+    if _meili_queue is None or not MEILI_KEY:
+        return
+    try:
+        _meili_queue.put_nowait((index, doc))
+    except asyncio.QueueFull:
+        pass  # drop oldest batch — sync isn't critical-path
+
+
+async def meili_sync_worker():
+    """Drain _meili_queue every 5s in batches, POST to Meili.
+    Best-effort: Meili down ≠ ingest stops. Drops on error after retry."""
+    global _meili_queue
+    _meili_queue = asyncio.Queue(maxsize=20000)
+    log.info("[meili] sync worker started url=%s", MEILI_URL)
+    while True:
+        await asyncio.sleep(5)
+        if _meili_queue.empty():
+            continue
+        # Drain up to 2000 per cycle, group by index
+        buckets: dict[str, list[dict]] = {}
+        while not _meili_queue.empty() and sum(len(v) for v in buckets.values()) < 2000:
+            try:
+                idx, doc = _meili_queue.get_nowait()
+                buckets.setdefault(idx, []).append(doc)
+            except asyncio.QueueEmpty:
+                break
+        for idx, docs in buckets.items():
+            try:
+                def _post():
+                    req = urllib.request.Request(
+                        f"{MEILI_URL}/indexes/{idx}/documents",
+                        data=json.dumps(docs).encode(),
+                        method="POST",
+                        headers={"Authorization": f"Bearer {MEILI_KEY}",
+                                 "Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return r.read()
+                await asyncio.to_thread(_post)
+                log.debug("[meili] flushed %d to %s", len(docs), idx)
+            except Exception as e:
+                log.warning("[meili] flush %s failed: %s (dropping %d docs)",
+                            idx, e, len(docs))
 
 SAFE_NAME = re.compile(r"[^\w\-._]+")
 
@@ -412,6 +466,24 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
             await maybe_auto_grab(conn, rel_id, parsed, file_size)
     except Exception as e:
         log.warning("[auto-grab] error rel_id=%s: %s", rel_id, e)
+    if rel_id:
+        _meili_enqueue("releases", {
+            "id": rel_id,
+            "name": rname,
+            "canonical_title": rname,
+            "series_title": parsed.get("title") if type_ == "tv" else None,
+            "movie_title": parsed.get("title") if type_ == "movie" else None,
+            "category": type_,
+            "quality": parsed.get("quality") or "",
+            "movie_year": parsed.get("year") or 0,
+            "season": parsed.get("season") or 0,
+            "episode": parsed.get("episode") or 0,
+            "parse_score": float(score or 0),
+            "grab_count": 0,
+            "size_bytes": file_size or 0,
+            "posted_at_ts": int(posted_at.timestamp()) if posted_at else 0,
+            "audience": "sfw",
+        })
     return rname
 
 
@@ -546,6 +618,22 @@ async def ingest_message(msg: Message) -> bool:
             except Exception as e:
                 log.warning("[parse] failed msg_id=%s file=%s err=%s", new_msg_id, file_name, e)
 
+        if new_msg_id:
+            _meili_enqueue("messages", {
+                "id": new_msg_id,
+                "file_name": file_name,
+                "audio_title": audio_title,
+                "audio_performer": audio_performer,
+                "audio_canonical_title": None,
+                "detected_lang": detected_lang or "unknown",
+                "media_type": media_type or "unknown",
+                "channel_username": msg.chat.username,
+                "audience": "sfw",
+                "has_local": False,
+                "file_size": file_size or 0,
+                "posted_at_ts": int(msg.date.timestamp()) if msg.date else 0,
+            })
+
         return bool(new_msg_id)
 
 
@@ -663,7 +751,12 @@ async def backfill_all() -> None:
 
 
 async def download_worker() -> None:
-    """Background loop: pick up pending downloads + fetch media via MTProto."""
+    """Background loop: pick up pending downloads + fetch media.
+
+    Tries HTTPS path (t.me/<ch>/<msg>?embed=1 video src) for video on public
+    channels — bypasses MTProto cross-DC FloodWait entirely. Falls back to
+    MTProto download_media() for non-video / private channel / scrape miss.
+    """
     log.info("[worker] download worker started; root=%s", DOWNLOAD_ROOT)
     os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
     while True:
@@ -671,10 +764,13 @@ async def download_worker() -> None:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """SELECT d.id AS dl_id, d.release_id, r.name AS rel_name,
-                              m.tg_chat_id, m.tg_message_id
+                              m.tg_chat_id, m.tg_message_id, m.media_type,
+                              m.file_size, m.file_name,
+                              c.username AS channel_username
                        FROM downloads d
                        JOIN releases r ON r.id = d.release_id
                        JOIN messages m ON m.id = r.primary_msg_id
+                       JOIN channels c ON c.id = m.channel_id
                        WHERE d.status = 'pending'
                        ORDER BY d.requested_at
                        LIMIT 1""")
@@ -689,15 +785,40 @@ async def download_worker() -> None:
             safe_name = SAFE_NAME.sub("_", row["rel_name"])[:160]
             target_dir = os.path.join(DOWNLOAD_ROOT, safe_name)
             os.makedirs(target_dir, exist_ok=True)
-            log.info("[worker] downloading id=%s release=%s → %s",
-                     row["dl_id"], row["rel_name"], target_dir)
+            log.info("[worker] downloading id=%s release=%s media=%s → %s",
+                     row["dl_id"], row["rel_name"], row["media_type"], target_dir)
 
             try:
-                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
-                if not msg or not (msg.video or msg.document or msg.audio):
-                    raise RuntimeError("media missing on source message")
-                local_path = await app.download_media(
-                    msg, file_name=f"{target_dir}/")
+                local_path = None
+                # ── Path 1: HTTPS for video on public channels (no MTProto burn). ──
+                if (row["media_type"] == "video" and row["channel_username"]):
+                    try:
+                        vurl = await _fetch_video_url_https(
+                            row["channel_username"], row["tg_message_id"])
+                        if vurl:
+                            # Filename: prefer original m.file_name, else release_name.mp4
+                            fname = row["file_name"] or f"{safe_name}.mp4"
+                            fname = SAFE_NAME.sub("_", fname)[:200]
+                            if not fname.lower().endswith((".mp4", ".mkv", ".webm", ".mov")):
+                                fname += ".mp4"
+                            target_path = os.path.join(target_dir, fname)
+                            written = await _download_video_https(
+                                vurl, target_path, row["file_size"])
+                            local_path = target_path
+                            log.info("[worker] HTTPS video done id=%s bytes=%d", row["dl_id"], written)
+                    except Exception as he:
+                        log.warning("[worker] HTTPS video failed id=%s: %s — falling back to MTProto",
+                                    row["dl_id"], he)
+
+                # ── Path 2: MTProto fallback (non-video / scrape miss / private). ──
+                if local_path is None:
+                    if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
+                        raise RuntimeError("THUMB_ONLY mode: MTProto download disabled")
+                    msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                    if not msg or not (msg.video or msg.document or msg.audio):
+                        raise RuntimeError("media missing on source message")
+                    local_path = await app.download_media(
+                        msg, file_name=f"{target_dir}/")
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE downloads
@@ -724,6 +845,100 @@ THUMBS_ROOT = "/downloads/thumbs"
 REGISTRY_URL = os.environ.get("TGARR_REGISTRY_URL", "https://tgarr.me").rstrip("/")
 CONTRIBUTE_ENABLED = os.environ.get("TGARR_CONTRIBUTE", "true").lower() == "true"
 CONTRIBUTE_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_INTERVAL_SEC", "21600"))  # 6h
+
+
+def _adaptive_sleep_seconds(pending: int) -> int:
+    """5-tier backlog-aware sleep. Same curve for both contrib workers.
+    Aggressive during catch-up, quiet at idle — central doesn't get spammed
+    once steady-state is reached.
+    """
+    if pending > 5000: return 30      # burst (catch-up backlog)
+    if pending > 100:  return 300     # 5 min — active ingest
+    if pending > 0:    return 1800    # 30 min — trickle
+    return 21600                       # 6h — heartbeat only
+
+
+# ════════════════════════════════════════════════════════════════════
+# Bloom-sketch handshake: client fetches central's "known-with-consensus"
+# filter, locally tests each pending fuid, skips push for those already
+# at consensus. Cuts redundant traffic ~99% in mature federations.
+# ════════════════════════════════════════════════════════════════════
+_BLOOM_BLOB: bytes = b""          # raw bit-array (m/8 bytes), header stripped
+_BLOOM_M_BITS: int = 0
+_BLOOM_K: int = 0
+_BLOOM_ETAG: str = ""
+_BLOOM_BUILT_AT: int = 0
+_BLOOM_N: int = 0
+
+
+async def _refresh_bloom_sketch() -> None:
+    """Pull latest sketch from central. ETag-cached → 304 = no-op."""
+    global _BLOOM_BLOB, _BLOOM_M_BITS, _BLOOM_K, _BLOOM_ETAG, _BLOOM_BUILT_AT, _BLOOM_N
+
+    def _fetch():
+        req = urllib.request.Request(
+            f"{REGISTRY_URL}/api/v1/known_resources/sketch",
+            headers={"If-None-Match": f'"{_BLOOM_ETAG}"' if _BLOOM_ETAG else "",
+                     "Accept-Encoding": "gzip",
+                     "User-Agent": "tgarr/bloom"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                etag = r.headers.get("etag", "").strip('"')
+                raw = r.read()
+                if r.headers.get("content-encoding", "").lower() == "gzip":
+                    raw = gzip.decompress(raw)
+                return r.status, etag, raw
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                return 304, _BLOOM_ETAG, b""
+            return e.code, "", b""
+        except Exception as e:
+            log.warning("[bloom] fetch error: %s", e)
+            return 0, "", b""
+
+    status, etag, blob = await asyncio.to_thread(_fetch)
+    if status == 304:
+        return  # cached version still good
+    if status != 200 or len(blob) < 20:
+        log.warning("[bloom] fetch failed status=%s len=%d", status, len(blob))
+        return
+    # 20-byte header: magic(4s) + m_bits(I) + k(B) + reserved(3x) + n(I) + built_at(I)
+    if blob[:4] != b"BLM1":
+        log.warning("[bloom] bad magic: %r", blob[:4])
+        return
+    try:
+        m_bits, k, n, built_at = struct.unpack("<IB3xII", blob[4:20])
+    except struct.error as e:
+        log.warning("[bloom] header parse: %s", e)
+        return
+    expected_size = 20 + m_bits // 8
+    if len(blob) != expected_size:
+        log.warning("[bloom] size mismatch: got %d expected %d", len(blob), expected_size)
+        return
+    _BLOOM_BLOB = blob[20:]
+    _BLOOM_M_BITS = m_bits
+    _BLOOM_K = k
+    _BLOOM_ETAG = etag
+    _BLOOM_BUILT_AT = built_at
+    _BLOOM_N = n
+    age = int(time.time() - built_at)
+    log.info("[bloom] sketch updated: n=%d m=%d k=%d size=%dKB age=%ds",
+             n, m_bits, k, len(blob)//1024, age)
+
+
+def _bloom_contains(fuid: str) -> bool:
+    """True if fuid is probably in central's consensus set.
+    False if definitely absent (need to push) or sketch unavailable.
+    Empty sketch → False everywhere → no skips → fail-safe behavior.
+    """
+    if not _BLOOM_BLOB or _BLOOM_M_BITS == 0 or not fuid:
+        return False
+    h = hashlib.sha256(fuid.encode()).digest()
+    for i in range(_BLOOM_K):
+        idx = int.from_bytes(h[i*4:(i+1)*4], 'little') % _BLOOM_M_BITS
+        if not (_BLOOM_BLOB[idx >> 3] & (1 << (idx & 7))):
+            return False
+    return True
 INSTANCE_UUID_ROTATE_DAYS = 7
 
 # Federation swarm validator (v0.4.34+): client pulls seed candidates from
@@ -849,45 +1064,141 @@ async def new_dialog_watcher() -> None:
         await asyncio.sleep(NEW_DIALOG_INTERVAL)
 
 
-async def thumb_downloader() -> None:
-    """Background: fetch one photo at a time via MTProto + save to disk.
+_TME_THUMB_RX = re.compile(
+    r"https://cdn[0-9]+\.telesco\.pe/file/[A-Za-z0-9_\-]+\.jpg")
 
-    Identifies eligible messages by media_type='photo' or — for legacy rows
-    indexed before the column existed — by the (file_name NULL + mime_type NULL
-    + file_unique_id NOT NULL) signature that Pyrogram photo objects produce.
-    Marks failed lookups with thumb_path='__failed__' so they don't churn.
+# Video src in t.me embed: <video src="https://cdn5.telesco.pe/file/xxx.mp4?token=...">
+# The token is a signed URL good for plain HTTPS GET. Supports Range.
+_TME_VIDEO_RX = re.compile(
+    r'<video[^>]*\bsrc="(https://cdn[0-9]+\.telesco\.pe/file/[^"]+\.mp4\?token=[^"]+)"')
+
+
+async def _fetch_video_url_https(username: str, tg_message_id: int) -> str | None:
+    """Scrape t.me embed page → extract the signed video src URL.
+    Returns the full URL (with token) or None if no video / private / scrape miss.
     """
-    log.info("[thumbs] downloader started; root=%s", THUMBS_ROOT)
-    os.makedirs(THUMBS_ROOT, exist_ok=True)
-    while True:
-        try:
-            async with db_pool.acquire() as conn:
-                # On-demand mode: only fetch when the UI flags
-                # thumb_path='__user_queued__'. No proactive scan.
-                row = await conn.fetchrow(
-                    """SELECT m.id, m.tg_chat_id, m.tg_message_id, m.file_unique_id
-                       FROM messages m
-                       WHERE m.thumb_path = '__user_queued__'
-                       ORDER BY m.id ASC
-                       LIMIT 1""")
-            if not row:
-                await asyncio.sleep(60)
-                continue
+    if not username:
+        return None
+    url = f"https://t.me/{username}/{tg_message_id}?embed=1&single"
 
-            safe_uid = SAFE_NAME.sub("_", row["file_unique_id"] or str(row["id"]))[:80]
-            fname = f"{safe_uid}.jpg"
-            target = os.path.join(THUMBS_ROOT, fname)
-            try:
+    def _scrape():
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                html = r.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
+        m = _TME_VIDEO_RX.search(html)
+        return m.group(1) if m else None
+
+    return await asyncio.to_thread(_scrape)
+
+
+async def _download_video_https(video_url: str, target_path: str,
+                                 expected_size: int | None = None) -> int:
+    """Stream-download a video URL to disk. Returns bytes written.
+    Raises on HTTP error or size mismatch (when expected_size given).
+    """
+    def _dl():
+        req = urllib.request.Request(
+            video_url, headers={"User-Agent": "Mozilla/5.0"})
+        written = 0
+        with urllib.request.urlopen(req, timeout=300) as r:
+            with open(target_path, "wb") as f:
+                while True:
+                    chunk = r.read(1024 * 1024)  # 1 MiB
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    written += len(chunk)
+        return written
+
+    bytes_written = await asyncio.to_thread(_dl)
+    if expected_size and bytes_written != expected_size:
+        raise RuntimeError(
+            f"size mismatch: got {bytes_written} expected {expected_size}")
+    return bytes_written
+
+
+async def _fetch_thumb_https(username: str, tg_message_id: int) -> bytes | None:
+    """Try public t.me embed → grab the small CDN thumb. No MTProto, no FloodWait.
+
+    Returns the JPEG bytes (≤~15KB usually) or None if HTTPS path unavailable
+    (private channel, deleted post, non-photo media, etc.). Falls back to
+    MTProto caller-side on None.
+    """
+    if not username:
+        return None
+    url = f"https://t.me/{username}/{tg_message_id}?embed=1&single"
+
+    def _scrape():
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                html = r.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
+        # Skip if post has no photo/video media (deleted / text-only post →
+        # embed only renders channel avatar, regex would falsely match it).
+        if ("tgme_widget_message_photo_wrap" not in html
+                and "tgme_widget_message_video_wrap" not in html):
+            return None
+        # First cdn URL in HTML = small thumb (<i src=>). background-image
+        # is the larger 450px preview — skip it.
+        m = _TME_THUMB_RX.search(html)
+        if not m:
+            return None
+        try:
+            req2 = urllib.request.Request(
+                m.group(0), headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req2, timeout=10) as r2:
+                return r2.read()
+        except Exception:
+            return None
+
+    return await asyncio.to_thread(_scrape)
+
+
+_THUMB_HTTPS_SEM = asyncio.Semaphore(10)
+_THUMB_MTPROTO_SEM = asyncio.Semaphore(1)
+_THUMB_BATCH = 20
+
+
+async def _thumb_process_one(row) -> None:
+    """Fetch + write + md5-dedup one queued thumb row. Concurrency-safe via
+    semaphores: HTTPS path runs up to 10-wide, MTProto fallback serializes.
+    """
+    safe_uid = SAFE_NAME.sub("_", row["file_unique_id"] or str(row["id"]))[:80]
+    fname = f"{safe_uid}.jpg"
+    target = os.path.join(THUMBS_ROOT, fname)
+    try:
+        # ── Path 1: HTTPS scrape via t.me embed (public channels only). ──
+        # Avoids MTProto + cross-DC auth.ExportAuthorization FloodWait.
+        https_bytes = None
+        if row["channel_username"]:
+            async with _THUMB_HTTPS_SEM:
+                https_bytes = await _fetch_thumb_https(
+                    row["channel_username"], row["tg_message_id"])
+        if https_bytes:
+            with open(target, "wb") as f:
+                f.write(https_bytes)
+        else:
+            # THUMB-ONLY emergency mode: skip MTProto fallback entirely — these
+            # rows just stay '__failed__' until the cross-DC FloodWait clears
+            # and the mode flag is flipped off.
+            if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
+                raise RuntimeError("THUMB_ONLY mode: HTTPS scrape miss + MTProto disabled")
+            # ── Path 2: MTProto fallback (serial; shared Pyrogram session). ──
+            async with _THUMB_MTPROTO_SEM:
                 msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
                 if not msg:
                     raise RuntimeError("message gone")
-                # Resolve the best available thumbnail source:
-                #   photo message → full photo (largest PhotoSize)
-                #   video message → embedded video thumbnail (last in thumbs list)
-                #   document message → embedded document thumbnail
                 thumb_media = None
                 if msg.photo:
-                    thumb_media = msg.photo
+                    pthumbs = getattr(msg.photo, "thumbs", None) or []
+                    thumb_media = pthumbs[-1] if pthumbs else msg.photo
                 elif msg.video and getattr(msg.video, "thumbs", None):
                     thumb_media = msg.video.thumbs[-1]
                 elif msg.document and getattr(msg.document, "thumbs", None):
@@ -895,43 +1206,75 @@ async def thumb_downloader() -> None:
                 if not thumb_media:
                     raise RuntimeError("no thumbnail available on message")
                 await app.download_media(thumb_media, file_name=target)
-                # MD5 of the downloaded bytes → dedup across channels
-                with open(target, "rb") as f:
-                    md5 = hashlib.md5(f.read()).hexdigest()
-                async with db_pool.acquire() as conn:
-                    existing = await conn.fetchval(
-                        """SELECT thumb_path FROM messages
-                           WHERE thumb_md5 = $1
-                             AND thumb_path IS NOT NULL
-                             AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
-                             AND id <> $2
-                           LIMIT 1""", md5, row["id"])
-                    if existing and existing != fname:
-                        # Duplicate content — discard our copy, point at canonical
-                        try:
-                            os.remove(target)
-                        except Exception:
-                            pass
-                        await conn.execute(
-                            "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
-                            existing, md5, row["id"])
-                        log.info("[thumbs] dedup id=%s → %s", row["id"], existing)
-                    else:
-                        await conn.execute(
-                            "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
-                            fname, md5, row["id"])
-            except FloodWait as fw:
-                wait = getattr(fw, "value", 60) + 5
-                log.warning("[thumbs] flood-wait %ds (id=%s) — pausing", wait, row["id"])
-                await asyncio.sleep(min(wait, 3600))
-                continue  # retry same row after cooldown; don't mark __failed__
-            except Exception as e:
-                log.warning("[thumbs] failed id=%s: %s", row["id"], e)
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
-                        row["id"])
-            await asyncio.sleep(0.8)
+        # MD5 of the downloaded bytes → dedup across channels
+        with open(target, "rb") as f:
+            md5 = hashlib.md5(f.read()).hexdigest()
+        async with db_pool.acquire() as conn:
+            existing = await conn.fetchval(
+                """SELECT thumb_path FROM messages
+                   WHERE thumb_md5 = $1
+                     AND thumb_path IS NOT NULL
+                     AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                     AND id <> $2
+                   LIMIT 1""", md5, row["id"])
+            if existing and existing != fname:
+                try:
+                    os.remove(target)
+                except Exception:
+                    pass
+                await conn.execute(
+                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
+                    existing, md5, row["id"])
+                log.info("[thumbs] dedup id=%s → %s", row["id"], existing)
+            else:
+                await conn.execute(
+                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
+                    fname, md5, row["id"])
+    except FloodWait as fw:
+        wait = getattr(fw, "value", 60) + 5
+        log.warning("[thumbs] flood-wait %ds (id=%s) — leaving in queue", wait, row["id"])
+        await asyncio.sleep(min(wait, 3600))
+        # Row stays as __user_queued__; will be retried on next batch.
+    except Exception as e:
+        log.warning("[thumbs] failed id=%s: %s", row["id"], e)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
+                row["id"])
+
+
+async def thumb_downloader() -> None:
+    """Concurrent thumb-fetch dispatcher.
+
+    Pulls a batch of queued rows, fans out to _thumb_process_one in parallel,
+    waits for the batch, repeats. HTTPS path is sem-capped at 10 concurrent;
+    MTProto fallback at 1 (shared Pyrogram session).
+
+    Eligible rows are flagged thumb_path='__user_queued__' by /api/thumb on
+    UI hits (on-demand mode). No proactive scan.
+    """
+    log.info("[thumbs] dispatcher started; root=%s batch=%d https_conc=10 mtproto_conc=1",
+             THUMBS_ROOT, _THUMB_BATCH)
+    os.makedirs(THUMBS_ROOT, exist_ok=True)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                # LIFO: newest queue requests first. User just switched channel
+                # → those rows have the biggest m.id (recently INSERTed by
+                # /api/thumb's UPDATE). Drain them before old leftovers so the
+                # 12s polling timeout in /api/thumb is more likely to win.
+                rows = await conn.fetch(
+                    """SELECT m.id, m.tg_chat_id, m.tg_message_id, m.file_unique_id,
+                              c.username AS channel_username
+                       FROM messages m JOIN channels c ON c.id = m.channel_id
+                       WHERE m.thumb_path = '__user_queued__'
+                       ORDER BY m.id DESC
+                       LIMIT $1""", _THUMB_BATCH)
+            if not rows:
+                await asyncio.sleep(60)
+                continue
+            tasks = [asyncio.create_task(_thumb_process_one(r)) for r in rows]
+            await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
             log.exception("[thumbs] outer loop: %s", e)
             await asyncio.sleep(10)
@@ -1623,7 +1966,12 @@ async def contribute_to_registry() -> None:
         return
     log.info("[federation] contribute task started; endpoint=%s interval=%ds",
              REGISTRY_URL, CONTRIBUTE_INTERVAL_SEC)
-    await asyncio.sleep(120)  # let backfill + metadata settle first
+    # Anti-thundering-herd: random jitter on top of base settle delay so 1M
+    # clients restarting simultaneously don't all push central in the same
+    # 30s window. Base 120s + 0-600s random = first push ∈ [2min, 12min].
+    initial_nap = 120 + random.uniform(0, 600)
+    log.info("[federation] initial jitter sleep %.0fs", initial_nap)
+    await asyncio.sleep(initial_nap)
     while True:
         try:
             async with db_pool.acquire() as conn:
@@ -1657,9 +2005,9 @@ async def contribute_to_registry() -> None:
                 )
 
             if not rows:
-                log.info("[federation] no eligible channels — sleeping %ds",
-                         CONTRIBUTE_INTERVAL_SEC)
-                await asyncio.sleep(CONTRIBUTE_INTERVAL_SEC)
+                nap = _adaptive_sleep_seconds(0)
+                log.info("[federation] no eligible channels — sleep %ds", nap)
+                await asyncio.sleep(nap)
                 continue
 
             # Collect pending caption-discovered seeds for upload
@@ -1693,17 +2041,26 @@ async def contribute_to_registry() -> None:
             }
 
             try:
+                body_raw = json.dumps(payload).encode()
+                body_gz = gzip.compress(body_raw, compresslevel=5)
                 req = urllib.request.Request(
                     REGISTRY_URL + "/api/v1/contribute",
-                    data=json.dumps(payload).encode(),
+                    data=body_gz,
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.34 (+https://tgarr.me)"},
+                             "Content-Encoding": "gzip",
+                             "Accept-Encoding": "gzip",
+                             "User-Agent": "tgarr/0.4.62 (+https://tgarr.me)"},
                     method="POST")
-                resp = await asyncio.to_thread(
-                    lambda: urllib.request.urlopen(req, timeout=30).read())
+                def _post():
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        raw = r.read()
+                        if r.headers.get("content-encoding", "").lower() == "gzip":
+                            raw = gzip.decompress(raw)
+                        return raw
+                resp = await asyncio.to_thread(_post)
                 result = json.loads(resp.decode())
-                log.info("[federation] contributed %s channels + %s seeds: %s",
-                         len(rows), len(pending_seeds), result)
+                log.info("[federation] contributed %s channels + %s seeds (%dKB→%dKB gzip): %s",
+                         len(rows), len(pending_seeds), len(body_raw)//1024, len(body_gz)//1024, result)
                 # Mark pushed seeds as contributed (only if server accepted)
                 if pending_seeds and result.get("status") == "ok":
                     async with db_pool.acquire() as conn:
@@ -1714,7 +2071,18 @@ async def contribute_to_registry() -> None:
             except Exception as e:
                 log.warning("[federation] contribute call failed: %s", e)
 
-            await asyncio.sleep(CONTRIBUTE_INTERVAL_SEC)
+            # adaptive: drive cadence by unpushed seed_candidates count.
+            # Channel meta is idempotent UPSERT; the real "is there new info"
+            # signal is fresh caption-mention seeds.
+            async with db_pool.acquire() as conn:
+                pending_seeds_n = await conn.fetchval(
+                    """SELECT count(*) FROM seed_candidates
+                       WHERE source IN ('caption-mention', 'caption-invite')
+                         AND contributed_at IS NULL""")
+            nap = _adaptive_sleep_seconds(pending_seeds_n or 0)
+            log.info("[federation] pending_seeds=%d → sleep %ds",
+                     pending_seeds_n or 0, nap)
+            await asyncio.sleep(nap)
         except Exception as e:
             log.exception("[federation] outer loop: %s", e)
             await asyncio.sleep(600)
@@ -2195,10 +2563,15 @@ async def deep_backfill_worker() -> None:
                                     (SELECT min(tg_message_id) FROM messages m
                                      WHERE m.channel_id = c.id)) AS cursor
                     FROM channels c
-                    WHERE c.subscribed = TRUE
-                      AND COALESCE(c.deep_backfilled, FALSE) = FALSE
+                    WHERE COALESCE(c.deep_backfilled, FALSE) = FALSE
                       AND c.tg_chat_id > -2000000000000  -- exclude placeholder ids
-                      AND c.last_polled_at IS NOT NULL    -- only resolved channels
+                      AND (
+                        -- explicit tgarr subscription resolved via TG API
+                        (c.subscribed = TRUE AND c.last_polled_at IS NOT NULL)
+                        OR
+                        -- channel Tom joined directly in TG (chat_id known real)
+                        (c.enabled = TRUE AND c.subscribed = FALSE)
+                      )
                       -- skip resource-poor channels (only if remote counts known)
                       AND NOT (
                         c.remote_counts_refreshed_at IS NOT NULL
@@ -2241,11 +2614,15 @@ async def deep_backfill_worker() -> None:
                         row["tg_chat_id"],
                         limit=DEEP_BACKFILL_PAGE_SIZE,
                         **offset_kw):
+                    # Coerce msg.date to UTC-aware if Pyrogram returned naive
+                    msg_date = msg.date
+                    if msg_date is not None and msg_date.tzinfo is None:
+                        msg_date = msg_date.replace(tzinfo=_tz.utc)
                     # Time-decay cutoff
-                    if cutoff_date and msg.date and msg.date < cutoff_date:
+                    if cutoff_date and msg_date and msg_date < cutoff_date:
                         hit_cutoff = True
                         log.info("[deep-backfill] @%s decay cutoff hit at msg %s (date=%s, category=%s)",
-                                 uname, msg.id, msg.date.date(), cat)
+                                 uname, msg.id, msg_date.date(), cat)
                         break
                     try:
                         await ingest_message(msg)
@@ -2317,7 +2694,10 @@ async def contribute_resources_worker() -> None:
         return
     log.info("[contrib-res] started; batch=%d interval=%ds",
              CONTRIBUTE_RESOURCES_BATCH, CONTRIBUTE_RESOURCES_INTERVAL_SEC)
-    await asyncio.sleep(180)  # let initial backfill / contribute_channels go first
+    # Same anti-thundering-herd jitter — see contribute_to_registry rationale.
+    initial_nap = 180 + random.uniform(0, 600)
+    log.info("[contrib-res] initial jitter sleep %.0fs", initial_nap)
+    await asyncio.sleep(initial_nap)
 
     while True:
         try:
@@ -2343,13 +2723,50 @@ async def contribute_resources_worker() -> None:
                     LIMIT {CONTRIBUTE_RESOURCES_BATCH}
                 """)
             if not rows:
-                await _heartbeat("contribute_resources_worker", "queue empty")
-                await asyncio.sleep(CONTRIBUTE_RESOURCES_INTERVAL_SEC)
+                # adaptive: empty queue → long heartbeat sleep
+                nap = _adaptive_sleep_seconds(0)
+                await _heartbeat("contribute_resources_worker",
+                                 f"queue empty; sleep {nap}s")
+                await asyncio.sleep(nap)
+                continue
+
+            # ── Bloom handshake: skip fuids central already has at consensus. ──
+            await _refresh_bloom_sketch()
+            push_rows = []
+            skipped_ids = []
+            for r in rows:
+                if r["file_unique_id"] and _bloom_contains(r["file_unique_id"]):
+                    skipped_ids.append(r["id"])  # mark contributed without push
+                else:
+                    push_rows.append(r)
+            if skipped_ids:
+                # Skipped rows are already at consensus on central — record locally
+                # so we don't keep retesting them every cycle. Saves DB scan time.
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET contributed_at=NOW() "
+                        "WHERE id = ANY($1::bigint[])", skipped_ids)
+                log.info("[contrib-res] bloom: skipped %d/%d (%d to push) — "
+                         "central already has consensus on these",
+                         len(skipped_ids), len(rows), len(push_rows))
+            if not push_rows:
+                # Whole batch was redundant — no HTTP call needed.
+                async with db_pool.acquire() as conn:
+                    pending_after = await conn.fetchval(
+                        """SELECT count(*) FROM messages m
+                           JOIN channels c ON c.id = m.channel_id
+                           WHERE m.file_unique_id IS NOT NULL
+                             AND m.contributed_at IS NULL
+                             AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'""")
+                nap = _adaptive_sleep_seconds(pending_after or 0)
+                log.info("[contrib-res] all-bloom-skipped; backlog=%d sleep %ds",
+                         pending_after or 0, nap)
+                await asyncio.sleep(nap)
                 continue
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.54",
+                "tgarr_version": "0.4.62",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -2361,35 +2778,53 @@ async def contribute_resources_worker() -> None:
                     "msg_id": r["tg_message_id"],
                     "posted_at": r["posted_at"].isoformat() if r["posted_at"] else None,
                     "requires_join": True,
-                } for r in rows],
+                } for r in push_rows],
             }
 
             try:
                 body_raw = json.dumps(payload).encode()
+                body_gz = gzip.compress(body_raw, compresslevel=5)
                 req = urllib.request.Request(
                     REGISTRY_URL + "/api/v1/contribute_resources",
-                    data=body_raw,
+                    data=body_gz,
                     headers={"Content-Type": "application/json",
-                             "User-Agent": "tgarr/0.4.55 (+https://tgarr.me)"},
+                             "Content-Encoding": "gzip",
+                             "Accept-Encoding": "gzip",
+                             "User-Agent": "tgarr/0.4.62 (+https://tgarr.me)"},
                     method="POST")
-                resp = await asyncio.to_thread(
-                    lambda: urllib.request.urlopen(req, timeout=120).read())
+                def _post():
+                    with urllib.request.urlopen(req, timeout=120) as r:
+                        raw = r.read()
+                        if r.headers.get("content-encoding", "").lower() == "gzip":
+                            raw = gzip.decompress(raw)
+                        return raw
+                resp = await asyncio.to_thread(_post)
                 result = json.loads(resp.decode())
-                log.info("[contrib-res] pushed %d resources (%dKB): %s",
-                         len(rows), len(body_raw)//1024, result)
+                log.info("[contrib-res] pushed %d resources (%dKB→%dKB gzip): %s",
+                         len(push_rows), len(body_raw)//1024, len(body_gz)//1024, result)
                 if result.get("status") == "ok":
                     async with db_pool.acquire() as conn:
                         await conn.execute(
                             "UPDATE messages SET contributed_at=NOW() WHERE id = ANY($1::bigint[])",
-                            [r["id"] for r in rows])
+                            [r["id"] for r in push_rows])
                     await _heartbeat("contribute_resources_worker",
-                                     f"pushed {len(rows)} resources")
+                                     f"pushed {len(push_rows)}, skipped {len(skipped_ids)} via bloom")
             except Exception as e:
                 log.warning("[contrib-res] POST failed: %s", e)
                 await _heartbeat("contribute_resources_worker",
                                  f"POST failed", error=str(e)[:200])
 
-            await asyncio.sleep(CONTRIBUTE_RESOURCES_INTERVAL_SEC)
+            # adaptive: re-measure backlog after this cycle, pick interval
+            async with db_pool.acquire() as conn:
+                pending_after = await conn.fetchval(
+                    """SELECT count(*) FROM messages m
+                       JOIN channels c ON c.id = m.channel_id
+                       WHERE m.file_unique_id IS NOT NULL
+                         AND m.contributed_at IS NULL
+                         AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'""")
+            nap = _adaptive_sleep_seconds(pending_after or 0)
+            log.info("[contrib-res] backlog=%d → sleep %ds", pending_after or 0, nap)
+            await asyncio.sleep(nap)
         except Exception:
             log.exception("[contrib-res] outer loop")
             await asyncio.sleep(600)
@@ -2403,15 +2838,28 @@ async def main() -> None:
     me = await app.get_me()
     log.info("connected as @%s (id=%s)", me.username or "-", me.id)
 
-    asyncio.create_task(download_worker())
+    # THUMB-ONLY MODE: emergency lockdown when MTProto cross-DC FloodWait is
+    # escalating. Runs only HTTPS-safe workers (thumb_downloader uses t.me
+    # web scrape, no MTProto). Skips deep_backfill, fed-validator, channel
+    # meta refresher, dialog watchers — anything that hits cross-DC auth.
+    THUMB_ONLY_MODE = os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true"
+
+    asyncio.create_task(meili_sync_worker())   # HTTPS to local Meili — safe
+    asyncio.create_task(thumb_downloader())    # HTTPS-first, MTProto fallback (gated by THUMB_ONLY)
+    asyncio.create_task(download_worker())     # HTTPS-first for video, MTProto fallback (gated)
+
+    if THUMB_ONLY_MODE:
+        log.warning("[main] THUMB-ONLY MODE — skipping MTProto-heavy workers")
+        log.info("[main] active: meili, thumb_downloader, download_worker (HTTPS-only paths), live listener")
+        log.info("backfill skipped (THUMB-ONLY)")
+        await asyncio.Event().wait()
+        return
+
     asyncio.create_task(on_demand_media_downloader())
     asyncio.create_task(deep_backfill_worker())
     asyncio.create_task(contribute_resources_worker())
     asyncio.create_task(decay_eviction_worker())
     asyncio.create_task(dialog_gc_worker())
-    # On-demand mode 2026-05-14: thumb_downloader stays but only processes
-    # rows where /api/thumb/{id} UI hit has set thumb_path='__user_queued__'.
-    asyncio.create_task(thumb_downloader())
     # thumb_hash_backfill is proactive (scans all thumbs for md5 dedup), so it's
     # disabled to match the no-pre-download rule.
     # asyncio.create_task(thumb_hash_backfill())
@@ -2426,10 +2874,6 @@ async def main() -> None:
     asyncio.create_task(federation_validator())
     asyncio.create_task(registry_puller())
     # seed_validator disabled on client: leftover from pre-federation split.
-    # Validation is central's role for its seed_candidates queue. Client uses
-    # federation_validator to pull seeds from central + validate locally.
-    # Running both = double-quota on the same @tjin09 TG account.
-    # asyncio.create_task(seed_validator())
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
     await backfill_all()
