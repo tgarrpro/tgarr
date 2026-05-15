@@ -55,6 +55,91 @@ db_pool: asyncpg.Pool = None
 
 SAFE_NAME = re.compile(r"[^\w\-._]+")
 
+# Time-sensitive content category detection. News-style channels have
+# rapidly-decaying value — 20-year-old news is historical archive territory,
+# not Sonarr/Radarr/Jellyfin replacement use case. Deep-backfill these only
+# back to NEWS_BACKFILL_DAYS, not to message id 1.
+# Decay model: per-category half-life. cutoff = 3 × half_life (V → ~12.5%).
+# Add new categories here without touching DB schema.
+_DECAY_HALF_LIFE_DAYS = {
+    'archival': None,   # movies/TV/ebooks/music — never decay
+    'mixed':    365,    # default — 2y window
+    'news':     30,     # news → 90d cutoff
+    'sports':   14,     # sports → 42d
+    'chat':     7,      # group/discussion → 21d
+}
+
+# Title-based category hint (coarse). Adaptive page-level detection in
+# deep_backfill_worker is the safety net for misclassified channels.
+_CATEGORY_HINTS = [
+    ('news',   re.compile(
+        r"(\bnews\b|\bnewsroom\b|\bbreaking\b|\bheadlines\b|\bdaily\b|"
+        r"新闻|头条|资讯|快讯|实时|"
+        r"اخبار|новости|notici|"
+        r"international tv|интернешнл|"
+        r"broadcasting|live tv|news network|news agency)",
+        re.IGNORECASE)),
+    ('sports', re.compile(r"\b(sports?|football|soccer|nba|nhl|球|赛|подкаст)\b", re.IGNORECASE)),
+    ('chat',   re.compile(r"\b(chat|discussion|group|聊天|交流|обсуждение)\b", re.IGNORECASE)),
+]
+
+
+# Multi-signal quality gate at ingest. Rejecting low-value messages here is
+# cheaper than indexing then evicting them later.
+_AD_KEYWORDS = re.compile(
+    r"(\bcrypto\b|\bnft\b|\busdt\b|赌博|赌场|博彩|casino|gamble|gambling|"
+    r"投资理财|做单|赚钱|月入|代理|代充|代购|刷单|"
+    r"telegram[\s_]*bot|airdrop|"
+    r"加[\s_]*我[\s_]*(微信|tg|telegram|wx)|私[\s_]*聊|"
+    r"limited[\s_]*offer|click[\s_]*here|join[\s_]*now[\s_]*free|"
+    r"earn[\s_]*money|earn[\s_]*cash|"
+    r"vip[\s_]*会员|赚钱机会|高佣金)",
+    re.IGNORECASE)
+
+_MIN_SIZES = {
+    # 5MB video proxy for ~3min @ 720p — sub-3min videos are usually
+    # ads, teasers, news clips, social-media filler. Real movies/episodes
+    # always cross this floor (movie min ~80-200MB; TV ep ~30-300MB).
+    'video':    5_000_000,
+    'audio':    100_000,      # < 100KB audio → voice note / clip
+    'document': 10_000,       # < 10KB document → just text junk
+    'photo':    5_000,        # < 5KB photo → ad logo / thumb only
+}
+
+
+def _quality_check(file_name: str | None, file_size: int | None,
+                   media_type: str | None, caption: str | None) -> tuple[bool, str | None]:
+    """Multi-signal quality gate. Returns (keep?, reject_reason_if_drop).
+
+    Composite scoring: any single hard signal → reject. Cheap O(1) checks only.
+    Captions are mostly NULL by now (we extract+discard at ingest), so file_name
+    + size do most of the work.
+    """
+    blob = (file_name or "") + " " + (caption or "")
+    if blob.strip() and _AD_KEYWORDS.search(blob):
+        return False, "ad-keyword"
+    floor = _MIN_SIZES.get(media_type)
+    if floor and file_size and file_size < floor:
+        return False, f"micro-{media_type}"
+    return True, None
+
+
+def _detect_content_category(title: str, username: str) -> str:
+    """Returns category string. NULL/None = 'mixed' (default 2y cutoff)."""
+    blob = (title or "") + " " + (username or "")
+    for cat, rx in _CATEGORY_HINTS:
+        if rx.search(blob):
+            return cat
+    return 'mixed'
+
+
+def _cutoff_days(category: str) -> int | None:
+    """3 × half-life. None = no cutoff (archival)."""
+    hl = _DECAY_HALF_LIFE_DAYS.get(category or 'mixed')
+    if hl is None:
+        return None
+    return 3 * hl
+
 # Caption-mention discovery: extract new channel hints from message text
 _MENTION_RX = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{4,31})\b")
 _INVITE_RX = re.compile(
@@ -268,6 +353,10 @@ async def ingest_message(msg: Message) -> bool:
         # text-only chatter has 0 resource value (we already extracted any
         # @mention / invite link signals above for discovery).
         if media is None:
+            return False
+        # QUALITY GATE: ad-keyword / micro-size junk rejected before persist.
+        keep, reason = _quality_check(file_name, file_size, media_type, caption)
+        if not keep:
             return False
         # Raw caption discarded — we already extracted mention/invite signals
         # above into seed_candidates. Storing raw text wastes ~200B/msg with
@@ -707,6 +796,7 @@ async def channel_meta_refresher() -> None:
             try:
                 chat = await app.get_chat(row["tg_chat_id"])
                 members = getattr(chat, "members_count", None)
+                category = _detect_content_category(chat.title or "", chat.username or "")
                 # Per-type remote counts via search_messages_count + MessagesFilter.
                 # Each is one cheap TG call returning the channel's total of that type.
                 from pyrogram import enums as _pf
@@ -725,10 +815,11 @@ async def channel_meta_refresher() -> None:
                              remote_msgs=$2, remote_photos=$3, remote_videos=$4,
                              remote_audio=$5, remote_documents=$6,
                              remote_counts_refreshed_at=NOW(),
+                             content_category=$7,
                              meta_updated_at=NOW()
-                           WHERE tg_chat_id=$7""",
+                           WHERE tg_chat_id=$8""",
                         members, remote_msgs, remote_photos, remote_videos,
-                        remote_audio, remote_docs, row["tg_chat_id"])
+                        remote_audio, remote_docs, category, row["tg_chat_id"])
                 log.info("[meta] chat_id=%s members=%s remote: msg=%s photo=%s "
                          "video=%s audio=%s doc=%s",
                          row["tg_chat_id"], members, remote_msgs, remote_photos,
@@ -1772,6 +1863,93 @@ DEEP_BACKFILL_DELAY_SEC = int(os.environ.get("TGARR_DEEP_BACKFILL_DELAY_SEC", "1
 DEEP_BACKFILL_MIN_MEDIA = int(os.environ.get("TGARR_DEEP_BACKFILL_MIN_MEDIA", "100"))
 
 
+async def decay_eviction_worker() -> None:
+    """Periodic LRU-by-decay cleanup: drop messages whose value has decayed
+    below pull cost. Same model as deep_backfill cutoff but operating on
+    already-indexed rows. Frees disk + speeds up queries.
+
+    Schedule: once per 6h. Per category, find rows past 3×half_life and DELETE.
+    file_unique_id federation value is preserved (central already has it from
+    contribute_resources push); eviction is purely local index hygiene.
+    """
+    await asyncio.sleep(600)  # let other workers settle
+    log.info("[eviction] worker started — 6h cadence")
+    while True:
+        try:
+            for category, half_life in _DECAY_HALF_LIFE_DAYS.items():
+                if half_life is None:
+                    continue
+                cutoff_days = 3 * half_life
+                async with db_pool.acquire() as conn:
+                    # Don't delete rows that user has grabbed (local_path set)
+                    # — those are local cache the user is using.
+                    result = await conn.execute(
+                        """DELETE FROM messages
+                           WHERE channel_id IN (
+                             SELECT id FROM channels WHERE content_category = $1
+                           )
+                           AND posted_at < NOW() - ($2 || ' days')::INTERVAL
+                           AND COALESCE(local_path, '') = ''
+                           AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)""",
+                        category, str(cutoff_days))
+                # asyncpg returns "DELETE N" — parse the number
+                deleted = int(result.split()[-1]) if result.startswith("DELETE") else 0
+                if deleted:
+                    log.info("[eviction] category=%s cutoff=%dd deleted=%d",
+                             category, cutoff_days, deleted)
+                await _heartbeat("decay_eviction_worker",
+                                 f"swept {category} >{cutoff_days}d (-{deleted})")
+            # Multi-signal quality sweep — orthogonal to time decay
+            async with db_pool.acquire() as conn:
+                # 1) Ad-keyword file_names
+                r1 = await conn.execute("""
+                    DELETE FROM messages
+                    WHERE file_name ~* $1
+                      AND COALESCE(local_path, '') = ''
+                      AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                """, r'(\bcrypto\b|\bnft\b|\busdt\b|赌博|博彩|casino|gamble|gambling|'
+                     r'投资理财|做单|赚钱|月入|代理|代充|代购|刷单|'
+                     r'telegram[\s_]*bot|airdrop|'
+                     r'limited[\s_]*offer|click[\s_]*here|join[\s_]*now[\s_]*free|'
+                     r'earn[\s_]*money|earn[\s_]*cash|vip[\s_]*会员)')
+                ads_n = int(r1.split()[-1]) if r1.startswith("DELETE") else 0
+                # 2) Micro-media: < 5MB video ≈ < 3min (ad/clip/news),
+                # < 100KB audio / < 10KB doc / < 5KB photo = junk
+                r2 = await conn.execute("""
+                    DELETE FROM messages
+                    WHERE (
+                      (media_type='video'    AND file_size < 5000000) OR
+                      (media_type='audio'    AND file_size < 100000)  OR
+                      (media_type='document' AND file_size < 10000)   OR
+                      (media_type='photo'    AND file_size < 5000)
+                    )
+                    AND COALESCE(local_path, '') = ''
+                    AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                """)
+                micro_n = int(r2.split()[-1]) if r2.startswith("DELETE") else 0
+                # 3) Cross-channel hash spam — same thumb_md5 in 20+ channels
+                r3 = await conn.execute("""
+                    DELETE FROM messages
+                    WHERE thumb_md5 IN (
+                        SELECT thumb_md5 FROM messages
+                        WHERE thumb_md5 IS NOT NULL
+                        GROUP BY thumb_md5
+                        HAVING count(DISTINCT channel_id) > 20
+                    )
+                    AND COALESCE(local_path, '') = ''
+                    AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                """)
+                spam_n = int(r3.split()[-1]) if r3.startswith("DELETE") else 0
+            if ads_n + micro_n + spam_n:
+                log.info("[eviction] quality sweep: ads=%d micro=%d cross-spam=%d",
+                         ads_n, micro_n, spam_n)
+                await _heartbeat("decay_eviction_worker",
+                                 f"quality sweep: -{ads_n+micro_n+spam_n}")
+        except Exception as e:
+            log.exception("[eviction] outer loop: %s", e)
+        await asyncio.sleep(21600)  # 6h
+
+
 async def deep_backfill_worker() -> None:
     """Continuously pages OLDER messages past the first 5000-cap backfill.
 
@@ -1797,6 +1975,7 @@ async def deep_backfill_worker() -> None:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow("""
                     SELECT c.id, c.tg_chat_id, c.username, c.title,
+                           c.content_category,
                            COALESCE(c.deep_oldest_tg_id,
                                     (SELECT min(tg_message_id) FROM messages m
                                      WHERE m.channel_id = c.id)) AS cursor
@@ -1832,12 +2011,27 @@ async def deep_backfill_worker() -> None:
 
             count_ingested = 0
             oldest_seen = cursor
+            hit_cutoff = False
+            # Decay-model cutoff for time-sensitive categories
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            cutoff_date = None
+            cat = row["content_category"]
+            if cat:
+                hl = _DECAY_HALF_LIFE_DAYS.get(cat)
+                if hl:
+                    cutoff_date = _dt.now(_tz.utc) - _td(days=3 * hl)
             try:
                 offset_kw = {"offset_id": cursor} if cursor else {}
                 async for msg in app.get_chat_history(
                         row["tg_chat_id"],
                         limit=DEEP_BACKFILL_PAGE_SIZE,
                         **offset_kw):
+                    # Time-decay cutoff
+                    if cutoff_date and msg.date and msg.date < cutoff_date:
+                        hit_cutoff = True
+                        log.info("[deep-backfill] @%s decay cutoff hit at msg %s (date=%s, category=%s)",
+                                 uname, msg.id, msg.date.date(), cat)
+                        break
                     try:
                         await ingest_message(msg)
                         count_ingested += 1
@@ -1865,8 +2059,8 @@ async def deep_backfill_worker() -> None:
             log.info("[deep-backfill] @%s page done: ingested=%d oldest=%s",
                      uname, count_ingested, oldest_seen)
 
-            # If page returned fewer than page_size, we likely hit the bottom
-            done = count_ingested < DEEP_BACKFILL_PAGE_SIZE
+            # Done if hit decay cutoff OR page returned fewer than page_size (TG bottom)
+            done = hit_cutoff or count_ingested < DEEP_BACKFILL_PAGE_SIZE
             async with db_pool.acquire() as conn:
                 await conn.execute("""
                     UPDATE channels
@@ -1887,6 +2081,105 @@ async def deep_backfill_worker() -> None:
             await asyncio.sleep(60)
 
 
+CONTRIBUTE_RESOURCES_ENABLED = os.environ.get("TGARR_CONTRIBUTE_RESOURCES", "true").lower() == "true"
+CONTRIBUTE_RESOURCES_BATCH = int(os.environ.get("TGARR_CONTRIBUTE_RESOURCES_BATCH", "5000"))
+CONTRIBUTE_RESOURCES_INTERVAL_SEC = int(os.environ.get("TGARR_CONTRIBUTE_RESOURCES_INTERVAL_SEC", "10"))
+
+
+async def contribute_resources_worker() -> None:
+    """Push local file_unique_id-keyed resources to central via /api/v1/contribute_resources.
+
+    This is the *core* federation value: each client tells central which TG
+    assets (file_unique_id) it has observed. Central aggregates across clients
+    → distinct_contributors per resource → swarm-verified resource registry.
+
+    Eligibility: messages with file_unique_id NOT NULL AND contributed_at IS NULL.
+    Batch: up to CONTRIBUTE_RESOURCES_BATCH per submission (server cap 5000).
+    Frequency: every CONTRIBUTE_RESOURCES_INTERVAL_SEC (default 30m).
+    """
+    if not CONTRIBUTE_RESOURCES_ENABLED:
+        log.info("[contrib-res] TGARR_CONTRIBUTE_RESOURCES=false — disabled")
+        return
+    log.info("[contrib-res] started; batch=%d interval=%ds",
+             CONTRIBUTE_RESOURCES_BATCH, CONTRIBUTE_RESOURCES_INTERVAL_SEC)
+    await asyncio.sleep(180)  # let initial backfill / contribute_channels go first
+
+    while True:
+        try:
+            await _heartbeat("contribute_resources_worker", "scanning pending")
+            async with db_pool.acquire() as conn:
+                uuid_val = await conn.fetchval(
+                    "SELECT value FROM config WHERE key='instance_uuid'")
+                if not uuid_val:
+                    log.info("[contrib-res] no instance_uuid yet, sleep 5min")
+                    await asyncio.sleep(300)
+                    continue
+                rows = await conn.fetch(f"""
+                    SELECT m.id, m.tg_message_id, m.file_unique_id, m.file_name,
+                           m.file_size, m.mime_type, m.media_type,
+                           m.audio_duration_sec, m.posted_at,
+                           c.username AS channel_username
+                    FROM messages m
+                    JOIN channels c ON c.id = m.channel_id
+                    WHERE m.file_unique_id IS NOT NULL
+                      AND m.contributed_at IS NULL
+                      AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+                    ORDER BY m.id DESC
+                    LIMIT {CONTRIBUTE_RESOURCES_BATCH}
+                """)
+            if not rows:
+                await _heartbeat("contribute_resources_worker", "queue empty")
+                await asyncio.sleep(CONTRIBUTE_RESOURCES_INTERVAL_SEC)
+                continue
+
+            payload = {
+                "instance_uuid": uuid_val,
+                "tgarr_version": "0.4.54",
+                "resources": [{
+                    "file_unique_id": r["file_unique_id"],
+                    "file_name": r["file_name"],
+                    "channel_username": r["channel_username"],
+                    "file_size": r["file_size"],
+                    "mime_type": r["mime_type"],
+                    "media_type": r["media_type"],
+                    "duration_sec": r["audio_duration_sec"],
+                    "msg_id": r["tg_message_id"],
+                    "posted_at": r["posted_at"].isoformat() if r["posted_at"] else None,
+                    "requires_join": True,
+                } for r in rows],
+            }
+
+            try:
+                body_raw = json.dumps(payload).encode()
+                req = urllib.request.Request(
+                    REGISTRY_URL + "/api/v1/contribute_resources",
+                    data=body_raw,
+                    headers={"Content-Type": "application/json",
+                             "User-Agent": "tgarr/0.4.55 (+https://tgarr.me)"},
+                    method="POST")
+                resp = await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(req, timeout=120).read())
+                result = json.loads(resp.decode())
+                log.info("[contrib-res] pushed %d resources (%dKB): %s",
+                         len(rows), len(body_raw)//1024, result)
+                if result.get("status") == "ok":
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE messages SET contributed_at=NOW() WHERE id = ANY($1::bigint[])",
+                            [r["id"] for r in rows])
+                    await _heartbeat("contribute_resources_worker",
+                                     f"pushed {len(rows)} resources")
+            except Exception as e:
+                log.warning("[contrib-res] POST failed: %s", e)
+                await _heartbeat("contribute_resources_worker",
+                                 f"POST failed", error=str(e)[:200])
+
+            await asyncio.sleep(CONTRIBUTE_RESOURCES_INTERVAL_SEC)
+        except Exception:
+            log.exception("[contrib-res] outer loop")
+            await asyncio.sleep(600)
+
+
 async def main() -> None:
     await init_db()
     await wait_for_session()
@@ -1898,6 +2191,8 @@ async def main() -> None:
     asyncio.create_task(download_worker())
     asyncio.create_task(on_demand_media_downloader())
     asyncio.create_task(deep_backfill_worker())
+    asyncio.create_task(contribute_resources_worker())
+    asyncio.create_task(decay_eviction_worker())
     # On-demand mode 2026-05-14: thumb_downloader stays but only processes
     # rows where /api/thumb/{id} UI hit has set thumb_path='__user_queued__'.
     asyncio.create_task(thumb_downloader())

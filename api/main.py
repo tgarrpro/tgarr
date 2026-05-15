@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.53"
+TGARR_VERSION = "0.4.56"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -159,6 +159,17 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_audio BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_documents BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_counts_refreshed_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS content_category TEXT;
+            -- content_category values:
+            --   NULL or 'archival' = full backfill (movie/tv/ebook/music)
+            --   'news' = 90d cutoff
+            --   'sports' = 30d cutoff
+            --   'chat' = 30d cutoff (live discussion)
+            --   'mixed' = full backfill (default safe)
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS contributed_at TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_messages_pending_contrib
+                ON messages (id)
+                WHERE file_unique_id IS NOT NULL AND contributed_at IS NULL;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -2074,6 +2085,7 @@ _EXPECTED_WORKERS = {
     "federation_validator":       3600 * 2,   # 20min batch + 1h sleep = ~80min between hb
     "deep_backfill_worker":       300,        # 10s/page, heartbeats per page = frequent
     "on_demand_media_downloader": 86400,      # only on user click, ok to be stale
+    "contribute_resources_worker": 30 * 60,   # 30min interval
 }
 
 
