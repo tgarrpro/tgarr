@@ -57,6 +57,124 @@ app = Client(
 
 db_pool: asyncpg.Pool = None
 
+
+# ════════════════════════════════════════════════════════════════════
+# Global MTProto rate limiter + circuit breaker
+#
+# Two failure modes the bare Pyrogram API exposes us to:
+#   1. FloodWait — TG punishes burst of calls with N-second wait. Critically,
+#      retrying inside the window EXTENDS it. So when ANY worker sees a
+#      FloodWait > 60s, ALL workers must pause uniformly.
+#   2. Per-method ceilings — `resolveUsername` ~5/min, `get_chat` ~10/min,
+#      `download_media` higher. Exceeding triggers FloodWait.
+#
+# This module gates every Pyrogram call through `_mtproto(...)`. It enforces
+# per-method token buckets, observes FloodWait, and sets a global halt that
+# all subsequent calls (across all workers) honor.
+# ════════════════════════════════════════════════════════════════════
+_MTPROTO_GLOBAL_HALT_UNTIL = 0.0   # epoch sec; all MTProto blocked until this
+_MTPROTO_LOCK = asyncio.Lock()
+_MTPROTO_BUDGETS = {
+    # method → (max calls, window seconds). Tuned conservative to stay below
+    # TG's actual ceilings even with concurrent workers.
+    "resolveUsername":   (5, 60),    # 5/min — most flood-prone
+    "get_chat":          (10, 60),
+    "get_chat_history":  (30, 60),
+    "get_messages":      (30, 60),
+    "download_media":    (60, 60),
+    "join_chat":         (3, 60),    # rare; TG hard-caps ~20/day
+    "leave_chat":        (3, 60),
+    "search_messages_count": (10, 60),
+    "default":           (30, 60),   # unclassified calls
+}
+_MTPROTO_CALL_LOG: dict = {}  # method → list[float] of recent call timestamps
+
+
+async def _mtproto(method_name: str, coro_factory):
+    """Gate any Pyrogram call: enforce per-method rate, honor global halt,
+    handle FloodWait by setting global halt. `coro_factory` is a callable
+    returning a fresh awaitable each invocation (so we can retry).
+    """
+    global _MTPROTO_GLOBAL_HALT_UNTIL
+    while True:
+        # 1. Honor global halt (set by prior FloodWait observation).
+        now = time.time()
+        if _MTPROTO_GLOBAL_HALT_UNTIL > now:
+            remaining = _MTPROTO_GLOBAL_HALT_UNTIL - now
+            log.info("[mtproto-rl] global halt %s: %ds remaining → sleeping",
+                     method_name, int(remaining))
+            await asyncio.sleep(min(remaining + 1, 60))
+            continue
+        # 2. Per-method bucket: wait until a slot opens.
+        limit, window = _MTPROTO_BUDGETS.get(method_name,
+                                            _MTPROTO_BUDGETS["default"])
+        async with _MTPROTO_LOCK:
+            bucket = _MTPROTO_CALL_LOG.setdefault(method_name, [])
+            now = time.time()
+            bucket[:] = [t for t in bucket if now - t < window]
+            if len(bucket) >= limit:
+                wait_s = window - (now - bucket[0]) + 0.1
+            else:
+                wait_s = 0
+                bucket.append(now)
+        if wait_s > 0:
+            log.debug("[mtproto-rl] %s at %d/%ds — sleep %.1fs",
+                      method_name, limit, window, wait_s)
+            await asyncio.sleep(wait_s)
+            continue
+        break
+    # 3. Make the call. On FloodWait, set global halt.
+    try:
+        return await coro_factory()
+    except FloodWait as fw:
+        fw_val = int(getattr(fw, "value", 60) or 60)
+        until = time.time() + fw_val + 5
+        async with _MTPROTO_LOCK:
+            if until > _MTPROTO_GLOBAL_HALT_UNTIL:
+                _MTPROTO_GLOBAL_HALT_UNTIL = until
+        log.warning("[mtproto-rl] %s FloodWait %ds → global halt set",
+                    method_name, fw_val)
+        raise
+
+
+async def _mtproto_wait_clearance():
+    """Block until any global halt expires. Use before async generators
+    (get_chat_history / get_dialogs) which can't be wrapped call-by-call."""
+    while True:
+        now = time.time()
+        if _MTPROTO_GLOBAL_HALT_UNTIL > now:
+            remaining = _MTPROTO_GLOBAL_HALT_UNTIL - now
+            log.info("[mtproto-rl] halt %ds remaining → sleeping", int(remaining))
+            await asyncio.sleep(min(remaining + 1, 60))
+            continue
+        return
+
+
+async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
+    """get_messages with auto-join on CHANNEL_INVALID — for restricted channels
+    where the session isn't yet a member. join_chat is itself rate-limited;
+    if join also fails, propagates the original error to caller.
+    """
+    from pyrogram.errors import ChannelInvalid
+    try:
+        return await _mtproto("get_messages",
+                               lambda: app.get_messages(chat_id, msg_id))
+    except ChannelInvalid:
+        # First try a refresh via get_chat_history (cheap, often fixes stale access_hash)
+        try:
+            async for _ in await _mtproto("get_chat_history",
+                                            lambda: app.get_chat_history(chat_id, limit=1)):
+                break
+            return await _mtproto("get_messages",
+                                   lambda: app.get_messages(chat_id, msg_id))
+        except ChannelInvalid:
+            pass
+        # Last resort: actually join the channel
+        log.info("[mtproto] auto-join %s after CHANNEL_INVALID", chat_id)
+        await _mtproto("join_chat", lambda: app.join_chat(chat_id))
+        return await _mtproto("get_messages",
+                               lambda: app.get_messages(chat_id, msg_id))
+
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
 _meili_queue: "asyncio.Queue[tuple[str, dict]] | None" = None
@@ -661,6 +779,7 @@ async def backfill_channel(chat_id: int, title: str) -> int:
              chat_id, title, BACKFILL_LIMIT)
     count = 0
     media_count = 0
+    await _mtproto_wait_clearance()
     async for msg in app.get_chat_history(chat_id, limit=BACKFILL_LIMIT):
         has_media = bool(msg.video or msg.document or msg.audio or msg.photo)
         try:
@@ -704,6 +823,7 @@ async def backfill_all() -> None:
         }
 
     current_dialog_ids: set[int] = set()
+    await _mtproto_wait_clearance()
     async for dialog in app.get_dialogs():
         ctype = dialog.chat.type.name
         if ctype in ("PRIVATE", "BOT"):
@@ -810,15 +930,19 @@ async def download_worker() -> None:
                         log.warning("[worker] HTTPS video failed id=%s: %s — falling back to MTProto",
                                     row["dl_id"], he)
 
-                # ── Path 2: MTProto fallback (non-video / scrape miss / private). ──
+                # ── Path 2: MTProto fallback with auto-join. User doesn't
+                # see this distinction — just sees grab succeed or fail. The
+                # rate limiter + global halt prevents quota burn cascading
+                # across workers.
                 if local_path is None:
                     if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
                         raise RuntimeError("THUMB_ONLY mode: MTProto download disabled")
-                    msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                    msg = await _mtproto_get_messages_with_auto_join(
+                        row["tg_chat_id"], row["tg_message_id"])
                     if not msg or not (msg.video or msg.document or msg.audio):
                         raise RuntimeError("media missing on source message")
-                    local_path = await app.download_media(
-                        msg, file_name=f"{target_dir}/")
+                    local_path = await _mtproto("download_media",
+                        lambda: app.download_media(msg, file_name=f"{target_dir}/"))
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE downloads
@@ -1038,6 +1162,7 @@ async def new_dialog_watcher() -> None:
                 known = {r["tg_chat_id"] for r in await conn.fetch(
                     "SELECT tg_chat_id FROM channels")}
             new_dialogs = []
+            await _mtproto_wait_clearance()
             async for dialog in app.get_dialogs(limit=NEW_DIALOG_SCAN_LIMIT):
                 ctype = dialog.chat.type.name
                 if ctype in ("PRIVATE", "BOT"):
@@ -1190,9 +1315,10 @@ async def _thumb_process_one(row) -> None:
             # and the mode flag is flipped off.
             if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
                 raise RuntimeError("THUMB_ONLY mode: HTTPS scrape miss + MTProto disabled")
-            # ── Path 2: MTProto fallback (serial; shared Pyrogram session). ──
+            # ── Path 2: MTProto fallback through global rate limiter. ──
             async with _THUMB_MTPROTO_SEM:
-                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                msg = await _mtproto_get_messages_with_auto_join(
+                    row["tg_chat_id"], row["tg_message_id"])
                 if not msg:
                     raise RuntimeError("message gone")
                 thumb_media = None
@@ -1205,7 +1331,8 @@ async def _thumb_process_one(row) -> None:
                     thumb_media = msg.document.thumbs[-1]
                 if not thumb_media:
                     raise RuntimeError("no thumbnail available on message")
-                await app.download_media(thumb_media, file_name=target)
+                await _mtproto("download_media",
+                    lambda: app.download_media(thumb_media, file_name=target))
         # MD5 of the downloaded bytes → dedup across channels
         with open(target, "rb") as f:
             md5 = hashlib.md5(f.read()).hexdigest()
@@ -1301,21 +1428,22 @@ async def channel_meta_refresher() -> None:
                 await asyncio.sleep(900)
                 continue
             try:
-                chat = await app.get_chat(row["tg_chat_id"])
+                chat = await _mtproto("get_chat",
+                    lambda: app.get_chat(row["tg_chat_id"]))
                 members = getattr(chat, "members_count", None)
                 category = _detect_content_category(chat.title or "", chat.username or "")
-                # Per-type remote counts via search_messages_count + MessagesFilter.
-                # Each is one cheap TG call returning the channel's total of that type.
                 from pyrogram import enums as _pf
-                remote_msgs = await app.get_chat_history_count(row["tg_chat_id"])
-                remote_photos = await app.search_messages_count(
-                    row["tg_chat_id"], filter=_pf.MessagesFilter.PHOTO)
-                remote_videos = await app.search_messages_count(
-                    row["tg_chat_id"], filter=_pf.MessagesFilter.VIDEO)
-                remote_audio = await app.search_messages_count(
-                    row["tg_chat_id"], filter=_pf.MessagesFilter.AUDIO)
-                remote_docs = await app.search_messages_count(
-                    row["tg_chat_id"], filter=_pf.MessagesFilter.DOCUMENT)
+                cid = row["tg_chat_id"]
+                remote_msgs = await _mtproto("get_chat_history",
+                    lambda: app.get_chat_history_count(cid))
+                remote_photos = await _mtproto("search_messages_count",
+                    lambda: app.search_messages_count(cid, filter=_pf.MessagesFilter.PHOTO))
+                remote_videos = await _mtproto("search_messages_count",
+                    lambda: app.search_messages_count(cid, filter=_pf.MessagesFilter.VIDEO))
+                remote_audio = await _mtproto("search_messages_count",
+                    lambda: app.search_messages_count(cid, filter=_pf.MessagesFilter.AUDIO))
+                remote_docs = await _mtproto("search_messages_count",
+                    lambda: app.search_messages_count(cid, filter=_pf.MessagesFilter.DOCUMENT))
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE channels SET members_count=$1,
@@ -1454,7 +1582,8 @@ async def local_media_downloader() -> None:
             safe = SAFE_NAME.sub("_", base)[:180]
             target = os.path.join(root, safe)
             try:
-                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                msg = await _mtproto_get_messages_with_auto_join(
+                    row["tg_chat_id"], row["tg_message_id"])
                 if not msg:
                     raise RuntimeError("message gone")
                 if mt == "audio":
@@ -1570,7 +1699,10 @@ async def subscription_poller() -> None:
             await _heartbeat("subscription_poller", f"polling @{uname}")
             log.info("[subscribe] poll @%s (backfilled=%s)", uname, row["backfilled"])
             try:
-                chat = await app.get_chat(uname)
+                # resolveUsername is the most flood-prone TG call — _mtproto
+                # rate-limits to 5/min globally + observes global halt.
+                chat = await _mtproto("resolveUsername",
+                    lambda: app.get_chat(uname))
                 real_chat_id = chat.id
                 title = chat.title or uname
                 members = getattr(chat, "members_count", None)
@@ -1616,6 +1748,7 @@ async def subscription_poller() -> None:
             limit = SUBSCRIBE_BACKFILL_LIMIT if not row["backfilled"] else 200
             count = media_count = 0
             try:
+                await _mtproto_wait_clearance()
                 async for msg in app.get_chat_history(real_chat_id, limit=limit):
                     try:
                         inserted = await ingest_message(msg)
@@ -1737,7 +1870,8 @@ async def seed_validator() -> None:
                 continue
 
             try:
-                chat = await app.get_chat(uname)
+                chat = await _mtproto("resolveUsername",
+                    lambda: app.get_chat(uname))
             except FloodWait as fw:
                 log.warning("[seed-validator] FloodWait %ds on @%s — backing off",
                             fw.value, uname)
@@ -1771,6 +1905,7 @@ async def seed_validator() -> None:
             # Last message timestamp via 1-msg history pull
             last_msg = None
             try:
+                await _mtproto_wait_clearance()
                 async for m in app.get_chat_history(chat.id, limit=1):
                     last_msg = m.date
                     break
@@ -2150,10 +2285,11 @@ async def federation_validator() -> None:
                     continue
                 try:
                     if invite:
-                        # join_chat → different rate-limit bucket
-                        chat = await app.join_chat(invite)
+                        chat = await _mtproto("join_chat",
+                            lambda: app.join_chat(invite))
                     else:
-                        chat = await app.get_chat(uname)
+                        chat = await _mtproto("resolveUsername",
+                            lambda: app.get_chat(uname))
                     members = getattr(chat, "members_count", None)
                     title = chat.title or (chat.username or uname)
                     real_username = chat.username or uname
@@ -2259,7 +2395,8 @@ async def dc_backfill_worker() -> None:
                 await asyncio.sleep(3600)
                 continue
             try:
-                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                msg = await _mtproto("get_messages",
+                    lambda: app.get_messages(row["tg_chat_id"], row["tg_message_id"]))
             except FloodWait as fw:
                 wait = getattr(fw, "value", 60) + 5
                 log.warning("[dc-backfill] FloodWait %ds", wait)
@@ -2337,7 +2474,8 @@ async def on_demand_media_downloader() -> None:
             rel = os.path.relpath(target, "/downloads")
 
             try:
-                msg = await app.get_messages(row["tg_chat_id"], row["tg_message_id"])
+                msg = await _mtproto_get_messages_with_auto_join(
+                    row["tg_chat_id"], row["tg_message_id"])
                 if not msg:
                     raise RuntimeError("msg gone")
                 media = (msg.audio if mt == "audio"
@@ -2609,6 +2747,7 @@ async def deep_backfill_worker() -> None:
                 if hl:
                     cutoff_date = _dt.now(_tz.utc) - _td(days=3 * hl)
             try:
+                await _mtproto_wait_clearance()
                 offset_kw = {"offset_id": cursor} if cursor else {}
                 async for msg in app.get_chat_history(
                         row["tg_chat_id"],
