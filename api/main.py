@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.51"
+TGARR_VERSION = "0.4.52"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -153,6 +153,26 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_total_pulled BIGINT NOT NULL DEFAULT 0;
             CREATE INDEX IF NOT EXISTS idx_channels_deep_backfilled ON channels (deep_backfilled);
+            CREATE TABLE IF NOT EXISTS seed_candidates (
+              username TEXT PRIMARY KEY,
+              title TEXT,
+              category TEXT,
+              region TEXT,
+              language TEXT,
+              audience_hint TEXT,
+              tags TEXT[],
+              source TEXT,
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              validated_at TIMESTAMPTZ,
+              validation_status TEXT,
+              invite_link TEXT,
+              validation_attempts INTEGER NOT NULL DEFAULT 0,
+              validation_error TEXT
+            );
+            ALTER TABLE seed_candidates ADD COLUMN IF NOT EXISTS contributed_at TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_seed_cand_pending_contrib
+                ON seed_candidates (added_at DESC)
+                WHERE source IN ('caption-mention','caption-invite') AND contributed_at IS NULL;
             CREATE TABLE IF NOT EXISTS stats_history (
               snapshot_at TIMESTAMPTZ NOT NULL,
               metric TEXT NOT NULL,

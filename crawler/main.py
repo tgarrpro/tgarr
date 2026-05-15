@@ -55,6 +55,36 @@ db_pool: asyncpg.Pool = None
 
 SAFE_NAME = re.compile(r"[^\w\-._]+")
 
+# Caption-mention discovery: extract new channel hints from message text
+_MENTION_RX = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{4,31})\b")
+_INVITE_RX = re.compile(
+    r"(?:https?://)?t(?:elegram)?\.me/(?:joinchat/|\+)([A-Za-z0-9_-]{16,32})")
+# Skip ones our own crawler / common bots / generic words that look like usernames
+_MENTION_SKIP = {
+    "tgarr", "tgarr_bot", "telegram", "telegrambot", "username",
+    "channel", "channels", "admin", "support", "bot", "bots",
+    "addlist", "addstickers", "share", "you", "your", "me", "myself",
+}
+CONTRIBUTE_MENTIONS_ENABLED = os.environ.get("TGARR_CONTRIBUTE_MENTIONS", "true").lower() == "true"
+
+
+def _extract_mentions(text: str) -> set[str]:
+    if not text:
+        return set()
+    out = set()
+    for m in _MENTION_RX.finditer(text):
+        u = m.group(1)
+        if u.lower() in _MENTION_SKIP:
+            continue
+        out.add(u)
+    return out
+
+
+def _extract_invites(text: str) -> set[str]:
+    if not text:
+        return set()
+    return set(_INVITE_RX.findall(text))
+
 
 async def init_db() -> None:
     global db_pool
@@ -199,11 +229,45 @@ async def ingest_message(msg: Message) -> bool:
             msg.chat.title or "",
             chat_type.lower(),
         )
+        # === Caption-mention extraction (always; contribute gated separately) ===
+        # Even text-only messages can contain @mention / invite links — those
+        # are pure discovery signal independent of media payload.
+        if caption:
+            try:
+                mentions = _extract_mentions(caption)
+                invites = _extract_invites(caption)
+                if mentions or invites:
+                    aud_hint = await conn.fetchval(
+                        "SELECT audience FROM channels WHERE id=$1", ch_id) or "sfw"
+                    for u in mentions:
+                        await conn.execute(
+                            "INSERT INTO seed_candidates "
+                            "  (username, source, audience_hint, validation_status) "
+                            "VALUES ($1, 'caption-mention', $2, NULL) "
+                            "ON CONFLICT (username) DO NOTHING",
+                            u, aud_hint)
+                    for inv in invites:
+                        ikey = f"INVITE:{inv[:24]}"
+                        iurl = (f"https://t.me/joinchat/{inv}"
+                                if inv.startswith("joinchat") else f"https://t.me/+{inv}")
+                        await conn.execute(
+                            "INSERT INTO seed_candidates "
+                            "  (username, invite_link, source, audience_hint, "
+                            "   validation_status) "
+                            "VALUES ($1, $2, 'caption-invite', $3, NULL) "
+                            "ON CONFLICT (username) DO NOTHING",
+                            ikey, iurl, aud_hint)
+            except Exception:
+                pass  # never let extraction break ingest
+
         # NOISE FILTER: skip persisting messages with no media attachment.
-        # text-only chatter has 0 resource value; discovery is handled via
-        # federation registry, not via parsing message text for mentions.
+        # text-only chatter has 0 resource value (we already extracted any
+        # @mention / invite link signals above for discovery).
         if media is None:
             return False
+        # Raw caption discarded — we already extracted mention/invite signals
+        # above into seed_candidates. Storing raw text wastes ~200B/msg with
+        # near-zero re-extract value. Use the structured fields downstream.
         new_msg_id = await conn.fetchval(
             """INSERT INTO messages
                  (channel_id, tg_message_id, tg_chat_id,
@@ -214,7 +278,7 @@ async def ingest_message(msg: Message) -> bool:
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
-            caption[:8000], file_size, mime_type, media_type,
+            None, file_size, mime_type, media_type,
             audio_title, audio_performer, audio_duration_sec, msg.date,
             file_dc,
         )
@@ -1318,9 +1382,21 @@ async def contribute_to_registry() -> None:
                 await asyncio.sleep(CONTRIBUTE_INTERVAL_SEC)
                 continue
 
+            # Collect pending caption-discovered seeds for upload
+            pending_seeds = []
+            if CONTRIBUTE_MENTIONS_ENABLED:
+                async with db_pool.acquire() as conn:
+                    pending_seeds = await conn.fetch(
+                        "SELECT username, invite_link, source, audience_hint "
+                        "FROM seed_candidates "
+                        "WHERE source IN ('caption-mention', 'caption-invite') "
+                        "  AND contributed_at IS NULL "
+                        "ORDER BY added_at DESC "
+                        "LIMIT 500")
+
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.34",
+                "tgarr_version": "0.4.52",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -1328,6 +1404,12 @@ async def contribute_to_registry() -> None:
                     "media_count": r["media_count"],
                     "audience": r["audience"] or "sfw",
                 } for r in rows],
+                "seed_mentions": [{
+                    "username": s["username"],
+                    "invite_link": s["invite_link"],
+                    "source": s["source"],
+                    "audience_hint": s["audience_hint"],
+                } for s in pending_seeds],
             }
 
             try:
@@ -1340,8 +1422,15 @@ async def contribute_to_registry() -> None:
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 result = json.loads(resp.decode())
-                log.info("[federation] contributed %s channels: %s",
-                         len(rows), result)
+                log.info("[federation] contributed %s channels + %s seeds: %s",
+                         len(rows), len(pending_seeds), result)
+                # Mark pushed seeds as contributed (only if server accepted)
+                if pending_seeds and result.get("status") == "ok":
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE seed_candidates SET contributed_at=NOW() "
+                            "WHERE username = ANY($1::text[])",
+                            [s["username"] for s in pending_seeds])
             except Exception as e:
                 log.warning("[federation] contribute call failed: %s", e)
 

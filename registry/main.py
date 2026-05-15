@@ -301,10 +301,57 @@ async def contribute(request: Request):
         await _bump_suspicion(f"ip:{ip_hash}", 20 * honeypot_hits,
                             f"honeypot-trip")
 
+    # === Caption-mention seeds (new field, optional) ===
+    # Clients extract @username + invite links from message captions inline
+    # and push them up. Central queues them in seed_candidates for later
+    # validation by federation_validator on other clients.
+    seed_mentions = body.get("seed_mentions") or []
+    seeds_accepted = 0
+    seeds_rejected = 0
+    seeds_csam_flagged = 0
+    if seed_mentions and isinstance(seed_mentions, list):
+        # Hard cap to prevent abuse: max 500 seeds per contribute call
+        seed_mentions = seed_mentions[:500]
+        async with db_pool.acquire() as conn:
+            for s in seed_mentions:
+                if not isinstance(s, dict):
+                    seeds_rejected += 1
+                    continue
+                u = (s.get("username") or "").strip()
+                inv = (s.get("invite_link") or "").strip() or None
+                src = s.get("source") or "caption-mention"
+                aud_hint = s.get("audience_hint") or "sfw"
+                if not u or len(u) > 80 or len(u) < 5:
+                    seeds_rejected += 1
+                    continue
+                # CSAM keyword pre-filter — same regex as channel-contribute
+                if _CSAM_RX.search(u) or (inv and _CSAM_RX.search(inv)):
+                    seeds_csam_flagged += 1
+                    continue
+                if src not in ("caption-mention", "caption-invite"):
+                    src = "caption-mention"
+                try:
+                    await conn.execute(
+                        "INSERT INTO seed_candidates "
+                        "  (username, invite_link, source, audience_hint, validation_status) "
+                        "VALUES ($1, $2, $3, $4, NULL) "
+                        "ON CONFLICT (username) DO NOTHING",
+                        u, inv, src, aud_hint)
+                    seeds_accepted += 1
+                except Exception:
+                    seeds_rejected += 1
+        if seeds_csam_flagged:
+            log.warning("CSAM-flagged %s seeds from instance %s",
+                       seeds_csam_flagged, inst_hash[:8])
+            await _bump_suspicion(f"inst:{inst_hash}", 30 * seeds_csam_flagged,
+                                f"csam-seed-x{seeds_csam_flagged}")
+
     # Honest deception: return the SAME shape regardless. Bad actor can't
     # tell their submission was caught — they just see normal-looking counts.
     return {"status": "ok", "accepted": accepted, "rejected": rejected,
-            "csam_flagged": csam_flagged}
+            "csam_flagged": csam_flagged,
+            "seeds_accepted": seeds_accepted, "seeds_rejected": seeds_rejected,
+            "seeds_csam_flagged": seeds_csam_flagged}
 
 
 
