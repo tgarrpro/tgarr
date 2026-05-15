@@ -62,6 +62,37 @@ async def init_db() -> None:
     log.info("postgres pool ready")
 
 
+async def _heartbeat(worker: str, action: str = "", error: str | None = None) -> None:
+    """Write worker heartbeat into worker_status table.
+    Call from inside each worker's main loop iteration.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            if error:
+                await conn.execute(
+                    "INSERT INTO worker_status "
+                    "  (worker, last_seen, last_action, iter_count, error_count, "
+                    "   last_error, last_error_at) "
+                    "VALUES ($1, NOW(), $2, 1, 1, $3, NOW()) "
+                    "ON CONFLICT (worker) DO UPDATE SET "
+                    "  last_seen=NOW(), last_action=$2, "
+                    "  iter_count=worker_status.iter_count+1, "
+                    "  error_count=worker_status.error_count+1, "
+                    "  last_error=$3, last_error_at=NOW()",
+                    worker, action[:200], error[:500])
+            else:
+                await conn.execute(
+                    "INSERT INTO worker_status "
+                    "  (worker, last_seen, last_action, iter_count) "
+                    "VALUES ($1, NOW(), $2, 1) "
+                    "ON CONFLICT (worker) DO UPDATE SET "
+                    "  last_seen=NOW(), last_action=$2, "
+                    "  iter_count=worker_status.iter_count+1",
+                    worker, action[:200])
+    except Exception:
+        pass  # never let heartbeat failures cascade
+
+
 MIN_MOVIE_BYTES = 100 * 1024 * 1024   # 100 MB — anything smaller is sample/trailer/junk
 MIN_TV_BYTES = 30 * 1024 * 1024       # 30 MB — short TV ep can be 50MB at 480p
 
@@ -849,6 +880,7 @@ async def subscription_poller() -> None:
                 continue
 
             uname = row["username"]
+            await _heartbeat("subscription_poller", f"polling @{uname}")
             log.info("[subscribe] poll @%s (backfilled=%s)", uname, row["backfilled"])
             try:
                 chat = await app.get_chat(uname)
@@ -993,11 +1025,13 @@ async def seed_validator() -> None:
                        ORDER BY added_at
                        LIMIT 1""")
             if not row:
+                await _heartbeat("seed_validator", "queue empty — sleeping 1h")
                 log.info("[seed-validator] all candidates processed — sleeping 1h")
                 await asyncio.sleep(3600)
                 continue
 
             uname = row["username"]
+            await _heartbeat("seed_validator", f"validating @{uname}")
             # Pre-check CSAM by name — never even resolve these.
             if _CSAM_RX.search(uname):
                 log.warning("[seed-validator] CSAM-pattern skipped: @%s", uname)
@@ -1346,6 +1380,7 @@ async def federation_validator() -> None:
 
     while True:
         try:
+            await _heartbeat("federation_validator", f"fetching seed batch (size={SEEDS_BATCH})")
             # ─── 1. Fetch a batch from central ──────────────────────────
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
@@ -1555,6 +1590,7 @@ async def on_demand_media_downloader() -> None:
                 continue
 
             mt = row["media_type"] or "document"
+            await _heartbeat("on_demand_media_downloader", f"streaming msg {row['id']} ({mt})")
             root = (AUDIO_ROOT if mt == "audio"
                     else VIDEO_ROOT if mt == "video"
                     else LIBRARY_ROOT)
@@ -1614,6 +1650,114 @@ async def on_demand_media_downloader() -> None:
             await asyncio.sleep(10)
 
 
+DEEP_BACKFILL_ENABLED = os.environ.get("TGARR_DEEP_BACKFILL", "true").lower() == "true"
+DEEP_BACKFILL_PAGE_SIZE = int(os.environ.get("TGARR_DEEP_BACKFILL_PAGE_SIZE", "200"))
+DEEP_BACKFILL_DELAY_SEC = int(os.environ.get("TGARR_DEEP_BACKFILL_DELAY_SEC", "10"))
+
+
+async def deep_backfill_worker() -> None:
+    """Continuously pages OLDER messages past the first 5000-cap backfill.
+
+    For each subscribed channel that's not yet deep_backfilled:
+      1. Find oldest tg_message_id we have locally (or use deep_oldest_tg_id cursor)
+      2. get_chat_history(offset_id=oldest, limit=DEEP_BACKFILL_PAGE_SIZE) →
+         returns messages OLDER than offset
+      3. Ingest each, update cursor to new oldest seen
+      4. If 0 returned → bottom reached, mark deep_backfilled=TRUE
+      5. Sleep DEEP_BACKFILL_DELAY_SEC between pages (paced for TG quota)
+
+    Honors FloodWait with exponential backoff. Designed to run for days.
+    """
+    if not DEEP_BACKFILL_ENABLED:
+        log.info("[deep-backfill] TGARR_DEEP_BACKFILL=false — disabled")
+        return
+    log.info("[deep-backfill] started: page_size=%d delay=%ds",
+             DEEP_BACKFILL_PAGE_SIZE, DEEP_BACKFILL_DELAY_SEC)
+    await asyncio.sleep(120)  # let initial backfill + subscribe settle first
+
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    SELECT c.id, c.tg_chat_id, c.username, c.title,
+                           COALESCE(c.deep_oldest_tg_id,
+                                    (SELECT min(tg_message_id) FROM messages m
+                                     WHERE m.channel_id = c.id)) AS cursor
+                    FROM channels c
+                    WHERE c.subscribed = TRUE
+                      AND COALESCE(c.deep_backfilled, FALSE) = FALSE
+                      AND c.tg_chat_id > -2000000000000  -- exclude placeholder ids
+                      AND c.last_polled_at IS NOT NULL    -- only resolved channels
+                    ORDER BY COALESCE(c.deep_last_run_at, '1970-01-01'::timestamptz) ASC
+                    LIMIT 1
+                """)
+            if not row:
+                await _heartbeat("deep_backfill_worker", "all channels deep-backfilled")
+                await asyncio.sleep(3600)  # all done, idle hourly
+                continue
+
+            uname = row["username"] or f"chat-{row['tg_chat_id']}"
+            cursor = row["cursor"]
+            await _heartbeat("deep_backfill_worker",
+                             f"paging @{uname} older-than={cursor}")
+
+            count_ingested = 0
+            oldest_seen = cursor
+            try:
+                offset_kw = {"offset_id": cursor} if cursor else {}
+                async for msg in app.get_chat_history(
+                        row["tg_chat_id"],
+                        limit=DEEP_BACKFILL_PAGE_SIZE,
+                        **offset_kw):
+                    try:
+                        await ingest_message(msg)
+                        count_ingested += 1
+                        if oldest_seen is None or msg.id < oldest_seen:
+                            oldest_seen = msg.id
+                    except Exception as e:
+                        log.warning("[deep-backfill] ingest err msg %s: %s", msg.id, e)
+            except FloodWait as fw:
+                log.warning("[deep-backfill] FloodWait %ds on @%s — backing off",
+                            fw.value, uname)
+                await _heartbeat("deep_backfill_worker",
+                                 f"FloodWait {fw.value}s on @{uname}",
+                                 error=f"FloodWait {fw.value}s")
+                await asyncio.sleep(fw.value + 5)
+                continue
+            except Exception as e:
+                log.warning("[deep-backfill] @%s page error: %s", uname, e)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET deep_last_run_at=NOW() WHERE id=$1",
+                        row["id"])
+                await asyncio.sleep(30)
+                continue
+
+            log.info("[deep-backfill] @%s page done: ingested=%d oldest=%s",
+                     uname, count_ingested, oldest_seen)
+
+            # If page returned fewer than page_size, we likely hit the bottom
+            done = count_ingested < DEEP_BACKFILL_PAGE_SIZE
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE channels
+                    SET deep_oldest_tg_id=$1,
+                        deep_last_run_at=NOW(),
+                        deep_backfilled=$2,
+                        deep_total_pulled=COALESCE(deep_total_pulled,0)+$3
+                    WHERE id=$4
+                """, oldest_seen, done, count_ingested, row["id"])
+            if done:
+                log.info("[deep-backfill] @%s BOTTOM REACHED — marked done", uname)
+                await _heartbeat("deep_backfill_worker",
+                                 f"@{uname} deep-backfill complete")
+
+            await asyncio.sleep(DEEP_BACKFILL_DELAY_SEC)
+        except Exception:
+            log.exception("[deep-backfill] outer loop")
+            await asyncio.sleep(60)
+
+
 async def main() -> None:
     await init_db()
     await wait_for_session()
@@ -1624,6 +1768,7 @@ async def main() -> None:
 
     asyncio.create_task(download_worker())
     asyncio.create_task(on_demand_media_downloader())
+    asyncio.create_task(deep_backfill_worker())
     # On-demand mode 2026-05-14: thumb_downloader stays but only processes
     # rows where /api/thumb/{id} UI hit has set thumb_path='__user_queued__'.
     asyncio.create_task(thumb_downloader())

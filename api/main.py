@@ -25,7 +25,7 @@ import login  # local module
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
-TGARR_VERSION = "0.4.50"
+TGARR_VERSION = "0.4.51"
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
@@ -139,6 +139,20 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_dc INTEGER;
+            CREATE TABLE IF NOT EXISTS worker_status (
+              worker TEXT PRIMARY KEY,
+              last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              last_action TEXT,
+              iter_count BIGINT NOT NULL DEFAULT 0,
+              error_count INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              last_error_at TIMESTAMPTZ
+            );
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_oldest_tg_id BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_total_pulled BIGINT NOT NULL DEFAULT 0;
+            CREATE INDEX IF NOT EXISTS idx_channels_deep_backfilled ON channels (deep_backfilled);
             CREATE TABLE IF NOT EXISTS stats_history (
               snapshot_at TIMESTAMPTZ NOT NULL,
               metric TEXT NOT NULL,
@@ -1877,6 +1891,7 @@ NAV_ITEMS = [
     ("/music",     "Music",     "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"),
     ("/library",   "Library",   "M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 18H6V4h7v6l2-1 2 1V4h1v16z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
+    ("/system",    "System",    "M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65A.488.488 0 0 0 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"),
     ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
     ("/settings",  "Settings",  "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94 0 .31.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"),
 ]
@@ -2025,6 +2040,161 @@ async def stats_distribution():
     return {"slices": [{"label": r["k"], "value": r["v"]} for r in rows]}
 
 
+# Expected workers — used to detect "should be running but isn't" cases
+_EXPECTED_WORKERS = {
+    "subscription_poller":        30 * 60,   # 30min poll, allow 35min stale
+    "federation_validator":       3600,      # 1h batch, allow 2h
+    "seed_validator":             3600,      # idle-after-queue-empty 1h
+    "deep_backfill_worker":       1800,      # 30min/page, allow longer between pages
+    "on_demand_media_downloader": 86400,     # only fires on user click; ok stale
+}
+
+
+def _worker_health(name: str, last_seen, expected_max: int) -> str:
+    """healthy | idle | stale | never"""
+    if not last_seen:
+        return "never"
+    import datetime as _dt
+    age = (_dt.datetime.now(last_seen.tzinfo) - last_seen).total_seconds()
+    if age < expected_max * 0.5:
+        return "healthy"
+    if age < expected_max * 2:
+        return "idle"
+    return "stale"
+
+
+@app.get("/api/workers")
+async def api_workers():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT worker, last_seen, last_action, iter_count, "
+            "error_count, last_error, last_error_at "
+            "FROM worker_status ORDER BY last_seen DESC")
+    out = []
+    seen = set()
+    for r in rows:
+        seen.add(r["worker"])
+        expected_max = _EXPECTED_WORKERS.get(r["worker"], 3600)
+        out.append({
+            "worker": r["worker"],
+            "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
+            "last_action": r["last_action"],
+            "iter_count": r["iter_count"],
+            "error_count": r["error_count"],
+            "last_error": r["last_error"],
+            "last_error_at": r["last_error_at"].isoformat() if r["last_error_at"] else None,
+            "health": _worker_health(r["worker"], r["last_seen"], expected_max),
+            "expected_max_sec": expected_max,
+        })
+    # Add expected-but-never-seen workers
+    for w, exp in _EXPECTED_WORKERS.items():
+        if w not in seen:
+            out.append({
+                "worker": w, "last_seen": None, "last_action": None,
+                "iter_count": 0, "error_count": 0,
+                "last_error": None, "last_error_at": None,
+                "health": "never", "expected_max_sec": exp,
+            })
+    stale_or_never = [w for w in out if w["health"] in ("stale", "never")]
+    return {"workers": out,
+            "all_healthy": len(stale_or_never) == 0,
+            "stale_or_never": [w["worker"] for w in stale_or_never]}
+
+
+@app.get("/api/deep-backfill-progress")
+async def api_deep_backfill_progress():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT username, title, deep_backfilled, deep_oldest_tg_id,
+                   deep_last_run_at, deep_total_pulled,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id) AS msgs_local
+            FROM channels
+            WHERE subscribed = TRUE
+            ORDER BY deep_backfilled ASC, deep_last_run_at DESC NULLS LAST
+        """)
+    return {"channels": [
+        {"username": r["username"], "title": r["title"],
+         "done": r["deep_backfilled"],
+         "oldest_id": r["deep_oldest_tg_id"],
+         "last_run_at": r["deep_last_run_at"].isoformat() if r["deep_last_run_at"] else None,
+         "pulled_deep": r["deep_total_pulled"],
+         "msgs_local": r["msgs_local"]}
+        for r in rows]}
+
+
+@app.get("/system", response_class=HTMLResponse)
+async def page_system():
+    if not login.session_exists():
+        return RedirectResponse("/login")
+    body = """
+<h2 class="section">System</h2>
+<section style="margin-bottom:28px">
+  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Workers</h3>
+  <div id="workersTable">loading...</div>
+</section>
+<section>
+  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Deep backfill progress</h3>
+  <div id="deepBackfillTable">loading...</div>
+</section>
+<script>
+function fmtAgo(iso) {
+  if (!iso) return "never";
+  const sec = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (sec < 60) return Math.floor(sec) + "s ago";
+  if (sec < 3600) return Math.floor(sec/60) + "m ago";
+  if (sec < 86400) return Math.floor(sec/3600) + "h ago";
+  return Math.floor(sec/86400) + "d ago";
+}
+function healthDot(h) {
+  const c = {healthy:"#22c55e",idle:"#eab308",stale:"#ef4444",never:"#94a3b8"}[h] || "#94a3b8";
+  return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${c};margin-right:6px"></span>`;
+}
+async function loadWorkers() {
+  const r = await fetch("/api/workers");
+  const j = await r.json();
+  const rows = (j.workers || []).map(w => `
+    <tr><td>${healthDot(w.health)}<b>${w.worker}</b></td>
+        <td>${fmtAgo(w.last_seen)}</td>
+        <td style="color:#64748b;font-size:13px">${w.last_action || "—"}</td>
+        <td style="text-align:right;color:#64748b">${w.iter_count.toLocaleString()}</td>
+        <td style="text-align:right;color:${w.error_count?"#ef4444":"#64748b"}">${w.error_count}</td>
+        <td style="color:#ef4444;font-size:12px">${w.last_error || ""}</td></tr>`);
+  document.getElementById("workersTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
+    <thead><tr style="text-align:left;color:#64748b;font-size:12px">
+    <th>Worker</th><th>Last seen</th><th>Last action</th>
+    <th style="text-align:right">Iters</th><th style="text-align:right">Errors</th>
+    <th>Last error</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+}
+async function loadDeepBackfill() {
+  const r = await fetch("/api/deep-backfill-progress");
+  const j = await r.json();
+  const rows = (j.channels || []).map(c => `
+    <tr><td>${c.done?"✅":"🔄"} <b>@${c.username || "—"}</b></td>
+        <td>${(c.title || "").substring(0, 40)}</td>
+        <td style="text-align:right">${c.msgs_local.toLocaleString()}</td>
+        <td style="text-align:right;color:#64748b">+${(c.pulled_deep || 0).toLocaleString()}</td>
+        <td style="text-align:right;color:#64748b;font-size:12px">${fmtAgo(c.last_run_at)}</td></tr>`);
+  document.getElementById("deepBackfillTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
+    <thead><tr style="text-align:left;color:#64748b;font-size:12px">
+    <th>Status</th><th>Title</th>
+    <th style="text-align:right">Msgs local</th>
+    <th style="text-align:right">Pulled deep</th>
+    <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+}
+loadWorkers(); loadDeepBackfill();
+setInterval(loadWorkers, 30000);
+setInterval(loadDeepBackfill, 60000);
+</script>
+<style>
+#workersTable table th, #workersTable table td,
+#deepBackfillTable table th, #deepBackfillTable table td {
+  padding: 8px 10px; border-bottom: 1px solid #e2e8f0;
+}
+</style>
+"""
+    return HTMLResponse(_layout("System", "/system", body))
+
+
 @app.get("/")
 async def root(accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
@@ -2069,6 +2239,28 @@ async def root(accept: Optional[str] = Header(None)):
                ORDER BY d.requested_at DESC LIMIT 10""")
 
     s = dict(stats)
+    worker_banner = """
+<div id="workerBanner" style="display:none;background:#fef3c7;border:1px solid #f59e0b;
+  border-radius:8px;padding:10px 14px;margin:0 0 16px 0;color:#92400e;font-size:13px">
+  <b>⚠ Workers need attention:</b> <span id="workerBannerList"></span>
+  <a href="/system" style="margin-left:8px;color:#92400e;text-decoration:underline">view system →</a>
+</div>
+<script>
+(async function checkWorkers() {
+  try {
+    const r = await fetch("/api/workers");
+    const j = await r.json();
+    if (!j.all_healthy && j.stale_or_never && j.stale_or_never.length) {
+      document.getElementById("workerBannerList").textContent = j.stale_or_never.join(", ");
+      document.getElementById("workerBanner").style.display = "block";
+    } else {
+      document.getElementById("workerBanner").style.display = "none";
+    }
+  } catch (e) {}
+  setTimeout(checkWorkers, 30000);
+})();
+</script>
+"""
     stats_html = "".join(
         f'<div class="stat-card"><div class="n">{v:,}</div><div class="l">{label}</div></div>'
         for v, label in [
@@ -2228,6 +2420,7 @@ async def root(accept: Optional[str] = Header(None)):
     base_url = os.environ.get("TGARR_BASE_URL") or "http://&lt;host&gt;:8765"
 
     body = f"""
+{worker_banner}
 <div class="stats">{stats_html}</div>{charts_html}
 
 <h2 class="section">Recent activity <span class="extra"><a href="/downloads">view all →</a></span></h2>
