@@ -2367,28 +2367,8 @@ async def root(accept: Optional[str] = Header(None)):
                ORDER BY d.requested_at DESC LIMIT 10""")
 
     s = dict(stats)
-    worker_banner = """
-<div id="workerBanner" style="display:none;background:#fef3c7;border:1px solid #f59e0b;
-  border-radius:8px;padding:10px 14px;margin:0 0 16px 0;color:#92400e;font-size:13px">
-  <b>⚠ Workers need attention:</b> <span id="workerBannerList"></span>
-  <a href="/system" style="margin-left:8px;color:#92400e;text-decoration:underline">view system →</a>
-</div>
-<script>
-(async function checkWorkers() {
-  try {
-    const r = await fetch("/api/workers");
-    const j = await r.json();
-    if (!j.all_healthy && j.stale_or_never && j.stale_or_never.length) {
-      document.getElementById("workerBannerList").textContent = j.stale_or_never.join(", ");
-      document.getElementById("workerBanner").style.display = "block";
-    } else {
-      document.getElementById("workerBanner").style.display = "none";
-    }
-  } catch (e) {}
-  setTimeout(checkWorkers, 30000);
-})();
-</script>
-"""
+    # Worker health surfaced on /system page only; no dashboard banner.
+    worker_banner = ""
     stats_html = "".join(
         f'<div class="stat-card"><div class="n">{v:,}</div><div class="l">{label}</div></div>'
         for v, label in [
