@@ -283,18 +283,26 @@ _CATEGORY_HINTS = [
 # Multi-signal quality gate at ingest. Rejecting low-value messages here is
 # cheaper than indexing then evicting them later.
 #
-# IMPORTANT: keep this regex in lockstep with the inlined PG pattern in
+# Two-tier regex: CORE keywords apply to every media type; PHOTO keywords
+# only apply when media_type='photo'. Photo keywords ("引流/招代理/推广/
+# qrcode/微信号") legitimately appear in Chinese marketing/business EPUBs
+# in book-archive channels and would false-positive on those if applied to
+# documents.
+#
+# IMPORTANT: keep both regexes in lockstep with the inlined PG patterns in
 # decay_eviction_worker (l.~3030). If you add a keyword here, add it there.
-_AD_KEYWORDS = re.compile(
+_AD_KEYWORDS_CORE = re.compile(
     r"(\bcrypto\b|\bnft\b|\busdt\b|赌博|赌场|博彩|casino|gamble|gambling|"
     r"投资理财|做单|赚钱|月入|代理|代充|代购|刷单|"
     r"telegram[\s_]*bot|airdrop|"
     r"加[\s_]*我[\s_]*(微信|tg|telegram|wx)|私[\s_]*聊|"
     r"limited[\s_]*offer|click[\s_]*here|join[\s_]*now[\s_]*free|"
     r"earn[\s_]*money|earn[\s_]*cash|"
-    r"vip[\s_]*会员|赚钱机会|高佣金|"
-    # Photo-promo patterns (common in caption + filename of ad images)
-    r"qrcode|qr[\s_]*code|二维码|"
+    r"vip[\s_]*会员|赚钱机会|高佣金)",
+    re.IGNORECASE)
+
+_AD_KEYWORDS_PHOTO = re.compile(
+    r"(qrcode|qr[\s_]*code|二维码|"
     r"微信号|wechat[\s_]*id|加微信|加[\s_]*wx|"
     r"contact[\s_]*us|联系我|联系方式|"
     r"招代理|招商|推广|引流|福利群)",
@@ -325,8 +333,11 @@ def _quality_check(file_name: str | None, file_size: int | None,
     Telegram photos is typically a generic `photo_NNNN.jpg`).
     """
     blob = (file_name or "") + " " + (caption or "")
-    if blob.strip() and _AD_KEYWORDS.search(blob):
-        return False, "ad-keyword"
+    if blob.strip():
+        if _AD_KEYWORDS_CORE.search(blob):
+            return False, "ad-keyword"
+        if media_type == "photo" and _AD_KEYWORDS_PHOTO.search(blob):
+            return False, "ad-keyword-photo"
     floor = _MIN_SIZES.get(media_type)
     if floor and file_size and file_size < floor:
         return False, f"micro-{media_type}"
@@ -3042,18 +3053,17 @@ async def decay_eviction_worker() -> None:
                                  f"swept {category} >{cutoff_days}d (-{deleted})")
             # Multi-signal quality sweep — orthogonal to time decay.
             #
-            # NOTE: ad regex below must stay in sync with _AD_KEYWORDS (l.~285).
-            # Both are intentionally duplicated rather than fetched from a
-            # config table — avoids a round-trip per ingest.
+            # NOTE: ad regexes below must stay in sync with _AD_KEYWORDS_CORE
+            # and _AD_KEYWORDS_PHOTO (l.~285). Duplicated rather than fetched
+            # from a config table to avoid a round-trip per ingest.
             async with db_pool.acquire() as conn:
-                # 1) Ad-keyword in file_name OR caption. Caption coverage
-                # landed in v0.4.66 (commit 71d22a7); promo photos that paste
-                # the pitch into the caption (vs the filename) now get caught.
-                r1 = await conn.execute("""
+                # 1a) Core ad keywords (crypto/gambling/scams) in file_name or
+                # caption — applied to ALL media types.
+                r1a = await conn.execute("""
                     DELETE FROM messages
                     WHERE (
                         COALESCE(file_name, '') ~* $1
-                        OR COALESCE(caption,   '') ~* $1
+                        OR COALESCE(caption, '') ~* $1
                     )
                     AND COALESCE(local_path, '') = ''
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
@@ -3061,12 +3071,25 @@ async def decay_eviction_worker() -> None:
                      r'投资理财|做单|赚钱|月入|代理|代充|代购|刷单|'
                      r'telegram[\s_]*bot|airdrop|'
                      r'limited[\s_]*offer|click[\s_]*here|join[\s_]*now[\s_]*free|'
-                     r'earn[\s_]*money|earn[\s_]*cash|vip[\s_]*会员|'
-                     r'qrcode|qr[\s_]*code|二维码|'
+                     r'earn[\s_]*money|earn[\s_]*cash|vip[\s_]*会员)')
+                # 1b) Photo-promo keywords (qrcode/微信号/招代理/引流) — PHOTO
+                # ONLY. These legitimately appear in Chinese marketing-book
+                # EPUB titles; applying them to documents false-positives.
+                r1b = await conn.execute("""
+                    DELETE FROM messages
+                    WHERE media_type = 'photo'
+                    AND (
+                        COALESCE(file_name, '') ~* $1
+                        OR COALESCE(caption, '') ~* $1
+                    )
+                    AND COALESCE(local_path, '') = ''
+                    AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                """, r'(qrcode|qr[\s_]*code|二维码|'
                      r'微信号|wechat[\s_]*id|加微信|加[\s_]*wx|'
                      r'contact[\s_]*us|联系我|联系方式|'
                      r'招代理|招商|推广|引流|福利群)')
-                ads_n = int(r1.split()[-1]) if r1.startswith("DELETE") else 0
+                ads_n = ((int(r1a.split()[-1]) if r1a.startswith("DELETE") else 0) +
+                         (int(r1b.split()[-1]) if r1b.startswith("DELETE") else 0))
 
                 # 2) Tiered photo eviction by channel members_count. The client
                 # has no gold_score (federation-only) so members_count is the
