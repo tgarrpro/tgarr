@@ -976,8 +976,11 @@ async def _notify_arr(local_path: str, row) -> None:
     try:
         kind = "movie" if (row.get("movie_year") and not row.get("episode")) else "tv"
         body = json.dumps({"path": local_path, "kind": kind}).encode()
+        # api listens on 8088 internally (host port 8765 is publish-only).
+        api_url = os.environ.get("TGARR_API_INTERNAL_URL",
+                                 "http://tgarr-api:8088")
         req = urllib.request.Request(
-            "http://tgarr-api:8765/api/internal/arr-scan",
+            f"{api_url}/api/internal/arr-scan",
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST")
