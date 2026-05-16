@@ -752,7 +752,7 @@ async def ingest_message(msg: Message) -> bool:
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
-            (caption[:1024] or None), file_size, mime_type, media_type,
+            (caption.replace("\x00", "")[:1024] or None), file_size, mime_type, media_type,
             audio_title, audio_performer, audio_duration_sec, msg.date,
             file_dc, detected_lang,
         )
