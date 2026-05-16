@@ -736,10 +736,11 @@ async def ingest_message(msg: Message) -> bool:
         keep, reason = _quality_check(file_name, file_size, media_type, caption)
         if not keep:
             return False
-        # Raw caption discarded — we already extracted mention/invite signals
-        # above into seed_candidates. Storing raw text wastes ~200B/msg with
-        # near-zero re-extract value. Use the structured fields downstream.
-        # Detect language from file_name (caption already null) for UI filters.
+        # Caption = the human-written description of the resource (title,
+        # synopsis, episode list, source, language). API detail-viewer renders
+        # it; extract_catalog_mentions parses it; search joins on it. Cap at
+        # 1024 — Telegram’s own media-caption limit.
+        # Detect language from file_name first (release names are more reliable).
         detected_lang = _detect_lang(file_name) or _detect_lang(msg.chat.title or "")
         new_msg_id = await conn.fetchval(
             """INSERT INTO messages
@@ -751,7 +752,7 @@ async def ingest_message(msg: Message) -> bool:
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
-            None, file_size, mime_type, media_type,
+            (caption[:1024] or None), file_size, mime_type, media_type,
             audio_title, audio_performer, audio_duration_sec, msg.date,
             file_dc, detected_lang,
         )
