@@ -282,6 +282,9 @@ _CATEGORY_HINTS = [
 
 # Multi-signal quality gate at ingest. Rejecting low-value messages here is
 # cheaper than indexing then evicting them later.
+#
+# IMPORTANT: keep this regex in lockstep with the inlined PG pattern in
+# decay_eviction_worker (l.~3030). If you add a keyword here, add it there.
 _AD_KEYWORDS = re.compile(
     r"(\bcrypto\b|\bnft\b|\busdt\b|赌博|赌场|博彩|casino|gamble|gambling|"
     r"投资理财|做单|赚钱|月入|代理|代充|代购|刷单|"
@@ -289,7 +292,12 @@ _AD_KEYWORDS = re.compile(
     r"加[\s_]*我[\s_]*(微信|tg|telegram|wx)|私[\s_]*聊|"
     r"limited[\s_]*offer|click[\s_]*here|join[\s_]*now[\s_]*free|"
     r"earn[\s_]*money|earn[\s_]*cash|"
-    r"vip[\s_]*会员|赚钱机会|高佣金)",
+    r"vip[\s_]*会员|赚钱机会|高佣金|"
+    # Photo-promo patterns (common in caption + filename of ad images)
+    r"qrcode|qr[\s_]*code|二维码|"
+    r"微信号|wechat[\s_]*id|加微信|加[\s_]*wx|"
+    r"contact[\s_]*us|联系我|联系方式|"
+    r"招代理|招商|推广|引流|福利群)",
     re.IGNORECASE)
 
 _MIN_SIZES = {
@@ -299,7 +307,10 @@ _MIN_SIZES = {
     'video':    5_000_000,
     'audio':    100_000,      # < 100KB audio → voice note / clip
     'document': 10_000,       # < 10KB document → just text junk
-    'photo':    5_000,        # < 5KB photo → ad logo / thumb only
+    # 10KB photo baseline = JPEG below this is icon/logo/QR code. Per-channel
+    # tier (members_count) bumps this floor higher in the eviction sweep:
+    # tiny<500 → 50KB, small<5k → 30KB, mid+ → 10KB (this baseline).
+    'photo':    10_000,
 }
 
 
@@ -308,8 +319,10 @@ def _quality_check(file_name: str | None, file_size: int | None,
     """Multi-signal quality gate. Returns (keep?, reject_reason_if_drop).
 
     Composite scoring: any single hard signal → reject. Cheap O(1) checks only.
-    Captions are mostly NULL by now (we extract+discard at ingest), so file_name
-    + size do most of the work.
+    file_name + caption are scanned with the same regex — captions land
+    populated since v0.4.66 (commit 71d22a7), so this gate now catches
+    promo-text on photo posts that previously slipped through (file_name on
+    Telegram photos is typically a generic `photo_NNNN.jpg`).
     """
     blob = (file_name or "") + " " + (caption or "")
     if blob.strip() and _AD_KEYWORDS.search(blob):
@@ -3027,42 +3040,78 @@ async def decay_eviction_worker() -> None:
                              category, cutoff_days, deleted)
                 await _heartbeat("decay_eviction_worker",
                                  f"swept {category} >{cutoff_days}d (-{deleted})")
-            # Multi-signal quality sweep — orthogonal to time decay
+            # Multi-signal quality sweep — orthogonal to time decay.
+            #
+            # NOTE: ad regex below must stay in sync with _AD_KEYWORDS (l.~285).
+            # Both are intentionally duplicated rather than fetched from a
+            # config table — avoids a round-trip per ingest.
             async with db_pool.acquire() as conn:
-                # 1) Ad-keyword file_names
+                # 1) Ad-keyword in file_name OR caption. Caption coverage
+                # landed in v0.4.66 (commit 71d22a7); promo photos that paste
+                # the pitch into the caption (vs the filename) now get caught.
                 r1 = await conn.execute("""
                     DELETE FROM messages
-                    WHERE file_name ~* $1
-                      AND COALESCE(local_path, '') = ''
-                      AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                    WHERE (
+                        COALESCE(file_name, '') ~* $1
+                        OR COALESCE(caption,   '') ~* $1
+                    )
+                    AND COALESCE(local_path, '') = ''
+                    AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """, r'(\bcrypto\b|\bnft\b|\busdt\b|赌博|博彩|casino|gamble|gambling|'
                      r'投资理财|做单|赚钱|月入|代理|代充|代购|刷单|'
                      r'telegram[\s_]*bot|airdrop|'
                      r'limited[\s_]*offer|click[\s_]*here|join[\s_]*now[\s_]*free|'
-                     r'earn[\s_]*money|earn[\s_]*cash|vip[\s_]*会员)')
+                     r'earn[\s_]*money|earn[\s_]*cash|vip[\s_]*会员|'
+                     r'qrcode|qr[\s_]*code|二维码|'
+                     r'微信号|wechat[\s_]*id|加微信|加[\s_]*wx|'
+                     r'contact[\s_]*us|联系我|联系方式|'
+                     r'招代理|招商|推广|引流|福利群)')
                 ads_n = int(r1.split()[-1]) if r1.startswith("DELETE") else 0
-                # 2) Micro-media: < 5MB video ≈ < 3min (ad/clip/news),
-                # < 100KB audio / < 10KB doc / < 5KB photo = junk
-                r2 = await conn.execute("""
+
+                # 2) Tiered photo eviction by channel members_count. The client
+                # has no gold_score (federation-only) so members_count is the
+                # best quality proxy. Tighter for low-trust channels.
+                r2a = await conn.execute("""
+                    DELETE FROM messages m
+                    USING channels c
+                    WHERE m.channel_id = c.id
+                      AND m.media_type = 'photo'
+                      AND (
+                        -- tiny (no members or <500): 50KB floor
+                        (COALESCE(c.members_count, 0) < 500   AND m.file_size < 50000) OR
+                        -- small (500-5k): 30KB
+                        (c.members_count BETWEEN 500 AND 4999 AND m.file_size < 30000) OR
+                        -- mid/large (>=5k): 10KB (baseline, matches ingest gate)
+                        (COALESCE(c.members_count, 0) >= 5000 AND m.file_size < 10000)
+                      )
+                      AND COALESCE(m.local_path, '') = ''
+                      AND m.id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                """)
+                photo_n = int(r2a.split()[-1]) if r2a.startswith("DELETE") else 0
+
+                # 2b) Non-photo micro-media — unchanged thresholds.
+                r2b = await conn.execute("""
                     DELETE FROM messages
                     WHERE (
                       (media_type='video'    AND file_size < 5000000) OR
                       (media_type='audio'    AND file_size < 100000)  OR
-                      (media_type='document' AND file_size < 10000)   OR
-                      (media_type='photo'    AND file_size < 5000)
+                      (media_type='document' AND file_size < 10000)
                     )
                     AND COALESCE(local_path, '') = ''
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
-                micro_n = int(r2.split()[-1]) if r2.startswith("DELETE") else 0
-                # 3) Cross-channel hash spam — same thumb_md5 in 20+ channels
+                micro_n = (int(r2b.split()[-1]) if r2b.startswith("DELETE") else 0) + photo_n
+
+                # 3) Cross-channel hash spam — tightened 20 → 10. Same thumb
+                # in 10+ channels = forwarded promo bundle (sticker drops,
+                # coordinated drops), not legitimate organic reach.
                 r3 = await conn.execute("""
                     DELETE FROM messages
                     WHERE thumb_md5 IN (
                         SELECT thumb_md5 FROM messages
                         WHERE thumb_md5 IS NOT NULL
                         GROUP BY thumb_md5
-                        HAVING count(DISTINCT channel_id) > 20
+                        HAVING count(DISTINCT channel_id) > 10
                     )
                     AND COALESCE(local_path, '') = ''
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
