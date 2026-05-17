@@ -653,14 +653,35 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
     return rname
 
 
-async def ingest_message(msg: Message) -> bool:
-    """Persist one message + maybe create release. Returns True if new row."""
+async def ingest_message(msg: Message, live: bool = False) -> bool:
+    """Persist one message + maybe create release. Returns True if new row.
+
+    `live=True` means the message came via on_message handler — TG only
+    delivers updates for chats the account is a member of, so we can mark
+    the channel as is_joined=TRUE.
+
+    `live=False` (default) is for backfill/poll-history paths. Those can
+    target channels the account has never joined (e.g. public-channel
+    subscriptions via @username). Gated: only proceed if chat is already
+    in the channels table as is_joined=TRUE OR subscribed=TRUE — never
+    let a non-joined non-subscribed channel pollute the local DB.
+    """
     chat_type = msg.chat.type.name
     if chat_type in ("PRIVATE", "BOT"):
         return False
 
     chat_id = msg.chat.id
     msg_id = msg.id
+
+    if not live:
+        async with db_pool.acquire() as conn:
+            allowed = await conn.fetchval(
+                """SELECT 1 FROM channels
+                   WHERE tg_chat_id=$1
+                     AND (is_joined=TRUE OR subscribed=TRUE)""",
+                chat_id)
+        if not allowed:
+            return False
 
     file_name = None
     file_size = None
@@ -706,19 +727,26 @@ async def ingest_message(msg: Message) -> bool:
         # sometimes returns msg.chat.username='' for forwarded/edited messages
         # even though the channel HAS a real public @username. Preserve the
         # known good value.
+        # is_joined=TRUE only when message arrived via live update (on_message)
+        # — TG only delivers those for chats the account is a member of.
+        # Non-live (backfill/poll) inserts come for already-known rows so the
+        # existing is_joined value is preserved by the COALESCE pattern.
         ch_id = await conn.fetchval(
-            """INSERT INTO channels (tg_chat_id, username, title, category, account_user_id)
-               VALUES ($1, $2, $3, $4, $5)
+            """INSERT INTO channels (tg_chat_id, username, title, category,
+                                     account_user_id, is_joined)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (tg_chat_id) DO UPDATE
                  SET username = COALESCE(NULLIF(EXCLUDED.username, ''), channels.username),
                      title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title),
-                     account_user_id = EXCLUDED.account_user_id
+                     account_user_id = EXCLUDED.account_user_id,
+                     is_joined = channels.is_joined OR EXCLUDED.is_joined
                RETURNING id""",
             chat_id,
             msg.chat.username,
             msg.chat.title or "",
             chat_type.lower(),
             CURRENT_USER_ID or None,
+            live,
         )
         # === Caption-mention extraction (always; contribute gated separately) ===
         # Even text-only messages can contain @mention / invite links — those
@@ -808,7 +836,7 @@ async def ingest_message(msg: Message) -> bool:
 
 @app.on_message()
 async def on_new_message(client: Client, msg: Message) -> None:
-    inserted = await ingest_message(msg)
+    inserted = await ingest_message(msg, live=True)
     if inserted and msg.chat.type.name != "PRIVATE":
         media = msg.video or msg.document or msg.audio or msg.photo
         file_info = (getattr(media, "file_name", "") or "") if media else ""
@@ -1468,6 +1496,16 @@ async def new_dialog_watcher() -> None:
             for chat_id, title in new_dialogs:
                 log.info("[new-dialog] discovered chat_id=%s title=%s",
                          chat_id, title)
+                # Mark joined immediately — get_dialogs returned it as a real
+                # dialog, so the account is a member.
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO channels (tg_chat_id, title, is_joined)
+                           VALUES ($1, $2, TRUE)
+                           ON CONFLICT (tg_chat_id) DO UPDATE
+                             SET is_joined = TRUE,
+                                 title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title)""",
+                        chat_id, title)
                 try:
                     await backfill_channel(chat_id, title)
                 except Exception as e:
@@ -1736,23 +1774,55 @@ async def _thumb_process_one(row) -> None:
 _PREVIEW_SEM = asyncio.Semaphore(5)  # concurrent HTTPS fetches
 
 
+async def _fetch_preview_mtproto(chat_id: int, msg_id: int) -> bytes | None:
+    """MTProto fallback for private-channel previews (NULL username can't
+    use t.me HTTPS scrape). Fetches the message, then downloads the photo
+    in-memory. download_media quota is generous (60/min) — safe for gallery
+    interaction rates.
+    """
+    try:
+        msg = await _mtproto("get_messages",
+            lambda: app.get_messages(chat_id, msg_id))
+    except Exception as e:
+        log.debug("[preview] mtproto get_messages chat=%s msg=%s: %s",
+                  chat_id, msg_id, e)
+        return None
+    if not msg or not msg.photo:
+        return None
+    try:
+        buf = await _mtproto("download_media",
+            lambda: app.download_media(msg.photo, in_memory=True))
+    except Exception as e:
+        log.debug("[preview] mtproto download chat=%s msg=%s: %s",
+                  chat_id, msg_id, e)
+        return None
+    if buf is None:
+        return None
+    data = buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
+    return data if data else None
+
+
 async def _preview_process_one(row):
-    if not row["channel_username"]:
+    blob = None
+    # HTTPS path (cheap, no MTProto quota) — only when public channel
+    if row["channel_username"]:
+        try:
+            async with _PREVIEW_SEM:
+                blob = await _fetch_preview_https(
+                    row["channel_username"], row["tg_message_id"])
+        except Exception as e:
+            log.debug("[preview] https err id=%s: %s", row["id"], e)
+    # MTProto fallback for private channels OR when HTTPS scrape missed
+    if not blob:
+        blob = await _fetch_preview_mtproto(
+            row["tg_chat_id"], row["tg_message_id"])
+    if not blob:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
                 row["id"])
         return
     try:
-        async with _PREVIEW_SEM:
-            blob = await _fetch_preview_https(
-                row["channel_username"], row["tg_message_id"])
-        if not blob:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
-                    row["id"])
-            return
         safe_uid = SAFE_NAME.sub(
             "_", row["file_unique_id"] or str(row["id"]))[:80]
         fname = f"{safe_uid}.jpg"
@@ -1764,7 +1834,7 @@ async def _preview_process_one(row):
                 "UPDATE messages SET preview_path=$1 WHERE id=$2",
                 fname, row["id"])
     except Exception as e:
-        log.warning("[preview] failed id=%s: %s", row["id"], e)
+        log.warning("[preview] write failed id=%s: %s", row["id"], e)
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
@@ -1783,7 +1853,8 @@ async def preview_downloader() -> None:
         try:
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch(
-                    """SELECT m.id, m.tg_message_id, m.file_unique_id,
+                    """SELECT m.id, m.tg_chat_id, m.tg_message_id,
+                              m.file_unique_id,
                               c.username AS channel_username
                        FROM messages m JOIN channels c ON c.id = m.channel_id
                        WHERE m.preview_path = '__user_queued__'
@@ -2130,24 +2201,56 @@ async def subscription_poller() -> None:
             await _heartbeat("subscription_poller", f"polling @{uname}")
             log.info("[subscribe] poll @%s (backfilled=%s)", uname, row["backfilled"])
             try:
-                # resolveUsername is the most flood-prone TG call — _mtproto
-                # rate-limits to 5/min globally + observes global halt.
-                chat = await _mtproto("resolveUsername",
-                    lambda: app.get_chat(uname))
+                # If we have a real chat_id (not placeholder), look up by int —
+                # get_chat(int) uses cached access_hash and does NOT burn the
+                # resolveUsername quota (uses get_chat budget instead).
+                # Placeholder rows (tg_chat_id <= -2e12) still need username
+                # resolve. Avoids 20 subscribed × 48 polls/day = 960 wasted
+                # resolveUsername/day that triggered 9h FloodWait on 2026-05-16.
+                if row["tg_chat_id"] > -2000000000000:
+                    chat = await _mtproto("get_chat",
+                        lambda: app.get_chat(row["tg_chat_id"]))
+                else:
+                    chat = await _mtproto("resolveUsername",
+                        lambda: app.get_chat(uname))
                 real_chat_id = chat.id
                 title = chat.title or uname
                 members = getattr(chat, "members_count", None)
             except FloodWait as fw:
-                log.warning("[subscribe] flood-wait %ds on @%s", fw.value, uname)
+                # Transient — back off, leave subscribed intact, retry next cycle.
+                log.warning("[subscribe] flood-wait %ds on @%s — transient",
+                            fw.value, uname)
                 await asyncio.sleep(min(fw.value + 2, 600))
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels SET subscribe_error=$1,
+                           last_polled_at=NOW() WHERE id=$2""",
+                        f"FloodWait {fw.value}s", row["id"])
                 continue
-            except Exception as e:
-                log.warning("[subscribe] resolve fail @%s: %s", uname, e)
+            except (UsernameNotOccupied, UsernameInvalid, ChannelPrivate) as e:
+                # Permanent — channel gone / username dead / account banned.
+                # Safe to disable.
+                log.warning("[subscribe] disable @%s — permanent: %s",
+                            uname, type(e).__name__)
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE channels SET subscribed=FALSE,
                            subscribe_error=$1, last_polled_at=NOW()
-                           WHERE id=$2""", str(e)[:200], row["id"])
+                           WHERE id=$2""", type(e).__name__, row["id"])
+                continue
+            except Exception as e:
+                # Transient — PeerIdInvalid (Pyrogram session cache miss, may
+                # recover after dialog rebuild), ChannelInvalid (stale access
+                # hash), network errors, internal TG. Keep subscribed=TRUE so
+                # the next poll cycle retries naturally. Bump last_polled_at
+                # to move on this round.
+                log.warning("[subscribe] transient err @%s: %s — keep subscribed",
+                            uname, str(e)[:120])
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels SET subscribe_error=$1,
+                           last_polled_at=NOW() WHERE id=$2""",
+                        f"{type(e).__name__}: {str(e)[:160]}", row["id"])
                 continue
 
             # If we resolved a real chat_id different from placeholder, replace it
@@ -2590,7 +2693,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.52",
+                "tgarr_version": "0.4.69",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -2770,7 +2873,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.34",
+                        "tgarr_version": "0.4.69",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3385,7 +3488,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.62",
+                "tgarr_version": "0.4.69",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],

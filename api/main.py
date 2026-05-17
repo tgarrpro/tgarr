@@ -288,6 +288,7 @@ async def _migrate_schema():
             -- to this channel. Crawler workers filter by current account so an
             -- account switch doesn't try to access channels it can't reach.
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS account_user_id BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS is_joined BOOLEAN NOT NULL DEFAULT FALSE;
             CREATE INDEX IF NOT EXISTS idx_channels_account ON channels (account_user_id);
             -- One-shot backfill: existing rows discovered before per-account
             -- tracking get assigned to @tjin09 (id=7506176065). Idempotent —
@@ -684,6 +685,11 @@ async def lazy_preview(msg_id: int):
         if os.path.exists(fpath):
             return FileResponse(fpath, media_type="image/jpeg",
                               headers={"Cache-Control": "public, max-age=604800"})
+    if pp == "__failed__":
+        # Permanent failure — never going to materialize. Tell client to stop
+        # retrying so slideshow can advance without waiting.
+        return Response(_TINY_TRANSPARENT_GIF, status_code=410,
+                       media_type="image/gif")
     # Queue preview fetch (worker picks up __user_queued__)
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -703,14 +709,12 @@ async def lazy_preview(msg_id: int):
                 return FileResponse(fpath, media_type="image/jpeg",
                                   headers={"Cache-Control": "public, max-age=604800"})
         if pp == "__failed__":
-            break
-    # Fall back to thumb if preview unavailable
-    tp = row.get("thumb_path") if hasattr(row, "get") else (row["thumb_path"] if "thumb_path" in (row.keys() if row else []) else None)
-    if tp and not tp.startswith("__"):
-        fpath = os.path.join(THUMBS_DIR, tp)
-        if os.path.exists(fpath):
-            return FileResponse(fpath, media_type="image/jpeg",
-                              headers={"Cache-Control": "public, max-age=604800"})
+            return Response(_TINY_TRANSPARENT_GIF, status_code=410,
+                           media_type="image/gif")
+    # Preview not ready — return 202 with 1x1 GIF so the JS probe sees
+    # naturalWidth==1 and keeps retrying. Lightbox is already showing the
+    # thumb (img.src=p.src in show()); duplicating it here would make the
+    # probe think the preview arrived and stop retrying.
     return Response(_TINY_TRANSPARENT_GIF, status_code=202,
                    media_type="image/gif")
 
@@ -2153,15 +2157,15 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 /* ── Lightbox + slideshow ─────────────────── */
 .lightbox { position:fixed; inset:0; background:rgba(15,23,42,0.96); display:none; align-items:center; justify-content:center; z-index:9999; padding:20px; overflow:hidden; }
 .lightbox.open { display:flex; }
-.lightbox img { width:96vw; height:90vh; object-fit:contain; border-radius:6px; box-shadow:0 16px 50px rgba(0,0,0,0.5); will-change:transform,opacity,filter; image-rendering:auto; }
+.lightbox img { z-index:1; width:96vw; height:90vh; object-fit:contain; border-radius:6px; box-shadow:0 16px 50px rgba(0,0,0,0.5); will-change:transform,opacity,filter; image-rendering:auto; }
 .lightbox .lb-meta { position:absolute; left:32px; right:32px; bottom:80px; color:#fff; font-size:15px; line-height:1.55; max-width:660px; pointer-events:none; transition:opacity 0.3s; }
 .lightbox .lb-meta .ch { color:var(--accent-hi); font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
-.lightbox .lb-close { position:absolute; top:18px; right:24px; color:#fff; font-size:36px; cursor:pointer; opacity:0.6; line-height:1; padding:6px 12px; background:none; border:none; }
+.lightbox .lb-close { z-index:10; position:absolute; top:18px; right:24px; color:#fff; font-size:36px; cursor:pointer; opacity:0.6; line-height:1; padding:6px 12px; background:none; border:none; }
 .lightbox .lb-close:hover { opacity:1; }
-.lightbox .lb-prev, .lightbox .lb-next { position:absolute; top:50%; transform:translateY(-50%); width:56px; height:56px; border-radius:50%; background:rgba(255,255,255,0.10); color:#fff; border:none; font-size:32px; cursor:pointer; display:flex; align-items:center; justify-content:center; padding-bottom:4px; backdrop-filter:blur(6px); transition:background 0.2s, transform 0.2s; opacity:0.7; }
+.lightbox .lb-prev, .lightbox .lb-next { z-index:10; position:absolute; top:50%; transform:translateY(-50%); width:56px; height:56px; border-radius:50%; background:rgba(255,255,255,0.10); color:#fff; border:none; font-size:32px; cursor:pointer; display:flex; align-items:center; justify-content:center; padding-bottom:4px; backdrop-filter:blur(6px); transition:background 0.2s, transform 0.2s; opacity:0.7; }
 .lightbox .lb-prev { left:24px; } .lightbox .lb-next { right:24px; }
 .lightbox .lb-prev:hover, .lightbox .lb-next:hover { opacity:1; background:rgba(255,255,255,0.20); }
-.lightbox .lb-controls { position:absolute; bottom:24px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:14px; padding:8px 16px; background:rgba(255,255,255,0.08); border-radius:24px; backdrop-filter:blur(8px); }
+.lightbox .lb-controls { z-index:10; position:absolute; bottom:24px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:14px; padding:8px 16px; background:rgba(255,255,255,0.08); border-radius:24px; backdrop-filter:blur(8px); }
 .lightbox .lb-controls button { background:none; border:none; color:#fff; font-size:20px; cursor:pointer; padding:4px 10px; line-height:1; opacity:0.85; }
 .lightbox .lb-controls button:hover { opacity:1; }
 .lightbox .lb-count { color:#fff; font-size:13px; font-variant-numeric:tabular-nums; opacity:0.85; min-width:60px; text-align:center; }
@@ -3560,23 +3564,49 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '    FX.forEach(c => img.classList.remove(c));'
         '    void img.offsetHeight;'
         '    img.src = p.src;'  # instant 12KB thumb
-        '    /* async upgrade to 450px+ preview; retry with backoff while server queues */'
+        '    /* Gate advance on preview load. Timer starts when full-size paints, '
+        '       not when thumb does. Prevents slide from changing while user still '
+        '       sees the blurry thumb. */'
         '    const previewBase = "/api/photo-preview/" + p.id;'
         '    const myIdx = idx;'
         '    let tries = 0;'
+        '    const startedAt = Date.now();'
+        '    const MAX_PREVIEW_WAIT = 30000;'
+        '    let advanceArmed = false;'
+        '    const armAdvance = (sharp) => {'
+        '      if (cur !== myIdx || advanceArmed) return;'
+        '      advanceArmed = true;'
+        '      if (playing) {'
+        '        clearTimeout(timer);'
+        '        timer = setTimeout(() => show(cur+1), DELAY);'
+        '        prog.style.transition = "none"; prog.style.width = "0";'
+        '        void prog.offsetHeight;'
+        '        prog.style.transition = "width " + DELAY + "ms linear";'
+        '        prog.style.width = "100%";'
+        '      }'
+        '      if (sharp) {'
+        '        const next = photos[((myIdx+1) % photos.length)];'
+        '        if (next) { const pf = new Image(); pf.src = "/api/photo-preview/" + next.id; }'
+        '      }'
+        '    };'
         '    const tryUpgrade = () => {'
         '      if (cur !== myIdx) return;'
+        '      if (Date.now() - startedAt > MAX_PREVIEW_WAIT) { armAdvance(false); return; }'
         '      const u = new Image();'
         '      u.onload = () => {'
         '        if (cur !== myIdx) return;'
         '        if (u.naturalWidth > 1) {'
-        '          img.src = previewBase + "?v=" + Date.now();'
-        '        } else if (tries < 6) {'
+        '          img.src = u.src;'
+        '          armAdvance(true);'
+        '        } else if (tries < 8) {'
         '          tries++;'
         '          setTimeout(tryUpgrade, 1500 + tries * 1000);'
+        '        } else {'
+        '          armAdvance(false);'
         '        }'
         '      };'
-        '      u.src = previewBase + "?r=" + Date.now();'
+        '      u.onerror = () => { if (cur === myIdx) armAdvance(false); };'
+        '      u.src = previewBase;'
         '    };'
         '    tryUpgrade();'
         '    let fx; do { fx = Math.floor(Math.random() * FX.length); } while (fx === lastFx && FX.length > 1);'
@@ -3585,14 +3615,13 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '    chEl.textContent = p.ch || "";'
         '    capEl.textContent = p.cap || "";'
         '    counter.textContent = (idx+1) + " / " + photos.length;'
-        '    updateProg();'
         '  }'
         '  function updateProg() {'
+        '    /* Progress bar is now driven by armAdvance() in show(). */'
         '    prog.style.transition = "none"; prog.style.width = "0";'
-        '    if (playing) { void prog.offsetHeight; prog.style.transition = "width " + DELAY + "ms linear"; prog.style.width = "100%"; }'
         '  }'
-        '  function play() { playing = true; playBtn.textContent = "⏸"; clearInterval(timer); timer = setInterval(() => show(cur+1), DELAY); updateProg(); }'
-        '  function pause() { playing = false; playBtn.textContent = "▶"; clearInterval(timer); prog.style.transition = "none"; prog.style.width = "0"; }'
+        '  function play() { playing = true; playBtn.textContent = "⏸"; clearTimeout(timer); show(cur); }'
+        '  function pause() { playing = false; playBtn.textContent = "▶"; clearTimeout(timer); prog.style.transition = "none"; prog.style.width = "0"; }'
         '  async function del() {'
         '    const p = photos[cur];'
         '    if (!confirm("Delete this photo? Will not be redownloaded.")) return;'
