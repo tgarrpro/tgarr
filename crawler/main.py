@@ -2201,17 +2201,31 @@ async def subscription_poller() -> None:
             await _heartbeat("subscription_poller", f"polling @{uname}")
             log.info("[subscribe] poll @%s (backfilled=%s)", uname, row["backfilled"])
             try:
-                # If we have a real chat_id (not placeholder), look up by int —
-                # get_chat(int) uses cached access_hash and does NOT burn the
-                # resolveUsername quota (uses get_chat budget instead).
-                # Placeholder rows (tg_chat_id <= -2e12) still need username
-                # resolve. Avoids 20 subscribed × 48 polls/day = 960 wasted
-                # resolveUsername/day that triggered 9h FloodWait on 2026-05-16.
-                if row["tg_chat_id"] > -2000000000000:
+                # Discriminator: title pattern '@<uname> (resolving…)' means
+                # row has placeholder chat_id from /api/channel/subscribe
+                # (the int-range trick is broken — placeholder range overlaps
+                # real TG channel ids in [-3e12, -1e12]).
+                is_placeholder = (row["title"] or "").startswith("@") and "(resolving" in (row["title"] or "")
+                try:
+                    if not is_placeholder:
+                        chat = await _mtproto("get_chat",
+                            lambda: app.get_chat(row["tg_chat_id"]))
+                    else:
+                        chat = await _mtproto("get_chat",
+                            lambda: app.get_chat(uname))
+                except (ChannelInvalid, ValueError) as e:
+                    # Stale Pyrogram peer cache (access_hash bad or missing).
+                    # Force fresh resolveUsername via raw API + repopulate peer
+                    # storage, then retry. One-time cost; cache stays fresh
+                    # for subsequent polls.
+                    if isinstance(e, ValueError) and "Peer id invalid" not in str(e):
+                        raise
+                    log.info("[subscribe] @%s stale peer cache → force-resolve", uname)
+                    from pyrogram.raw.functions.contacts import ResolveUsername
+                    r = await _mtproto("resolveUsername",
+                        lambda: app.invoke(ResolveUsername(username=uname.lstrip("@"))))
+                    await app.fetch_peers(r.chats + r.users)
                     chat = await _mtproto("get_chat",
-                        lambda: app.get_chat(row["tg_chat_id"]))
-                else:
-                    chat = await _mtproto("resolveUsername",
                         lambda: app.get_chat(uname))
                 real_chat_id = chat.id
                 title = chat.title or uname
@@ -2693,7 +2707,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.69",
+                "tgarr_version": "0.4.70",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -2873,7 +2887,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.69",
+                        "tgarr_version": "0.4.70",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3488,7 +3502,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.69",
+                "tgarr_version": "0.4.70",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
