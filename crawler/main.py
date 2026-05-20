@@ -85,13 +85,76 @@ _REVOKED_AUTH_ERRORS = (
 _REVOKED_FIRED = False
 
 
-def _mark_revoked(reason: str) -> None:
-    """Write .revoked marker and self-exit. Idempotent — first call wins.
-    Entrypoint will refuse restart until QR re-login clears the marker."""
+async def wipe_private_channel_data() -> dict:
+    """Drop all channels with no public username (= private/invite-only) and
+    everything that depends on them — messages, releases, downloads, and the
+    auto_grab_log/Meili docs that follow. Returns counts for logging.
+
+    Rationale: private channels are reachable only via MTProto from the
+    account that joined them. Once that account is logged out / revoked,
+    the local rows are dead pointers (no client can fetch them). Central
+    federation already has the resources, so on next login the client can
+    pull a fresh snapshot.
+
+    Public channels (username IS NOT NULL) are kept — any new account can
+    re-join and re-index them, and the cached browse data stays useful in
+    read-only mode while logged out.
+    """
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            target_ids = [r["id"] for r in await conn.fetch(
+                "SELECT id FROM channels WHERE username IS NULL")]
+            if not target_ids:
+                return {"channels": 0, "messages": 0, "releases": 0}
+            msg_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE channel_id = ANY($1::int[])",
+                target_ids)
+            rel_target_q = """
+                SELECT r.id FROM releases r
+                JOIN messages m ON m.id = r.primary_msg_id
+                WHERE m.channel_id = ANY($1::int[])"""
+            # Order matters — bottom-up so FK constraints don't fire:
+            # downloads → releases → monitored_movies-nullify → releases →
+            # (channels cascade messages, auto_grab_log cascades from releases).
+            await conn.execute(
+                f"DELETE FROM downloads WHERE release_id IN ({rel_target_q})",
+                target_ids)
+            await conn.execute(
+                f"UPDATE monitored_movies SET grabbed_release_id = NULL "
+                f"WHERE grabbed_release_id IN ({rel_target_q})",
+                target_ids)
+            rel_count = int((await conn.execute(
+                f"""DELETE FROM releases WHERE primary_msg_id IN (
+                       SELECT id FROM messages
+                       WHERE channel_id = ANY($1::int[]))""",
+                target_ids)).split()[-1])
+            await conn.execute(
+                "DELETE FROM channels WHERE id = ANY($1::int[])", target_ids)
+    log.warning("[wipe-private] removed %d channels + %d messages + %d releases",
+                len(target_ids), msg_count, rel_count)
+    # Meili will reconcile on next sync pass — its docs reference the now-gone
+    # message/release ids, those become stale until meili_sync_worker prunes.
+    return {"channels": len(target_ids), "messages": msg_count,
+            "releases": rel_count}
+
+
+async def _mark_revoked(reason: str) -> None:
+    """Write .revoked marker, wipe private-channel rows (dead pointers without
+    the account), and self-exit. Idempotent — first call wins. Entrypoint
+    will refuse restart until QR re-login clears the marker."""
     global _REVOKED_FIRED
     if _REVOKED_FIRED:
         return
     _REVOKED_FIRED = True
+    # Wipe BEFORE marker write — if wipe fails, marker still gets set so the
+    # safety property (no MTProto with dead session) is preserved. If wipe
+    # succeeds, dashboard drops to public-only view on next render.
+    try:
+        if db_pool is not None:
+            counts = await wipe_private_channel_data()
+            log.warning("[revoked] wiped private slice: %s", counts)
+    except Exception as e:
+        log.exception("[revoked] wipe failed (continuing): %s", e)
     try:
         with open(REVOKED_MARKER, "w") as f:
             f.write(f"{int(time.time())} {reason}\n")
@@ -184,7 +247,7 @@ async def _mtproto(method_name: str, coro_factory):
         # Account revoked / session killed / user deactivated. Terminal — no
         # retry can recover. Write marker + exit so docker doesn't loop us
         # back into the same dead state. UI prompts re-login via /login.
-        _mark_revoked(type(e).__name__)
+        await _mark_revoked(type(e).__name__)
         raise
     except FloodWait as fw:
         fw_val = int(getattr(fw, "value", 60) or 60)
@@ -3696,7 +3759,7 @@ async def main() -> None:
         app.add_handler(RawUpdateHandler(on_raw_update))
         me = await app.get_me()
     except _REVOKED_AUTH_ERRORS as e:
-        _mark_revoked(type(e).__name__)
+        await _mark_revoked(type(e).__name__)
         return  # unreachable — _mark_revoked calls os._exit
     CURRENT_USER_ID = me.id
     try:

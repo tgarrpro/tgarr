@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.71"
+TGARR_VERSION = "0.4.72"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -1842,9 +1842,56 @@ async def api_login_sms_verify(code: str = Form(...), password: Optional[str] = 
     return await login.sms_verify(code, password)
 
 
+async def wipe_private_channel_data() -> dict:
+    """Drop all channels with no public username (= private/invite-only) and
+    their cascade. Mirrors crawler/main.py:wipe_private_channel_data — see
+    that docstring for rationale. Called on user-explicit logout to leave the
+    dashboard in clean public-only state."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            target_ids = [r["id"] for r in await conn.fetch(
+                "SELECT id FROM channels WHERE username IS NULL")]
+            if not target_ids:
+                return {"channels": 0, "messages": 0, "releases": 0}
+            msg_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE channel_id = ANY($1::int[])",
+                target_ids)
+            rel_target_q = """
+                SELECT r.id FROM releases r
+                JOIN messages m ON m.id = r.primary_msg_id
+                WHERE m.channel_id = ANY($1::int[])"""
+            await conn.execute(
+                f"DELETE FROM downloads WHERE release_id IN ({rel_target_q})",
+                target_ids)
+            await conn.execute(
+                f"UPDATE monitored_movies SET grabbed_release_id = NULL "
+                f"WHERE grabbed_release_id IN ({rel_target_q})",
+                target_ids)
+            rel_count = int((await conn.execute(
+                f"""DELETE FROM releases WHERE primary_msg_id IN (
+                       SELECT id FROM messages
+                       WHERE channel_id = ANY($1::int[]))""",
+                target_ids)).split()[-1])
+            await conn.execute(
+                "DELETE FROM channels WHERE id = ANY($1::int[])", target_ids)
+    logging.getLogger("tgarr").warning(
+        "[wipe-private] removed %d channels + %d messages + %d releases",
+        len(target_ids), msg_count, rel_count)
+    return {"channels": len(target_ids), "messages": msg_count,
+            "releases": rel_count}
+
+
 @app.post("/api/login/logout")
 async def api_login_logout():
-    return login.logout()
+    # Wipe BEFORE clearing the session — private channels are dead pointers
+    # without their owner account; central federation has the resources for
+    # next login to re-hydrate. Public slice stays for read-only browse.
+    try:
+        wipe = await wipe_private_channel_data()
+    except Exception as e:
+        logging.getLogger("tgarr").exception("[logout] wipe failed: %s", e)
+        wipe = {"error": str(e)}
+    return {**login.logout(), "wiped": wipe}
 
 
 @app.post("/api/photo/{msg_id}/delete")
@@ -1985,6 +2032,12 @@ async def api_grab(guid: str):
     """User clicks Grab in tgarr UI → queue download directly. Avoids the
     Newznab `t=get` path that returns an .nzb file (only useful to Sonarr).
     """
+    # Grab fetches via MTProto in the crawler — no account = no fetch path.
+    # Block at the API to avoid queuing rows that would sit forever.
+    if not login.session_exists() or _is_revoked():
+        return JSONResponse(
+            {"status": "error", "message": "not signed in — visit /login to authenticate"},
+            status_code=401)
     async with db_pool.acquire() as conn:
         rel = await conn.fetchrow(
             "SELECT id, name FROM releases WHERE guid = $1", guid)
@@ -2738,20 +2791,22 @@ async def root(accept: Optional[str] = Header(None)):
                       (SELECT count(*) FROM downloads
                          WHERE status='completed')                   AS completed""")
 
-    # An indexed-channel count is a strong fallback indicator that the
-    # crawler is authed — even if the disk session file got truncated by
-    # restarts. Prevents bouncing a working instance back to /login.
-    # BUT: a .revoked marker is authoritative — overrides everything else,
-    # because channels rows survive a server-side TG logout.
+    # authed = can perform write actions (grab/refresh/crawl). browsable =
+    # something cached to render. We split them so a logged-out user still
+    # sees the public-channel cache rather than being bounced to /login —
+    # private rows have already been wiped via _mark_revoked or /logout.
     revoked = _is_revoked()
-    authed = (login.session_exists() or stats["channels"] > 0) and not revoked
+    authed = login.session_exists() and not revoked
+    browsable = stats["channels"] > 0
 
     wants_html = accept and "text/html" in accept
     if not wants_html:
         return {"tgarr": TGARR_VERSION, "authed": authed,
-                "revoked": revoked, **dict(stats)}
+                "revoked": revoked, "browsable": browsable, **dict(stats)}
 
-    if not authed:
+    # Only bounce to /login when there's literally nothing to show — fresh
+    # install or post-full-wipe. Otherwise render the public-only dashboard.
+    if not browsable:
         return RedirectResponse("/login")
 
     async with db_pool.acquire() as conn:
