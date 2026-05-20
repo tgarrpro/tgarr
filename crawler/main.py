@@ -3688,9 +3688,16 @@ async def main() -> None:
         await asyncio.sleep(2)
         os._exit(0)
     await wait_for_session()
-    await app.start()
-    app.add_handler(RawUpdateHandler(on_raw_update))
-    me = await app.get_me()
+    # app.start() + initial get_me() bypass _mtproto, so a revoked auth_key
+    # would normally crash main() before any watcher fires. Catch the same
+    # auth-revoke errors here to write the marker + clean exit.
+    try:
+        await app.start()
+        app.add_handler(RawUpdateHandler(on_raw_update))
+        me = await app.get_me()
+    except _REVOKED_AUTH_ERRORS as e:
+        _mark_revoked(type(e).__name__)
+        return  # unreachable — _mark_revoked calls os._exit
     CURRENT_USER_ID = me.id
     try:
         CURRENT_DC = await app.storage.dc_id()
