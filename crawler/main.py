@@ -29,6 +29,8 @@ from pyrogram.raw.types import UpdateChannel
 from pyrogram.errors import (
     FloodWait, UsernameNotOccupied, UsernameInvalid,
     ChannelInvalid, ChannelPrivate,
+    AuthKeyUnregistered, SessionRevoked, SessionExpired,
+    UserDeactivated, UserDeactivatedBan, Unauthorized,
 )
 from pyrogram.types import Message
 
@@ -56,6 +58,53 @@ app = Client(
 )
 
 db_pool: asyncpg.Pool = None
+
+# ════════════════════════════════════════════════════════════════════
+# Account-revoke auto-shutdown
+#
+# When the bound TG account is logged out from Telegram's device list,
+# Pyrogram's read-only calls (get_chat_history) keep returning success
+# briefly via residual auth_key — but the account considers the session
+# dead. Every worker that touches TG must stop, the container must NOT
+# auto-restart into the same dead state, and the UI must surface
+# "re-login required" instead of silently failing.
+#
+# Mechanism:
+#   1. /app/session/.revoked marker — written on detection, refused at boot
+#   2. _mtproto() central wrapper traps AuthKeyUnregistered/SessionRevoked/
+#      UserDeactivated/Unauthorized → mark + exit
+#   3. _session_revoke_watcher() background coroutine pings get_me() so
+#      read-only-only workloads still detect the revoke within ~60s
+#   4. QR re-login (api container) deletes the marker on success
+# ════════════════════════════════════════════════════════════════════
+REVOKED_MARKER = "/app/session/.revoked"
+_REVOKED_AUTH_ERRORS = (
+    AuthKeyUnregistered, SessionRevoked, SessionExpired,
+    UserDeactivated, UserDeactivatedBan, Unauthorized,
+)
+_REVOKED_FIRED = False
+
+
+def _mark_revoked(reason: str) -> None:
+    """Write .revoked marker and self-exit. Idempotent — first call wins.
+    Entrypoint will refuse restart until QR re-login clears the marker."""
+    global _REVOKED_FIRED
+    if _REVOKED_FIRED:
+        return
+    _REVOKED_FIRED = True
+    try:
+        with open(REVOKED_MARKER, "w") as f:
+            f.write(f"{int(time.time())} {reason}\n")
+    except Exception as e:
+        log.error("[revoked] failed to write %s: %s", REVOKED_MARKER, e)
+    log.warning("[revoked] TG account revoked (%s) — exiting. "
+                "Re-login via /login QR to clear %s.", reason, REVOKED_MARKER)
+    # Brief flush so the log line lands
+    try:
+        time.sleep(1)
+    except Exception:
+        pass
+    os._exit(0)
 
 # Set in main() after app.start() — the TG user id of the connected account.
 # Workers filter channel access by this so an account switch leaves the prior
@@ -131,6 +180,12 @@ async def _mtproto(method_name: str, coro_factory):
     # 3. Make call. FloodWait → halt JUST this method.
     try:
         return await coro_factory()
+    except _REVOKED_AUTH_ERRORS as e:
+        # Account revoked / session killed / user deactivated. Terminal — no
+        # retry can recover. Write marker + exit so docker doesn't loop us
+        # back into the same dead state. UI prompts re-login via /login.
+        _mark_revoked(type(e).__name__)
+        raise
     except FloodWait as fw:
         fw_val = int(getattr(fw, "value", 60) or 60)
         until = time.time() + fw_val + 5
@@ -3566,6 +3621,25 @@ async def contribute_resources_worker() -> None:
             await asyncio.sleep(600)
 
 
+async def _session_revoke_watcher():
+    """Periodic get_me() probe. Telegram doesn't always invalidate read-only
+    calls (get_chat_history etc.) immediately after a server-side logout, so
+    workers can keep polling on a residual auth_key for hours. A direct
+    get_me() forces auth and surfaces AuthKeyUnregistered/SessionRevoked fast.
+    Wrapped through _mtproto so the central trap handles the marker+exit.
+    """
+    await asyncio.sleep(45)  # let backfill / startup settle past the noisy phase
+    while True:
+        try:
+            await _mtproto("get_me", lambda: app.get_me())
+        except _REVOKED_AUTH_ERRORS:
+            # _mtproto already marked + os._exit; this line is unreachable
+            return
+        except Exception as e:
+            log.debug("[revoke-watch] non-auth probe err: %s", e)
+        await asyncio.sleep(60)
+
+
 async def _session_change_watcher(boot_user_id: int):
     """Detect when /login QR-changes the underlying session to a different
     TG account. Crawler can't hot-swap Pyrogram client mid-flight; on change
@@ -3599,6 +3673,20 @@ async def _session_change_watcher(boot_user_id: int):
 async def main() -> None:
     global CURRENT_USER_ID, CURRENT_DC
     await init_db()
+    # If a prior boot or live worker detected revocation, refuse to touch TG
+    # until the QR re-login flow clears the marker. Stay alive (so /api/health
+    # can surface the state) without restart-looping. unless-stopped + this
+    # block defeats the loop without leaning on compose restart policy.
+    if os.path.exists(REVOKED_MARKER):
+        log.warning("[boot] %s present — TG account marked revoked. "
+                    "Refusing all TG ops. Re-login via /login QR to clear.",
+                    REVOKED_MARKER)
+        while os.path.exists(REVOKED_MARKER):
+            await asyncio.sleep(30)
+        log.info("[boot] %s cleared — restarting for clean Pyrogram init",
+                 REVOKED_MARKER)
+        await asyncio.sleep(2)
+        os._exit(0)
     await wait_for_session()
     await app.start()
     app.add_handler(RawUpdateHandler(on_raw_update))
@@ -3624,6 +3712,7 @@ async def main() -> None:
             log.info("[worker] %s stale downloading → pending on boot "
                      "(bytes_done preserved)", reset)
     asyncio.create_task(_session_change_watcher(me.id))
+    asyncio.create_task(_session_revoke_watcher())
     asyncio.create_task(_cancel_watcher())
 
     # THUMB-ONLY MODE: emergency lockdown when MTProto cross-DC FloodWait is

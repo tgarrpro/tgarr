@@ -35,6 +35,7 @@ log = logging.getLogger("tgarr.login")
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_DIR = "/app/session"
+REVOKED_MARKER = os.path.join(SESSION_DIR, ".revoked")
 
 # Singleton state — only one login attempt at a time.
 class LoginState:
@@ -68,7 +69,11 @@ def session_exists() -> bool:
     Without this check, a half-finished login (token exported, never scanned) leaves
     the file on disk with auth_key set but user_id NULL — crawler then tries
     Pyrogram phone-prompt authorize and crashes with EOFError (no TTY).
+    A .revoked marker forces False — the session file may still parse fine
+    but the upstream account is gone, so we must re-auth.
     """
+    if os.path.exists(REVOKED_MARKER):
+        return False
     import sqlite3
     path = os.path.join(SESSION_DIR, "tgarr.session")
     if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -90,13 +95,18 @@ def _clean_stale_session():
     Pyrogram's FileStorage.update() calls SELECT FROM version. If the file
     is 0-byte or missing the version table, that fails and qr_start hangs.
     Safe because we only run this when session_exists() == False.
+
+    Also purge when .revoked marker is present: file looks structurally
+    valid but its auth_key is dead upstream, so re-login must start clean.
     """
     import sqlite3
     sf = os.path.join(SESSION_DIR, "tgarr.session")
     if not os.path.exists(sf):
         return
     needs_purge = False
-    if os.path.getsize(sf) == 0:
+    if os.path.exists(REVOKED_MARKER):
+        needs_purge = True
+    elif os.path.getsize(sf) == 0:
         needs_purge = True
     else:
         try:
@@ -179,6 +189,14 @@ async def _save_user_and_disconnect(user_obj):
     state.status = "success"
     state.message = f"signed in as @{state.user_info['username'] or state.user_info['first_name']}"
     log.info("[login] success: %s", state.message)
+    # Clear .revoked marker — fresh auth = healthy account again. Crawler's
+    # boot-time check will see clean state on next start.
+    try:
+        if os.path.exists(REVOKED_MARKER):
+            os.remove(REVOKED_MARKER)
+            log.info("[login] cleared %s", REVOKED_MARKER)
+    except Exception as e:
+        log.warning("[login] could not clear %s: %s", REVOKED_MARKER, e)
 
 
 # ─────── QR LOGIN ───────────────────────────────────────────────────

@@ -31,7 +31,26 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.70"
+TGARR_VERSION = "0.4.71"
+
+# /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
+# SessionRevoked / UserDeactivated, deleted by QR re-login success. While
+# present the UI surfaces "re-login required" and authed=False regardless
+# of session file or channel count (channels persist in DB after revoke).
+REVOKED_MARKER = "/app/session/.revoked"
+
+
+def _is_revoked() -> bool:
+    return os.path.exists(REVOKED_MARKER)
+
+
+def _clear_revoked_marker() -> None:
+    try:
+        if os.path.exists(REVOKED_MARKER):
+            os.remove(REVOKED_MARKER)
+            logging.getLogger("tgarr").info("[revoked] cleared %s", REVOKED_MARKER)
+    except Exception as e:
+        logging.getLogger("tgarr").warning("[revoked] clear %s: %s", REVOKED_MARKER, e)
 
 
 async def meili_search(index: str, q: str, *, limit: int = 60,
@@ -1796,7 +1815,9 @@ qrStart();
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(preview: Optional[int] = None):
-    if login.session_exists() and not preview:
+    # .revoked marker overrides "already signed in" — session file is stale,
+    # account was logged out upstream, must re-auth before doing anything.
+    if login.session_exists() and not preview and not _is_revoked():
         return RedirectResponse("/")
     return HTMLResponse(LOGIN_HTML)
 
@@ -2720,11 +2741,15 @@ async def root(accept: Optional[str] = Header(None)):
     # An indexed-channel count is a strong fallback indicator that the
     # crawler is authed — even if the disk session file got truncated by
     # restarts. Prevents bouncing a working instance back to /login.
-    authed = login.session_exists() or stats["channels"] > 0
+    # BUT: a .revoked marker is authoritative — overrides everything else,
+    # because channels rows survive a server-side TG logout.
+    revoked = _is_revoked()
+    authed = (login.session_exists() or stats["channels"] > 0) and not revoked
 
     wants_html = accept and "text/html" in accept
     if not wants_html:
-        return {"tgarr": TGARR_VERSION, "authed": authed, **dict(stats)}
+        return {"tgarr": TGARR_VERSION, "authed": authed,
+                "revoked": revoked, **dict(stats)}
 
     if not authed:
         return RedirectResponse("/login")
