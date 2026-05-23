@@ -462,6 +462,54 @@ def _quality_check(file_name: str | None, file_size: int | None,
     return True, None
 
 
+# Hard-reject news/TV channels: they pass the media-density filter (every post
+# is a video clip) but every clip is unique to that one channel, so the
+# resulting file_unique_ids are singletons — federation/dedup value = 0.
+# _CATEGORY_HINTS above only LABELS news for faster decay; this gate REJECTS
+# outright before backfill. Strong-signal keywords only ("TV station",
+# "Телеканал", "تلویزیون", "电视台" — not soft hits like "Daily" or "Live").
+_NOISE_TITLE_RX = re.compile(
+    r"(?:^|[\s\-\|\:_·•/【\(\[])"
+    r"(?:"
+    r"TV\d*|News\s+(?:Channel|Network|Agency)|Broadcast(?:ing)?|"  # English
+    r"Телеканал|телевиден|тв[\s\-]*канал|СМИ|"                    # Russian
+    r"تلویزیون|شبکه|"                                              # Persian
+    r"تلفزيون|البث|قناة\s*إخبارية|"                                # Arabic
+    r"电视台|新闻台"                                                # Chinese
+    r")"
+    r"(?:$|[\s\-\|\:_·•/】\)\]])",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Username-side check. Titles like "Iran International" don't carry strong
+# signals but the @username (IranintlTV, ManotoTV, tvrain, smi_*) does.
+# Conservative: require ≥2 leading letters before "tv" to avoid noise on
+# unrelated names; require "news" / "live" as a discrete segment.
+_NOISE_USERNAME_RX = re.compile(
+    r"(?:"
+    r"[a-z]{2,}tv\d*$|"               # ...TV at end: iranintltv, manototv
+    r"^tv[a-z]|"                       # ...starts: tvrain, tvchannel
+    r"(?:^|_)(?:news|live|smi)(?:$|_|\d)|"  # _news_ / _live_ / _smi_ segments
+    r"telekanal|telecast|telenews"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_noise_title(title: str | None, username: str | None = None) -> tuple[bool, str | None]:
+    """Returns (is_noise, matched_keyword). Checks title (multi-lang strong
+    news/TV keywords) and username (camelCase TV suffix, news/live segments)."""
+    if title:
+        m = _NOISE_TITLE_RX.search(title)
+        if m:
+            return True, m.group(0).strip()
+    if username:
+        m = _NOISE_USERNAME_RX.search(username)
+        if m:
+            return True, f"@{username}:{m.group(0)}"
+    return False, None
+
+
 def _detect_content_category(title: str, username: str) -> str:
     """Returns category string. NULL/None = 'mixed' (default 2y cutoff)."""
     blob = (title or "") + " " + (username or "")
@@ -963,7 +1011,7 @@ async def on_new_message(client: Client, msg: Message) -> None:
                  msg.chat.id, msg.id, file_info, caption)
 
 
-async def backfill_channel(chat_id: int, title: str) -> int:
+async def backfill_channel(chat_id: int, title: str, username: str | None = None) -> int:
     """Backfill recent history with sample-then-decide noise filter.
 
     After NOISE_SAMPLE_AT messages, if media density < NOISE_THRESHOLD_PCT,
@@ -974,6 +1022,18 @@ async def backfill_channel(chat_id: int, title: str) -> int:
     NOISE_THRESHOLD_PCT = 5
     log.info("[backfill] start chat_id=%s title=%s limit=%s",
              chat_id, title, BACKFILL_LIMIT)
+    # Title/username gate: reject news/TV up front (see _is_noise_title).
+    noise_hit, noise_kw = _is_noise_title(title, username)
+    if noise_hit:
+        log.info("[backfill] chat_id=%s NOISE-TITLE kw=%r title=%s — abort",
+                 chat_id, noise_kw, title)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE channels
+                   SET enabled=FALSE, category='noise',
+                       content_category='noise', backfilled=TRUE
+                   WHERE tg_chat_id=$1""", chat_id)
+        return 0
     count = 0
     media_count = 0
     await _mtproto_wait_clearance()
@@ -1032,7 +1092,7 @@ async def backfill_all() -> None:
             log.info("[backfill] skip already-done chat_id=%s title=%s", chat_id, title)
             continue
         try:
-            await backfill_channel(chat_id, title)
+            await backfill_channel(chat_id, title, dialog.chat.username)
         except Exception as e:
             log.error("[backfill] failed chat_id=%s: %s", chat_id, e)
 
@@ -1578,8 +1638,9 @@ async def on_raw_update(client, update, users, chats) -> None:
             return  # already known (could be a meta-update, not a join)
         chat_obj = chats.get(raw_id) if chats else None
         title = getattr(chat_obj, "title", "") or ""
+        username = getattr(chat_obj, "username", None)
         log.info("[live-join] new channel chat_id=%s title=%s", chat_id, title)
-        asyncio.create_task(backfill_channel(chat_id, title))
+        asyncio.create_task(backfill_channel(chat_id, title, username))
     except Exception as e:
         log.exception("[live-join] error: %s", e)
 
@@ -1610,8 +1671,8 @@ async def new_dialog_watcher() -> None:
                     continue
                 if dialog.chat.id not in known:
                     new_dialogs.append(
-                        (dialog.chat.id, dialog.chat.title or ""))
-            for chat_id, title in new_dialogs:
+                        (dialog.chat.id, dialog.chat.title or "", dialog.chat.username))
+            for chat_id, title, username in new_dialogs:
                 log.info("[new-dialog] discovered chat_id=%s title=%s",
                          chat_id, title)
                 # Mark joined immediately — get_dialogs returned it as a real
@@ -1625,7 +1686,7 @@ async def new_dialog_watcher() -> None:
                                  title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title)""",
                         chat_id, title)
                 try:
-                    await backfill_channel(chat_id, title)
+                    await backfill_channel(chat_id, title, username)
                 except Exception as e:
                     log.error("[new-dialog] backfill failed chat_id=%s: %s",
                               chat_id, e)
@@ -2385,6 +2446,23 @@ async def subscription_poller() -> None:
                         f"{type(e).__name__}: {str(e)[:160]}", row["id"])
                 continue
 
+            # News/TV title/username gate: reject before backfill (federation
+            # value=0 — every clip is unique to one channel). See _is_noise_title.
+            noise_hit, noise_kw = _is_noise_title(title, uname)
+            if noise_hit:
+                log.info("[subscribe] @%s NOISE-TITLE kw=%r title=%s — blocked",
+                         uname, noise_kw, title)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels
+                           SET subscribed=FALSE, enabled=FALSE,
+                               category='noise', content_category='noise',
+                               last_polled_at=NOW(),
+                               subscribe_error=$1
+                           WHERE id=$2""",
+                        f"news/TV title match: {noise_kw}", row["id"])
+                continue
+
             # If we resolved a real chat_id different from placeholder, replace it
             if real_chat_id != row["tg_chat_id"]:
                 async with db_pool.acquire() as conn:
@@ -2825,7 +2903,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.70",
+                "tgarr_version": "0.4.73",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3005,7 +3083,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.70",
+                        "tgarr_version": "0.4.73",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3620,7 +3698,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.70",
+                "tgarr_version": "0.4.73",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
