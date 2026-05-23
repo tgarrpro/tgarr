@@ -39,7 +39,7 @@ jobs:
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
         run: |
-          git remote add codeberg "https://codeberg-mirror:${CODEBERG_TOKEN}@codeberg.org/tgarrpro/tgarr.git"
+          git remote add codeberg "https://codeberg-mirror:${CODEBERG_TOKEN}@codeberg.org/tgarr-pro/tgarr.git"
           git push codeberg --all --force
           git push codeberg --tags --force
-          echo "✓ Mirrored to https://codeberg.org/tgarrpro/tgarr"
+          echo "✓ Mirrored to https://codeberg.org/tgarr-pro/tgarr"

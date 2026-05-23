@@ -26,7 +26,7 @@ Status: v0.1.0-alpha, MIT licensed. Web UI lands in v0.2. RESPONSIBLE_USE.md sta
 
 Repo: https://github.com/tgarrpro/tgarr  
 Website: https://tgarr.me  
-Codeberg mirror: https://codeberg.org/tgarrpro/tgarr
+Codeberg mirror: https://codeberg.org/tgarr-pro/tgarr
 
 Happy to answer technical questions about MTProto rate limits, Newznab API compatibility quirks, parser strategy, or anything else.
 

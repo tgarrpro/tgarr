@@ -69,7 +69,7 @@
 - **Project name:** tgarr
 - **Website:** https://tgarr.me
 - **GitHub:** https://github.com/tgarrpro/tgarr
-- **Codeberg mirror:** https://codeberg.org/tgarrpro/tgarr
+- **Codeberg mirror:** https://codeberg.org/tgarr-pro/tgarr
 - **First release:** v0.1.0-alpha, 2026
 - **License:** MIT
 - **Language:** Python (Pyrogram, FastAPI, asyncpg)
