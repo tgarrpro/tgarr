@@ -495,6 +495,19 @@ _NOISE_USERNAME_RX = re.compile(
     re.IGNORECASE,
 )
 
+# Service-spam / fan-club / sticker channels behave exactly like news/TV for
+# federation purposes: their media are singleton hashes (escort-ad photos,
+# fan-cam clips, sticker packs) shared by no one else → dedup/federation value
+# = 0, but they post at high volume and dominate the index. Strong, unambiguous
+# title signals only — must not catch real resource channels (incl. NSFW ones
+# that carry actual video files, e.g. "强奸乱伦系列", which produce releases).
+_JUNK_INTENT_RX = re.compile(
+    r"(包养|学生妹|押金[\d\s]*[uU](?:sdt)?|外围(?:女|资源)|楼凤|"   # escort / sugar-baby ads
+    r"球迷(?:群|频道|站|圈)|هواداران|"                              # sports fan clubs (هواداران = Persian "fans")
+    r"мемач|\bмемы\b|стикер[ыа]?\b|sticker\s*pack)",                # meme / sticker-pack channels
+    re.IGNORECASE | re.UNICODE,
+)
+
 
 def _is_noise_title(title: str | None, username: str | None = None) -> tuple[bool, str | None]:
     """Returns (is_noise, matched_keyword). Checks title (multi-lang strong
@@ -507,6 +520,10 @@ def _is_noise_title(title: str | None, username: str | None = None) -> tuple[boo
         m = _NOISE_USERNAME_RX.search(username)
         if m:
             return True, f"@{username}:{m.group(0)}"
+    if title:
+        m = _JUNK_INTENT_RX.search(title)
+        if m:
+            return True, m.group(0).strip()
     return False, None
 
 
@@ -2903,7 +2920,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.73",
+                "tgarr_version": "0.4.74",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3029,14 +3046,31 @@ async def federation_validator() -> None:
                     continue
                 try:
                     if invite:
-                        chat = await _mtproto("join_chat",
-                            lambda: app.join_chat(invite))
+                        # CRITICAL: validate invite via PREVIEW, not join_chat.
+                        # join_chat is hard-capped ~20/day by TG and was the root
+                        # cause of the account sitting in permanent join FloodWait
+                        # (validator burned the whole join budget on validation).
+                        # get_chat() on an invite link resolves via
+                        # messages.CheckChatInvite — returns title + member count
+                        # WITHOUT joining, and never sends a join request either.
+                        chat = await _mtproto("get_chat",
+                            lambda: app.get_chat(invite))
                     else:
                         chat = await _mtproto("resolveUsername",
                             lambda: app.get_chat(uname))
                     members = getattr(chat, "members_count", None)
                     title = chat.title or (chat.username or uname)
                     real_username = chat.username or uname
+                    # News/TV/escort/fan-club/sticker junk = singleton-hash
+                    # noise, federation value 0. The subscribe path already
+                    # rejects these; the validator must too, or it just feeds
+                    # central garbage seeds that every client re-validates.
+                    noise_hit, noise_kw = _is_noise_title(title, real_username)
+                    if noise_hit:
+                        log.info("[fed-validator] NOISE-TITLE @%s kw=%r title=%s — skip",
+                                 real_username, noise_kw, (title or "")[:40])
+                        await asyncio.sleep(PER_SEED_DELAY_SEC)
+                        continue
                     verified_alive.append({
                         "username": real_username,
                         "title": title,
@@ -3083,7 +3117,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.73",
+                        "tgarr_version": "0.4.74",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3698,7 +3732,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.73",
+                "tgarr_version": "0.4.74",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
