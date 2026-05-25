@@ -2921,7 +2921,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.75",
+                "tgarr_version": "0.4.76",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3118,7 +3118,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.75",
+                        "tgarr_version": "0.4.76",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3661,12 +3661,29 @@ async def deep_backfill_worker() -> None:
                 await asyncio.sleep(fw.value + 5)
                 continue
             except Exception as e:
-                log.warning("[deep-backfill] @%s page error: %s", uname, e)
+                # Gate C: permanent-unreadable errors. The account can't read
+                # this channel (subscribed but never joined → peer not in cache,
+                # or private/gone) and we don't aggressive-join (account safety),
+                # so it will NEVER deep-backfill. Mark done so the worker stops
+                # re-selecting it every cycle — 300 such phantom subs were
+                # thrashing the queue at ~30s each, burning resolveUsername quota.
+                es = str(e)
+                permanent = isinstance(e, (ChannelInvalid, ChannelPrivate)) or any(
+                    s in es for s in ("CHAT_ID_INVALID", "PEER_ID_INVALID",
+                                      "CHANNEL_INVALID", "CHANNEL_PRIVATE",
+                                      "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID"))
                 async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE channels SET deep_last_run_at=NOW() WHERE id=$1",
-                        row["id"])
-                await asyncio.sleep(30)
+                    if permanent:
+                        await conn.execute(
+                            "UPDATE channels SET deep_backfilled=TRUE, "
+                            "deep_last_run_at=NOW() WHERE id=$1", row["id"])
+                    else:
+                        await conn.execute(
+                            "UPDATE channels SET deep_last_run_at=NOW() WHERE id=$1",
+                            row["id"])
+                log.warning("[deep-backfill] @%s page error%s: %s", uname,
+                            " (permanent — marked done)" if permanent else "", e)
+                await asyncio.sleep(2 if permanent else 30)
                 continue
 
             log.info("[deep-backfill] @%s page done: ingested=%d oldest=%s",
@@ -3787,7 +3804,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.75",
+                "tgarr_version": "0.4.76",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
