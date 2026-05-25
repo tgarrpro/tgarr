@@ -504,7 +504,8 @@ _NOISE_USERNAME_RX = re.compile(
 _JUNK_INTENT_RX = re.compile(
     r"(包养|学生妹|押金[\d\s]*[uU](?:sdt)?|外围(?:女|资源)|楼凤|"   # escort / sugar-baby ads
     r"球迷(?:群|频道|站|圈)|هواداران|"                              # sports fan clubs (هواداران = Persian "fans")
-    r"мемач|\bмемы\b|стикер[ыа]?\b|sticker\s*pack)",                # meme / sticker-pack channels
+    r"мемач|\bмемы\b|стикер[ыа]?\b|sticker\s*pack|"                # meme / sticker-pack channels
+    r"新闻|新聞|新闻台|новости|новини|новостей)",                   # generic news (singleton clips, fed value 0)
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -2920,7 +2921,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.74",
+                "tgarr_version": "0.4.75",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3117,7 +3118,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.74",
+                        "tgarr_version": "0.4.75",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3309,6 +3310,14 @@ DEEP_BACKFILL_DELAY_SEC = int(os.environ.get("TGARR_DEEP_BACKFILL_DELAY_SEC", "1
 # Channels with fewer than this many TOTAL media items (TG-reported) are
 # skipped. Saves quota on pure-text/discussion channels.
 DEEP_BACKFILL_MIN_MEDIA = int(os.environ.get("TGARR_DEEP_BACKFILL_MIN_MEDIA", "100"))
+# Realized-yield gate: a channel that has already surfaced >= MIN_MSGS messages
+# but parses < MAX_RATE of them into releases AND is photo-dominated (> PHOTO_FRAC)
+# is a singleton-hash photo dump (car ads, news, escort) — federation value ~0.
+# Stop spending deep-backfill paging budget on it. The high-yield channels
+# (e.g. docs at 19%) are far above MAX_RATE and never tripped.
+DEEP_YIELD_MIN_MSGS = int(os.environ.get("TGARR_DEEP_YIELD_MIN_MSGS", "2000"))
+DEEP_YIELD_MAX_RATE = float(os.environ.get("TGARR_DEEP_YIELD_MAX_RATE", "0.005"))
+DEEP_YIELD_PHOTO_FRAC = float(os.environ.get("TGARR_DEEP_YIELD_PHOTO_FRAC", "0.70"))
 
 
 async def dialog_gc_worker() -> None:
@@ -3558,6 +3567,52 @@ async def deep_backfill_worker() -> None:
                 continue
 
             uname = row["username"] or f"chat-{row['tg_chat_id']}"
+
+            # ── Gate A: noise title/username. The subscribe/backfill paths
+            # already reject news/TV/escort/fan/meme, but the deep-backfill
+            # selector did NOT — so news giants (Iran International, ТСН новини,
+            # Україна Новини …) slipped in and dominated the queue, the worker
+            # thrashing on 100K-300K-msg channels. Disable + mark done so they
+            # leave the queue for good.
+            noise_hit, noise_kw = _is_noise_title(row["title"], row["username"])
+            if noise_hit:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels SET deep_backfilled=TRUE, enabled=FALSE,
+                           subscribed=FALSE, category='noise', content_category='noise'
+                           WHERE id=$1""", row["id"])
+                log.info("[deep-backfill] NOISE-TITLE skip @%s kw=%r — disabled",
+                         uname, noise_kw)
+                continue
+
+            # ── Gate B: realized-yield. A channel that has surfaced enough
+            # history but parses almost nothing into releases while being
+            # photo-dominated is a singleton-hash photo dump (car-market ads,
+            # photo-news). Stop paging it. Photo-dominance protects video/doc
+            # resource channels whose titles the parser just can't read (#2).
+            async with db_pool.acquire() as conn:
+                ys = await conn.fetchrow("""
+                    SELECT count(*) AS msgs,
+                           count(*) FILTER (WHERE media_type='photo') AS photos,
+                           (SELECT count(*) FROM releases r
+                              WHERE r.primary_msg_id IN
+                                (SELECT id FROM messages mm WHERE mm.channel_id=$1)) AS rels
+                    FROM messages WHERE channel_id=$1
+                """, row["id"])
+            if ys and ys["msgs"] >= DEEP_YIELD_MIN_MSGS \
+                    and ys["rels"] < DEEP_YIELD_MAX_RATE * ys["msgs"] \
+                    and ys["photos"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels SET deep_backfilled=TRUE, enabled=FALSE,
+                           category='noise', content_category='noise' WHERE id=$1""",
+                        row["id"])
+                log.info("[deep-backfill] YIELD-GATE skip @%s: %d msgs / %d rels "
+                         "(%.3f%%) / %d photos — photo dump, stop",
+                         uname, ys["msgs"], ys["rels"],
+                         100.0 * ys["rels"] / max(ys["msgs"], 1), ys["photos"])
+                continue
+
             cursor = row["cursor"]
             await _heartbeat("deep_backfill_worker",
                              f"paging @{uname} older-than={cursor}")
@@ -3732,7 +3787,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.74",
+                "tgarr_version": "0.4.75",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
