@@ -42,6 +42,19 @@ CSAM_RX = re.compile(
     r"\b(loli|lolicon|shota|shotacon|child\s*porn|kid\s*porn|"
     r"pre[\s_-]*teen|under[\s_-]*age|\bcp\d+|\bcp_)\b", re.IGNORECASE)
 
+# Federation-noise gate (server-side, defense in depth — the client v0.4.74
+# fed-validator also filters, but central must reject regardless of which
+# client submits). News / regional-news / TV-station / escort-ad / sports-fan /
+# meme+sticker channels: every post is a singleton hash shared by no one else,
+# so dedup/federation value = 0 while they dominate volume. Same patterns used
+# for the 2026-05-25 retroactive block. Substrings only (no \b/\y — Cyrillic
+# word boundaries are locale-fragile); 'радио' deliberately excluded to avoid
+# matching 'радиология' etc.
+NOISE_RX = re.compile(
+    r"(包养|学生妹|外围|楼凤|约炮|援交|押金[0-9 ]*[uU]|球迷|هواداران|"
+    r"мемач|мемы|стикер|sticker|电视台|電視台|телеканал|新闻|新聞|"
+    r"новости|новини|новостей)", re.IGNORECASE)
+
 app = FastAPI(title="tgarr-registry", version=VERSION)
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -315,7 +328,7 @@ async def contribute(request: Request):
         raise HTTPException(413, "too many channels in one submission (max 500)")
 
     accepted = rejected = 0
-    csam_flagged = honeypot_hits = 0
+    csam_flagged = honeypot_hits = noise_flagged = 0
     async with db_pool.acquire() as conn:
         for c in channels:
             username = (c.get("username") or "").strip().lstrip("@")
@@ -342,6 +355,20 @@ async def contribute(request: Request):
                        ON CONFLICT (username) DO UPDATE SET
                          blocked = TRUE, audience = 'blocked_csam',
                          block_reason = 'csam-keyword'""",
+                    username, title)
+                continue
+
+            # Federation-noise reject (news/escort/fan/meme singleton-hash junk).
+            # Pre-block the slot so future submissions short-circuit fast.
+            if NOISE_RX.search(title or "") or NOISE_RX.search(username):
+                noise_flagged += 1
+                rejected += 1
+                await conn.execute(
+                    """INSERT INTO registry_channels
+                         (username, title, audience, blocked, block_reason)
+                       VALUES ($1, $2, 'sfw', TRUE, 'noise-ingest')
+                       ON CONFLICT (username) DO UPDATE SET
+                         blocked = TRUE, block_reason = 'noise-ingest'""",
                     username, title)
                 continue
 
@@ -441,6 +468,11 @@ async def contribute(request: Request):
                 if CSAM_RX.search(u) or (inv and CSAM_RX.search(inv)):
                     seeds_csam_flagged += 1
                     continue
+                # Federation-noise username pre-filter (title unknown at seed
+                # time, so this only catches junk that's obvious in the @name)
+                if NOISE_RX.search(u):
+                    seeds_rejected += 1
+                    continue
                 if src not in ("caption-mention", "caption-invite"):
                     src = "caption-mention"
                 try:
@@ -462,7 +494,7 @@ async def contribute(request: Request):
     # Honest deception: return the SAME shape regardless. Bad actor can't
     # tell their submission was caught — they just see normal-looking counts.
     return {"status": "ok", "accepted": accepted, "rejected": rejected,
-            "csam_flagged": csam_flagged,
+            "csam_flagged": csam_flagged, "noise_flagged": noise_flagged,
             "seeds_accepted": seeds_accepted, "seeds_rejected": seeds_rejected,
             "seeds_csam_flagged": seeds_csam_flagged}
 
