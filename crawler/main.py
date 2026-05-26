@@ -2921,7 +2921,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.78",
+                "tgarr_version": "0.4.79",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3118,7 +3118,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.78",
+                        "tgarr_version": "0.4.79",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3532,7 +3532,11 @@ async def dialog_leave_worker() -> None:
                     SELECT id, tg_chat_id, username, title
                     FROM channels
                     WHERE is_joined = TRUE
-                      AND NOT COALESCE(enabled, TRUE)   -- only marked-not-to-crawl junk
+                      -- Leave once we HAVE the data: fully-crawled (deep_backfilled)
+                      -- OR marked-not-to-crawl junk (enabled=FALSE). The resource
+                      -- data (file_unique_ids) is the moat, not channel membership.
+                      -- Keep ONLY still-actively-crawling channels (not yet done).
+                      AND (COALESCE(deep_backfilled, FALSE) OR NOT COALESCE(enabled, TRUE))
                       AND title NOT ILIKE 'KwickPOS%'
                     ORDER BY id
                     LIMIT $1
@@ -3878,7 +3882,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.78",
+                "tgarr_version": "0.4.79",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
