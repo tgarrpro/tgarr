@@ -2921,7 +2921,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.77",
+                "tgarr_version": "0.4.78",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3118,7 +3118,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.77",
+                        "tgarr_version": "0.4.78",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3532,6 +3532,7 @@ async def dialog_leave_worker() -> None:
                     SELECT id, tg_chat_id, username, title
                     FROM channels
                     WHERE is_joined = TRUE
+                      AND NOT COALESCE(enabled, TRUE)   -- only marked-not-to-crawl junk
                       AND title NOT ILIKE 'KwickPOS%'
                     ORDER BY id
                     LIMIT $1
@@ -3542,6 +3543,14 @@ async def dialog_leave_worker() -> None:
                 await asyncio.sleep(3600)
                 continue
             for r in rows:
+                # Re-check the kill switch before EVERY leave so it can be
+                # halted mid-batch (not just between batches).
+                async with db_pool.acquire() as conn:
+                    if ((await conn.fetchval(
+                            "SELECT value FROM config WHERE key='dialog_leave_active'")
+                         ) or "").lower() != "true":
+                        log.info("[dialog-leave] kill switch off — stopping")
+                        break
                 uname = r["username"] or f"chat-{r['tg_chat_id']}"
                 try:
                     await _mtproto_wait_clearance()
@@ -3869,7 +3878,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.77",
+                "tgarr_version": "0.4.78",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
