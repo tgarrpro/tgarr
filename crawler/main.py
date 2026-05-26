@@ -2921,7 +2921,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.76",
+                "tgarr_version": "0.4.77",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3118,7 +3118,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.76",
+                        "tgarr_version": "0.4.77",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3506,6 +3506,71 @@ async def decay_eviction_worker() -> None:
         await asyncio.sleep(21600)  # 6h
 
 
+DIALOG_LEAVE_DELAY_SEC = int(os.environ.get("TGARR_DIALOG_LEAVE_DELAY_SEC", "45"))
+DIALOG_LEAVE_BATCH = int(os.environ.get("TGARR_DIALOG_LEAVE_BATCH", "20"))
+
+
+async def dialog_leave_worker() -> None:
+    """Leave tgarr-auto-joined channels to declutter the account's dialog list
+    and free join slots. Gated by config flag 'dialog_leave_active'='true' (set
+    via SQL — no container restart to start/stop). NEVER leaves KwickPOS* (Tom's
+    own channels). Throttled HARD: leave_chat is rate-limited and bulk join/leave
+    churn re-flags the account (we just recovered from a FloodWait session kick).
+    On success sets is_joined=FALSE; public channels can be re-discovered + re-
+    joined later.
+    """
+    await asyncio.sleep(120)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                active = await conn.fetchval(
+                    "SELECT value FROM config WHERE key='dialog_leave_active'")
+                if (active or "").lower() != "true":
+                    await asyncio.sleep(300)
+                    continue
+                rows = await conn.fetch("""
+                    SELECT id, tg_chat_id, username, title
+                    FROM channels
+                    WHERE is_joined = TRUE
+                      AND title NOT ILIKE 'KwickPOS%'
+                    ORDER BY id
+                    LIMIT $1
+                """, DIALOG_LEAVE_BATCH)
+            if not rows:
+                log.info("[dialog-leave] nothing left to leave — idle")
+                await _heartbeat("dialog_leave_worker", "drained — idle")
+                await asyncio.sleep(3600)
+                continue
+            for r in rows:
+                uname = r["username"] or f"chat-{r['tg_chat_id']}"
+                try:
+                    await _mtproto_wait_clearance()
+                    await _mtproto("leave_chat",
+                                   lambda: app.leave_chat(r["tg_chat_id"]))
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE channels SET is_joined=FALSE WHERE id=$1", r["id"])
+                    log.info("[dialog-leave] left @%s (%s)", uname, (r["title"] or "")[:30])
+                    await _heartbeat("dialog_leave_worker", f"left @{uname}")
+                except FloodWait as fw:
+                    log.warning("[dialog-leave] FloodWait %ds — backing off", fw.value)
+                    await asyncio.sleep(fw.value + 5)
+                    break
+                except (ChannelInvalid, ChannelPrivate) as e:
+                    # Not actually a member / gone — clear the flag and move on.
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE channels SET is_joined=FALSE WHERE id=$1", r["id"])
+                    log.info("[dialog-leave] @%s not joinable (%s) — cleared flag",
+                             uname, type(e).__name__)
+                except Exception as e:
+                    log.warning("[dialog-leave] @%s leave error: %s", uname, str(e)[:120])
+                await asyncio.sleep(DIALOG_LEAVE_DELAY_SEC)
+        except Exception:
+            log.exception("[dialog-leave] outer loop")
+            await asyncio.sleep(60)
+
+
 async def deep_backfill_worker() -> None:
     """Continuously pages OLDER messages past the first 5000-cap backfill.
 
@@ -3804,7 +3869,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.76",
+                "tgarr_version": "0.4.77",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -3992,6 +4057,7 @@ async def main() -> None:
     asyncio.create_task(contribute_resources_worker())
     asyncio.create_task(decay_eviction_worker())
     asyncio.create_task(dialog_gc_worker())
+    asyncio.create_task(dialog_leave_worker())
     # thumb_hash_backfill is proactive (scans all thumbs for md5 dedup), so it's
     # disabled to match the no-pre-download rule.
     # asyncio.create_task(thumb_hash_backfill())
