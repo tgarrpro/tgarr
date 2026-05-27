@@ -2923,7 +2923,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.91",
+                "tgarr_version": "0.4.92",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3120,7 +3120,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.91",
+                        "tgarr_version": "0.4.92",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3768,15 +3768,15 @@ async def deep_backfill_worker() -> None:
             from datetime import datetime as _dt, timedelta as _td, timezone as _tz
             cutoff_date = None
             cat = row["content_category"]
-            # Doc-dominant channels are ARCHIVES (ebook/PDF/course libraries) —
-            # books/docs don't age out, so NEVER apply the time-decay cutoff
-            # (it was wrongly truncating e.g. @EbookPDF_Library at 2021-11-21,
-            # dropping ~7000 older books and marking it "done"). Treat as
-            # archival regardless of the coarse content_category label.
-            _docs = row["remote_documents"] or 0
-            _pv = (row["remote_photos"] or 0) + (row["remote_videos"] or 0)
-            doc_archive = _docs >= 500 and _docs >= _pv
-            if cat and not doc_archive:
+            # Decay-cutoff ONLY for genuinely time-sensitive content
+            # (news/sports/chat) — old clips there are worthless. ALL media
+            # archives (movies/music/books/PDF/porn-resource, incl. the 'mixed'
+            # default) keep their FULL history — old books/music/films stay
+            # valuable. The old per-category cutoff truncated 'mixed' archives at
+            # a date and marked them "done" (e.g. @EbookPDF_Library at 2021,
+            # @Bh_PM at 35%). Mis-classified news still gets caught by Gate B
+            # (media-dominant + ~0 release), so dropping 'mixed' decay is safe.
+            if cat in ("news", "sports", "chat"):
                 hl = _DECAY_HALF_LIFE_DAYS.get(cat)
                 if hl:
                     cutoff_date = _dt.now(_tz.utc) - _td(days=3 * hl)
@@ -3956,7 +3956,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.91",
+                "tgarr_version": "0.4.92",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
