@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.89"
+TGARR_VERSION = "0.4.90"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -2650,6 +2650,7 @@ async def api_deep_backfill_progress():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT username, title, deep_backfilled, deep_oldest_tg_id,
+                   is_joined, subscribed,
                    deep_last_run_at, deep_total_pulled,
                    remote_msgs, remote_photos, remote_videos,
                    remote_audio, remote_documents,
@@ -2669,6 +2670,7 @@ async def api_deep_backfill_progress():
     return {"channels": [
         {"username": r["username"], "title": r["title"],
          "done": r["deep_backfilled"],
+         "mode": "JOIN" if r["is_joined"] else ("SUB" if r["subscribed"] else "—"),
          "oldest_id": r["deep_oldest_tg_id"],
          "last_run_at": r["deep_last_run_at"].isoformat() if r["deep_last_run_at"] else None,
          "pulled_deep": r["deep_total_pulled"],
@@ -2739,12 +2741,21 @@ async function loadDeepBackfill() {
     const w = Math.max(2, Math.min(100, pct));
     return `<div style="background:#e2e8f0;border-radius:3px;width:80px;height:8px;display:inline-block;overflow:hidden;vertical-align:middle"><div style="width:${w}%;height:100%;background:${barColor(pct)}"></div></div> <span style="font-size:11px;color:#475569">${fmtPct(pct)}</span>`;
   };
+  const modeBadge = (m) => {
+    const s = m==="JOIN" ? "background:#fef3c7;color:#92400e"
+            : m==="SUB"  ? "background:#dcfce7;color:#166534"
+            : "background:#f1f5f9;color:#94a3b8";
+    const t = m==="JOIN" ? "加入+爬 (账号成员, 占 join 槽)"
+            : m==="SUB"  ? "订阅+爬 (公开轮询, 不 join)" : "未订阅/未加入";
+    return `<span title="${t}" style="${s};padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600">${m}</span>`;
+  };
   const rows = (j.channels || []).map(c => {
     const totalCell = c.remote_msgs
       ? `${c.msgs_local.toLocaleString()} / ${c.remote_msgs.toLocaleString()}`
       : c.msgs_local.toLocaleString();
     return `
     <tr><td>${c.done?"✅":"🔄"} <b>@${c.username || "—"}</b></td>
+        <td>${modeBadge(c.mode)}</td>
         <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(c.title || "").substring(0, 40)}</td>
         <td style="text-align:right;font-size:13px">${totalCell}</td>
         <td>${bar(c.pct_msgs)}</td>
@@ -2756,7 +2767,7 @@ async function loadDeepBackfill() {
   });
   document.getElementById("deepBackfillTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
-    <th>Status</th><th>Title</th>
+    <th>Status</th><th>Mode</th><th>Title</th>
     <th style="text-align:right">Msgs (local/remote)</th>
     <th>Progress</th>
     <th style="text-align:right">Photos</th>
