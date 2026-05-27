@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.0"
+TGARR_VERSION = "0.5.1"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -702,6 +702,8 @@ async def lazy_thumb(msg_id: int):
             "WHERE id = $1 AND (thumb_path IS NULL "
             "OR thumb_path = $$__user_queued__$$)",
             msg_id)
+        # Wake the crawler's thumb dispatcher instantly (event-driven, no poll).
+        await conn.execute("NOTIFY thumb_queued")
     for _ in range(24):
         await asyncio.sleep(0.5)
         async with db_pool.acquire() as conn:
@@ -753,6 +755,8 @@ async def lazy_preview(msg_id: int):
             "UPDATE messages SET preview_path='__user_queued__' "
             "WHERE id=$1 AND (preview_path IS NULL OR preview_path='__user_queued__')",
             msg_id)
+        # Wake the crawler's preview dispatcher instantly (event-driven).
+        await conn.execute("NOTIFY preview_queued")
     # Brief poll — if it arrives within ~6s, serve fresh; else fall back to thumb
     for _ in range(12):
         await asyncio.sleep(0.5)

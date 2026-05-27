@@ -1986,11 +1986,27 @@ async def _thumb_process_one(row) -> None:
         await asyncio.sleep(min(wait, 3600))
         # Row stays as __user_queued__; will be retried on next batch.
     except Exception as e:
-        log.warning("[thumbs] failed id=%s: %s", row["id"], e)
+        es = str(e)
+        log.warning("[thumbs] failed id=%s: %s", row["id"], es[:120])
+        # If the whole CHANNEL is unreachable (no username → no HTTPS, peer not
+        # resolvable), fail ALL its queued thumbs in one shot instead of
+        # grinding them one-by-one (~1s each on the single MTProto lane) — the
+        # main cause of a sluggish gallery full of un-fetchable channels.
+        channel_dead = any(s in es for s in (
+            "CHANNEL_INVALID", "PEER_ID_INVALID", "Peer id invalid",
+            "CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID"))
         async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
-                row["id"])
+            if channel_dead and row["tg_chat_id"]:
+                res = await conn.execute(
+                    "UPDATE messages SET thumb_path='__failed__' "
+                    "WHERE tg_chat_id=$1 AND thumb_path='__user_queued__'",
+                    row["tg_chat_id"])
+                log.info("[thumbs] channel %s unreachable — failed queued batch %s",
+                         row["tg_chat_id"], res)
+            else:
+                await conn.execute(
+                    "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
+                    row["id"])
 
 
 THUMB_TTL_HOURS = int(os.environ.get("TGARR_THUMB_TTL_HOURS", "5"))
@@ -2127,16 +2143,49 @@ async def _preview_process_one(row):
                 row["id"])
 
 
+# On-demand wake signals. The API NOTIFYs the moment it queues a thumb/preview;
+# the dispatchers wait on these events so they fire INSTANTLY (0ms latency, no
+# idle polling, no busy-loop). A short fallback timeout re-checks in case a
+# NOTIFY is ever missed (e.g. listener reconnect).
+_thumb_wake = asyncio.Event()
+_preview_wake = asyncio.Event()
+_ONDEMAND_IDLE_FALLBACK_SEC = 30
+
+
+async def _ondemand_notify_listener() -> None:
+    """Hold a dedicated connection LISTENing for on-demand enqueue NOTIFYs and
+    set the wake events. Reconnects on error. This is what makes the gallery /
+    slideshow feel instant — no 30-60s dispatcher nap."""
+    while True:
+        conn = None
+        try:
+            conn = await asyncpg.connect(DB_DSN)
+            await conn.add_listener("thumb_queued", lambda *_: _thumb_wake.set())
+            await conn.add_listener("preview_queued", lambda *_: _preview_wake.set())
+            log.info("[ondemand] NOTIFY listener attached (thumb_queued, preview_queued)")
+            while True:
+                await asyncio.sleep(3600)  # keep the connection alive
+        except Exception as e:
+            log.warning("[ondemand] listener reconnect in 5s: %s", e)
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
+
+
 async def preview_downloader() -> None:
     """450px+ JPEG preview fetcher — sem-capped 5 concurrent HTTPS scrapes.
     LIFO batch (newest queued first) so user's just-opened slideshow is
     prioritized over backlog. Same t.me embed source as thumb, takes the
-    larger CDN URL.
+    larger CDN URL. Wakes instantly on preview_queued NOTIFY (no idle nap).
     """
     log.info("[preview] dispatcher started; root=%s conc=5", PREVIEWS_ROOT)
     os.makedirs(PREVIEWS_ROOT, exist_ok=True)
     while True:
         try:
+            _preview_wake.clear()
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch(
                     """SELECT m.id, m.tg_chat_id, m.tg_message_id,
@@ -2145,15 +2194,19 @@ async def preview_downloader() -> None:
                        FROM messages m JOIN channels c ON c.id = m.channel_id
                        WHERE m.preview_path = '__user_queued__'
                        ORDER BY m.id DESC LIMIT 20""")
-            if not rows:
-                await asyncio.sleep(30)
-                continue
-            await asyncio.gather(
-                *[_preview_process_one(r) for r in rows],
-                return_exceptions=True)
+            if rows:
+                await asyncio.gather(
+                    *[_preview_process_one(r) for r in rows],
+                    return_exceptions=True)
+                continue  # drain immediately, no nap
+            try:
+                await asyncio.wait_for(_preview_wake.wait(),
+                                       timeout=_ONDEMAND_IDLE_FALLBACK_SEC)
+            except asyncio.TimeoutError:
+                pass
         except Exception:
             log.exception("[preview] outer loop")
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 
 async def thumb_downloader() -> None:
@@ -2171,6 +2224,7 @@ async def thumb_downloader() -> None:
     os.makedirs(THUMBS_ROOT, exist_ok=True)
     while True:
         try:
+            _thumb_wake.clear()  # clear before query so a NOTIFY during it isn't lost
             async with db_pool.acquire() as conn:
                 # LIFO: newest queue requests first. User just switched channel
                 # → those rows have the biggest m.id (recently INSERTed by
@@ -2183,14 +2237,20 @@ async def thumb_downloader() -> None:
                        WHERE m.thumb_path = '__user_queued__'
                        ORDER BY m.id DESC
                        LIMIT $1""", _THUMB_BATCH)
-            if not rows:
-                await asyncio.sleep(60)
-                continue
-            tasks = [asyncio.create_task(_thumb_process_one(r)) for r in rows]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if rows:
+                tasks = [asyncio.create_task(_thumb_process_one(r)) for r in rows]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                continue  # drain immediately, no nap
+            # queue empty → wake instantly on the next thumb_queued NOTIFY
+            # (fallback re-check guards against a missed wakeup).
+            try:
+                await asyncio.wait_for(_thumb_wake.wait(),
+                                       timeout=_ONDEMAND_IDLE_FALLBACK_SEC)
+            except asyncio.TimeoutError:
+                pass
         except Exception as e:
             log.exception("[thumbs] outer loop: %s", e)
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 
 async def channel_meta_refresher() -> None:
@@ -3028,7 +3088,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.0",
+                "tgarr_version": "0.5.1",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3225,7 +3285,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.5.0",
+                        "tgarr_version": "0.5.1",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -4088,7 +4148,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.0",
+                "tgarr_version": "0.5.1",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4521,6 +4581,7 @@ async def main() -> None:
     # meta refresher, dialog watchers — anything that hits cross-DC auth.
     THUMB_ONLY_MODE = os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true"
 
+    asyncio.create_task(_ondemand_notify_listener())  # instant thumb/preview wake
     asyncio.create_task(meili_sync_worker())   # HTTPS to local Meili — safe
     asyncio.create_task(thumb_downloader())    # HTTPS-first, MTProto fallback (gated by THUMB_ONLY)
     asyncio.create_task(preview_downloader())  # HTTPS-only (450px slideshow preview)
