@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.84"
+TGARR_VERSION = "0.4.85"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -565,6 +565,17 @@ async def _metadata_worker():
                     """, result.get("poster_url"), result.get("canonical_title"),
                          result.get("overview"), result.get("source"),
                          new_score, row["id"])
+                elif re.search(r"[一-鿿぀-ヿ가-힯]", row["title"] or ""):
+                    # CJK title + TMDB miss. TMDB has poor coverage of Chinese/
+                    # Japanese/Korean indie content (docs, regional films), so a
+                    # miss is NOT evidence the release is fake — it's just not in
+                    # TMDB. KEEP it (no metadata) instead of deleting; otherwise
+                    # legit CJK doc/movie releases (e.g. 纪录片爱好者) get wiped.
+                    await conn.execute("""
+                        UPDATE releases SET metadata_source='miss-cjk',
+                          metadata_lookup_at=NOW()
+                        WHERE id=$1
+                    """, row["id"])
                 else:
                     # TMDB miss — title doesn't match any known movie/show.
                     # Drop parse_score. If < 0.30 threshold → delete the release
