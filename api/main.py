@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.96"
+TGARR_VERSION = "0.4.97"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -3510,7 +3510,7 @@ async def api_registry_pull_now():
 # ════════════════════════════════════════════════════════════════════
 @app.get("/gallery", response_class=HTMLResponse)
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
-                       q: Optional[str] = None):
+                       q: Optional[str] = None, dc: Optional[str] = None):
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -3537,6 +3537,15 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
     # CSAM hard-block — overrides every setting, always.
     where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
+
+    # Same-DC filter (DEFAULT ON): the photo library is huge and cross-DC
+    # fetches are slow + FloodWait-prone, so by default show only images on the
+    # client's own DC (fast path). ?dc=all shows every DC.
+    my_dc = await _get_my_dc()
+    same_dc_only = (dc != "all") and bool(my_dc)
+    if same_dc_only:
+        params.append(my_dc)
+        where.append(f"m.file_dc = ${len(params)}")
 
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
@@ -3606,9 +3615,27 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         'padding:5px 12px;font-size:12px">all</a>' +
         "".join(_ch_chip(r["username"], r["title"], r["n"]) for r in top_channels)
     )
+    # DC toggle: same-DC (fast) ⇄ all DCs. Preserves the channel filter.
+    dc_toggle = ''
+    if my_dc:
+        _ch = f"&channel={channel}" if channel else ""
+        if same_dc_only:
+            dc_toggle = (
+                f'<a class="btn ghost" href="/gallery?dc=all{_ch}" '
+                f'style="padding:5px 12px;font-size:12px;'
+                f'background:rgba(16,185,129,0.15);color:#10b981;border-color:#10b981" '
+                f'title="showing only your DC {my_dc} (fast). Click to show all DCs.">'
+                f'● DC {my_dc} only</a>')
+        else:
+            _ch2 = f"?channel={channel}" if channel else ""
+            dc_toggle = (
+                f'<a class="btn ghost" href="/gallery{_ch2}" '
+                f'style="padding:5px 12px;font-size:12px" '
+                f'title="showing all DCs. Click to show only your DC {my_dc} (fast).">'
+                f'all DCs</a>')
     ch_chips_html = (
         '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">'
-        + ch_chips + '</div>')
+        + dc_toggle + ch_chips + '</div>')
 
     if not rows:
         body = (
