@@ -759,6 +759,113 @@ async def contribute_resources(request: Request):
             "csam_flagged": csam_flagged}
 
 
+# ====================================================================
+# Resolve / rehydrate -- the read side of "TG-as-storage". A client that
+# has crawled a channel, contributed its index, left the channel AND purged
+# its local index (crawl-and-release model) relies on these to:
+#   • confirm a fuid is durably held by central BEFORE purging it locally
+#     (a fuid that resolves here has a usable channel pointer), and
+#   • re-acquire the binary later: re-subscribe the channel, then re-fetch
+#     the message via the returned channel_username + msg_id pointer.
+# ====================================================================
+@app.post("/api/v1/resolve_resources")
+async def resolve_resources(request: Request):
+    """Body: {"instance_uuid": str, "file_unique_ids": [str, ...]}.
+    Returns {"resolved": {fuid: {channel_username, msg_id, file_name,
+    file_size, mime_type, media_type, posted_at, distinct_channels}}}.
+    Only fuids with a usable (channel_username + msg_id) pointer are returned;
+    unknown ones are omitted so the caller keeps them locally.
+    """
+    raw = await request.body()
+    if request.headers.get("content-encoding", "").lower() == "gzip":
+        import gzip as _gzip
+        try:
+            raw = _gzip.decompress(raw)
+        except Exception:
+            raise HTTPException(400, "invalid gzip body")
+    try:
+        body = json.loads(raw)
+    except Exception:
+        raise HTTPException(400, "invalid json body")
+    ip_hash = _ip_hash(request)
+    await _ban_check(ip_hash, _instance_hash((body.get("instance_uuid") or "").strip()))
+    fuids = body.get("file_unique_ids") or []
+    if not isinstance(fuids, list):
+        raise HTTPException(400, "file_unique_ids must be array")
+    if len(fuids) > 100000:
+        raise HTTPException(413, "too many file_unique_ids (max 100000)")
+    clean = list({f.strip() for f in fuids
+                  if isinstance(f, str) and FILE_UNIQUE_ID_RX.match(f.strip())})
+    if not clean:
+        return {"status": "ok", "resolved": {}}
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT ON (rc.file_unique_id)
+                   rc.file_unique_id, rc.channel_username, rc.msg_id, rc.posted_at,
+                   r.file_name, r.file_size, r.mime_type, r.media_type,
+                   r.distinct_channels
+            FROM registry_resource_channels rc
+            JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
+            WHERE rc.file_unique_id = ANY($1::text[])
+              AND rc.channel_username IS NOT NULL
+              AND rc.msg_id IS NOT NULL
+            ORDER BY rc.file_unique_id, rc.posted_at DESC NULLS LAST
+        """, clean)
+    resolved = {r["file_unique_id"]: {
+        "channel_username": r["channel_username"],
+        "msg_id": r["msg_id"],
+        "file_name": r["file_name"],
+        "file_size": r["file_size"],
+        "mime_type": r["mime_type"],
+        "media_type": r["media_type"],
+        "posted_at": r["posted_at"].isoformat() if r["posted_at"] else None,
+        "distinct_channels": r["distinct_channels"],
+    } for r in rows}
+    return {"status": "ok", "resolved": resolved}
+
+
+@app.post("/api/v1/channel_resources")
+async def channel_resources(request: Request):
+    """Body: {"instance_uuid": str, "channel_username": str, "limit"?: int}.
+    Returns every resource central holds for the channel, newest msg first —
+    lets a client rehydrate its local index after a post-leave purge so grab
+    / download works again without re-crawling the whole history from TG.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid json body")
+    ip_hash = _ip_hash(request)
+    await _ban_check(ip_hash, _instance_hash((body.get("instance_uuid") or "").strip()))
+    channel = (body.get("channel_username") or "").strip().lstrip("@")
+    if not channel or not USERNAME_RX.match(channel):
+        raise HTTPException(400, "invalid channel_username")
+    try:
+        limit = min(int(body.get("limit") or 50000), 100000)
+    except (TypeError, ValueError):
+        limit = 50000
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT rc.file_unique_id, rc.msg_id, rc.posted_at,
+                   r.file_name, r.file_size, r.mime_type, r.media_type
+            FROM registry_resource_channels rc
+            JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
+            WHERE rc.channel_username = $1 AND rc.msg_id IS NOT NULL
+            ORDER BY rc.msg_id DESC
+            LIMIT $2
+        """, channel, limit)
+    return {"status": "ok", "channel_username": channel, "count": len(rows),
+            "resources": [{
+                "file_unique_id": r["file_unique_id"],
+                "msg_id": r["msg_id"],
+                "file_name": r["file_name"],
+                "file_size": r["file_size"],
+                "mime_type": r["mime_type"],
+                "media_type": r["media_type"],
+                "posted_at": r["posted_at"].isoformat() if r["posted_at"] else None,
+            } for r in rows]}
+
+
 
 # ====================================================================
 # GET /api/v1/seeds

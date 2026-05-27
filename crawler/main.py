@@ -314,6 +314,14 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
             log.info("[mtproto] join by username @%s (no access_hash for %s)",
                      uname, chat_id)
             await _mtproto("join_chat", lambda: app.join_chat(uname))
+        # Mark as tgarr-auto-joined so dialog_leave_worker may release it later
+        # (vs Tom's personal joins, which stay auto_joined NULL = protected).
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE channels SET auto_joined=TRUE WHERE tg_chat_id=$1", chat_id)
+        except Exception:
+            pass
         return await _mtproto("get_messages",
                                lambda: app.get_messages(chat_id, msg_id))
 
@@ -2923,7 +2931,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.94",
+                "tgarr_version": "0.4.95",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3120,7 +3128,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.94",
+                        "tgarr_version": "0.4.95",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3572,16 +3580,43 @@ async def dialog_leave_worker() -> None:
                 if (active or "").lower() != "true":
                     await asyncio.sleep(300)
                     continue
+                # ── Release SUBSCRIBED channels (no TG call, local only). tgarr
+                # "subscribe" is poll-only membership we created — never Tom's
+                # personal joins — so once a subscribed channel is fully crawled
+                # AND fully contributed to central, stop polling it. It drops off
+                # the working set; a later grab re-subscribes + rehydrates.
+                unsub = await conn.execute("""
+                    UPDATE channels c SET subscribed = FALSE
+                    WHERE subscribed = TRUE
+                      AND COALESCE(deep_backfilled, FALSE) = TRUE
+                      AND title NOT ILIKE 'KwickPOS%'
+                      AND COALESCE(category, '') <> 'personal'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM messages m
+                        WHERE m.channel_id = c.id AND m.file_unique_id IS NOT NULL
+                          AND m.contributed_at IS NULL)
+                """)
+                if unsub and unsub != "UPDATE 0":
+                    log.info("[dialog-leave] released (unsubscribed) %s done+contributed channels", unsub)
+                # ── Leave JOINED channels. SAFETY: only channels tgarr itself
+                # auto-joined (auto_joined IS TRUE) — never Tom's personal joins
+                # (auto_joined NULL) and never KwickPOS. Leave once fully crawled
+                # AND fully contributed, OR if flagged junk (enabled=FALSE).
                 rows = await conn.fetch("""
                     SELECT id, tg_chat_id, username, title
-                    FROM channels
+                    FROM channels c
                     WHERE is_joined = TRUE
-                      -- Leave once we HAVE the data: fully-crawled (deep_backfilled)
-                      -- OR marked-not-to-crawl junk (enabled=FALSE). The resource
-                      -- data (file_unique_ids) is the moat, not channel membership.
-                      -- Keep ONLY still-actively-crawling channels (not yet done).
-                      AND (COALESCE(deep_backfilled, FALSE) OR NOT COALESCE(enabled, TRUE))
+                      AND auto_joined IS TRUE
                       AND title NOT ILIKE 'KwickPOS%'
+                      AND COALESCE(category, '') <> 'personal'
+                      AND (
+                        NOT COALESCE(enabled, TRUE)
+                        OR (COALESCE(deep_backfilled, FALSE) = TRUE
+                            AND NOT EXISTS (
+                              SELECT 1 FROM messages m
+                              WHERE m.channel_id = c.id AND m.file_unique_id IS NOT NULL
+                                AND m.contributed_at IS NULL))
+                      )
                     ORDER BY id
                     LIMIT $1
                 """, DIALOG_LEAVE_BATCH)
@@ -3956,7 +3991,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.94",
+                "tgarr_version": "0.4.95",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4017,6 +4052,196 @@ async def contribute_resources_worker() -> None:
             await asyncio.sleep(nap)
         except Exception:
             log.exception("[contrib-res] outer loop")
+            await asyncio.sleep(600)
+
+
+# ── Crawl-and-release: once a channel is contributed + released, drop its
+# local index. Central is the source of truth; grab rehydrates on demand. ──
+INDEX_PURGE_ENABLED = os.environ.get("TGARR_INDEX_PURGE", "false").lower() == "true"
+INDEX_PURGE_INTERVAL_SEC = int(os.environ.get("TGARR_INDEX_PURGE_INTERVAL_SEC", "180"))
+INDEX_PURGE_BATCH = int(os.environ.get("TGARR_INDEX_PURGE_BATCH", "2000"))
+
+
+async def _instance_uuid_val():
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval("SELECT value FROM config WHERE key='instance_uuid'")
+
+
+async def _central_post(path: str, payload: dict, timeout: int = 120) -> dict:
+    """POST gzip JSON to central, return parsed JSON. Raises on failure."""
+    body_gz = gzip.compress(json.dumps(payload).encode(), 5)
+    req = urllib.request.Request(
+        REGISTRY_URL + path, data=body_gz,
+        headers={"Content-Type": "application/json",
+                 "Content-Encoding": "gzip", "Accept-Encoding": "gzip",
+                 "User-Agent": "tgarr/0.4.95 (+https://tgarr.me)"},
+        method="POST")
+    def _post():
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            if r.headers.get("content-encoding", "").lower() == "gzip":
+                raw = gzip.decompress(raw)
+            return raw
+    resp = await asyncio.to_thread(_post)
+    return json.loads(resp.decode())
+
+
+async def _central_resolve(fuids: list) -> dict:
+    """Ask central which fuids it durably holds (with a usable channel pointer).
+    Returns {fuid: {channel_username, msg_id, ...}}. Empty on error so the
+    caller treats them as UNconfirmed and keeps the local rows — we never
+    purge data central might not have."""
+    if not fuids:
+        return {}
+    try:
+        uuid_val = await _instance_uuid_val()
+        result = await _central_post("/api/v1/resolve_resources",
+                                     {"instance_uuid": uuid_val or "",
+                                      "file_unique_ids": list(fuids)})
+        return result.get("resolved", {}) or {}
+    except Exception as e:
+        log.warning("[central-resolve] failed: %s", e)
+        return {}
+
+
+async def _purge_messages(channel_id: int, msg_ids) -> int:
+    """FK-safe delete of messages for one channel (downloads → releases →
+    messages, one transaction). msg_ids=None purges every message in the
+    channel. Messages whose release has an active/queued download are kept.
+    Returns count of messages deleted."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            if msg_ids is None:
+                rel = await conn.fetch(
+                    "SELECT id, primary_msg_id FROM releases WHERE primary_msg_id IN "
+                    "(SELECT id FROM messages WHERE channel_id=$1)", channel_id)
+            else:
+                rel = await conn.fetch(
+                    "SELECT id, primary_msg_id FROM releases "
+                    "WHERE primary_msg_id = ANY($1::bigint[])", msg_ids)
+            rel_ids = [r["id"] for r in rel]
+            blocked_rel = set()
+            if rel_ids:
+                active = await conn.fetch(
+                    "SELECT DISTINCT release_id FROM downloads "
+                    "WHERE release_id = ANY($1::bigint[]) "
+                    "AND status IN ('pending','downloading','queued','paused')", rel_ids)
+                blocked_rel = {r["release_id"] for r in active}
+                purge_rel = [r for r in rel_ids if r not in blocked_rel]
+                if purge_rel:
+                    await conn.execute(
+                        "UPDATE monitored_movies SET grabbed_release_id=NULL "
+                        "WHERE grabbed_release_id = ANY($1::bigint[])", purge_rel)
+                    await conn.execute(
+                        "DELETE FROM downloads WHERE release_id = ANY($1::bigint[])", purge_rel)
+                    await conn.execute(
+                        "DELETE FROM releases WHERE id = ANY($1::bigint[])", purge_rel)
+            keep_msgs = {r["primary_msg_id"] for r in rel if r["id"] in blocked_rel}
+            if msg_ids is None:
+                if keep_msgs:
+                    res = await conn.execute(
+                        "DELETE FROM messages WHERE channel_id=$1 "
+                        "AND id <> ALL($2::bigint[])", channel_id, list(keep_msgs))
+                else:
+                    res = await conn.execute(
+                        "DELETE FROM messages WHERE channel_id=$1", channel_id)
+            else:
+                final_ids = [m for m in msg_ids if m not in keep_msgs]
+                if not final_ids:
+                    return 0
+                res = await conn.execute(
+                    "DELETE FROM messages WHERE id = ANY($1::bigint[])", final_ids)
+    try:
+        return int(res.split()[-1])
+    except Exception:
+        return 0
+
+
+async def index_purge_worker() -> None:
+    """Crawl-and-release. After a channel is fully crawled, contributed to
+    central, and released (left + unsubscribed), delete its local index rows
+    to reclaim storage — central is the source of truth and a later grab
+    re-subscribes + rehydrates from it.
+
+    DESTRUCTIVE → gated off by default (TGARR_INDEX_PURGE). Safety rails:
+      • only released channels (NOT is_joined AND NOT subscribed) + deep_backfilled
+      • never KwickPOS / personal channels
+      • every fuid row must already be contributed_at NOT NULL, AND central must
+        CONFIRM it holds the fuid (resolve_resources) — unconfirmed rows are
+        kept + retried, so we never delete data central lacks
+      • messages with an active/queued download are kept
+      • FK-safe order in a transaction (downloads → releases → messages)
+    """
+    if not INDEX_PURGE_ENABLED:
+        log.info("[index-purge] TGARR_INDEX_PURGE=false — disabled")
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at timestamptz")
+    except Exception as e:
+        log.warning("[index-purge] add purged_at col: %s", e)
+    log.info("[index-purge] started; batch=%d interval=%ds",
+             INDEX_PURGE_BATCH, INDEX_PURGE_INTERVAL_SEC)
+    await asyncio.sleep(300)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                ch = await conn.fetchrow("""
+                    SELECT c.id, c.username, c.title
+                    FROM channels c
+                    WHERE COALESCE(c.deep_backfilled,FALSE)=TRUE
+                      AND COALESCE(c.is_joined,FALSE)=FALSE
+                      AND COALESCE(c.subscribed,FALSE)=FALSE
+                      AND COALESCE(c.title,'') NOT ILIKE 'KwickPOS%'
+                      AND COALESCE(c.category,'') <> 'personal'
+                      AND EXISTS (SELECT 1 FROM messages m
+                                  WHERE m.channel_id=c.id AND m.file_unique_id IS NOT NULL)
+                      AND NOT EXISTS (SELECT 1 FROM messages m
+                                  WHERE m.channel_id=c.id AND m.file_unique_id IS NOT NULL
+                                    AND m.contributed_at IS NULL)
+                    ORDER BY c.deep_last_run_at ASC NULLS FIRST
+                    LIMIT 1
+                """)
+            if not ch:
+                await _heartbeat("index_purge_worker", "nothing eligible to purge")
+                await asyncio.sleep(3600)
+                continue
+            uname = ch["username"] or f"chat-{ch['id']}"
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT id, file_unique_id FROM messages
+                    WHERE channel_id=$1 AND file_unique_id IS NOT NULL
+                      AND contributed_at IS NOT NULL
+                    LIMIT $2
+                """, ch["id"], INDEX_PURGE_BATCH)
+            fuids = list({r["file_unique_id"] for r in rows})
+            confirmed = await _central_resolve(fuids)
+            del_ids = [r["id"] for r in rows if r["file_unique_id"] in confirmed]
+            if not del_ids:
+                log.info("[index-purge] @%s: central confirmed 0/%d fuids — keep, retry",
+                         uname, len(fuids))
+                await asyncio.sleep(INDEX_PURGE_INTERVAL_SEC)
+                continue
+            deleted = await _purge_messages(ch["id"], del_ids)
+            log.info("[index-purge] @%s: purged %d msgs (central-confirmed %d/%d fuids)",
+                     uname, deleted, len(confirmed), len(fuids))
+            await _heartbeat("index_purge_worker",
+                             f"@{uname} purged {deleted} (confirmed {len(confirmed)}/{len(fuids)})")
+            async with db_pool.acquire() as conn:
+                remaining = await conn.fetchval(
+                    "SELECT count(*) FROM messages WHERE channel_id=$1 "
+                    "AND file_unique_id IS NOT NULL AND contributed_at IS NOT NULL",
+                    ch["id"])
+            if remaining == 0:
+                await _purge_messages(ch["id"], None)  # sweep leftover text/no-fuid rows
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET purged_at=NOW() WHERE id=$1", ch["id"])
+                log.info("[index-purge] @%s fully purged — marked purged_at", uname)
+            await asyncio.sleep(INDEX_PURGE_INTERVAL_SEC)
+        except Exception:
+            log.exception("[index-purge] outer loop")
             await asyncio.sleep(600)
 
 
@@ -4155,6 +4380,7 @@ async def main() -> None:
     asyncio.create_task(decay_eviction_worker())
     asyncio.create_task(dialog_gc_worker())
     asyncio.create_task(dialog_leave_worker())
+    asyncio.create_task(index_purge_worker())
     # thumb_hash_backfill is proactive (scans all thumbs for md5 dedup), so it's
     # disabled to match the no-pre-download rule.
     # asyncio.create_task(thumb_hash_backfill())

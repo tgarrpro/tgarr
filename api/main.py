@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.94"
+TGARR_VERSION = "0.4.95"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -210,6 +210,8 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_oldest_tg_id BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_joined BOOLEAN;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_total_pulled BIGINT NOT NULL DEFAULT 0;
             CREATE INDEX IF NOT EXISTS idx_channels_deep_backfilled ON channels (deep_backfilled);
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_msgs BIGINT;
@@ -2663,9 +2665,25 @@ async def api_deep_backfill_progress():
                    (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='audio') AS local_audio,
                    (SELECT count(*) FROM messages m WHERE m.channel_id = channels.id AND m.media_type='document') AS local_documents
             FROM channels
-            WHERE subscribed = TRUE OR enabled = TRUE
+            -- Working set only: actively followed (subscribed/joined) or still
+            -- queued for crawl (enabled & not yet done). Released channels
+            -- (done + unfollowed) and purged ones drop off the list — the
+            -- moat is the contributed resource data, not the channel row.
+            WHERE purged_at IS NULL
+              AND (subscribed = TRUE OR is_joined = TRUE
+                   OR (COALESCE(enabled, TRUE) = TRUE
+                       AND COALESCE(deep_backfilled, FALSE) = FALSE))
             ORDER BY deep_backfilled ASC, COALESCE(remote_msgs, 0) DESC
         """)
+        released_count = await conn.fetchval("""
+            SELECT count(*) FROM channels
+            WHERE purged_at IS NULL
+              AND COALESCE(deep_backfilled, FALSE) = TRUE
+              AND COALESCE(subscribed, FALSE) = FALSE
+              AND COALESCE(is_joined, FALSE) = FALSE
+        """)
+        purged_count = await conn.fetchval(
+            "SELECT count(*) FROM channels WHERE purged_at IS NOT NULL")
     def pct(local, remote):
         if not remote or remote <= 0:
             return None
@@ -2696,7 +2714,9 @@ async def api_deep_backfill_progress():
          "pct_audio": pct(r["local_audio"], r["remote_audio"]),
          "local_documents": r["local_documents"], "remote_documents": r["remote_documents"],
          "pct_documents": pct(r["local_documents"], r["remote_documents"])}
-        for r in rows]}
+        for r in rows],
+        "released_count": released_count or 0,
+        "purged_count": purged_count or 0}
 
 
 @app.get("/system", response_class=HTMLResponse)
