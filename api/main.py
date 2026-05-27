@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.95"
+TGARR_VERSION = "0.4.96"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -4267,9 +4267,9 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         size = _fmt_size(r["file_size"]) if r["file_size"] else ""
         date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
         ch = r["ch_title"] or r["ch_user"] or ""
-        parsed_pill = ('<span class="pill ok" style="font-size:11px">parsed</span>'
+        parsed_pill = ('<span class="pill ok" style="font-size:11px" title="parsed">P</span>'
                        if r["release_id"] else
-                       '<span class="pill muted" style="font-size:11px">unparsed</span>')
+                       '<span class="pill muted" style="font-size:11px" title="unparsed">U</span>')
         return (
             f'<div class="poster-card">'
             f'<div class="poster">'
