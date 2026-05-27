@@ -2921,7 +2921,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.79",
+                "tgarr_version": "0.4.80",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3118,7 +3118,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.79",
+                        "tgarr_version": "0.4.80",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3366,6 +3366,28 @@ async def dialog_gc_worker() -> None:
                              uname, age if age is not None else "never")
             await _heartbeat("dialog_gc_worker",
                              f"swept {len(rows)} silent candidates, dropped {len(dead)}")
+
+            # Purge dead EMPTY phantom rows: 0 messages (no resource data to lose),
+            # not joined, and either never-subscribed/forgotten or a confirmed
+            # unreadable phantom (CHAT_ID_INVALID / username gone). Keeps the
+            # channels table from growing unbounded with caption-mention discovery
+            # noise. Never touches rows with data or KwickPOS*.
+            async with db_pool.acquire() as conn:
+                gc = await conn.execute("""
+                    DELETE FROM channels c
+                    WHERE NOT c.is_joined
+                      AND c.title NOT ILIKE 'KwickPOS%'
+                      AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id)
+                      AND (
+                        NOT c.subscribed
+                        OR c.subscribe_error ILIKE '%CHAT_ID_INVALID%'
+                        OR c.subscribe_error ILIKE '%USERNAME_NOT_OCCUPIED%'
+                        OR c.subscribe_error ILIKE '%not found%'
+                      )
+                """)
+                n = int(gc.split()[-1]) if gc.startswith("DELETE") else 0
+            if n:
+                log.info("[dialog-gc] purged %d empty phantom rows", n)
         except Exception:
             log.exception("[dialog-gc] outer")
         await asyncio.sleep(21600)  # 6h
@@ -3577,7 +3599,18 @@ async def dialog_leave_worker() -> None:
                     log.info("[dialog-leave] @%s not joinable (%s) — cleared flag",
                              uname, type(e).__name__)
                 except Exception as e:
-                    log.warning("[dialog-leave] @%s leave error: %s", uname, str(e)[:120])
+                    es = str(e)
+                    # Stale is_joined: account isn't actually a member (peer not
+                    # in cache / left already) — leave_chat can't help, clear the
+                    # flag so we stop retrying it every batch (was an infinite loop).
+                    if any(s in es for s in ("Peer id invalid", "PEER_ID_INVALID",
+                                             "USER_NOT_PARTICIPANT", "CHANNEL_INVALID")):
+                        async with db_pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE channels SET is_joined=FALSE WHERE id=$1", r["id"])
+                        log.info("[dialog-leave] @%s not a member — cleared stale flag", uname)
+                    else:
+                        log.warning("[dialog-leave] @%s leave error: %s", uname, es[:120])
                 await asyncio.sleep(DIALOG_LEAVE_DELAY_SEC)
         except Exception:
             log.exception("[dialog-leave] outer loop")
@@ -3882,7 +3915,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.79",
+                "tgarr_version": "0.4.80",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
