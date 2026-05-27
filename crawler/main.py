@@ -1922,9 +1922,15 @@ async def _thumb_process_one(row) -> None:
             if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
                 raise RuntimeError("THUMB_ONLY mode: HTTPS scrape miss + MTProto disabled")
             # ── Path 2: MTProto fallback through global rate limiter. ──
+            # NEVER auto-join for a thumbnail: join_chat is capped ~20/day +
+            # FloodWait-prone, and this queue is dominated by left/private
+            # channels whose peer won't resolve. Plain get_messages works for
+            # cached/joined peers and fails FAST for the rest (→ __failed__),
+            # instead of grinding the 3/60s join limiter (the slow-thumbnail
+            # cause). Re-acquiring a left channel happens on user grab, not here.
             async with _THUMB_MTPROTO_SEM:
-                msg = await _mtproto_get_messages_with_auto_join(
-                    row["tg_chat_id"], row["tg_message_id"])
+                msg = await _mtproto("get_messages",
+                    lambda: app.get_messages(row["tg_chat_id"], row["tg_message_id"]))
                 if not msg:
                     raise RuntimeError("message gone")
                 thumb_media = None
@@ -2931,7 +2937,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.97",
+                "tgarr_version": "0.4.98",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3128,7 +3134,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.97",
+                        "tgarr_version": "0.4.98",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3991,7 +3997,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.97",
+                "tgarr_version": "0.4.98",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
