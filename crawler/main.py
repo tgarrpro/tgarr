@@ -2923,7 +2923,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.82",
+                "tgarr_version": "0.4.83",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3120,7 +3120,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.82",
+                        "tgarr_version": "0.4.83",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3700,13 +3700,16 @@ async def deep_backfill_worker() -> None:
 
             # ── Gate B: realized-yield. A channel that has surfaced enough
             # history but parses almost nothing into releases while being
-            # photo-dominated is a singleton-hash photo dump (car-market ads,
-            # photo-news). Stop paging it. Photo-dominance protects video/doc
-            # resource channels whose titles the parser just can't read (#2).
+            # MEDIA-dominated (photo OR video) is singleton-hash noise: a photo
+            # dump (car ads) OR keyword-less VIDEO-NEWS (BBC Persian, Soloviev —
+            # news clips, no real titles). Since v0.4.82 the parser recognizes
+            # real CJK/latin titles, so genuine doc/movie channels earn releases
+            # (rate > MAX_RATE) and are NOT gated — only title-less news/junk
+            # falls through. Honors "no news videos".
             async with db_pool.acquire() as conn:
                 ys = await conn.fetchrow("""
                     SELECT count(*) AS msgs,
-                           count(*) FILTER (WHERE media_type='photo') AS photos,
+                           count(*) FILTER (WHERE media_type IN ('photo','video')) AS media,
                            (SELECT count(*) FROM releases r
                               WHERE r.primary_msg_id IN
                                 (SELECT id FROM messages mm WHERE mm.channel_id=$1)) AS rels
@@ -3714,16 +3717,16 @@ async def deep_backfill_worker() -> None:
                 """, row["id"])
             if ys and ys["msgs"] >= DEEP_YIELD_MIN_MSGS \
                     and ys["rels"] < DEEP_YIELD_MAX_RATE * ys["msgs"] \
-                    and ys["photos"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]:
+                    and ys["media"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]:
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE channels SET deep_backfilled=TRUE, enabled=FALSE,
                            category='noise', content_category='noise' WHERE id=$1""",
                         row["id"])
                 log.info("[deep-backfill] YIELD-GATE skip @%s: %d msgs / %d rels "
-                         "(%.3f%%) / %d photos — photo dump, stop",
+                         "(%.3f%%) / %d media — singleton noise (photo-dump/video-news), stop",
                          uname, ys["msgs"], ys["rels"],
-                         100.0 * ys["rels"] / max(ys["msgs"], 1), ys["photos"])
+                         100.0 * ys["rels"] / max(ys["msgs"], 1), ys["media"])
                 continue
 
             cursor = row["cursor"]
@@ -3917,7 +3920,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.82",
+                "tgarr_version": "0.4.83",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
