@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.87"
+TGARR_VERSION = "0.4.88"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -4325,7 +4325,7 @@ def _release_card(r, my_dc=None) -> str:
     sub_bits = [b for b in (se, posted) if b]
     cat_pill = ("accent" if r["category"] == "movie"
                 else "ok" if r["category"] == "tv" else "muted")
-    cat_label = {"movie": "MO", "tv": "TV"}.get(r["category"], "NA")  # 2-letter, fits card
+    cat_label = {"movie": "MV", "tv": "TV"}.get(r["category"], "NA")  # 2-letter, fits card
     # Always render the emoji fallback in the DOM and let the <img> overlay
     # cover it. If the img 404s/410s the browser onerror hides the img and
     # the emoji shows through. CSS .poster .fallback is absolute-positioned;
