@@ -739,6 +739,13 @@ def _extract_invites(text: str) -> set[str]:
 async def init_db() -> None:
     global db_pool
     db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=4)
+    # Crawl-and-release columns (also created by api _migrate_schema; ensure
+    # here so crawler workers can query them regardless of migration order).
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_joined BOOLEAN")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ")
     log.info("postgres pool ready")
 
 
@@ -2520,6 +2527,22 @@ async def subscription_poller() -> None:
                         row = dict(row)
                         row["tg_chat_id"] = real_chat_id
 
+            # Rehydrate: if this channel was purged after release (crawl-and-
+            # release), pull its index back from central BEFORE polling so
+            # grab/download works again; the backfill below then catches any
+            # messages posted since the purge.
+            async with db_pool.acquire() as conn:
+                was_purged = await conn.fetchval(
+                    "SELECT purged_at FROM channels WHERE id=$1", row["id"])
+            if was_purged:
+                restored = await _rehydrate_channel(
+                    row["id"], row["tg_chat_id"], uname)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET purged_at=NULL WHERE id=$1", row["id"])
+                log.info("[subscribe] @%s rehydrated %d rows from central (was purged)",
+                         uname, restored)
+
             # Backfill on first poll, then incremental on later polls.
             limit = SUBSCRIBE_BACKFILL_LIMIT if not row["backfilled"] else 200
             count = media_count = 0
@@ -2937,7 +2960,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.98",
+                "tgarr_version": "0.4.99",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3134,7 +3157,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.98",
+                        "tgarr_version": "0.4.99",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3997,7 +4020,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.98",
+                "tgarr_version": "0.4.99",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4108,6 +4131,68 @@ async def _central_resolve(fuids: list) -> dict:
     except Exception as e:
         log.warning("[central-resolve] failed: %s", e)
         return {}
+
+
+async def _central_channel_resources(username: str) -> list:
+    """Fetch a channel's full resource index from central (for rehydrate)."""
+    if not username:
+        return []
+    try:
+        uuid_val = await _instance_uuid_val()
+        result = await _central_post("/api/v1/channel_resources",
+                                     {"instance_uuid": uuid_val or "",
+                                      "channel_username": username.lstrip("@"),
+                                      "limit": 100000})
+        return result.get("resources", []) or []
+    except Exception as e:
+        log.warning("[rehydrate] channel_resources @%s failed: %s", username, e)
+        return []
+
+
+async def _rehydrate_channel(channel_id: int, tg_chat_id: int, username: str) -> int:
+    """Re-seed a purged channel's local index from central so grab/download
+    works again. Central indexes by username, so private/no-username channels
+    can't rehydrate (returns 0). file_dc is absent in central → starts NULL and
+    backfills on first fetch. Returns rows restored."""
+    resources = await _central_channel_resources(username)
+    if not resources:
+        return 0
+    from datetime import datetime as _dt
+    restored = 0
+    async with db_pool.acquire() as conn:
+        for r in resources:
+            fuid = r.get("file_unique_id")
+            msg_id = r.get("msg_id")
+            if not fuid or not msg_id:
+                continue
+            fname = r.get("file_name")
+            posted_dt = None
+            if r.get("posted_at"):
+                try:
+                    posted_dt = _dt.fromisoformat(r["posted_at"])
+                except Exception:
+                    posted_dt = None
+            new_id = await conn.fetchval(
+                """INSERT INTO messages
+                     (channel_id, tg_message_id, tg_chat_id, file_unique_id,
+                      file_name, file_size, mime_type, media_type, posted_at,
+                      detected_lang, contributed_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+                   ON CONFLICT (channel_id, tg_message_id) DO NOTHING
+                   RETURNING id""",
+                channel_id, msg_id, tg_chat_id, fuid, fname,
+                r.get("file_size"), r.get("mime_type"), r.get("media_type"),
+                posted_dt, _detect_lang(fname or ""))
+            if new_id:
+                restored += 1
+                if fname:
+                    try:
+                        await maybe_create_release(
+                            conn, new_id, fname, r.get("file_size"), posted_dt)
+                    except Exception:
+                        pass
+    log.info("[rehydrate] @%s restored %d rows from central", username, restored)
+    return restored
 
 
 async def _purge_messages(channel_id: int, msg_ids) -> int:
