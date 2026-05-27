@@ -748,6 +748,8 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_accessed_at TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview_accessed_at TIMESTAMPTZ")
     log.info("postgres pool ready")
 
 
@@ -2010,66 +2012,74 @@ async def _thumb_process_one(row) -> None:
 
 
 THUMB_TTL_HOURS = int(os.environ.get("TGARR_THUMB_TTL_HOURS", "5"))
-THUMB_GC_INTERVAL_SEC = int(os.environ.get("TGARR_THUMB_GC_INTERVAL_SEC", "1800"))
+PREVIEW_TTL_HOURS = int(os.environ.get("TGARR_PREVIEW_TTL_HOURS", "5"))
+MEDIA_GC_INTERVAL_SEC = int(os.environ.get("TGARR_MEDIA_GC_INTERVAL_SEC", "1800"))
+
+
+async def _gc_media_cache(label, path_col, accessed_col, root, ttl_hours):
+    """Evict files in `root` whose EVERY referrer is stale (MAX accessed_at <
+    now-ttl). md5-dedup-safe: a file shared by several messages is removed only
+    when all are cold. Clearing the path re-queues it on next view. Returns
+    (files_removed, bytes_freed, rows_cleared). path_col/accessed_col are fixed
+    literals (not user input)."""
+    async with db_pool.acquire() as conn:
+        stale = await conn.fetch(f"""
+            SELECT {path_col} AS p
+            FROM messages
+            WHERE {path_col} IS NOT NULL
+              AND {path_col} NOT IN ('__user_queued__','__failed__','__deleted__')
+            GROUP BY {path_col}
+            HAVING MAX(COALESCE({accessed_col}, 'epoch'::timestamptz))
+                   < NOW() - INTERVAL '{int(ttl_hours)} hours'
+            LIMIT 2000
+        """)
+    removed = freed = cleared = 0
+    for r in stale:
+        fn = r["p"]
+        fpath = os.path.join(root, fn)
+        try:
+            freed += os.path.getsize(fpath)
+            os.remove(fpath)
+            removed += 1
+        except FileNotFoundError:
+            pass  # already gone — still clear dangling refs
+        except Exception as e:
+            log.warning("[%s-gc] remove %s: %s", label, fn, e)
+            continue
+        async with db_pool.acquire() as conn:
+            res = await conn.execute(
+                f"UPDATE messages SET {path_col}=NULL WHERE {path_col}=$1", fn)
+        try:
+            cleared += int(res.split()[-1])
+        except Exception:
+            pass
+    return removed, freed, cleared
 
 
 async def thumb_cache_gc_worker() -> None:
-    """Evict thumbnail files not READ within TGARR_THUMB_TTL_HOURS (default 5h)
-    to keep the cache small — on-demand thumbs re-fetch fast (HTTPS / same-DC).
-
-    A thumb FILE can be shared by several messages (md5 dedup), so it's evicted
-    only when EVERY message pointing at it is stale (MAX accessed_at < cutoff).
-    Deleting the file clears thumb_path=NULL on all its referrers → they
-    re-queue ('__user_queued__') and re-download on next view.
+    """Evict thumbnail AND preview files not READ within their TTL (default 5h
+    each). On-demand caches re-fetch fast, so we don't hoard — and full-res
+    previews are large, so they especially need trimming.
     """
     await asyncio.sleep(600)  # settle after boot
-    log.info("[thumb-gc] started; ttl=%dh interval=%ds",
-             THUMB_TTL_HOURS, THUMB_GC_INTERVAL_SEC)
+    log.info("[media-gc] started; thumb_ttl=%dh preview_ttl=%dh interval=%ds",
+             THUMB_TTL_HOURS, PREVIEW_TTL_HOURS, MEDIA_GC_INTERVAL_SEC)
     while True:
         try:
-            async with db_pool.acquire() as conn:
-                stale_files = await conn.fetch(f"""
-                    SELECT thumb_path
-                    FROM messages
-                    WHERE thumb_path IS NOT NULL
-                      AND thumb_path NOT IN ('__user_queued__','__failed__','__deleted__')
-                    GROUP BY thumb_path
-                    HAVING MAX(COALESCE(thumb_accessed_at, 'epoch'::timestamptz))
-                           < NOW() - INTERVAL '{THUMB_TTL_HOURS} hours'
-                    LIMIT 2000
-                """)
-            if not stale_files:
-                await _heartbeat("thumb_cache_gc_worker",
-                                 f"clean — nothing unread > {THUMB_TTL_HOURS}h")
-                await asyncio.sleep(THUMB_GC_INTERVAL_SEC)
-                continue
-            removed = freed = cleared = 0
-            for r in stale_files:
-                fn = r["thumb_path"]
-                fpath = os.path.join(THUMBS_ROOT, fn)
-                try:
-                    freed += os.path.getsize(fpath)
-                    os.remove(fpath)
-                    removed += 1
-                except FileNotFoundError:
-                    pass  # file already gone — still clear dangling refs
-                except Exception as e:
-                    log.warning("[thumb-gc] remove %s: %s", fn, e)
-                    continue
-                async with db_pool.acquire() as conn:
-                    res = await conn.execute(
-                        "UPDATE messages SET thumb_path=NULL WHERE thumb_path=$1", fn)
-                try:
-                    cleared += int(res.split()[-1])
-                except Exception:
-                    pass
-            log.info("[thumb-gc] evicted %d files (%.1f MB), cleared %d rows (ttl %dh)",
-                     removed, freed / 1e6, cleared, THUMB_TTL_HOURS)
+            tr, tf, tc = await _gc_media_cache(
+                "thumb", "thumb_path", "thumb_accessed_at",
+                THUMBS_ROOT, THUMB_TTL_HOURS)
+            pr, pf, pc = await _gc_media_cache(
+                "preview", "preview_path", "preview_accessed_at",
+                PREVIEWS_ROOT, PREVIEW_TTL_HOURS)
+            if tr or pr:
+                log.info("[media-gc] evicted thumbs %d (%.1fMB) / previews %d (%.1fMB)",
+                         tr, tf / 1e6, pr, pf / 1e6)
             await _heartbeat("thumb_cache_gc_worker",
-                             f"evicted {removed} files ({freed // 1024 // 1024}MB)")
-            await asyncio.sleep(THUMB_GC_INTERVAL_SEC)
+                             f"thumbs {tr} ({tf//1024//1024}MB), previews {pr} ({pf//1024//1024}MB)")
+            await asyncio.sleep(MEDIA_GC_INTERVAL_SEC)
         except Exception:
-            log.exception("[thumb-gc] outer loop")
+            log.exception("[media-gc] outer loop")
             await asyncio.sleep(300)
 
 
@@ -2106,18 +2116,32 @@ async def _fetch_preview_mtproto(chat_id: int, msg_id: int) -> bytes | None:
 
 async def _preview_process_one(row):
     blob = None
-    # HTTPS path (cheap, no MTProto quota) — only when public channel
-    if row["channel_username"]:
-        try:
-            async with _PREVIEW_SEM:
-                blob = await _fetch_preview_https(
-                    row["channel_username"], row["tg_message_id"])
-        except Exception as e:
-            log.debug("[preview] https err id=%s: %s", row["id"], e)
-    # MTProto fallback for private channels OR when HTTPS scrape missed
-    if not blob:
+    # Same-DC → MTProto full-res FIRST. The t.me embed serves tiny ~240px
+    # grid-thumbs for ALBUMS (grouped media), which look blurry fullscreen;
+    # download_media gives the original. Gallery is same-DC by default so this
+    # is the common path. Cross-DC → HTTPS only (no cross-DC auth FloodWait).
+    same_dc = bool(row["file_dc"] and CURRENT_DC and row["file_dc"] == CURRENT_DC)
+    if same_dc:
         blob = await _fetch_preview_mtproto(
             row["tg_chat_id"], row["tg_message_id"])
+        if not blob and row["channel_username"]:
+            try:
+                async with _PREVIEW_SEM:
+                    blob = await _fetch_preview_https(
+                        row["channel_username"], row["tg_message_id"])
+            except Exception as e:
+                log.debug("[preview] https err id=%s: %s", row["id"], e)
+    else:
+        if row["channel_username"]:
+            try:
+                async with _PREVIEW_SEM:
+                    blob = await _fetch_preview_https(
+                        row["channel_username"], row["tg_message_id"])
+            except Exception as e:
+                log.debug("[preview] https err id=%s: %s", row["id"], e)
+        if not blob:
+            blob = await _fetch_preview_mtproto(
+                row["tg_chat_id"], row["tg_message_id"])
     if not blob:
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -2133,8 +2157,8 @@ async def _preview_process_one(row):
             f.write(blob)
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "UPDATE messages SET preview_path=$1 WHERE id=$2",
-                fname, row["id"])
+                "UPDATE messages SET preview_path=$1, preview_accessed_at=NOW() "
+                "WHERE id=$2", fname, row["id"])
     except Exception as e:
         log.warning("[preview] write failed id=%s: %s", row["id"], e)
         async with db_pool.acquire() as conn:
@@ -2189,7 +2213,7 @@ async def preview_downloader() -> None:
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch(
                     """SELECT m.id, m.tg_chat_id, m.tg_message_id,
-                              m.file_unique_id,
+                              m.file_unique_id, m.file_dc,
                               c.username AS channel_username
                        FROM messages m JOIN channels c ON c.id = m.channel_id
                        WHERE m.preview_path = '__user_queued__'
@@ -3088,7 +3112,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.1",
+                "tgarr_version": "0.5.2",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3285,7 +3309,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.5.1",
+                        "tgarr_version": "0.5.2",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -4148,7 +4172,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.1",
+                "tgarr_version": "0.5.2",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
