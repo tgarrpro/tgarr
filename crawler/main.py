@@ -2923,7 +2923,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.88",
+                "tgarr_version": "0.4.89",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3120,7 +3120,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.88",
+                        "tgarr_version": "0.4.89",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3390,6 +3390,26 @@ async def dialog_gc_worker() -> None:
                 n = int(gc.split()[-1]) if gc.startswith("DELETE") else 0
             if n:
                 log.info("[dialog-gc] purged %d empty phantom rows", n)
+
+            # Mark resource-poor channels deep-backfilled so they stop lingering
+            # in the deep-backfill queue forever. The deep_backfill_worker SELECT
+            # excludes channels with < DEEP_BACKFILL_MIN_MEDIA remote media items
+            # (passive WHERE filter), so they're never processed AND never marked
+            # done → they show "pending" indefinitely (e.g. text channels like
+            # KwickPOS HQ with 4 media / 660 text msgs). Actively close them out.
+            async with db_pool.acquire() as conn:
+                rp = await conn.execute("""
+                    UPDATE channels SET deep_backfilled=TRUE
+                    WHERE NOT COALESCE(deep_backfilled, FALSE)
+                      AND remote_counts_refreshed_at IS NOT NULL
+                      AND (COALESCE(remote_photos,0)+COALESCE(remote_videos,0)
+                           +COALESCE(remote_audio,0)+COALESCE(remote_documents,0))
+                          < $1
+                """, DEEP_BACKFILL_MIN_MEDIA)
+                rpn = int(rp.split()[-1]) if rp.startswith("UPDATE") else 0
+            if rpn:
+                log.info("[dialog-gc] closed %d resource-poor channels (< %d media)",
+                         rpn, DEEP_BACKFILL_MIN_MEDIA)
         except Exception:
             log.exception("[dialog-gc] outer")
         await asyncio.sleep(21600)  # 6h
@@ -3927,7 +3947,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.88",
+                "tgarr_version": "0.4.89",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
