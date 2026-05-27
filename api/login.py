@@ -11,6 +11,7 @@ State machine:
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 from typing import Optional
@@ -36,6 +37,10 @@ API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_DIR = "/app/session"
 REVOKED_MARKER = os.path.join(SESSION_DIR, ".revoked")
+# user_info lives in-memory (lost on container restart) but the session file
+# persists on the mounted volume. Persist the self-user beside it so the
+# sidebar doesn't fall back to @anonymous after a watchtower restart.
+USER_INFO_FILE = os.path.join(SESSION_DIR, "user_info.json")
 
 # Singleton state — only one login attempt at a time.
 class LoginState:
@@ -62,6 +67,35 @@ class LoginState:
 
 
 state = LoginState()
+
+
+def _persist_user_info() -> None:
+    """Write the self-user to the session volume so it survives restarts."""
+    try:
+        if state.user_info:
+            with open(USER_INFO_FILE, "w", encoding="utf-8") as f:
+                json.dump(state.user_info, f)
+    except Exception as e:
+        log.warning("[login] persist user_info failed: %s", e)
+
+
+def ensure_user_info() -> Optional[dict]:
+    """Return the cached self-user, lazily restoring it from disk after a
+    restart. user_info is in-memory only, but we persist a copy beside the
+    session file — reload it here so callers (sidebar, settings) show the
+    real username instead of @anonymous until a get_me re-populates it.
+    """
+    if state.user_info:
+        return state.user_info
+    if not session_exists():
+        return None
+    try:
+        if os.path.exists(USER_INFO_FILE):
+            with open(USER_INFO_FILE, "r", encoding="utf-8") as f:
+                state.user_info = json.load(f)
+    except Exception as e:
+        log.warning("[login] load user_info failed: %s", e)
+    return state.user_info
 
 
 def session_exists() -> bool:
@@ -121,7 +155,7 @@ def _clean_stale_session():
         except Exception:
             needs_purge = True
     if needs_purge:
-        for fn in ("tgarr.session", "tgarr.session-journal"):
+        for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json"):
             p = os.path.join(SESSION_DIR, fn)
             if os.path.exists(p):
                 try:
@@ -188,6 +222,7 @@ async def _save_user_and_disconnect(user_obj):
     }
     state.status = "success"
     state.message = f"signed in as @{state.user_info['username'] or state.user_info['first_name']}"
+    _persist_user_info()
     log.info("[login] success: %s", state.message)
     # Clear .revoked marker — fresh auth = healthy account again. Crawler's
     # boot-time check will see clean state on next start.
@@ -324,7 +359,7 @@ def logout() -> dict:
     state.reset()
     state.client = None
     removed = []
-    for fn in ("tgarr.session", "tgarr.session-journal"):
+    for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json"):
         path = os.path.join(SESSION_DIR, fn)
         if os.path.exists(path):
             try:

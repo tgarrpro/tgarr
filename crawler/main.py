@@ -2923,7 +2923,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.93",
+                "tgarr_version": "0.4.94",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3120,7 +3120,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.93",
+                        "tgarr_version": "0.4.94",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3956,7 +3956,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.93",
+                "tgarr_version": "0.4.94",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4104,6 +4104,16 @@ async def main() -> None:
         CURRENT_DC = 0
     log.info("connected as @%s (id=%s) dc=%s",
              me.username or "-", me.id, CURRENT_DC)
+    # Persist self-user beside the session (shared volume) so the API sidebar
+    # shows the real username instead of @anonymous after a restart — the API
+    # has no live client to get_me, so the crawler is the authoritative source.
+    try:
+        import json as _json
+        with open("/app/session/user_info.json", "w", encoding="utf-8") as _f:
+            _json.dump({"id": me.id, "username": me.username,
+                        "first_name": me.first_name}, _f)
+    except Exception as _e:
+        log.debug("[boot] persist user_info failed: %s", _e)
     # Reset stale 'downloading' from previous crash/restart — worker is
     # single-task serial, so only one can really be in flight at a time.
     # Any leftover 'downloading' from a previous boot is dead state.

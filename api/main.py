@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.93"
+TGARR_VERSION = "0.4.94"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -129,6 +129,9 @@ async def _startup():
     global db_pool
     db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
     await _migrate_schema()
+    # Restore self-user from the session volume so the sidebar shows the real
+    # username (not @anonymous) immediately after a restart, before any get_me.
+    login.ensure_user_info()
     # Seed TMDB key from env into config table on first run only
     env_key = os.environ.get("TMDB_API_KEY", "").strip()
     if env_key:
@@ -2352,7 +2355,7 @@ def _color_for(s: str) -> str:
 
 def _user_block() -> str:
     if login.session_exists():
-        user = login.state.user_info or {}
+        user = login.ensure_user_info() or {}
         name = user.get("username") or user.get("first_name") or "anonymous"
         return f'<div class="name">@{html.escape(str(name))}</div><div>signed in</div>'
     return '<div class="name">not signed in</div><a href="/login">sign in →</a>'
@@ -4828,7 +4831,7 @@ async def page_search(q: Optional[str] = None,
 @app.get("/settings", response_class=HTMLResponse)
 async def page_settings():
     authed = login.session_exists()
-    user = login.state.user_info or {}
+    user = login.ensure_user_info() or {}
     async with db_pool.acquire() as conn:
         tmdb_raw = await conn.fetchval(
             "SELECT value FROM config WHERE key='tmdb_api_key'")
