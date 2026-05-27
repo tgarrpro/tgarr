@@ -294,8 +294,21 @@ def parse_filename(name: str) -> dict:
 
     # Score (0.0–1.0)
     s = 0.0
-    if out.get("title") and len(out["title"]) >= 2:
+    _t = out.get("title") or ""
+    if _t and len(_t) >= 2:
         s += 0.20
+        # Substantial real title is itself a strong release signal even without
+        # year/episode/quality metadata — common for CJK doc/movie files whose
+        # title lives in the file_name (e.g. "侯季然《書店裡的影像詩》", "我是无名女").
+        # A bare ≥3-CJK-char title or ≥2 real (non-numeric) words clears 0.30;
+        # generic stubs like "02", "8.mp4" stay at 0.20 and are still rejected.
+        # CJK-only boost: a ≥3-CJK-char title is almost always a real
+        # movie/doc name. Latin/Cyrillic multi-word titles are NOT boosted —
+        # they'd false-match news headlines ("Москвач Новости") and real
+        # latin releases usually carry year/quality metadata that already scores.
+        _cjk = len(re.findall(r"[一-鿿぀-ヿ가-힯]", _t))
+        if _cjk >= 3:
+            s += 0.15
     if out.get("year"):
         s += 0.20
     if out.get("season") is not None:
