@@ -40,7 +40,11 @@ USERNAME_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 # Same as client — defense in depth
 CSAM_RX = re.compile(
     r"\b(loli|lolicon|shota|shotacon|child\s*porn|kid\s*porn|"
-    r"pre[\s_-]*teen|under[\s_-]*age|\bcp\d+|\bcp_)\b", re.IGNORECASE)
+    # Tightened from the loose \bcp\d+|\bcp_ which false-matched innocent file
+    # names (cp1250 charset, cp_2023 …) → bogus csam-resource flags → suspicion
+    # ban → 403 on contribute_resources. Require 3+ digits or explicit CSAM word.
+    r"pre[\s_-]*teen|under[\s_-]*age|cp\d{3,}|cp_(?:young|teen|kid|pthc|lolita|child))\b",
+    re.IGNORECASE)
 
 # Federation-noise gate (server-side, defense in depth — the client v0.4.74
 # fed-validator also filters, but central must reject regardless of which

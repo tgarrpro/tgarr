@@ -2545,7 +2545,9 @@ SEED_VALIDATOR_INTERVAL = int(os.environ.get("TGARR_SEED_VALIDATOR_INTERVAL", "3
 # Same CSAM regex as registry server — defense in depth.
 _CSAM_RX = re.compile(
     r"\b(loli|lolicon|shota|shotacon|child\s*porn|kid\s*porn|"
-    r"pre[\s_-]*teen|under[\s_-]*age|\bcp\d+|\bcp_)\b", re.IGNORECASE)
+    # Tightened: loose \bcp\d+|\bcp_ false-matched innocent names (cp1250, cp_2023)
+    r"pre[\s_-]*teen|under[\s_-]*age|cp\d{3,}|cp_(?:young|teen|kid|pthc|lolita|child))\b",
+    re.IGNORECASE)
 _NSFW_RX = re.compile(
     r"(porn|xxx|nsfw|adult|18\+|hentai|erotic|nude|naked|onlyfan|"
     r"sexy|sex\b|色情|成人|18禁|裸|淫|эротик|порно|секс|اباحي|سكس|"
@@ -2921,7 +2923,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.80",
+                "tgarr_version": "0.4.81",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3118,7 +3120,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.80",
+                        "tgarr_version": "0.4.81",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3915,7 +3917,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.80",
+                "tgarr_version": "0.4.81",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
