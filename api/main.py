@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.86"
+TGARR_VERSION = "0.4.87"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -4325,6 +4325,7 @@ def _release_card(r, my_dc=None) -> str:
     sub_bits = [b for b in (se, posted) if b]
     cat_pill = ("accent" if r["category"] == "movie"
                 else "ok" if r["category"] == "tv" else "muted")
+    cat_label = {"movie": "MO", "tv": "TV"}.get(r["category"], "NA")  # 2-letter, fits card
     # Always render the emoji fallback in the DOM and let the <img> overlay
     # cover it. If the img 404s/410s the browser onerror hides the img and
     # the emoji shows through. CSS .poster .fallback is absolute-positioned;
@@ -4355,7 +4356,7 @@ def _release_card(r, my_dc=None) -> str:
         f'</div>'
         f'<div class="pills">'
         f'{_dc_badge(r.get("file_dc") if hasattr(r,"get") else r["file_dc"], my_dc)}'
-        f'<span class="pill {cat_pill}">{"NA" if r["category"] not in ("movie", "tv") else r["category"]}</span>'
+        f'<span class="pill {cat_pill}">{cat_label}</span>'
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
         f'</div>'
         f'<div class="grab-row" style="display:flex;gap:6px">'
