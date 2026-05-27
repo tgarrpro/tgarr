@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.92"
+TGARR_VERSION = "0.4.93"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -2677,6 +2677,14 @@ async def api_deep_backfill_progress():
          "msgs_local": r["msgs_local"],
          "remote_msgs": r["remote_msgs"],
          "pct_msgs": pct(r["msgs_local"], r["remote_msgs"]),
+         "local_media": (r["local_photos"] or 0) + (r["local_videos"] or 0)
+                        + (r["local_audio"] or 0) + (r["local_documents"] or 0),
+         "remote_media": (r["remote_photos"] or 0) + (r["remote_videos"] or 0)
+                         + (r["remote_audio"] or 0) + (r["remote_documents"] or 0),
+         "pct_media": pct((r["local_photos"] or 0) + (r["local_videos"] or 0)
+                          + (r["local_audio"] or 0) + (r["local_documents"] or 0),
+                          (r["remote_photos"] or 0) + (r["remote_videos"] or 0)
+                          + (r["remote_audio"] or 0) + (r["remote_documents"] or 0)),
          "local_photos": r["local_photos"], "remote_photos": r["remote_photos"],
          "pct_photos": pct(r["local_photos"], r["remote_photos"]),
          "local_videos": r["local_videos"], "remote_videos": r["remote_videos"],
@@ -2750,15 +2758,15 @@ async function loadDeepBackfill() {
     return `<span title="${t}" style="${s};padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600">${m}</span>`;
   };
   const rows = (j.channels || []).map(c => {
-    const totalCell = c.remote_msgs
-      ? `${c.msgs_local.toLocaleString()} / ${c.remote_msgs.toLocaleString()}`
-      : c.msgs_local.toLocaleString();
+    const totalCell = c.remote_media
+      ? `${(c.local_media||0).toLocaleString()} / ${c.remote_media.toLocaleString()}`
+      : (c.local_media||0).toLocaleString();
     return `
     <tr><td>${c.done?"✅":"🔄"} <b>@${c.username || "—"}</b></td>
         <td>${modeBadge(c.mode)}</td>
         <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(c.title || "").substring(0, 40)}</td>
         <td style="text-align:right;font-size:13px">${totalCell}</td>
-        <td>${bar(c.pct_msgs)}</td>
+        <td>${bar(c.pct_media)}</td>
         <td style="text-align:right;font-size:11px;color:#475569">P ${fmtPct(c.pct_photos)}</td>
         <td style="text-align:right;font-size:11px;color:#475569">V ${fmtPct(c.pct_videos)}</td>
         <td style="text-align:right;font-size:11px;color:#475569">A ${fmtPct(c.pct_audio)}</td>
@@ -2768,7 +2776,7 @@ async function loadDeepBackfill() {
   document.getElementById("deepBackfillTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
     <th>Status</th><th>Mode</th><th>Title</th>
-    <th style="text-align:right">Msgs (local/remote)</th>
+    <th style="text-align:right">Media (local/remote)</th>
     <th>Progress</th>
     <th style="text-align:right">Photos</th>
     <th style="text-align:right">Videos</th>

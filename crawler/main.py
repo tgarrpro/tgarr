@@ -2923,7 +2923,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.92",
+                "tgarr_version": "0.4.93",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3120,7 +3120,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.92",
+                        "tgarr_version": "0.4.93",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3956,7 +3956,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.92",
+                "tgarr_version": "0.4.93",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
