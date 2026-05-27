@@ -2923,7 +2923,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.83",
+                "tgarr_version": "0.4.84",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3120,7 +3120,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.83",
+                        "tgarr_version": "0.4.84",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3709,24 +3709,31 @@ async def deep_backfill_worker() -> None:
             async with db_pool.acquire() as conn:
                 ys = await conn.fetchrow("""
                     SELECT count(*) AS msgs,
-                           count(*) FILTER (WHERE media_type IN ('photo','video')) AS media,
+                           count(*) FILTER (WHERE media_type='photo') AS photos,
+                           count(*) FILTER (WHERE media_type='video') AS videos,
                            (SELECT count(*) FROM releases r
                               WHERE r.primary_msg_id IN
                                 (SELECT id FROM messages mm WHERE mm.channel_id=$1)) AS rels
                     FROM messages WHERE channel_id=$1
                 """, row["id"])
+            # Gate if SOLELY photo-dominated (photo-dump) OR SOLELY video-dominated
+            # (video-news). A single media type >70% = singleton noise. Mixed
+            # photo+video channels (book covers + sample clips, archives) are NOT
+            # gated — protects resource channels whose value is books/audio/docs
+            # that don't parse into movie/TV releases.
             if ys and ys["msgs"] >= DEEP_YIELD_MIN_MSGS \
                     and ys["rels"] < DEEP_YIELD_MAX_RATE * ys["msgs"] \
-                    and ys["media"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]:
+                    and (ys["photos"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]
+                         or ys["videos"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]):
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         """UPDATE channels SET deep_backfilled=TRUE, enabled=FALSE,
                            category='noise', content_category='noise' WHERE id=$1""",
                         row["id"])
                 log.info("[deep-backfill] YIELD-GATE skip @%s: %d msgs / %d rels "
-                         "(%.3f%%) / %d media — singleton noise (photo-dump/video-news), stop",
+                         "(%.3f%%) / %dp %dv — singleton noise (photo-dump/video-news), stop",
                          uname, ys["msgs"], ys["rels"],
-                         100.0 * ys["rels"] / max(ys["msgs"], 1), ys["media"])
+                         100.0 * ys["rels"] / max(ys["msgs"], 1), ys["photos"], ys["videos"])
                 continue
 
             cursor = row["cursor"]
@@ -3920,7 +3927,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.83",
+                "tgarr_version": "0.4.84",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
