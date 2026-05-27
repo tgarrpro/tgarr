@@ -31,7 +31,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.4.99"
+TGARR_VERSION = "0.5.0"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -198,6 +198,13 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_dc INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_accessed_at TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_messages_thumb_accessed ON messages (thumb_accessed_at) WHERE thumb_path IS NOT NULL;
+            -- One-time grace: give already-cached thumbs a fresh clock so the
+            -- 5h TTL GC doesn't wipe them all on first run (idempotent: only NULLs).
+            UPDATE messages SET thumb_accessed_at = NOW()
+              WHERE thumb_accessed_at IS NULL AND thumb_path IS NOT NULL
+                AND thumb_path NOT IN ('__user_queued__','__failed__','__deleted__');
             CREATE TABLE IF NOT EXISTS worker_status (
               worker TEXT PRIMARY KEY,
               last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -654,6 +661,19 @@ _TINY_TRANSPARENT_GIF = bytes.fromhex(
 )
 
 
+async def _touch_thumb(msg_id: int) -> None:
+    """Bump thumb_accessed_at (throttled to ≤1 write/30min/thumb) so the TTL
+    cache GC keeps recently-viewed thumbs and evicts the rest."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET thumb_accessed_at = NOW() "
+                "WHERE id = $1 AND (thumb_accessed_at IS NULL "
+                "OR thumb_accessed_at < NOW() - INTERVAL '30 minutes')", msg_id)
+    except Exception:
+        pass
+
+
 @app.get("/api/thumb/{msg_id}")
 async def lazy_thumb(msg_id: int):
     """On-demand thumb materialization. Cached -> serve. Uncached -> mark
@@ -670,6 +690,7 @@ async def lazy_thumb(msg_id: int):
     if tp and not tp.startswith("__"):
         fpath = os.path.join(THUMBS_DIR, tp)
         if os.path.exists(fpath):
+            await _touch_thumb(msg_id)
             return FileResponse(fpath, media_type="image/jpeg",
                               headers={"Cache-Control": "public, max-age=604800"})
     if tp in ("__failed__", "__deleted__"):
@@ -692,6 +713,7 @@ async def lazy_thumb(msg_id: int):
         if tp and not tp.startswith("__"):
             fpath = os.path.join(THUMBS_DIR, tp)
             if os.path.exists(fpath):
+                await _touch_thumb(msg_id)
                 return FileResponse(fpath, media_type="image/jpeg",
                                   headers={"Cache-Control": "public, max-age=604800"})
         if tp in ("__failed__", "__deleted__"):

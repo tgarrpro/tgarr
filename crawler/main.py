@@ -746,6 +746,8 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_joined BOOLEAN")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_accessed_at TIMESTAMPTZ")
     log.info("postgres pool ready")
 
 
@@ -1969,12 +1971,14 @@ async def _thumb_process_one(row) -> None:
                 except Exception:
                     pass
                 await conn.execute(
-                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
+                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
+                    "thumb_accessed_at=NOW() WHERE id=$3",
                     existing, md5, row["id"])
                 log.info("[thumbs] dedup id=%s → %s", row["id"], existing)
             else:
                 await conn.execute(
-                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2 WHERE id=$3",
+                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
+                    "thumb_accessed_at=NOW() WHERE id=$3",
                     fname, md5, row["id"])
     except FloodWait as fw:
         wait = getattr(fw, "value", 60) + 5
@@ -1987,6 +1991,70 @@ async def _thumb_process_one(row) -> None:
             await conn.execute(
                 "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
                 row["id"])
+
+
+THUMB_TTL_HOURS = int(os.environ.get("TGARR_THUMB_TTL_HOURS", "5"))
+THUMB_GC_INTERVAL_SEC = int(os.environ.get("TGARR_THUMB_GC_INTERVAL_SEC", "1800"))
+
+
+async def thumb_cache_gc_worker() -> None:
+    """Evict thumbnail files not READ within TGARR_THUMB_TTL_HOURS (default 5h)
+    to keep the cache small — on-demand thumbs re-fetch fast (HTTPS / same-DC).
+
+    A thumb FILE can be shared by several messages (md5 dedup), so it's evicted
+    only when EVERY message pointing at it is stale (MAX accessed_at < cutoff).
+    Deleting the file clears thumb_path=NULL on all its referrers → they
+    re-queue ('__user_queued__') and re-download on next view.
+    """
+    await asyncio.sleep(600)  # settle after boot
+    log.info("[thumb-gc] started; ttl=%dh interval=%ds",
+             THUMB_TTL_HOURS, THUMB_GC_INTERVAL_SEC)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                stale_files = await conn.fetch(f"""
+                    SELECT thumb_path
+                    FROM messages
+                    WHERE thumb_path IS NOT NULL
+                      AND thumb_path NOT IN ('__user_queued__','__failed__','__deleted__')
+                    GROUP BY thumb_path
+                    HAVING MAX(COALESCE(thumb_accessed_at, 'epoch'::timestamptz))
+                           < NOW() - INTERVAL '{THUMB_TTL_HOURS} hours'
+                    LIMIT 2000
+                """)
+            if not stale_files:
+                await _heartbeat("thumb_cache_gc_worker",
+                                 f"clean — nothing unread > {THUMB_TTL_HOURS}h")
+                await asyncio.sleep(THUMB_GC_INTERVAL_SEC)
+                continue
+            removed = freed = cleared = 0
+            for r in stale_files:
+                fn = r["thumb_path"]
+                fpath = os.path.join(THUMBS_ROOT, fn)
+                try:
+                    freed += os.path.getsize(fpath)
+                    os.remove(fpath)
+                    removed += 1
+                except FileNotFoundError:
+                    pass  # file already gone — still clear dangling refs
+                except Exception as e:
+                    log.warning("[thumb-gc] remove %s: %s", fn, e)
+                    continue
+                async with db_pool.acquire() as conn:
+                    res = await conn.execute(
+                        "UPDATE messages SET thumb_path=NULL WHERE thumb_path=$1", fn)
+                try:
+                    cleared += int(res.split()[-1])
+                except Exception:
+                    pass
+            log.info("[thumb-gc] evicted %d files (%.1f MB), cleared %d rows (ttl %dh)",
+                     removed, freed / 1e6, cleared, THUMB_TTL_HOURS)
+            await _heartbeat("thumb_cache_gc_worker",
+                             f"evicted {removed} files ({freed // 1024 // 1024}MB)")
+            await asyncio.sleep(THUMB_GC_INTERVAL_SEC)
+        except Exception:
+            log.exception("[thumb-gc] outer loop")
+            await asyncio.sleep(300)
 
 
 _PREVIEW_SEM = asyncio.Semaphore(5)  # concurrent HTTPS fetches
@@ -2960,7 +3028,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.99",
+                "tgarr_version": "0.5.0",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3157,7 +3225,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.4.99",
+                        "tgarr_version": "0.5.0",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -4020,7 +4088,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.4.99",
+                "tgarr_version": "0.5.0",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4103,7 +4171,7 @@ async def _central_post(path: str, payload: dict, timeout: int = 120) -> dict:
         REGISTRY_URL + path, data=body_gz,
         headers={"Content-Type": "application/json",
                  "Content-Encoding": "gzip", "Accept-Encoding": "gzip",
-                 "User-Agent": "tgarr/0.4.95 (+https://tgarr.me)"},
+                 "User-Agent": "tgarr/0.5.0 (+https://tgarr.me)"},
         method="POST")
     def _post():
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -4472,6 +4540,7 @@ async def main() -> None:
     asyncio.create_task(dialog_gc_worker())
     asyncio.create_task(dialog_leave_worker())
     asyncio.create_task(index_purge_worker())
+    asyncio.create_task(thumb_cache_gc_worker())
     # thumb_hash_backfill is proactive (scans all thumbs for md5 dedup), so it's
     # disabled to match the no-pre-download rule.
     # asyncio.create_task(thumb_hash_backfill())
