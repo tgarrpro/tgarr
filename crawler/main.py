@@ -3112,7 +3112,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.2",
+                "tgarr_version": "0.5.3",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3309,7 +3309,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.5.2",
+                        "tgarr_version": "0.5.3",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3855,6 +3855,100 @@ async def dialog_leave_worker() -> None:
             await asyncio.sleep(60)
 
 
+DIALOG_RECONCILE_INTERVAL_SEC = int(os.environ.get("TGARR_DIALOG_RECONCILE_INTERVAL_SEC", "10800"))
+
+
+async def dialog_reconcile_worker() -> None:
+    """Enumerate the account's REAL Telegram dialogs and reconcile them with
+    tgarr's view. is_joined was only set from live updates, so it badly
+    undercounts actual memberships — tgarr auto-joined many channels (old
+    aggressive-join era) that still clutter the user's TG app; the other leave
+    workers only touch the few DB rows flagged is_joined and miss the rest.
+
+    Mode comes from config key 'dialog_reconcile_mode' (hot-flippable, no
+    restart) or env TGARR_DIALOG_RECONCILE; default 'off':
+      report — enumerate + classify + log counts/list, leave NOTHING (safe first)
+      leave  — also leave the tgarr-auto channels, throttled (FloodWait-prone)
+    NEVER leaves KwickPOS or channels flagged personal (auto_joined=FALSE OR
+    category='personal'). Mark personal channels auto_joined=FALSE BEFORE
+    switching to leave — everything else is treated as tgarr-auto. Config key
+    'dialog_reconcile_stop'='true' is a mid-run kill switch.
+    """
+    await asyncio.sleep(180)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                mode = (await conn.fetchval(
+                    "SELECT value FROM config WHERE key='dialog_reconcile_mode'")
+                    or os.environ.get("TGARR_DIALOG_RECONCILE", "off")).lower()
+            if mode not in ("report", "leave"):
+                await asyncio.sleep(600)
+                continue
+
+            await _mtproto_wait_clearance()
+            leavable = []   # (chat_id, username, title)
+            real = protected = 0
+            async for dialog in app.get_dialogs():
+                if dialog.chat.type.name not in ("CHANNEL", "SUPERGROUP"):
+                    continue
+                real += 1
+                chat_id = dialog.chat.id
+                title = dialog.chat.title or ""
+                uname = dialog.chat.username
+                async with db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT id, auto_joined, category FROM channels "
+                        "WHERE tg_chat_id=$1", chat_id)
+                    if row:  # reconcile the stale flag against ground truth
+                        await conn.execute(
+                            "UPDATE channels SET is_joined=TRUE WHERE id=$1 "
+                            "AND COALESCE(is_joined,FALSE)=FALSE", row["id"])
+                is_kwickpos = title.upper().startswith("KWICKPOS")
+                personal = bool(row and (row["auto_joined"] is False
+                                         or row["category"] == "personal"))
+                if is_kwickpos or personal:
+                    protected += 1
+                    continue
+                leavable.append((chat_id, uname, title))
+            log.info("[dialog-reconcile] %s: real_channels=%d protected=%d leavable=%d",
+                     mode, real, protected, len(leavable))
+            for cid, un, ti in leavable[:60]:
+                log.info("[dialog-reconcile] LEAVABLE @%s id=%s %s",
+                         un or "-", cid, ti[:34])
+            await _heartbeat("dialog_reconcile_worker",
+                             f"{mode}: real={real} leavable={len(leavable)} protected={protected}")
+
+            if mode == "leave":
+                left = 0
+                for cid, un, ti in leavable:
+                    async with db_pool.acquire() as conn:
+                        if ((await conn.fetchval(
+                                "SELECT value FROM config WHERE key='dialog_reconcile_stop'")
+                             ) or "").lower() == "true":
+                            log.info("[dialog-reconcile] kill switch — stopping")
+                            break
+                    try:
+                        await _mtproto_wait_clearance()
+                        await _mtproto("leave_chat", lambda c=cid: app.leave_chat(c))
+                        async with db_pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE channels SET is_joined=FALSE WHERE tg_chat_id=$1", cid)
+                        left += 1
+                        log.info("[dialog-reconcile] left @%s (%s)", un or cid, ti[:30])
+                    except FloodWait as fw:
+                        log.warning("[dialog-reconcile] FloodWait %ds — backing off", fw.value)
+                        await asyncio.sleep(fw.value + 5)
+                        continue
+                    except Exception as e:
+                        log.warning("[dialog-reconcile] leave %s err: %s", cid, str(e)[:100])
+                    await asyncio.sleep(DIALOG_LEAVE_DELAY_SEC)
+                log.info("[dialog-reconcile] leave pass done: left=%d", left)
+            await asyncio.sleep(DIALOG_RECONCILE_INTERVAL_SEC)
+        except Exception:
+            log.exception("[dialog-reconcile] outer loop")
+            await asyncio.sleep(300)
+
+
 async def deep_backfill_worker() -> None:
     """Continuously pages OLDER messages past the first 5000-cap backfill.
 
@@ -4172,7 +4266,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.2",
+                "tgarr_version": "0.5.3",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4624,6 +4718,7 @@ async def main() -> None:
     asyncio.create_task(decay_eviction_worker())
     asyncio.create_task(dialog_gc_worker())
     asyncio.create_task(dialog_leave_worker())
+    asyncio.create_task(dialog_reconcile_worker())
     asyncio.create_task(index_purge_worker())
     asyncio.create_task(thumb_cache_gc_worker())
     # thumb_hash_backfill is proactive (scans all thumbs for md5 dedup), so it's
