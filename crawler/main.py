@@ -4532,6 +4532,12 @@ async def index_purge_worker() -> None:
                       AND COALESCE(c.subscribed,FALSE)=FALSE
                       AND COALESCE(c.title,'') NOT ILIKE 'KwickPOS%'
                       AND COALESCE(c.category,'') <> 'personal'
+                      -- Central indexes resources by channel USERNAME; a no-
+                      -- username (private) channel's fuids are never resolvable
+                      -- on central, so resolve_resources always confirms 0 and
+                      -- purging would destroy the only copy. Exclude them — they
+                      -- need re-join/re-contribute, not purge.
+                      AND c.username IS NOT NULL
                       AND EXISTS (SELECT 1 FROM messages m
                                   WHERE m.channel_id=c.id AND m.file_unique_id IS NOT NULL)
                       AND NOT EXISTS (SELECT 1 FROM messages m
@@ -4556,8 +4562,19 @@ async def index_purge_worker() -> None:
             confirmed = await _central_resolve(fuids)
             del_ids = [r["id"] for r in rows if r["file_unique_id"] in confirmed]
             if not del_ids:
-                log.info("[index-purge] @%s: central confirmed 0/%d fuids — keep, retry",
+                # Central confirmed none of this channel's fuids. Keep the rows
+                # (never delete data central lacks) BUT advance the cursor so we
+                # don't re-pick the same channel forever — the SELECT orders by
+                # deep_last_run_at ASC NULLS FIRST, so bumping it sends this
+                # channel to the back and lets purgeable channels run. Without
+                # this, one unconfirmable channel (private/no-username, or a
+                # failed contribution) livelocks the whole worker.
+                log.info("[index-purge] @%s: central confirmed 0/%d fuids — keep, defer",
                          uname, len(fuids))
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET deep_last_run_at=NOW() WHERE id=$1",
+                        ch["id"])
                 await asyncio.sleep(INDEX_PURGE_INTERVAL_SEC)
                 continue
             deleted = await _purge_messages(ch["id"], del_ids)
