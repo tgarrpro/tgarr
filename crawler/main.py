@@ -4523,6 +4523,44 @@ async def index_purge_worker() -> None:
     await asyncio.sleep(300)
     while True:
         try:
+            # Noise channels first: central correctly REFUSES noise on contribute
+            # (noise_flagged/rejected), so resolve_resources always returns 0 and
+            # the central-confirm gate below would keep them FOREVER. Noise is
+            # junk we want gone, not data to preserve — central lacking a copy is
+            # the desired end state, not a reason to keep it. Hard-purge locally
+            # without central-confirm, and without the username gate (a private
+            # noise channel is still junk). Only condition: left + has rows.
+            async with db_pool.acquire() as conn:
+                nz = await conn.fetchrow("""
+                    SELECT c.id, c.username, c.title
+                    FROM channels c
+                    WHERE (c.category='noise' OR c.content_category='noise')
+                      AND COALESCE(c.is_joined,FALSE)=FALSE
+                      AND COALESCE(c.subscribed,FALSE)=FALSE
+                      AND COALESCE(c.title,'') NOT ILIKE 'KwickPOS%'
+                      AND COALESCE(c.category,'') <> 'personal'
+                      AND EXISTS (SELECT 1 FROM messages m WHERE m.channel_id=c.id)
+                    ORDER BY c.id
+                    LIMIT 1
+                """)
+            if nz:
+                uname = nz["username"] or f"chat-{nz['id']}"
+                deleted = await _purge_messages(nz["id"], None)
+                async with db_pool.acquire() as conn:
+                    remaining = await conn.fetchval(
+                        "SELECT count(*) FROM messages WHERE channel_id=$1", nz["id"])
+                    if remaining == 0:
+                        await conn.execute(
+                            "DELETE FROM channels WHERE id=$1", nz["id"])
+                    else:
+                        await conn.execute(
+                            "UPDATE channels SET purged_at=NOW() WHERE id=$1", nz["id"])
+                log.info("[index-purge] @%s NOISE hard-purged %d msgs "
+                         "(central refuses noise — no confirm needed)", uname, deleted)
+                await _heartbeat("index_purge_worker",
+                                 f"@{uname} noise-purged {deleted}")
+                await asyncio.sleep(INDEX_PURGE_INTERVAL_SEC)
+                continue
             async with db_pool.acquire() as conn:
                 ch = await conn.fetchrow("""
                     SELECT c.id, c.username, c.title
