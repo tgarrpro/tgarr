@@ -4031,6 +4031,12 @@ async def settings_nsfw_enabled(value: str = Form("false")):
         await conn.execute(
             """INSERT INTO config (key, value) VALUES ('nsfw_enabled', $1)
                ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""", val)
+        if val == "true":
+            # fetch the adult part of the Discover list now, not in 12 hours
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('registry_pull_force', $1)
+                   ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""",
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     return RedirectResponse("/settings", status_code=302)
 
 
@@ -5747,7 +5753,10 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
     elif not page:
         listing = ('<div class="empty-state"><div class="icon">🔭</div><div>'
                    + ("No channel matches." if (q or kind) else
-                      "You already follow everything on the list.") + '</div></div>')
+                      "This part of the list has not arrived yet." if not rows else
+                      "You already follow everything on the list.") + '</div>'
+                   + ('<div style="margin-top:8px;font-size:13px">“Refresh list” asks tgarr.me for it now.</div>'
+                      if not rows and not (q or kind) else '') + '</div>')
     else:
         listing = (f'<div class="ls">{"".join(_card(r) for r in page)}</div>'
                    + _page_nav("/discover", _dq, page_offset, page_size, len(page), len(view)))

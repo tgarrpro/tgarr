@@ -4496,27 +4496,31 @@ async def registry_puller() -> None:
                     await conn.execute(
                         "DELETE FROM config WHERE key='registry_pull_force'")
                     log.info("[pull] force-trigger received, pulling now")
-                last_pulled = await conn.fetchval(
-                    "SELECT max(last_pulled_at) FROM discovered")
-            params = {"audience": "sfw", "only_verified": "1", "limit": "5000"}
-            if last_pulled:
-                params["since"] = last_pulled.isoformat()
-            qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-            url = REGISTRY_URL + "/api/v1/registry?" + qs
-
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": TGARR_UA,
-                             "Accept": "application/json"},
-                )
-                resp = await asyncio.to_thread(
-                    lambda: urllib.request.urlopen(req, timeout=30).read())
-                data = json.loads(resp.decode())
-                channels = data.get("channels", [])
-            except Exception as e:
-                log.warning("[pull] registry GET failed: %s", e)
-                channels = []
+                # The list is asked for per audience. It used to be asked for
+                # "sfw" only, whatever the setting said: someone who had
+                # switched adult content on got an empty adult Discover.
+                _adult = (await conn.fetchval(
+                    "SELECT value FROM config WHERE key='nsfw_enabled'")) == "true"
+                _since = {r["audience"]: r["t"] for r in await conn.fetch(
+                    "SELECT audience, max(last_pulled_at) AS t FROM discovered GROUP BY 1")}
+            channels = []
+            for _aud in (["sfw", "nsfw"] if _adult else ["sfw"]):
+                params = {"audience": _aud, "only_verified": "1", "limit": "5000"}
+                if _since.get(_aud):
+                    params["since"] = _since[_aud].isoformat()
+                qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
+                url = REGISTRY_URL + "/api/v1/registry?" + qs
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": TGARR_UA,
+                                 "Accept": "application/json"},
+                    )
+                    resp = await asyncio.to_thread(
+                        lambda: urllib.request.urlopen(req, timeout=30).read())
+                    channels += json.loads(resp.decode()).get("channels", [])
+                except Exception as e:
+                    log.warning("[pull] registry GET (%s) failed: %s", _aud, e)
 
             inserted = updated = 0
             async with db_pool.acquire() as conn:
