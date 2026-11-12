@@ -3384,7 +3384,7 @@ async def watch_page(msg_id: int):
                 msg_id)
 
     body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>{html.escape(title)} — tgarr</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(title)} — tgarr</title>
 <style>
 body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif;
        margin:0; padding:0; min-height:100vh; display:flex; flex-direction:column; }}
@@ -5119,9 +5119,12 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         return {"tgarr": TGARR_VERSION, "authed": authed,
                 "revoked": revoked, "browsable": browsable, **dict(stats)}
 
-    # Only bounce to /login when there's literally nothing to show — fresh
-    # install or post-full-wipe. Otherwise render the public-only dashboard.
-    if not browsable:
+    # Only bounce to /login when there is nothing to show AND nobody is signed
+    # in. Signed in with an empty index is the first minute of every new
+    # install (and the permanent state of an account that follows no
+    # channels): /login sends a signed-in visitor back here, so bouncing them
+    # was an endless redirect - the first thing a new user saw.
+    if not browsable and not authed:
         return RedirectResponse("/login")
 
     async with db_pool.acquire() as conn:
@@ -5219,6 +5222,15 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
     sto = _status("warn" if free_gb < 10 else "ok", "Storage",
                   f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
     status_html = f'<div class="st-row">{tg}{cr}{sh}{sto}</div>'
+    if not browsable:
+        status_html = (
+            '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;'
+            'padding:16px 18px;margin-bottom:16px;line-height:1.6">'
+            '<b>You are signed in. Nothing is indexed yet.</b><br>'
+            'tgarr is reading the channels your Telegram account follows; they appear here '
+            'within a few minutes, and their files over the next hours. If the account follows '
+            'no channels with files, pick some on <a href="/discover">Discover</a>.'
+            '</div>' + status_html)
 
     # ── library ──
     def _tile(href, icon, n, label, plus=0):
@@ -6498,6 +6510,22 @@ _MUSIC_PLAYER_HTML = r"""
 @media (max-width:900px){ .np-panel{ left:0 } .np-panel .mid{ flex-direction:column; gap:14px; padding:0 20px }
   .np-panel .art{ width:150px } .np-panel .art .t{ font-size:16px; margin-top:10px } .np-panel .lyr{ width:100%; padding:20vh 0 }
   .player-bar #mini, .player-bar .seek span { display:none } .player-bar .np { flex:1 1 120px } }
+/* phone: the side menu is a top bar, so the player spans the whole width
+   and wraps onto two rows; the list keeps title, length and the two buttons */
+@media (max-width:820px){
+  .player-bar { left:0; flex-wrap:wrap; padding:8px 10px; gap:6px 8px; }
+  .player-bar .np { min-width:0; flex:1 1 100%; }
+  .player-bar .np-icon { width:34px; height:34px; font-size:17px; }
+  .player-bar .np-text { min-width:0; flex:1; }
+  .player-bar .np-t, .player-bar .np-a { max-width:none; }
+  .player-bar .seek { flex:1 1 100%; order:5; }
+  .player-bar .ctl button, .player-bar .ctl a { padding:7px 9px; font-size:15px; }
+  .player-bar #npBtn { font-size:12px; }
+  .music-list th:nth-child(4), .music-list td:nth-child(4),
+  .music-list th:nth-child(5), .music-list td:nth-child(5) { display:none; }
+  .music-list td, .music-list th { padding-left:8px; padding-right:8px; }
+  .music-list { margin-bottom:130px; }
+}
 </style>
 <div class="np-panel" id="npPanel">
   <div class="bgimg" id="npBg"></div>
