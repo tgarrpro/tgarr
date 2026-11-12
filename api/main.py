@@ -5578,7 +5578,13 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
     else:
         sh = _status("off", "Shared with tgarr.me", "nothing shared yet")
     used = sum(r["bytes"] for r in usage)
-    sto = _status("warn" if free_gb < 10 else "ok", "Storage",
+    try:
+        import shutil as _sh
+        _du = _sh.disk_usage("/downloads")
+        _sto_lvl = _disk_level(_du.free, _du.total)
+    except OSError:
+        _sto_lvl = "off"
+    sto = _status(_sto_lvl, "Storage",
                   f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
     status_html = f'<div class="st-row">{tg}{cr}{sh}{sto}</div>'
     status_html = await _update_banner() + status_html
@@ -8587,6 +8593,77 @@ async def page_search(q: Optional[str] = None,
 # ════════════════════════════════════════════════════════════════════
 # Page: Settings
 # ════════════════════════════════════════════════════════════════════
+# ── the machine tgarr runs on, as far as a container can see it ───────
+def _disk_level(free: float, total: float) -> str:
+    """ok / warn / bad for a disk. Both an absolute floor and a share: 10 GB
+    free is plenty on a small disk's scale and nothing next to a 4K film."""
+    if not total:
+        return "off"
+    gb, share = free / 1024 ** 3, free / total
+    if gb < 5 or share < 0.03:
+        return "bad"
+    if gb < 20 or share < 0.10:
+        return "warn"
+    return "ok"
+
+
+def _host_info() -> dict:
+    """Disk, memory, load and uptime of the host. A bind-mounted folder
+    reports the host's disk, and /proc shows the host's memory and load, so
+    these are the real machine's numbers - not the container's."""
+    import platform
+    import shutil
+    info = {"disks": [], "mem": None, "load": None, "cores": os.cpu_count() or 0,
+            "uptime_s": None, "kernel": platform.release(), "arch": platform.machine()}
+    seen = {}
+    for path, label in (("/downloads", "Downloads folder"), ("/app/session", "tgarr data")):
+        try:
+            dev = os.stat(path).st_dev
+            u = shutil.disk_usage(path)
+        except OSError:
+            continue
+        if dev in seen:
+            seen[dev]["label"] += " + " + label.lower()
+            continue
+        d = {"label": label, "total": u.total, "free": u.free, "used": u.total - u.free,
+             "level": _disk_level(u.free, u.total)}
+        seen[dev] = d
+        info["disks"].append(d)
+    try:
+        kv = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                kv[k] = int(v.split()[0]) * 1024
+        total, avail = kv.get("MemTotal", 0), kv.get("MemAvailable", 0)
+        if total:
+            share = avail / total
+            info["mem"] = {"total": total, "avail": avail,
+                           "level": "bad" if share < 0.05 else "warn" if share < 0.12 else "ok"}
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        l1, l5, l15 = os.getloadavg()
+        per = l5 / max(1, info["cores"])
+        info["load"] = {"l1": l1, "l5": l5, "l15": l15,
+                        "level": "bad" if per > 3 else "warn" if per > 1.5 else "ok"}
+    except (OSError, AttributeError):
+        pass
+    try:
+        with open("/proc/uptime") as f:
+            info["uptime_s"] = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return info
+
+
+def _fmt_uptime(sec) -> str:
+    if not sec:
+        return "–"
+    d, h = int(sec // 86400), int(sec % 86400 // 3600)
+    return f"{d} d {h} h" if d else f"{h} h {int(sec % 3600 // 60)} min"
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def page_settings(request: Request):
     if not _signed_in():
@@ -8619,26 +8696,125 @@ async def page_settings(request: Request):
         for r in _usage) or "nothing downloaded yet"
     _full = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
     _uname = user.get("username")
+    _shown = _full or (("@" + _uname) if _uname else "Telegram account")
     try:                                   # the account's own picture, when it has one
-        user_icon = (f'<img src="/api/me/avatar?v={int(os.path.getmtime(login.AVATAR_FILE))}" alt="" '
-                     f'style="width:46px;height:46px;border-radius:50%;object-fit:cover;display:block">')
+        _av = (f'<img class="acct-av" src="/api/me/avatar?v={int(os.path.getmtime(login.AVATAR_FILE))}" alt="">')
     except OSError:
-        user_icon = "👤"
-    user_html = (
-        f'<div class="name">{html.escape(_full or (("@" + _uname) if _uname else "-"))} '
-        + (f'<span style="color:var(--muted);font-weight:400">@{html.escape(_uname)}</span> '
-           if _uname and _full else '')
-        + '<span class="pill ok">signed in</span></div>'
-        if authed else
-        '<div class="name">not signed in <span class="pill bad">no session</span></div>'
-    )
-    user_right = (
-        '<a class="btn" href="/login">Sign in</a>' if not authed
-        else '<button class="ghost" onclick="if(confirm(\'Sign out and remove session?\'))fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/login\')">Sign out</button>'
-    )
+        _av = (f'<div class="acct-av" style="background:{_color_for(_shown)}">'
+               f'{html.escape(_shown.lstrip("@")[:1].upper())}</div>')
+    account_html = (
+        f'<div class="acct">{_av}<div class="acct-txt">'
+        f'<div class="acct-name">{html.escape(_shown)}</div>'
+        f'<div class="acct-sub">'
+        + (f'@{html.escape(_uname)} · ' if _uname and _full else '')
+        + f'Telegram data center {my_dc_disp} <span class="pill ok">signed in</span></div>'
+        f'<div class="acct-meta">API ID <code>{html.escape(os.environ.get("TG_API_ID", "-"))}</code> · '
+        f'session at <code>_data/session/tgarr.session</code></div></div>'
+        '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'Sign out of Telegram on this tgarr?'
+        '\\n\\nPrivate chats are removed from the index. Public channels and files already saved stay.\'))'
+        'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">Sign out</button></div></div>')
+
+    # ── this machine ──
+    host = await asyncio.to_thread(_host_info)
+    async with db_pool.acquire() as conn:
+        db_bytes = await conn.fetchval("SELECT pg_database_size(current_database())")
+        idx_counts = await conn.fetchrow(
+            "SELECT (SELECT count(*) FROM channels) AS ch, (SELECT count(*) FROM messages) AS msgs")
+    _lvl_col = {"ok": "#10b981", "warn": "#f59e0b", "bad": "#ef4444", "off": "#94a3b8"}
+
+    def _bar(share: float, level: str) -> str:
+        return (f'<div class="sys-bar"><i style="width:{max(2, min(100, share * 100)):.0f}%;'
+                f'background:{_lvl_col[level]}"></i></div>')
+
+    def _gb(b) -> str:
+        g = (b or 0) / 1024 ** 3
+        return f"{g:.0f} GB" if g >= 10 else f"{g:.1f} GB"
+    tiles, alerts = [], []
+    for d in host["disks"]:
+        used_share = d["used"] / d["total"] if d["total"] else 0
+        tiles.append(
+            f'<div class="sys-t {d["level"]}"><div class="sys-l">💽 {html.escape(d["label"])}</div>'
+            f'<div class="sys-n">{_gb(d["free"])} <small>free</small></div>'
+            f'{_bar(used_share, d["level"])}'
+            f'<div class="sys-s">{_gb(d["used"])} used of {_gb(d["total"])} · {used_share * 100:.0f}% full</div></div>')
+        if d["level"] in ("warn", "bad"):
+            alerts.append((d["level"],
+                           f'<b>{html.escape(d["label"])}: {_gb(d["free"])} free.</b> '
+                           + ("New downloads and plays will start failing. " if d["level"] == "bad" else
+                              "Space is getting short. ")
+                           + 'Free some under <a href="#files">Downloaded files</a> below, or set an automatic clean-up there.'))
+    if host["mem"]:
+        m = host["mem"]
+        tiles.append(
+            f'<div class="sys-t {m["level"]}"><div class="sys-l">🧠 Memory</div>'
+            f'<div class="sys-n">{_gb(m["avail"])} <small>available</small></div>'
+            f'{_bar(1 - m["avail"] / m["total"], m["level"])}'
+            f'<div class="sys-s">of {_gb(m["total"])} in this machine</div></div>')
+        if m["level"] == "bad":
+            alerts.append(("bad", f'<b>Memory: only {_gb(m["avail"])} available.</b> '
+                                  'Converting e-books and playing several files at once may fail.'))
+    if host["load"]:
+        ld = host["load"]
+        tiles.append(
+            f'<div class="sys-t {ld["level"]}"><div class="sys-l">⚙ Processor</div>'
+            f'<div class="sys-n">{host["cores"]} <small>cores</small></div>'
+            f'<div class="sys-s">load {ld["l1"]:.2f} · {ld["l5"]:.2f} · {ld["l15"]:.2f}'
+            f'<br>(1, 5 and 15 minutes)</div></div>')
+    tiles.append(
+        f'<div class="sys-t"><div class="sys-l">🗂 Index</div>'
+        f'<div class="sys-n">{_fmt_size(db_bytes) or "0"}</div>'
+        f'<div class="sys-s">{idx_counts["ch"]:,} channels · {_fmt_count(idx_counts["msgs"])} posts<br>'
+        f'downloaded files: {html.escape(cache_total)}</div></div>')
+    tiles.append(
+        f'<div class="sys-t"><div class="sys-l">🖥 System</div>'
+        f'<div class="sys-n">{_fmt_uptime(host["uptime_s"])} <small>up</small></div>'
+        f'<div class="sys-s">Linux {html.escape(host["kernel"])}<br>{html.escape(host["arch"])} · '
+        f'tgarr {TGARR_VERSION}</div></div>')
+    alerts.sort(key=lambda a: a[0] != "bad")
+    machine_html = (
+        "".join(f'<div class="sys-alert {lvl}">{txt}</div>' for lvl, txt in alerts)
+        + f'<div class="sys">{"".join(tiles)}</div>')
 
     body = f"""
 <style>
+.settings {{ max-width:1060px; }}
+.settings h2.section {{ margin-top:32px; }}
+.settings .dl-list {{ border-radius:12px; }}
+.settings .dl-item {{ grid-template-columns:44px 1fr auto; gap:16px; padding:18px 20px; align-items:start; }}
+.settings .dl-item .icon {{ width:44px; height:44px; border-radius:12px; background:rgba(127,127,127,.09);
+  display:flex; align-items:center; justify-content:center; font-size:20px; }}
+.settings .dl-item .info .name {{ font-size:15.5px; line-height:1.5; }}
+.settings .dl-item .info .meta {{ font-size:13.5px; }}
+.settings code {{ font-size:12.5px; padding:1px 6px; border-radius:5px; background:rgba(127,127,127,.12); }}
+.acct {{ display:flex; align-items:center; gap:22px; padding:22px 24px; background:var(--surface);
+  border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow); flex-wrap:wrap; }}
+.acct-av {{ width:92px; height:92px; border-radius:50%; object-fit:cover; flex:none; display:flex;
+  align-items:center; justify-content:center; color:#fff; font-size:38px; font-weight:700;
+  box-shadow:0 0 0 4px var(--surface), 0 0 0 5px var(--border); }}
+.acct-txt {{ flex:1; min-width:220px; }}
+.acct-name {{ font-size:22px; font-weight:700; color:var(--fg); line-height:1.25; }}
+.acct-sub {{ margin-top:4px; font-size:14px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+.acct-meta {{ margin-top:10px; font-size:13px; color:var(--muted); }}
+.acct-act {{ flex:none; }}
+.sys {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:12px; }}
+.sys-t {{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px;
+  box-shadow:var(--shadow); }}
+.sys-t.warn {{ border-color:#fcd34d; background:#fffbeb; }}
+.sys-t.bad {{ border-color:#fca5a5; background:#fef2f2; }}
+.sys-l {{ font-size:12px; font-weight:600; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }}
+.sys-n {{ font-size:24px; font-weight:700; color:var(--fg); margin:6px 0 8px; line-height:1.15; }}
+.sys-n small {{ font-size:13px; font-weight:500; color:var(--muted); }}
+.sys-t.warn .sys-n {{ color:#b45309; }} .sys-t.bad .sys-n {{ color:#b91c1c; }}
+.sys-s {{ font-size:12.5px; color:var(--muted); line-height:1.5; }}
+.sys-bar {{ height:6px; border-radius:3px; background:rgba(127,127,127,.18); overflow:hidden; margin-bottom:8px; }}
+.sys-bar i {{ display:block; height:100%; border-radius:3px; }}
+.sys-alert {{ padding:12px 16px; border-radius:10px; margin-bottom:12px; font-size:14px; line-height:1.55; }}
+.sys-alert.warn {{ background:#fffbeb; border:1px solid #fde68a; color:#92400e; }}
+.sys-alert.bad {{ background:#fef2f2; border:1px solid #fecaca; color:#991b1b; }}
+.sys-alert a {{ color:inherit; font-weight:600; }}
+@media (max-width:820px) {{ .acct {{ padding:16px; gap:14px; }} .acct-av {{ width:68px; height:68px; font-size:28px; }}
+  .acct-name {{ font-size:19px; }} .settings .dl-item {{ grid-template-columns:36px 1fr; }}
+  .settings .dl-item .icon {{ width:36px; height:36px; font-size:17px; }} .settings .dl-item .right {{ grid-column:1 / -1; }} }}
 .settings .dl-item .meta {{ display:block; line-height:1.65; }}
 .settings .dl-item .meta .pill {{ vertical-align:middle; }}
 .settings input[type=number] {{ font:inherit; font-size:14px; padding:6px 8px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--fg); text-align:center; }}
@@ -8648,16 +8824,10 @@ async def page_settings(request: Request):
 </style>
 <script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
 <div class="settings">
-<h2 class="section">Telegram account</h2>
-<div class="dl-list">
-  <div class="dl-item">
-    <div class="icon">{user_icon}</div>
-    <div class="info">{user_html}
-      <div class="meta">API ID <code>{os.environ.get("TG_API_ID","-")}</code> · session at <code>_data/session/tgarr.session</code></div>
-    </div>
-    <div class="right">{user_right}</div>
-  </div>
-</div>
+{account_html}
+
+<h2 class="section">This machine</h2>
+{machine_html}
 
 <h2 class="section">Library</h2>
 <div class="dl-list">
