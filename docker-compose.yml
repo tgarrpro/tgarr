@@ -123,6 +123,11 @@ services:
     restart: unless-stopped
     logging: *tgarr-logging
     environment:
+      # watchtower speaks Docker API 1.25 unless told otherwise, and Docker
+      # engines from 2025 on refuse anything that old: without this line the
+      # updater crashes at start and nothing is ever updated. 1.40 is
+      # understood by every engine since 19.03.
+      DOCKER_API_VERSION: "${TGARR_DOCKER_API:-1.40}"
       WATCHTOWER_LABEL_ENABLE: "true"
       WATCHTOWER_CLEANUP: "true"
       WATCHTOWER_POLL_INTERVAL: "${TGARR_AUTOUPDATE_INTERVAL:-1800}"
