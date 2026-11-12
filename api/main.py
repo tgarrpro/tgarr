@@ -8777,7 +8777,6 @@ async def page_settings(request: Request):
 
     body = f"""
 <style>
-.settings {{ max-width:1060px; }}
 .settings h2.section {{ margin-top:32px; }}
 .settings .dl-list {{ border-radius:12px; }}
 .settings .dl-item {{ grid-template-columns:44px 1fr auto; gap:16px; padding:18px 20px; align-items:start; }}
