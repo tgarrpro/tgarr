@@ -11,7 +11,8 @@ RX_EXT = re.compile(
     r"\.(mkv|mp4|avi|m4v|mov|webm|flv|wmv|mpg|mpeg|3gp|ts|m2ts|iso|rmvb|rm)$",
     re.IGNORECASE,
 )
-RX_YEAR = re.compile(r"\b(19\d{2}|20\d{2})\b")
+# not \b: a year glued to CJK text ("美好的一年2006") has no word boundary
+RX_YEAR = re.compile(r"(?<![0-9A-Za-z])(19\d{2}|20\d{2})(?![0-9A-Za-z])")
 RX_TV_SXEY = re.compile(r"S(\d{1,3})\s*E(\d{1,3})(?:-E?(\d{1,3}))?", re.IGNORECASE)
 RX_TV_NXM = re.compile(r"\b(\d{1,2})x(\d{1,3})\b")
 RX_TV_VERBOSE = re.compile(
@@ -212,6 +213,180 @@ def decide_release(parsed: dict, *, file_size=None, duration=None, width=None,
     return out
 
 
+# ── names that say nothing, and where the title is then ─────────────────
+# Many channels post a film as a poster with a caption ("名称: 消失的她 (HD国语)
+# ... 年份: 2023") followed by the file itself, named by an uploader tool:
+# 01_0.mp4, 02_0.mp4, 720P.mp4, IMG_4857.MP4. The name is useless; the title
+# is in the caption of the file or of the poster right before it.
+RX_GENERIC_STEM = re.compile(
+    r"^(?:[\d\s_().\-\u6708\u65e5\u5e74]+"
+    r"|(?:IMG|VID|MOV|DSC|PXL|MVI|video|trim|document|file)[\s_\-]*[\d_\-. ()]*"
+    r"|(?:HD|FHD|UHD|4K|\d{3,4}[pP])?[\s_.\-|\uff5c/]*"
+    r"(?:(?:\u56fd\u8bed|\u7ca4\u8bed|\u4e2d\u5b57|\u56fd\u7ca4|\u53cc\u8bed|\u82f1\u8bed|\u65e5\u8bed|\u97e9\u8bed)[\s_.\-|\uff5c/]*)*"
+    r")$", re.IGNORECASE)
+_RX_ANY_EXT = re.compile(r"\.(?=[0-9]*[A-Za-z])[A-Za-z0-9]{2,4}$")
+RX_PART_STEM = re.compile(r"^0*(\d{1,2})(?:_0)?$")
+_VIDEO_EXT = re.compile(
+    r"\.(mkv|mp4|avi|m4v|mov|webm|flv|wmv|mpg|mpeg|3gp|ts|m2ts|iso|rmvb|rm)$", re.IGNORECASE)
+
+
+def is_video_file(file_name, mime_type=None, media_type=None) -> bool:
+    """Only video can be a film or an episode: not a PDF, a zip or a song
+    that happens to have a year in its name."""
+    if media_type == "video":
+        return True
+    if mime_type and str(mime_type).lower().startswith("video/"):
+        return True
+    return bool(file_name and _VIDEO_EXT.search(file_name))
+
+
+def is_generic_name(name) -> bool:
+    """True for a file name that carries no title: empty, digits, a camera
+    counter, or just a quality/language tag."""
+    if not name:
+        return True
+    stem = _RX_ANY_EXT.sub("", name).strip()
+    return not stem or bool(RX_GENERIC_STEM.match(stem))
+
+
+def part_number(name):
+    """01_0.mp4 -> 1, 08.mp4 -> 8; None when the name is not a bare counter."""
+    if not name:
+        return None
+    m = RX_PART_STEM.match(_RX_ANY_EXT.sub("", name).strip())
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= 99 else None
+
+
+RX_CAP_LABEL = re.compile(
+    r"^[^\w\n]{0,4}(?:\u540d\u79f0|\u7247\u540d|\u5267\u540d|\u5f71\u7247\u540d\u79f0|\u7535\u5f71\u540d|\u4e2d\u6587\u540d|\u8bd1\u540d"
+    r"|Title|Name|Movie|Film)\s*[:\uff1a]\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE)
+RX_CAP_YEAR = re.compile(
+    r"(?:\u5e74\u4efd|\u5e74\u4ee3|\u4e0a\u6620|Year|Released?)\s*[:\uff1a]?\s*((?:19|20)\d{2})(?!\d)",
+    re.IGNORECASE)
+# "帝陵·西汉帝陵 (2015)   第8集"
+RX_CAP_TITLE_YEAR = re.compile(
+    r"^\s*([^\n#@]{2,60}?)\s*[\uff08(]((?:19|20)\d{2})[)\uff09]"
+    r"(?:\s*\u7b2c\s*(\d{1,3})\s*[\u96c6\u8bdd\u8a71\u671f])?")
+RX_CAP_SERIES = re.compile(
+    r"(\u8fde\u7eed\u5267|\u96fb\u8996\u5287|\u7535\u89c6\u5267|\u5267\u96c6|\u56fd\u4ea7\u5267|\u97e9\u5267|\u7f8e\u5267|\u65e5\u5267|\u6e2f\u5267|\u53f0\u5267|\u6cf0\u5267"
+    r"|\u52a8\u6f2b|\u756a\u5267|\u7efc\u827a|\u5168\s*\d+\s*\u96c6|\u66f4\u65b0\u81f3|\u7b2c\s*\d+\s*\u96c6|TV Series|Season\s*\d)",
+    re.IGNORECASE)
+_RX_CAP_SEASON = re.compile(
+    r"\u7b2c\s*([\d一\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]{1,3})\s*[\u5b63\u90e8]|\bSeason\s*(\d{1,2})\b",
+    re.IGNORECASE)
+_CN_NUM = {"一": 1, "\u4e8c": 2, "\u4e09": 3, "\u56db": 4, "\u4e94": 5, "\u516d": 6,
+           "\u4e03": 7, "\u516b": 8, "\u4e5d": 9, "\u5341": 10}
+_RX_TRAIL_TAG = re.compile(r"\s*[\uff08(\u3010\[]([^\uff09)\u3011\]]*)[\uff09)\u3011\]]\s*$")
+
+
+def title_from_caption(caption):
+    """The title a caption states, or None.
+
+    Only an explicit statement counts: a labelled line ("名称: …", "Title: …")
+    or a first line shaped "Title (2015)". Free text is not a title: captions
+    are mostly descriptions, hashtags and adverts.
+
+    Returns {"title", "year", "season", "episode", "series", "quality"}.
+    """
+    if not caption:
+        return None
+    cap = caption.replace("\r", "")
+    year = episode = None
+    tags = ""
+    m = RX_CAP_LABEL.search(cap)
+    if m:
+        title = m.group(1)
+    else:
+        m = RX_CAP_TITLE_YEAR.match(cap)
+        if not m:
+            return None
+        title, year = m.group(1), int(m.group(2))
+        if m.group(3):
+            episode = int(m.group(3))
+    # trailing "(HD国语)", "(2023)", "【完结】"
+    for _ in range(4):
+        t = _RX_TRAIL_TAG.search(title)
+        if not t:
+            break
+        inner = t.group(1).strip()
+        if re.fullmatch(r"(?:19|20)\d{2}", inner):
+            year = year or int(inner)
+        else:
+            tags += " " + inner
+        title = title[:t.start()]
+    title = re.split(r"\s+[/|\uff5c]\s+", title)[0]
+    season = None
+    if (sm := _RX_CAP_SEASON.search(title)):
+        g = sm.group(1) or sm.group(2)
+        season = int(g) if g.isdigit() else _CN_NUM.get(g)
+        if season:
+            title = title[:sm.start()] + " " + title[sm.end():]
+    title = re.sub(r"[#@]\S+", " ", title)
+    title = RX_WS.sub(" ", title).strip(" -_.:\uff1a\u300a\u300b\"'")
+    if not (1 <= len(title) <= 80) or not any(ch.isalpha() for ch in title):
+        return None
+    if year is None and (y := RX_CAP_YEAR.search(cap)):
+        year = int(y.group(1))
+    if year is not None and year > time.gmtime().tm_year + 1:
+        year = None
+    quality = None
+    if (q := RX_RES.search(tags)):
+        v = q.group(1).lower()
+        quality = _RES_NORM.get(v, v)
+    return {"title": title, "year": year, "season": season, "episode": episode,
+            "series": bool(season or episode is not None or RX_CAP_SERIES.search(cap)),
+            "quality": quality}
+
+
+def with_context(parsed: dict, ctx: dict, part=None, parts_total: int = 1) -> dict:
+    """Parsed fields for a file whose title comes from a caption (its own or
+    the poster's before it). `part` is the file's counter (01_0.mp4 -> 1);
+    under a series caption it is the episode, otherwise - when the group has
+    several files - the part of a film posted in pieces."""
+    out = {k: v for k, v in parsed.items()
+           if k in ("quality", "source", "codec", "audio", "hdr", "language", "subtitle")}
+    out["title"] = ctx["title"]
+    out["has_title"] = True
+    out["from_context"] = True
+    if ctx.get("year"):
+        out["year"] = ctx["year"]
+    if not out.get("quality") and ctx.get("quality"):
+        out["quality"] = ctx["quality"]
+    episode = ctx.get("episode")
+    if episode is None and ctx.get("series") and part is not None:
+        episode = part
+    if ctx.get("series"):
+        out.update(type="tv", season=ctx.get("season") or 1)
+        if episode is not None:
+            out["episode"] = episode
+    else:
+        out["type"] = "movie"
+        if part is not None and parts_total > 1:
+            out["part"] = part
+    # a title someone wrote out on purpose is worth more than a bare name
+    s = 0.40
+    if out.get("year"):
+        s += 0.20
+    if out["type"] == "tv":
+        s += 0.30
+    if out.get("quality"):
+        s += 0.15
+    out["score"] = round(min(s, 1.0), 2)
+    return out
+
+
+# Streaming-site rips carry the site's slogan after the title:
+#   隐秘的生活_高清_欧乐影院_欧乐影院面向海外华人的在线视频媒体平台…
+#   本心-免费在线观看-爱壹帆国际版
+RX_SITE_TAIL = re.compile(
+    r"[\s_\-.]*(?:(?:\u9ad8\u6e05|\u8d85\u6e05|\u84dd\u5149)[\s_\-.]*)?"
+    r"(?:\u514d\u8d39)?(?:\u5728\u7ebf\u89c2\u770b|\u6b27\u4e50\u5f71\u9662|\u7231\u58f9\u5e06).*$")
+
+
 def parse_filename(name: str) -> dict:
     """Parse a release-style filename into structured fields.
 
@@ -223,6 +398,7 @@ def parse_filename(name: str) -> dict:
         return {"score": 0.0, "type": "unknown"}
 
     base = RX_EXT.sub("", name)
+    base = RX_SITE_TAIL.sub("", base) or base
     work = base
 
     out = {}
@@ -277,6 +453,8 @@ def parse_filename(name: str) -> dict:
             # title-like precedes it: "2012.1080p.mkv" - keep it as the title,
             # not as a year.
             _year_m = None if _year_m.start() == 0 else _year_m
+    if _year_m and is_generic_name(name):
+        _year_m = None          # IMG_2024.jpg, VID_2019_0001.mp4: a counter
     if _year_m:
         out["year"] = int(_year_m.group(1))
     _year_pos = _year_m.start() if _year_m else None
@@ -415,7 +593,9 @@ def parse_filename(name: str) -> dict:
 
     # Normalize separators → spaces.
     work = RX_DOTSPACE.sub(" ", work)
-    work = RX_WS.sub(" ", work).strip(" -_.")
+    work = RX_WS.sub(" ", work).strip(" -_.(" + "（")
+    # an uploader's counter in front of a CJK title: "1-战狼"
+    work = re.sub(r"^\d{1,2}\s*[-_.]\s*(?=[一-鿿])", "", work)
 
     title = work
     if not title:
@@ -492,6 +672,8 @@ def to_release_name(parsed: dict, fallback: str = "") -> str:
         parts.append(sep)
     elif parsed.get("year"):
         parts.append(str(parsed["year"]))
+    if parsed.get("part"):
+        parts.append(f"Part{int(parsed['part']):02d}")
     if parsed.get("quality"):
         parts.append(parsed["quality"])
     if parsed.get("source"):

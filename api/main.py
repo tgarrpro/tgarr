@@ -1411,13 +1411,16 @@ async def ebook_status(msg_id: int, request: Request):
     import asyncio
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name, file_size FROM messages WHERE id=$1", msg_id)
     if not row or not row["local_path"] or row["local_path"].startswith("__"):
         return {"state": "no_source"}
     ext = (row["file_name"] or "").rsplit(".", 1)[-1].lower()
     src, pdf, _ = _ebook_paths(row["local_path"])
     if not os.path.exists(src):
         return {"state": "no_source"}
+    # Still arriving from Telegram: half an archive is not a broken archive.
+    if row["file_size"] and os.path.getsize(src) < row["file_size"]:
+        return {"state": "downloading", "src_size": os.path.getsize(src)}
     if ext == "pdf":
         return {"state": "ready", "url": f"/media/{msg_id}"}
     if ext not in _EBOOK_CONVERTIBLE:
@@ -1467,7 +1470,7 @@ async def ebook_pdf(msg_id: int):
     """
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name, file_size FROM messages WHERE id=$1", msg_id)
     if not row or not row["local_path"] or row["local_path"].startswith("__"):
         return Response("not cached — open via /watch to trigger download",
                         status_code=404)
@@ -1475,6 +1478,8 @@ async def ebook_pdf(msg_id: int):
     src, pdf, _ = _ebook_paths(row["local_path"])
     if not os.path.exists(src):
         return Response("source file missing", status_code=410)
+    if row["file_size"] and os.path.getsize(src) < row["file_size"]:
+        return Response("still downloading — retry in a moment", status_code=202)
     # .pdf source: serve directly, no conversion
     if ext == "pdf":
         return FileResponse(src, media_type="application/pdf",
@@ -1934,8 +1939,10 @@ function renderPlayer() {{
         }}
 
         let msg;
-        if (j.state === "queued") {{
-          msg = `queued — position ${{j.position}} in line`;
+        if (j.state === "downloading") {{
+          msg = "downloading…";
+        }} else if (j.state === "queued") {{
+          msg = `queued — position ${{j.position || 1}} in line`;
           if (j.eta_s) msg += ` · est wait ~${{Math.ceil(j.eta_s/60)}} min`;
         }} else {{
           msg = "converting…";
@@ -1993,8 +2000,10 @@ async function poll() {{
         `downloading ${{fmtBytes(j.bytes)}}${{j.total ? " / " + fmtBytes(j.total) : ""}} (${{pct.toFixed(0)}}%)`;
       document.getElementById("progBar").style.width = pct + "%";
       // Start the player as soon as ~2MB or 10% is on disk — progressive
-      // playback can then keep up with the download.
-      if (j.bytes > 2_000_000 || (j.total && pct > 10)) {{
+      // playback can then keep up with the download. Only for video and
+      // audio: a book or a PDF is useless until it is whole.
+      if ((MEDIA_TYPE === "video" || MEDIA_TYPE === "audio") &&
+          (j.bytes > 2_000_000 || (j.total && pct > 10))) {{
         renderPlayer();
         return;
       }}
