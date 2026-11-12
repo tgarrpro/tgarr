@@ -5852,13 +5852,13 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         + _chip_link(f'include the {len(have):,} I already have', "/discover" + _dq(mine=None if mine else 1, offset=None),
                      bool(mine)))
     search = (
-        '<form method="GET" action="/discover" style="display:flex;gap:8px;margin:0 0 12px;align-items:center">'
+        '<form method="GET" action="/discover" style="display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;align-items:center">'
         + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
                   for k, v in (("kind", kind), ("audience", audience if audience != "sfw" else None),
                                ("sort", sort if sort != "best" else None),
                                ("mine", 1 if mine else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-          'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
+          'placeholder="find a channel by name or @username…" style="flex:1;min-width:150px;max-width:420px"/>'
           '<button class="btn" type="submit">Search</button>'
         + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">clear</a>' if q else '')
         + '<span style="flex:1"></span>'
@@ -6848,7 +6848,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
         + lang_chips_html + '</div>'
-        '<div style="display:flex;gap:6px;margin-bottom:18px;align-items:center">'
+        '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;align-items:center">'
         '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>'
         + sort_chips_html + '</div>'
     )
