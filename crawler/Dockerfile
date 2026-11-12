@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc python3-dev \
     && pip install --no-cache-dir \
-        pyrogram==2.0.106 \
+        kurigram==2.2.27 \
         tgcrypto==1.2.5 \
         asyncpg==0.30.0 \
         meilisearch==0.31.6 \

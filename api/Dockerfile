@@ -28,7 +28,7 @@ RUN apt-get update \
         uvicorn[standard]==0.32.0 \
         asyncpg==0.30.0 \
         python-multipart==0.0.12 \
-        pyrogram==2.0.106 \
+        kurigram==2.2.27 \
         tgcrypto==1.2.5 \
         qrcode[pil]==7.4.2 \
     && apt-get purge -y --auto-remove gcc python3-dev \
