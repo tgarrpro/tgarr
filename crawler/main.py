@@ -1083,7 +1083,34 @@ def _extract_invites(text: str) -> set[str]:
 
 async def init_db() -> None:
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=4)
+    # The database may still be starting, and on a first start the tables are
+    # created by the API container, which comes up at the same moment: wait
+    # for both instead of dying on "relation does not exist".
+    for _i in range(90):
+        try:
+            db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=4)
+            break
+        except (OSError, asyncpg.PostgresError) as e:
+            if _i == 89:
+                raise
+            if _i % 10 == 0:
+                log.info("[boot] waiting for the database (%s)", type(e).__name__)
+            await asyncio.sleep(2)
+    for _i in range(90):
+        try:
+            async with db_pool.acquire() as conn:
+                if await conn.fetchval(
+                        "SELECT to_regclass('public.messages') IS NOT NULL "
+                        "AND to_regclass('public.config') IS NOT NULL") and await conn.fetchval(
+                        "SELECT 1 FROM config WHERE key = 'schema_ready'"):
+                    break
+        except asyncpg.PostgresError:
+            pass
+        if _i % 10 == 0:
+            log.info("[boot] waiting for the API to prepare the database")
+        await asyncio.sleep(2)
+    else:
+        log.warning("[boot] the API has not reported the database ready after 3 min — going on")
     # Crawl-and-release columns (also created by api _migrate_schema; ensure
     # here so crawler workers can query them regardless of migration order).
     async with db_pool.acquire() as conn:

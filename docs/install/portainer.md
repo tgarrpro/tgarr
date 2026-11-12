@@ -22,21 +22,9 @@
 7. **Enable automatic updates** (optional) → Polling interval `6h` → auto-pull new tgarr versions.
 8. **Deploy the stack**.
 
-## First-time Telegram login (interactive SMS)
+## First-time Telegram login
 
-Portainer's web UI can't accept the SMS code interactively. You need a one-shot terminal session against the crawler container:
-
-1. SSH into the Docker host.
-2. Find the project directory (Portainer puts it under `/data/compose/<stack-id>/` by default; check Portainer logs for the exact path).
-3. Run:
-
-   ```bash
-   cd /data/compose/<stack-id>
-   docker compose run --rm crawler python login.py
-   ```
-
-4. Type the SMS code Telegram sends to your phone.
-5. The session is now persisted in the `_data/session/` volume — Portainer can restart the stack as much as it wants without re-logging in.
+Once the stack is up, open `http://<your-host>:8765` in a browser and sign in — scan the QR code with the Telegram app, or enter your phone number and the code Telegram sends you. Nothing is typed in a terminal, and the code never touches a file.
 
 ## Stack template URL (for App Templates)
 

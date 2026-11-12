@@ -1,0 +1,52 @@
+# The tgarr.me registry server (the federation's central service). Not for
+# ordinary installs. It runs the database and the registry and NOTHING else:
+# no crawler, no Telegram account.
+#
+#   docker compose -f docker-compose.central.yml up -d --build
+#   (or put COMPOSE_FILE=docker-compose.central.yml in .env on that host)
+
+name: tgarr
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tgarr-db
+    restart: unless-stopped
+    logging: &tgarr-logging
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      POSTGRES_USER: tgarr
+      POSTGRES_DB: tgarr
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./_data/postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    networks:
+      - tgarr-net
+
+  registry:
+    build: ./registry
+    container_name: tgarr-registry
+    restart: unless-stopped
+    logging: *tgarr-logging
+    depends_on: [db]
+    environment:
+      REGISTRY_MIN_CONSENSUS: "1"
+      BLOOM_DC_THRESHOLD: "1"
+      TGARR_TEST_SHOWCASE_IPS: ${TGARR_TEST_SHOWCASE_IPS:-}
+      SUSPICION_BATCH_THRESHOLD: "10000"
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+    volumes:
+      - ./registry:/app
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks:
+      - tgarr-net
+
+networks:
+  tgarr-net:
+    driver: bridge

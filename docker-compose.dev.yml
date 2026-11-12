@@ -1,0 +1,106 @@
+# tgarr built from this checkout (development, or if you want to run your own
+# changes). No automatic updates. Most installs want docker-compose.yml.
+#
+#   docker compose -f docker-compose.dev.yml up -d --build
+
+name: tgarr
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tgarr-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tgarr
+      POSTGRES_DB: tgarr
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./_data/postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    networks:
+      - tgarr-net
+
+  meili:
+    image: getmeili/meilisearch:v1.11
+    container_name: tgarr-meili
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_ENV: production
+    volumes:
+      - ./_data/meili:/meili_data
+    ports:
+      - "127.0.0.1:7700:7700"
+    networks:
+      - tgarr-net
+
+  crawler:
+    build: ./crawler
+    container_name: tgarr-crawler
+    # The crawler exits on purpose in a few situations (new login, account
+    # switch) and relies on being restarted.
+    restart: unless-stopped
+    depends_on: [db, meili]
+    logging: &tgarr-logging
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TG_PHONE: ${TG_PHONE}
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      MEILI_URL: http://meili:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      TG_DOWNLOAD_ROOT: /downloads/tgarr
+      TGARR_SEED_VALIDATOR: ${TGARR_SEED_VALIDATOR:-false}
+      TGARR_SEED_VALIDATOR_INTERVAL: ${TGARR_SEED_VALIDATOR_INTERVAL:-30}
+      TG_PARSE_SCORE_MIN: "0.30"
+    volumes:
+      - ./_data/session:/app/session
+      - ./_data/downloads:/downloads
+      - ./tools:/app/tools:ro
+    networks:
+      - tgarr-net
+    # Sign in at http://<host>:8765/login once the stack is up; the crawler
+    # waits for that session and starts by itself.
+
+  api:
+    build: ./api
+    container_name: tgarr-api
+    restart: unless-stopped
+    depends_on: [db]
+    logging: *tgarr-logging
+    # Lets tgarr reach Sonarr / Radarr published on this same host as
+    # host.docker.internal (the default SONARR_URL / RADARR_URL) without
+    # knowing the host's LAN address, so a DHCP change breaks nothing.
+    # an init process reaps what a stopped e-book conversion leaves behind
+    init: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      TGARR_BASE_URL: ${TGARR_BASE_URL:-}
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      # search page needs the same Meilisearch the crawler writes to
+      MEILI_URL: http://meili:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      # optional access control — see README "Securing tgarr"
+      TGARR_API_KEY: ${TGARR_API_KEY:-}
+      TGARR_UI_PASSWORD: ${TGARR_UI_PASSWORD:-}
+    volumes:
+      - ./api:/app
+      - ./_data/session:/app/session
+      - ./_data/downloads:/downloads
+    ports:
+      - "${TGARR_PORT:-8765}:8088"
+    networks:
+      - tgarr-net
+
+networks:
+  tgarr-net:
+    driver: bridge

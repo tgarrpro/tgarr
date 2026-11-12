@@ -254,7 +254,28 @@ async def _ebook_queue_restore() -> None:
 @app.on_event("startup")
 async def _startup():
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
+    # The database may still be starting: wait for it instead of crash-looping.
+    for _i in range(60):
+        try:
+            db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
+            break
+        except (OSError, asyncpg.PostgresError) as e:
+            if _i == 59:
+                raise
+            await asyncio.sleep(2)
+    # The base tables. They used to come only from a file mounted into the
+    # database container (./schema) - which an install that fetched just the
+    # compose file does not have, and nothing else created them. They are
+    # part of the image now and (re)applied at every start; every statement
+    # is IF NOT EXISTS.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql"),
+                  encoding="utf-8") as _f:
+            _base = _f.read()
+        async with db_pool.acquire() as conn:
+            await conn.execute(_base)
+    except FileNotFoundError:
+        pass
     # The migration takes brief exclusive locks; against a busy crawler it can
     # lose a deadlock. Retry rather than failing startup.
     for _attempt in range(1, 7):
@@ -269,6 +290,12 @@ async def _startup():
                 "schema migration lock conflict (%s) — retry %d/5",
                 type(e).__name__, _attempt)
             await asyncio.sleep(2 * _attempt)
+    # Tell the crawler the schema is in place (it waits for this before it
+    # touches the tables - on a first start the two come up together).
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('schema_ready', $1)
+               ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", TGARR_VERSION)
     # Restore self-user from the session volume so the sidebar shows the real
     # username (not @anonymous) immediately after a restart, before any get_me.
     login.ensure_user_info()
@@ -4645,6 +4672,18 @@ async def api_workers():
             "SELECT worker, last_seen, last_action, iter_count, "
             "error_count, last_error, last_error_at "
             "FROM worker_status ORDER BY last_seen DESC")
+        _rec_mode = (await conn.fetchval(
+            "SELECT value FROM config WHERE key='dialog_reconcile_mode'") or "off").lower()
+    # A job that is switched off, or that an older version ran and this one
+    # no longer has, is not a broken job: show it grey, not red.
+    off = set()
+    if _rec_mode not in ("report", "leave"):
+        off.add("dialog_reconcile_worker")
+    import datetime as _dt
+    for r in rows:
+        if (r["worker"] not in _EXPECTED_WORKERS and r["last_seen"]
+                and (_dt.datetime.now(r["last_seen"].tzinfo) - r["last_seen"]).days >= 7):
+            off.add(r["worker"])
     out = []
     seen = set()
     for r in rows:
@@ -4658,7 +4697,8 @@ async def api_workers():
             "error_count": r["error_count"],
             "last_error": r["last_error"],
             "last_error_at": r["last_error_at"].isoformat() if r["last_error_at"] else None,
-            "health": _worker_health(r["worker"], r["last_seen"], expected_max),
+            "health": ("off" if r["worker"] in off
+                       else _worker_health(r["worker"], r["last_seen"], expected_max)),
             "expected_max_sec": expected_max,
         })
     # Add expected-but-never-seen workers
@@ -4937,7 +4977,7 @@ function fmtAgo(iso) {
   return Math.floor(sec/86400) + "d ago";
 }
 function healthDot(h) {
-  const c = {healthy:"#22c55e",idle:"#eab308",stale:"#ef4444",never:"#94a3b8"}[h] || "#94a3b8";
+  const c = {healthy:"#22c55e",idle:"#eab308",stale:"#ef4444",never:"#94a3b8",off:"#cbd5e1"}[h] || "#94a3b8";
   return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${c};margin-right:6px"></span>`;
 }
 async function loadWorkers() {

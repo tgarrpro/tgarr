@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/docker-compose.
 curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/.env.example -o .env
 chmod 600 .env
 $EDITOR .env
-docker compose run --rm crawler python login.py   # interactive SMS code
+# then sign in in the browser: http://<your-host>:8765
 docker compose up -d
 ```
 
