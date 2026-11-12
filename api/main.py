@@ -118,6 +118,13 @@ def _pub(alias: str = "c") -> str:
     return "" if _signed_in() else f" AND {alias}.username IS NOT NULL"
 
 
+def _pub_m(alias: str = "m") -> str:
+    """The same for a query on messages that may not join channels at all (a
+    page's count and facet queries reuse its filter without the join)."""
+    return "" if _signed_in() else (
+        f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL)")
+
+
 async def _signed_out_block(request: Request):
     if _signed_in():
         return None
@@ -7210,7 +7217,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         "size":     "m.file_size DESC NULLS LAST",
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
-    where_parts = ["m.media_type = 'audio'" + _pub()]
+    where_parts = ["m.media_type = 'audio'" + _pub_m()]
     params = []
     if q:
         params.append(f"%{q}%")
@@ -7404,7 +7411,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         "title":  "m.file_name ASC NULLS LAST",
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
-    where_parts = ["m.media_type = 'document'" + _pub(),
+    where_parts = ["m.media_type = 'document'" + _pub_m(),
                    "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"]
     params = []
     if q:
@@ -7580,7 +7587,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         if not n:
             return RedirectResponse("/login")
 
-    where = ["m.media_type = 'video'" + _pub(),
+    where = ["m.media_type = 'video'" + _pub_m(),
              "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
     params = []
     if q:
