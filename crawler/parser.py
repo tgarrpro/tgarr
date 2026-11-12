@@ -5,6 +5,7 @@ field and the remainder collapses into a clean title. Outputs a dict with a
 `score` field (0.0-1.0) representing parse confidence.
 """
 import re
+import time
 
 RX_EXT = re.compile(
     r"\.(mkv|mp4|avi|m4v|mov|webm|flv|wmv|mpg|mpeg|3gp|ts|m2ts|iso|rmvb|rm)$",
@@ -19,9 +20,22 @@ RX_TV_VERBOSE = re.compile(
 RX_TV_SEASON_PACK = re.compile(r"\bS(\d{1,2})(?!\s*E)\b|\bSeason[\s_.\-]+(\d{1,2})\b", re.IGNORECASE)
 RX_RES = re.compile(r"\b(2160p|1440p|1080p|720p|576p|480p|360p|240p|4K|UHD)\b", re.IGNORECASE)
 RX_SOURCE = re.compile(
-    r"\b(BluRay|Blu[-_. ]?Ray|BDRip|BDMux|BR[-_. ]?Rip|WEB[-_. ]?DL|WEB[-_. ]?Rip|WEBMux|WEB|HDTV|HDRip|HC[-_. ]?HDRip|DVDRip|DVDR|DVD|R5|HDTS|TELESYNC|HDCAM|HD[-_. ]?CAM|CAMRip|CAM|TS|TC|PDVD|PreDVD|VHSRip|TVRip|SDTV)\b",
+    r"\b(BluRay|Blu[-_. ]?Ray|BDRip|BDMux|BR[-_. ]?Rip|WEB[-_. ]?DL|WEB[-_. ]?Rip|WEBMux|HDTV|HDRip|HC[-_. ]?HDRip|DVDRip|DVDR|HDTS|TELESYNC|HDCAM|HD[-_. ]?CAM|CAMRip|PDVD|PreDVD|VHSRip|TVRip|SDTV)\b",
     re.IGNORECASE,
 )
+# Short tags that are also ordinary words or initials ("The Web", "TS Eliot",
+# "Cam"). Only a source when written in capitals AND sitting in the release-tag
+# part of the name (after the year / resolution), never inside the title.
+RX_SOURCE_WEAK = re.compile(r"\b(WEB|DVD|R5|CAM|TS|TC)\b")
+# A year that is really part of a date or timestamp is not a release year:
+#   2024-08-18, 2024.08.18, 20240818, 2024-08, 18-08-2024, 2024年8月
+RX_DATE = re.compile(
+    r"(?<!\d)(?:"
+    r"(?:19|20)\d{2}[-./_ ]?(?:0[1-9]|1[0-2])[-./_ ]?(?:0[1-9]|[12]\d|3[01])(?!\d)"
+    r"|(?:19|20)\d{2}[-/_](?:0[1-9]|1[0-2])(?!\d)"
+    r"|(?:0?[1-9]|[12]\d|3[01])[-./_](?:0?[1-9]|1[0-2])[-./_](?:19|20)\d{2}(?!\d)"
+    r"|(?:19|20)\d{2}\s*\u5e74\s*\d{1,2}\s*\u6708"
+    r")")
 RX_CODEC = re.compile(r"\b(x264|x265|h\.?264|h\.?265|HEVC|AVC|AV1|XviD|DivX|VP9|MPEG2)\b", re.IGNORECASE)
 RX_AUDIO = re.compile(
     r"\b(DTS[-_. ]?HD[-_. ]?MA|DTS[-_. ]?HD|DTS[-_. ]?X|DTS|DDP?5\.?1|EAC3|AC3|TrueHD|Atmos|AAC2?\.?\d?|MP3|FLAC|Opus|PCM|LPCM)\b",
@@ -59,7 +73,8 @@ _CN_QUALITY_MAP = {
 
 # Chinese season/episode: 第N季 / 第N集 / 第N话 / 第N期 / EP12 / 12集
 RX_CN_SEASON = re.compile(r"第\s*(\d{1,3})\s*[季部]")
-RX_CN_EPISODE = re.compile(r"(?:第\s*)?(\d{1,3})\s*(?:集|话|話|期|话)")
+# (?<!\d): "2024集" is not episode 24
+RX_CN_EPISODE = re.compile(r"(?:第\s*)?(?<!\d)(\d{1,3})\s*(?:集|话|話|期|话)")
 RX_CN_EPISODE_RANGE = re.compile(r"(\d{1,3})\s*[-—~]\s*(\d{1,3})\s*集")
 
 # Arabic language/release tags
@@ -148,10 +163,29 @@ def parse_filename(name: str) -> dict:
                     out["type"] = "tv"
                     work = work[: m.start()] + " " + work[m.end():]
 
-    # Year (only first match — usually the release year)
-    m = RX_YEAR.search(work)
-    if m:
-        out["year"] = int(m.group(1))
+    # Year. Not every 4-digit number is one:
+    #  - dates and timestamps ("2024-08-18 21", "20240818") are masked out;
+    #  - nothing later than next year ("2046", "2077", "2048.cc");
+    #  - when several remain, the release year is the LAST one before the
+    #    quality tags ("Blade.Runner.2049.2017.1080p" -> 2017, "2012.2009" ->
+    #    2009), unless that would leave no title at all.
+    _masked = RX_DATE.sub(lambda m_: " " * len(m_.group(0)), work)
+    _max_year = time.gmtime().tm_year + 1
+    _cands = [m_ for m_ in RX_YEAR.finditer(_masked) if int(m_.group(1)) <= _max_year]
+    _tag = min((m_.start() for rx in (RX_RES, RX_SOURCE, RX_CODEC)
+                if (m_ := rx.search(_masked))), default=len(_masked))
+    _before = [m_ for m_ in _cands if m_.start() < _tag] or _cands
+    _year_m = None
+    if _before:
+        _year_m = _before[-1]
+        if not re.search(r"[^\W\d_]", _masked[:_year_m.start()]) and len(_before) == 1:
+            # the only "year" is the first thing in the name and nothing
+            # title-like precedes it: "2012.1080p.mkv" - keep it as the title,
+            # not as a year.
+            _year_m = None if _year_m.start() == 0 else _year_m
+    if _year_m:
+        out["year"] = int(_year_m.group(1))
+    _year_pos = _year_m.start() if _year_m else None
 
     # Quality / source / codec / audio / hdr — each extracted via search,
     # also stripped from working title.
@@ -176,6 +210,13 @@ def parse_filename(name: str) -> dict:
     if (m := RX_SOURCE.search(work)):
         out["source"] = m.group(1).replace("-", "").replace("_", "").replace(" ", "")
     strip(RX_SOURCE)
+    # ambiguous short tags: only in the tag part of the name
+    _anchor = _year_pos if _year_pos is not None else (_tag if _tag < len(_masked) else None)
+    if _anchor is not None and _anchor < len(work):
+        _tail = work[_anchor:]
+        if (m := RX_SOURCE_WEAK.search(_tail)):
+            out.setdefault("source", m.group(1))
+            work = work[:_anchor] + RX_SOURCE_WEAK.sub(" ", _tail)
 
     if (m := RX_CODEC.search(work)):
         v = m.group(1).lower().replace(".", "").replace("-", "")
@@ -268,12 +309,15 @@ def parse_filename(name: str) -> dict:
     work = RX_BRACKETS.sub(" ", work)
     work = RX_CJK_BRACKETS.sub(" ", work)
 
-    # Cut at year if present (title is everything before the year).
+    # Cut at year if present (title is everything before the year). The LAST
+    # occurrence: an earlier one belongs to the title ("Blade Runner 2049").
     if "year" in out:
         ystr = str(out["year"])
-        i = work.find(ystr)
+        i = work.rfind(ystr)
         if i > 0:
             work = work[:i]
+    # dates are not part of a title either
+    work = RX_DATE.sub(" ", work)
 
     # Normalize separators → spaces.
     work = RX_DOTSPACE.sub(" ", work)
@@ -285,9 +329,16 @@ def parse_filename(name: str) -> dict:
 
     out["title"] = title
 
+    # A title needs letters. "2024 08 18 21", "001", "1080p" are not titles.
+    # (resolution / codec words do not count: the fallback title of a
+    # tag-only name is the name itself)
+    _probe = RX_CODEC.sub(" ", RX_RES.sub(" ", title))
+    _letters = sum(1 for ch in _probe if ch.isalpha())
+    out["has_title"] = _letters >= 2
+
     # Decide type
     if "type" not in out:
-        if "year" in out:
+        if "year" in out and out["has_title"]:
             out["type"] = "movie"
         else:
             out["type"] = "unknown"
@@ -295,7 +346,7 @@ def parse_filename(name: str) -> dict:
     # Score (0.0–1.0)
     s = 0.0
     _t = out.get("title") or ""
-    if _t and len(_t) >= 2:
+    if _t and out.get("has_title"):
         s += 0.20
         # Substantial real title is itself a strong release signal even without
         # year/episode/quality metadata — common for CJK doc/movie files whose
