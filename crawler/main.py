@@ -892,6 +892,15 @@ async def init_db() -> None:
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_accessed_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview_accessed_at TIMESTAMPTZ")
+        # Stale-index cleanup bookkeeping (see stale_index_sweeper).
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS dead_at TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS dead_reason TEXT")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verify_cursor BIGINT")
     log.info("postgres pool ready")
 
 
@@ -2155,6 +2164,268 @@ async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
     return None
 
 
+# ════════════════════════════════════════════════════════════════════
+# Stale-index cleanup
+#
+# The index is a set of POINTERS to Telegram messages. Channels delete posts,
+# get banned, go private or disappear; the pointers stay behind and show up as
+# cards that can never produce a thumbnail, preview or download. Two ways a
+# dead pointer is found:
+#   - reactively: a user-requested thumbnail fetch comes back "message empty";
+#   - proactively: stale_index_sweeper re-checks indexed media in slow,
+#     200-id get_messages batches.
+# Rules: only an explicit answer from Telegram removes anything; a channel
+# that has become unreachable is first marked dead and only purged after a
+# grace period; personal chats, KwickPOS* channels, rows with a file the user
+# downloaded, and anything with an active download are never removed.
+# ════════════════════════════════════════════════════════════════════
+STALE_SWEEP_ENABLED = os.environ.get("TGARR_STALE_SWEEP", "true").lower() == "true"
+STALE_SWEEP_INTERVAL_SEC = int(os.environ.get("TGARR_STALE_SWEEP_INTERVAL_SEC", "120"))
+# ids per get_messages. Telegram allows 200, but several 200-id calls in a
+# row earn a ~30s flood wait on channels.GetMessages; 100 every 2 minutes
+# stays far below that.
+STALE_SWEEP_BATCH = int(os.environ.get("TGARR_STALE_SWEEP_BATCH", "100"))
+STALE_RECHECK_DAYS = int(os.environ.get("TGARR_STALE_RECHECK_DAYS", "30"))
+DEAD_CHANNEL_GRACE_DAYS = int(os.environ.get("TGARR_DEAD_CHANNEL_GRACE_DAYS", "7"))
+STALE_SWEEP_RESOLVE_PER_DAY = 30  # username lookups the sweeper may spend
+_GONE_CHANNEL_MARKS = ("CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID",
+                       "CHANNEL_BANNED", "CHAT_FORBIDDEN")
+_sweep_resolves = ["", 0]        # [utc day, count]
+
+
+async def _meili_delete(index: str, ids: list) -> None:
+    """Best-effort removal of documents from the search index."""
+    if not ids or not MEILI_KEY:
+        return
+    def _post():
+        req = urllib.request.Request(
+            f"{MEILI_URL}/indexes/{index}/documents/delete-batch",
+            data=json.dumps(ids).encode(), method="POST",
+            headers={"Authorization": f"Bearer {MEILI_KEY}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    try:
+        await asyncio.to_thread(_post)
+    except Exception as e:
+        log.debug("[meili] delete %s x%d failed: %s", index, len(ids), e)
+
+
+async def _drop_gone_messages(channel_id: int, msg_ids: list) -> int:
+    """Remove index rows whose Telegram message no longer exists. Keeps rows
+    that still have a file the user downloaded, and (via _purge_messages)
+    anything with an active download. Returns rows deleted."""
+    if not msg_ids:
+        return 0
+    async with db_pool.acquire() as conn:
+        keep = {r["id"] for r in await conn.fetch(
+            """SELECT id FROM messages WHERE id = ANY($1::bigint[])
+                 AND local_path IS NOT NULL AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'""",
+            msg_ids)}
+        ids = [i for i in msg_ids if i not in keep]
+        if not ids:
+            return 0
+        rel_ids = [r["id"] for r in await conn.fetch(
+            "SELECT id FROM releases WHERE primary_msg_id = ANY($1::bigint[])", ids)]
+    n = await _purge_messages(channel_id, ids)
+    if n:
+        await _meili_delete("messages", ids)
+        await _meili_delete("releases", rel_ids)
+    return n
+
+
+async def _mark_channel_dead(channel_id: int, reason: str) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE channels SET dead_at = COALESCE(dead_at, NOW()), dead_reason = $2
+               WHERE id = $1""", channel_id, reason[:120])
+
+
+async def _channel_gone(chat_id: int, username) -> "bool | None":
+    """Is the channel itself gone/unreachable for good?
+    True = Telegram said so explicitly. False = it answered normally.
+    None = could not tell (flood wait, missing peer, network)."""
+    try:
+        if username:
+            await _mtproto("resolveUsername", lambda: app.get_chat(username))
+        else:
+            await _mtproto("get_chat", lambda: app.get_chat(chat_id))
+        return False
+    except (FloodWait, DailyBudgetExhausted):
+        return None
+    except Exception as e:
+        return True if any(m in str(e) for m in _GONE_CHANNEL_MARKS) else None
+
+
+async def _reconcile_missing(channel_id: int, chat_id: int, username,
+                             requested: list, found: dict) -> tuple:
+    """Given index rows we asked Telegram about (`requested`: records with id +
+    tg_message_id) and what it returned (`found`: tg_message_id → Message),
+    drop the ones that no longer exist. Returns (removed, channel_dead).
+
+    If EVERYTHING in a real batch came back empty, don't trust it blindly:
+    confirm the channel still answers before deleting, and if it is gone mark
+    it dead instead (purged later, after the grace period)."""
+    missing = [r for r in requested if r["tg_message_id"] not in found]
+    if not missing:
+        return 0, False
+    if len(missing) == len(requested) and len(requested) >= 3:
+        gone = await _channel_gone(chat_id, username)
+        if gone is True:
+            await _mark_channel_dead(channel_id, "unreachable: all indexed messages empty")
+            return 0, True
+        if gone is None:
+            return 0, False          # can't confirm → change nothing
+    n = await _drop_gone_messages(channel_id, [r["id"] for r in missing])
+    return n, False
+
+
+async def stale_index_sweeper():
+    """Slowly re-verify that indexed media still exists on Telegram.
+
+    One get_messages call (100 message ids) per interval - about 72K
+    pointers/day at the default 120s — walking each channel once every
+    TGARR_STALE_RECHECK_DAYS. Also purges channels that have been dead for
+    longer than TGARR_DEAD_CHANNEL_GRACE_DAYS. Metadata calls only; nothing is
+    downloaded and nothing is joined. Opt-out: TGARR_STALE_SWEEP=false
+    """
+    if not STALE_SWEEP_ENABLED:
+        log.info("[stale] TGARR_STALE_SWEEP=false — disabled")
+        return
+    log.info("[stale] sweeper started; batch=%d every %ds, recheck %dd, dead grace %dd",
+             STALE_SWEEP_BATCH, STALE_SWEEP_INTERVAL_SEC, STALE_RECHECK_DAYS,
+             DEAD_CHANNEL_GRACE_DAYS)
+    await asyncio.sleep(600 + random.uniform(0, 300))
+    while True:
+        nap = STALE_SWEEP_INTERVAL_SEC
+        try:
+            # ── 0. retire channels that stayed dead through the grace period ──
+            async with db_pool.acquire() as conn:
+                dead = await conn.fetchrow(
+                    """SELECT c.id, c.username, c.dead_reason FROM channels c
+                       WHERE c.dead_at < NOW() - make_interval(days => $1)
+                         AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+                         AND COALESCE(c.category, '') <> 'personal'
+                         AND EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id
+                                     AND (m.local_path IS NULL
+                                          OR m.local_path LIKE '\\_\\_%' ESCAPE '\\'))
+                       ORDER BY c.dead_at LIMIT 1""", DEAD_CHANNEL_GRACE_DAYS)
+                dead_ids = []
+                if dead:
+                    dead_ids = [r["id"] for r in await conn.fetch(
+                        """SELECT id FROM messages WHERE channel_id = $1
+                             AND (local_path IS NULL
+                                  OR local_path LIKE '\\_\\_%' ESCAPE '\\')
+                           LIMIT 5000""", dead["id"])]
+            if dead and dead_ids:
+                n = await _drop_gone_messages(dead["id"], dead_ids)
+                log.info("[stale] dead channel @%s (%s): purged %d index rows",
+                         dead["username"] or dead["id"], dead["dead_reason"], n)
+                await _heartbeat("stale_index_sweeper",
+                                 f"dead @{dead['username'] or dead['id']}: purged {n}")
+                if n == 0:   # only protected rows left; don't re-pick it forever
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE channels SET dead_at = NOW() WHERE id = $1", dead["id"])
+                await asyncio.sleep(5)
+                continue
+
+            # ── 1. next channel + where we left off in it ──────────────────
+            async with db_pool.acquire() as conn:
+                ch = await conn.fetchrow(
+                    """SELECT c.id, c.tg_chat_id, c.username,
+                              COALESCE(c.verify_cursor, 0) AS cur
+                       FROM channels c
+                       WHERE c.dead_at IS NULL
+                         AND (c.account_user_id = $1 OR c.account_user_id IS NULL)
+                         AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+                         AND COALESCE(c.category, '') <> 'personal'
+                         AND (c.verified_at IS NULL
+                              OR c.verified_at < NOW() - make_interval(days => $2))
+                         AND EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id
+                                     AND m.file_unique_id IS NOT NULL)
+                       ORDER BY c.verified_at ASC NULLS FIRST, c.id
+                       LIMIT 1""", CURRENT_USER_ID, STALE_RECHECK_DAYS)
+                rows = []
+                if ch:
+                    rows = await conn.fetch(
+                        """SELECT id, tg_message_id FROM messages
+                           WHERE channel_id = $1 AND file_unique_id IS NOT NULL
+                             AND tg_message_id > $2
+                           ORDER BY tg_message_id LIMIT $3""",
+                        ch["id"], ch["cur"], STALE_SWEEP_BATCH)
+            if not ch:
+                await _heartbeat("stale_index_sweeper", "index fully verified")
+                await asyncio.sleep(3600)
+                continue
+            uname = ch["username"] or f"chat-{ch['id']}"
+            if not rows:      # reached the end of this channel
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET verified_at = NOW(), verify_cursor = 0 "
+                        "WHERE id = $1", ch["id"])
+                await asyncio.sleep(1)
+                continue
+
+            # ── 2. one round-trip ──────────────────────────────────────────
+            today = _utc_day()
+            if _sweep_resolves[0] != today:
+                _sweep_resolves[0], _sweep_resolves[1] = today, 0
+            may_resolve = (ch["username"] and _sweep_resolves[1] < STALE_SWEEP_RESOLVE_PER_DAY
+                           and ch["username"] not in _thumb_resolve_tried)
+            defer_sql = ("UPDATE channels SET verified_at = NOW() - make_interval(days => $2) "
+                         "WHERE id = $1")          # look again tomorrow
+            try:
+                if may_resolve:
+                    _sweep_resolves[1] += 1
+                found = await _thumb_get_messages(
+                    ch["tg_chat_id"], ch["username"] if may_resolve else None,
+                    [r["tg_message_id"] for r in rows])
+            except FloodWait as fw:
+                nap = min(int(getattr(fw, "value", 60) or 60) + 5, 3600)
+                log.warning("[stale] flood-wait %ds", nap)
+                await asyncio.sleep(nap)
+                continue
+            except DailyBudgetExhausted:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(defer_sql, ch["id"], STALE_RECHECK_DAYS - 1)
+                await asyncio.sleep(nap)
+                continue
+            except Exception as e:
+                es = str(e)
+                if any(m in es for m in _GONE_CHANNEL_MARKS):
+                    await _mark_channel_dead(ch["id"], es)
+                    log.info("[stale] @%s marked dead: %s", uname, es[:80])
+                else:
+                    # No usable peer / transient. Not evidence of anything.
+                    log.debug("[stale] @%s skipped: %s", uname, es[:80])
+                async with db_pool.acquire() as conn:
+                    await conn.execute(defer_sql, ch["id"], STALE_RECHECK_DAYS - 1)
+                await asyncio.sleep(nap)
+                continue
+
+            removed, is_dead = await _reconcile_missing(
+                ch["id"], ch["tg_chat_id"], ch["username"], rows, found)
+            async with db_pool.acquire() as conn:
+                if is_dead:
+                    await conn.execute(defer_sql, ch["id"], 0)
+                else:
+                    await conn.execute(
+                        "UPDATE channels SET verify_cursor = $2, dead_at = NULL, "
+                        "dead_reason = NULL WHERE id = $1",
+                        ch["id"], rows[-1]["tg_message_id"])
+            if removed or is_dead:
+                log.info("[stale] @%s: checked %d, removed %d%s", uname, len(rows),
+                         removed, " — channel marked dead" if is_dead else "")
+            await _heartbeat("stale_index_sweeper",
+                             f"@{uname}: checked {len(rows)}, removed {removed}"
+                             + (" (dead)" if is_dead else ""))
+        except Exception as e:
+            log.exception("[stale] sweeper error: %s", e)
+            await _heartbeat("stale_index_sweeper", error=str(e)[:200])
+        await asyncio.sleep(nap)
+
+
 def _pick_thumb_media(msg):
     """The small embedded thumbnail of a message's media (never the original)."""
     if msg.photo:
@@ -2315,6 +2586,18 @@ async def _thumb_process_batch(rows) -> None:
         except Exception as e:
             await _thumb_fail(grp[0], e, whole_channel=True)
             continue
+
+        # Telegram answered for this channel: any requested message that came
+        # back empty has been deleted at the source. Drop those pointers now
+        # rather than leaving dead cards behind.
+        try:
+            removed, is_dead = await _reconcile_missing(
+                grp[0]["channel_id"], chat_id, grp[0]["channel_username"], grp, msgs)
+            if removed or is_dead:
+                log.info("[thumbs] channel %s: %d stale pointer(s) removed%s", chat_id,
+                         removed, " — channel marked dead" if is_dead else "")
+        except Exception as e:
+            log.warning("[thumbs] stale reconcile for %s failed: %s", chat_id, e)
 
         async def dl(r, msgs=msgs):
             fname, target = _thumb_target(r)
@@ -2591,8 +2874,8 @@ async def thumb_downloader() -> None:
                 # /api/thumb's UPDATE). Drain them before old leftovers so the
                 # 12s polling timeout in /api/thumb is more likely to win.
                 rows = await conn.fetch(
-                    """SELECT m.id, m.tg_chat_id, m.tg_message_id, m.file_unique_id,
-                              c.username AS channel_username
+                    """SELECT m.id, m.channel_id, m.tg_chat_id, m.tg_message_id,
+                              m.file_unique_id, c.username AS channel_username
                        FROM messages m JOIN channels c ON c.id = m.channel_id
                        WHERE m.thumb_path = '__user_queued__'
                        ORDER BY m.id DESC
@@ -5205,6 +5488,7 @@ async def main() -> None:
     asyncio.create_task(federation_validator())
     asyncio.create_task(registry_puller())
     asyncio.create_task(audience_classifier_worker())
+    asyncio.create_task(stale_index_sweeper())
     # seed_validator disabled on client: leftover from pre-federation split.
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
