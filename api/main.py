@@ -5841,7 +5841,9 @@ async def api_registry_pull_now():
 # ════════════════════════════════════════════════════════════════════
 @app.get("/gallery", response_class=HTMLResponse)
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
-                       q: Optional[str] = None, dc: Optional[str] = None):
+                       q: Optional[str] = None, dc: Optional[str] = None,
+                       ch: Optional[int] = None, private: int = 0,
+                       offset: int = 0, sort: str = "new"):
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -5859,13 +5861,22 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     if channel:
         params.append(channel)
         where.append(f"c.username = ${len(params)}")
+    if ch:
+        # any chat, by its own id: a private chat has no @username to go by
+        params.append(int(ch))
+        where.append(f"c.id = ${len(params)}")
+    if private:
+        where.append("c.username IS NULL")
     if q:
         for w in q.split():
             params.append(f"%{w}%")
             where.append(f"(m.caption ILIKE ${len(params)} OR m.file_name ILIKE ${len(params)})")
     # Gate NSFW unless user has explicitly opted in via /settings.
-    if not await _is_nsfw_enabled():
+    _nsfw_on = await _is_nsfw_enabled()
+    if not _nsfw_on:
         where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
     # CSAM hard-block — overrides every setting, always.
     where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
 
@@ -5894,16 +5905,22 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                WHERE thumb_path IS NULL AND (media_type='photo' OR
                      (media_type IS NULL AND file_name IS NULL
                       AND COALESCE(mime_type,'')='' AND file_unique_id IS NOT NULL))""")
-        # Top channels by photo count for chip filter
-        top_channels = await conn.fetch(
-            """SELECT c.username, c.title, count(*) AS n
-               FROM messages m JOIN channels c ON c.id=m.channel_id
-               WHERE m.media_type='photo'
-                 AND c.username IS NOT NULL
-                 AND COALESCE(c.audience,'sfw') <> 'blocked_csam'
-               GROUP BY c.id, c.username, c.title
-               HAVING count(*) > 50
-               ORDER BY count(*) DESC LIMIT 12""")
+        # Every chat that has photos - private chats and groups included -
+        # for the channel picker. (This used to be the twelve public channels
+        # with the most photos, shown as unexplained chips; a chat without a
+        # @username could not be chosen at all.)
+        all_channels = await conn.fetch(
+            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, count(*) AS n
+               FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE m.media_type = 'photo'
+                 AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+                 {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}
+               GROUP BY c.id
+               ORDER BY count(*) DESC""")
+        matched = await conn.fetchval(f"""
+            SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where)}""", *params)
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -5926,60 +5943,107 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
               WHERE {' AND '.join(where)}
               ORDER BY COALESCE(m.thumb_md5, 'id-' || m.id::text), m.posted_at DESC NULLS LAST
             ) sub
-            ORDER BY posted_at DESC NULLS LAST
-            LIMIT {max(1, min(limit, 500))}
+            ORDER BY posted_at {"ASC NULLS LAST" if sort == "old" else "DESC NULLS LAST"}
+            LIMIT {page_size} OFFSET {page_offset}
         """, *params)
 
-    # Channel filter chips
-    def _ch_chip(uname, title, n):
-        active = channel == uname
-        bg = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
-              "border-color:var(--accent);") if active else ""
-        label = title or f"@{uname}"
-        if len(label) > 18:
-            label = label[:16] + '…'
-        return (f'<a class="btn ghost" href="/gallery?channel={_q(uname or "")}{_dc_q}" '
-                f'style="{bg}padding:5px 12px;font-size:12px">'
-                f'{html.escape(label)} <span style="opacity:0.6">{n:,}</span></a>')
+    # ── which photos: all / my private chats / one chat ──────────────
+    def _gqs(**over):
+        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "q": q,
+               "dc": "mine" if same_dc_only else None,
+               "sort": sort if sort == "old" else None,
+               "limit": limit if limit != 240 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
 
-    ch_chips = (
-        f'<a class="btn ghost" href="/gallery{"?dc=mine" if same_dc_only else ""}" style="' +
-        ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
-         'border-color:var(--accent);' if not channel else '') +
-        'padding:5px 12px;font-size:12px">all</a>' +
-        "".join(_ch_chip(r["username"], r["title"], r["n"]) for r in top_channels)
-    )
-    # DC toggle: same-DC (fast) ⇄ all DCs. Preserves the channel filter.
-    dc_toggle = ''
-    if my_dc:
-        _ch = f"&channel={_q(channel)}" if channel else ""
-        if same_dc_only:
-            dc_toggle = (
-                f'<a class="btn ghost" href="/gallery?dc=all{_ch}" '
-                f'style="padding:5px 12px;font-size:12px;'
-                f'background:rgba(16,185,129,0.15);color:#10b981;border-color:#10b981" '
-                f'title="showing only your DC {my_dc}. Click to show all DCs.">'
-                f'● DC {my_dc} only</a>')
-        else:
-            dc_toggle = (
-                f'<a class="btn ghost" href="/gallery?dc=mine{_ch}" '
-                f'style="padding:5px 12px;font-size:12px" '
-                f'title="showing all DCs. Click to show only your DC {my_dc}.">'
-                f'all DCs</a>')
+    picked = None
+    for r in all_channels:
+        if (ch and r["id"] == ch) or (channel and r["username"] == channel):
+            picked = r
+            break
+    priv = [r for r in all_channels if not r["username"]]
+    priv_n = sum(r["n"] for r in priv)
+
+    def _name(r):
+        return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
+    opts = "".join(
+        f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, offset=None)}" '
+        f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
+        f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
+        + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
+           else '<small>🔒 private</small>')
+        + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
+        for r in all_channels)
+    picker = (
+        '<div class="gp" id="gp">'
+        f'<button type="button" class="btn ghost gp-btn{" on" if picked else ""}" id="gpBtn">'
+        + (f'📡 {html.escape(_name(picked)[:28])} <span style="opacity:.6">{picked["n"]:,}</span>'
+           if picked else f'📡 Choose a channel… <span style="opacity:.6">{len(all_channels):,}</span>')
+        + ' ▾</button>'
+        '<div class="gp-pop" id="gpPop">'
+        '<input type="text" id="gpQ" placeholder="type to find a channel or chat…" autocomplete="off"/>'
+        f'<div class="gp-list" id="gpList">{opts}</div></div></div>')
     ch_chips_html = (
-        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">'
-        + dc_toggle + ch_chips + '</div>')
+        '<style>'
+        '.gp{position:relative}'
+        '.gp-btn{padding:5px 12px;font-size:12px}'
+        '.gp-btn.on{background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent)}'
+        '.gp-pop{display:none;position:absolute;z-index:50;top:calc(100% + 6px);left:0;width:min(380px,86vw);'
+        'background:var(--surface);border:1px solid var(--border);border-radius:10px;'
+        'box-shadow:0 14px 40px rgba(15,23,42,.18);padding:10px}'
+        '.gp.open .gp-pop{display:block}'
+        '.gp-pop input{width:100%;box-sizing:border-box;margin-bottom:8px}'
+        '.gp-list{max-height:52vh;overflow:auto}'
+        '.gp-opt{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:8px;'
+        'text-decoration:none;color:var(--fg)}'
+        '.gp-opt:hover{background:rgba(127,127,127,.10)}'
+        '.gp-n{flex:1;min-width:0;font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;'
+        'text-overflow:ellipsis}'
+        '.gp-n small{display:block;font-weight:400;font-size:11.5px;color:var(--muted)}'
+        '.gp-c{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}'
+        '</style>'
+        '<div class="bar-tools" style="margin-bottom:16px">'
+        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, offset=None),
+                     not (picked or private))
+        + (_chip_link(f'🔒 My private chats <span style="opacity:.6">{priv_n:,}</span>',
+                      "/gallery" + _gqs(ch=None, channel=None, private=1, offset=None), bool(private),
+                      "photos from chats and groups that have no public @username - yours alone")
+           if priv else "")
+        + picker
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
+        + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
+        + (('<span class="sep"></span>'
+            + _chip_link(f"only my data center (DC {my_dc})",
+                         "/gallery" + _gqs(dc=None if same_dc_only else "mine", offset=None),
+                         same_dc_only,
+                         "photos stored on your own Telegram data center load fastest; "
+                         "the others work too")) if my_dc else "")
+        + '</div>'
+        '<script>(function(){const gp=document.getElementById("gp"),q=document.getElementById("gpQ");'
+        'document.getElementById("gpBtn").onclick=e=>{e.stopPropagation();gp.classList.toggle("open");'
+        'if(gp.classList.contains("open"))q.focus()};'
+        'document.addEventListener("click",e=>{if(!gp.contains(e.target))gp.classList.remove("open")});'
+        'q.addEventListener("input",()=>{const v=q.value.trim().toLowerCase();'
+        'document.querySelectorAll("#gpList .gp-opt").forEach(o=>{o.style.display=!v||o.dataset.k.includes(v)?"flex":"none"})});'
+        'q.addEventListener("keydown",e=>{if(e.key==="Escape")gp.classList.remove("open");'
+        'if(e.key==="Enter"){const f=[...document.querySelectorAll("#gpList .gp-opt")].find(o=>o.style.display!=="none");'
+        'if(f)location.href=f.href}})})()</script>')
+    _where_txt = (f'in {html.escape(_name(picked))}' if picked else
+                  'in my private chats' if private else '')
 
     if not rows:
         body = (
-            '<h2 class="section">Gallery <span class="count">0</span></h2>'
+            f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">0</span></h2>'
             f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
-            '<div>No photos cached yet.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending:,} photo messages indexed — '
-            'crawler is downloading thumbnails in the background. Refresh in a minute.</div>'
-            '</div>'
+            + ('<div>No photo matches.</div>' if (picked or private or q or same_dc_only or page_offset) else
+               '<div>No photos yet.</div>'
+               f'<div style="margin-top:8px;font-size:13px">{pending:,} photos are indexed; their '
+               'thumbnails are fetched as pages are opened.</div>')
+            + '</div>'
         )
         return HTMLResponse(_layout("Gallery", "/gallery", body))
 
@@ -5999,16 +6063,15 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         for r in rows
     )
 
-    dup_saved = max(0, total - unique_total) if unique_total else 0
     body = (
-        f'<h2 class="section">Gallery <span class="count">{len(rows)} unique · {unique_total:,} total dedup</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{dup_saved:,} dup'
-           f'{f" · {pending:,} indexed (click to fetch)" if pending else ""}</span>'
-           if dup_saved or pending else '')
-        + ' <span class="extra" style="color:var(--muted);font-size:13px">'
-        '← → arrows · Space pause · Del delete · Esc close</span></h2>'
+        f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">{matched:,}</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
+        f'letter-spacing:0;margin-left:10px">photos {_where_txt}'
+        + (f' matching “{html.escape(q)}”' if q else '')
+        + ' · the same picture posted in several places is shown once · click one for the slideshow</span></h2>'
         f'{ch_chips_html}'
         f'<div class="gallery">{items}</div>'
+        + _page_nav("/gallery", _gqs, page_offset, page_size, len(rows), matched or 0) +
         '<div class="lightbox">'
         '  <div class="lb-progress"><div class="lb-progress-bar" id="lbProgress"></div></div>'
         '  <button class="lb-close" id="lbClose">×</button>'
