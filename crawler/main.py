@@ -11,6 +11,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import sys
 import logging
 import random
 import struct
@@ -247,6 +248,22 @@ _MTPROTO_DAILY_MAX = {
     "exportAuthorization": int(os.environ.get("TGARR_EXPORT_AUTH_DAILY_MAX", "40")),
 }
 _MTPROTO_DAILY: dict = {}   # method → [utc_day:str, count:int]
+# Who gets the allowance.
+#
+# Username lookups are the scarcest thing an account has (Telegram tolerates
+# roughly 150-300 a day). The federation validator - work done for tgarr.me,
+# not for the person running this install - was built to spend about 144 of
+# the 200 a day, around the clock. What was left for the person's own
+# thumbnails, films and follows ran out by the evening of an ordinary day,
+# and a restart (which sent the validator straight into another batch) made
+# it worse.
+#
+# So the allowance is split: BACKGROUND work may use at most this share of
+# the day's allowance; work a person is waiting on may use all of it. And it
+# is recorded who used how much, so that "where did it go" has an answer.
+_MTPROTO_BG_SHARE = float(os.environ.get("TGARR_BACKGROUND_SHARE", "0.4"))
+_MTPROTO_BG_HALT_UNTIL: dict = {}     # method → epoch: background callers only
+_MTPROTO_DAILY_BY: dict = {}          # method → [utc_day, {caller: count}]
 
 
 class DailyBudgetExhausted(RuntimeError):
@@ -262,8 +279,11 @@ def _secs_to_utc_midnight() -> float:
     return 86400 - (now % 86400)
 
 
-async def _daily_budget_take(method_name: str) -> bool:
-    """Consume one unit of today's budget. False = exhausted. Persisted."""
+async def _daily_budget_take(method_name: str, user: bool = True, who: str = "") -> bool:
+    """Consume one unit of today's allowance. False = none left FOR THIS
+    CALLER: a background caller is refused once background work has used its
+    share, while work a person is waiting on can still go ahead. Persisted,
+    with a per-caller tally."""
     cap = _MTPROTO_DAILY_MAX.get(method_name)
     if not cap or cap <= 0:
         return True   # uncapped (0 or negative disables the ceiling)
@@ -272,35 +292,69 @@ async def _daily_budget_take(method_name: str) -> bool:
     ent = _MTPROTO_DAILY.get(method_name)
     if ent is None:
         ent = [today, 0]
+        by = [today, {}]
         try:
             if db_pool is not None:
                 async with db_pool.acquire() as conn:
                     v = await conn.fetchval(
                         "SELECT value FROM config WHERE key=$1", key)
+                    vb = await conn.fetchval(
+                        "SELECT value FROM config WHERE key=$1", f"mtproto_daily_by:{method_name}")
                 if v and ":" in v:
                     d, _, c = v.partition(":")
                     ent = [d, int(c or 0)]
+                if vb and "|" in vb:
+                    d, _, j = vb.partition("|")
+                    by = [d, json.loads(j)]
         except Exception as e:
             log.debug("[mtproto-rl] daily budget load %s: %s", method_name, e)
         _MTPROTO_DAILY[method_name] = ent
+        _MTPROTO_DAILY_BY[method_name] = by
+    by = _MTPROTO_DAILY_BY.setdefault(method_name, [today, {}])
     if ent[0] != today:
         ent[0], ent[1] = today, 0
+    if by[0] != today:
+        by[0], by[1] = today, {}
     if ent[1] >= cap:
         return False
+    if not user:
+        bg_used = sum(n for k, n in by[1].items() if k.startswith("bg:"))
+        if bg_used >= int(cap * _MTPROTO_BG_SHARE):
+            return False
     ent[1] += 1
+    tag = ("" if user else "bg:") + (who or "?")
+    by[1][tag] = by[1].get(tag, 0) + 1
     try:
         if db_pool is not None:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     """INSERT INTO config (key, value) VALUES ($1, $2)
-                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
                     key, f"{ent[0]}:{ent[1]}")
+                await conn.execute(
+                    """INSERT INTO config (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                    f"mtproto_daily_by:{method_name}", f"{by[0]}|{json.dumps(by[1])}")
     except Exception as e:
         log.debug("[mtproto-rl] daily budget save %s: %s", method_name, e)
     return True
 
 
-async def _mtproto(method_name: str, coro_factory, wait: bool = True):
+async def _username_cached(username) -> bool:
+    """Does the session already know this @username? Then looking it up costs
+    Telegram nothing, and must not be charged to the day's allowance (Pyrogram
+    keeps a username for eight hours)."""
+    if not username or not isinstance(username, str):
+        return False
+    try:
+        await app.storage.get_peer_by_username(username.lstrip("@").lower())
+        return True
+    except Exception:
+        return False
+
+
+async def _mtproto(method_name: str, coro_factory, wait: bool = True,
+                   user: "bool | None" = None, username=None):
     """Gate Pyrogram calls: per-method rate limit + per-method halt + FloodWait observation.
     Halt is per-method: TG flood-waits specific endpoints (e.g. resolveUsername)
     rather than the whole session, so other methods stay unblocked.
@@ -311,11 +365,24 @@ async def _mtproto(method_name: str, coro_factory, wait: bool = True):
     of sleeping. A background job can sit out twelve hours; the thumbnail
     dispatcher sleeping twelve hours inside one channel's lookup meant no
     thumbnail at all, for anything, until midnight.
+
+    user: is a person waiting on this? Defaults to "yes if we may not wait".
+    Background work only gets its share of a daily allowance (see
+    _MTPROTO_BG_SHARE). username: for resolveUsername, the name being looked
+    up - if the session still knows it the call is free and is not charged.
     """
+    if user is None:
+        # joining only ever happens because someone opened a file
+        user = (not wait) or method_name == "join_chat"
+    who = sys._getframe(1).f_code.co_name
+    if method_name == "resolveUsername" and username and await _username_cached(username):
+        method_name = "get_chat"          # answered from the session: no lookup happens
     while True:
         # 1. Honor THIS method's halt (set by prior FloodWait on same method).
         now = time.time()
         halt_until = _MTPROTO_HALT_UNTIL.get(method_name, 0)
+        if not user:
+            halt_until = max(halt_until, _MTPROTO_BG_HALT_UNTIL.get(method_name, 0))
         if halt_until > now:
             remaining = halt_until - now
             if not wait and remaining > 3:
@@ -329,8 +396,21 @@ async def _mtproto(method_name: str, coro_factory, wait: bool = True):
         # user-click download path, so say so instead of hanging until
         # midnight. Username resolution is background-only: park the method
         # until the UTC day rolls over, exactly like a FloodWait halt.
-        if method_name in _MTPROTO_DAILY_MAX and not await _daily_budget_take(method_name):
+        if method_name in _MTPROTO_DAILY_MAX and not await _daily_budget_take(
+                method_name, user=user, who=who):
             cap = _MTPROTO_DAILY_MAX[method_name]
+            _spent = (_MTPROTO_DAILY.get(method_name) or ["", 0])[1] >= cap
+            if not _spent:
+                # only the background share is used up: park background
+                # callers, leave the rest for the person
+                _park = _secs_to_utc_midnight() + 5
+                async with _MTPROTO_LOCK:
+                    _MTPROTO_BG_HALT_UNTIL[method_name] = time.time() + _park
+                log.info("[mtproto-rl] %s: background work has used its share of today's "
+                         "allowance (%d of %d) — background paused %dh%02dm, the rest is kept "
+                         "for you", method_name, int(cap * _MTPROTO_BG_SHARE), cap,
+                         int(_park // 3600), int(_park % 3600 // 60))
+                continue
             if method_name == "join_chat":
                 log.warning("[mtproto-rl] join_chat daily budget (%d) spent — refusing", cap)
                 raise DailyBudgetExhausted(
@@ -553,7 +633,8 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
                 _uname = await conn.fetchval(
                     "SELECT username FROM channels WHERE tg_chat_id=$1", chat_id)
             if _uname:
-                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname), wait=False)
+                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname), wait=False,
+                               username=_uname)
                 return await _mtproto("get_messages",
                                       lambda: app.get_messages(chat_id, msg_id))
         except FloodWait:
@@ -2269,10 +2350,12 @@ INSTANCE_UUID_ROTATE_DAYS = 7
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
 FEDERATION_VALIDATOR_ENABLED = os.environ.get("TGARR_FEDERATION_VALIDATOR", "true").lower() == "true"
-# 6 seeds per ~66 min cycle ≈ 130 username lookups/day — inside Telegram's
-# daily tolerance with room left for the user's own subscriptions. (The old
-# default of 20 worked out to ~360/day.)
-SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "6"))
+# 3 seeds an hour ≈ 70 username lookups a day, and never more than the
+# background share of the day's allowance (_MTPROTO_BG_SHARE): this is work
+# done for the federation, on the user's account, and it comes after the
+# user's own. (6 an hour was ~144/day - 70% of the allowance; the first
+# default, 20, was ~360.)
+SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "3"))
 SEEDS_INTERVAL_SEC = int(os.environ.get("TGARR_SEEDS_INTERVAL_SEC", "3600"))  # 1h
 PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/seed -> 1/min resolveUsername
 AUDIO_ROOT = "/downloads/audio"
@@ -3066,11 +3149,27 @@ async def _channel_gone(chat_id: int, username) -> "bool | None":
     """Is the channel itself gone/unreachable for good?
     True = Telegram said so explicitly. False = it answered normally.
     None = could not tell (flood wait, missing peer, network)."""
+    hit = _GONE_CACHE.get(chat_id)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]          # asked recently: every empty batch must not cost a lookup
+    res = await _channel_gone_ask(chat_id, username)
+    if res is not None:
+        if len(_GONE_CACHE) > 2000:
+            _GONE_CACHE.clear()
+        _GONE_CACHE[chat_id] = (time.time(), res)
+    return res
+
+
+_GONE_CACHE: dict = {}        # chat_id → (asked at, answer)
+
+
+async def _channel_gone_ask(chat_id: int, username) -> "bool | None":
     try:
         if username:
             # never wait here: this runs inside the thumbnail and preview
             # dispatchers, and "cannot tell right now" is a valid answer
-            await _mtproto("resolveUsername", lambda: app.get_chat(username), wait=False)
+            await _mtproto("resolveUsername", lambda: app.get_chat(username), wait=False,
+                           username=username)
         else:
             await _mtproto("get_chat", lambda: app.get_chat(chat_id), wait=False)
         return False
@@ -3367,7 +3466,8 @@ async def _thumb_get_messages(chat_id: int, username, ids: list) -> dict:
             raise
         log.info("[thumbs] no peer for %s — resolving @%s once", chat_id, username)
         try:
-            await _mtproto("resolveUsername", lambda: app.resolve_peer(username), wait=False)
+            await _mtproto("resolveUsername", lambda: app.resolve_peer(username), wait=False,
+                           username=username)
         except DailyBudgetExhausted:
             raise                        # not this channel's fault: try again another day
         except Exception:
@@ -4120,8 +4220,10 @@ async def subscription_poller() -> None:
                         raise
                     log.info("[subscribe] @%s stale peer cache → force-resolve", uname)
                     from pyrogram.raw.functions.contacts import ResolveUsername
+                    # a channel is followed because someone chose to follow it
                     r = await _mtproto("resolveUsername",
-                        lambda: app.invoke(ResolveUsername(username=uname.lstrip("@"))))
+                        lambda: app.invoke(ResolveUsername(username=uname.lstrip("@"))),
+                        user=True)
                     await app.fetch_peers(r.chats + r.users)
                     chat = await _mtproto("get_chat",
                         lambda: app.get_chat(uname))
@@ -4741,10 +4843,31 @@ async def federation_validator() -> None:
     log.info("[fed-validator] enabled; batch=%d interval=%ds per_seed=%ds endpoint=%s",
              SEEDS_BATCH, SEEDS_INTERVAL_SEC, PER_SEED_DELAY_SEC, REGISTRY_URL)
     await asyncio.sleep(180)  # let backfill + metadata settle first
+    # A restart is not a reason to validate another batch: wait out what is
+    # left of the interval since the last one. (A day of updates used to mean
+    # a batch per restart.)
+    try:
+        async with db_pool.acquire() as conn:
+            _last = await conn.fetchval(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - updated_at)) FROM config "
+                "WHERE key = 'fed_validator_last'")
+        if _last is not None and _last < SEEDS_INTERVAL_SEC:
+            log.info("[fed-validator] last batch %d min ago — next in %d min",
+                     int(_last // 60), int((SEEDS_INTERVAL_SEC - _last) // 60))
+            await asyncio.sleep(SEEDS_INTERVAL_SEC - _last)
+    except Exception:
+        pass
 
     while True:
         try:
             await _heartbeat("federation_validator", f"fetching seed batch (size={SEEDS_BATCH})")
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO config (key, value) VALUES ('fed_validator_last', 'x')
+                           ON CONFLICT (key) DO UPDATE SET updated_at = NOW()""")
+            except Exception:
+                pass
             # ─── 1. Fetch a batch from central ──────────────────────────
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
@@ -4788,7 +4911,7 @@ async def federation_validator() -> None:
                             lambda: app.get_chat(invite))
                     else:
                         chat = await _mtproto("resolveUsername",
-                            lambda: app.get_chat(uname))
+                            lambda: app.get_chat(uname), username=uname)
                     members = getattr(chat, "members_count", None)
                     _cu = getattr(chat, "username", None)
                     title = getattr(chat, "title", None) or (_cu or uname)
@@ -6195,6 +6318,14 @@ async def index_purge_worker() -> None:
       • messages with an active/queued download are kept
       • FK-safe order in a transaction (downloads → releases → messages)
     """
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('mtproto_caps', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
+                json.dumps({"caps": _MTPROTO_DAILY_MAX, "bg_share": _MTPROTO_BG_SHARE}))
+    except Exception:
+        pass
     # The API tells people what "unfollow" will do: it has to know this.
     try:
         async with db_pool.acquire() as conn:

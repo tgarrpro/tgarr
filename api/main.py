@@ -4862,8 +4862,63 @@ async def api_deep_backfill_progress():
 async def page_system():
     if not login.session_exists():
         return RedirectResponse("/login")
+    # What the account's daily Telegram allowances went on today.
+    import json as _json
+    async with db_pool.acquire() as conn:
+        _cfg = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key LIKE 'mtproto_daily%' OR key = 'mtproto_caps'")}
+    try:
+        _caps = _json.loads(_cfg.get("mtproto_caps") or "{}")
+    except ValueError:
+        _caps = {}
+    _today = time.strftime("%Y-%m-%d", time.gmtime())
+    _names = {"resolveUsername": ("Looking a channel up by @username",
+                                  "needed the first time a channel is read; Telegram tolerates a few hundred a day"),
+              "join_chat": ("Joining a channel", "only when a file cannot be read without joining"),
+              "exportAuthorization": ("Opening another data center",
+                                      "once per data center a file lives on, then reused")}
+    _who = {"federation_validator": "checking channels for tgarr.me", "_thumb_get_messages": "thumbnails and previews",
+            "_channel_gone_ask": "checking whether a channel still exists",
+            "_mtproto_get_messages_with_auto_join": "opening a film, a song or a book",
+            "subscription_poller": "reading followed channels", "seed_validator": "checking channels for tgarr.me"}
+    _rows = []
+    for _m, (_label, _hint) in _names.items():
+        _cap = (_caps.get("caps") or {}).get(_m)
+        _v = _cfg.get(f"mtproto_daily:{_m}") or ""
+        _used = int(_v.partition(":")[2] or 0) if _v.startswith(_today) else 0
+        _by = {}
+        _vb = _cfg.get(f"mtproto_daily_by:{_m}") or ""
+        if _vb.startswith(_today):
+            try:
+                _by = _json.loads(_vb.partition("|")[2])
+            except ValueError:
+                _by = {}
+        _parts = []
+        for _k, _n in sorted(_by.items(), key=lambda x: -x[1]):
+            _bg = _k.startswith("bg:")
+            _name = _who.get(_k[3:] if _bg else _k, (_k[3:] if _bg else _k))
+            _parts.append(f'{html.escape(_name)} <b>{_n}</b>' + (' <span class="pill muted">background</span>' if _bg else ''))
+        _pct = min(100, _used * 100 // _cap) if _cap else 0
+        _col = "#ef4444" if _pct >= 100 else "#f59e0b" if _pct >= 75 else "#10b981"
+        _rows.append(
+            f'<tr><td><b>{_label}</b><div style="font-size:12px;color:var(--muted)">{_hint}</div></td>'
+            f'<td style="white-space:nowrap"><b>{_used}</b> of {_cap if _cap else "–"}'
+            f'<div style="height:6px;width:120px;background:var(--border);border-radius:3px;margin-top:5px">'
+            f'<div style="height:6px;width:{_pct}%;background:{_col};border-radius:3px"></div></div></td>'
+            f'<td style="font-size:13px">{" · ".join(_parts) or "<span style=color:var(--muted)>nothing yet today</span>"}</td></tr>')
+    _share = int(float(_caps.get("bg_share", 0.4)) * 100)
+    allowances_html = (
+        '<section style="margin-bottom:28px">'
+        '<h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 8px">'
+        'Telegram allowances today (resets at 00:00 UTC)</h3>'
+        '<table><thead><tr><th>what</th><th>used</th><th>who used it</th></tr></thead>'
+        f'<tbody>{"".join(_rows)}</tbody></table>'
+        f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr keeps well inside what Telegram '
+        f'tolerates so that your account is never slowed down. Background work may use at most {_share}% of an '
+        'allowance; the rest is kept for what you open yourself.</div></section>')
     body = """
 <h2 class="section">System</h2>
+__ALLOWANCES__
 <section style="margin-bottom:28px">
   <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Workers</h3>
   <div id="workersTable">loading...</div>
@@ -4968,6 +5023,7 @@ setInterval(loadDeepBackfill, 60000);
 }
 </style>
 """
+    body = body.replace("__ALLOWANCES__", allowances_html)
     return HTMLResponse(_layout("System", "/system", body))
 
 
