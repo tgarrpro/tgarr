@@ -2453,7 +2453,7 @@ _PDF_INFO_CACHE: dict = {}            # path -> (mtime, info)
 _PDF_PAGE_CACHE: "collections.OrderedDict" = None
 _PDF_PAGE_CACHE_MAX = 48
 _PDF_RENDER_SEM = None
-_PDF_WIDTHS = (800, 1200, 1600, 2000, 2400)
+_PDF_WIDTHS = (800, 1000, 1200, 1400, 1600, 1800, 2000, 2400, 2800, 3200)
 
 
 def _pdf_source(row):
@@ -2518,7 +2518,7 @@ def _pdf_render(path: str, n: int, width: int, clean: bool) -> bytes:
         r = subprocess.run(
             ["pdftoppm", "-f", str(n), "-l", str(n), "-singlefile",
              "-scale-to-x", str(width), "-scale-to-y", "-1",
-             "-jpeg", "-jpegopt", "quality=84", path, base],
+             "-jpeg", "-jpegopt", "quality=93", path, base],
             capture_output=True, timeout=60, preexec_fn=_nice)
         out = base + ".jpg"
         if r.returncode != 0 or not os.path.exists(out):
@@ -2530,7 +2530,7 @@ def _pdf_render(path: str, n: int, width: int, clean: bool) -> bytes:
         from PIL import Image
         buf = _io.BytesIO()
         with Image.open(out) as im:
-            _pdf_clean(im.convert("RGB")).save(buf, "JPEG", quality=84)
+            _pdf_clean(im.convert("RGB")).save(buf, "JPEG", quality=93)
         return buf.getvalue()
 
 
@@ -2560,7 +2560,10 @@ async def pdf_page(msg_id: int, n: int, w: int = 1200, clean: int = 0):
     path = _pdf_source(row)
     if not path:
         return Response("not downloaded yet", status_code=404)
-    width = min(_PDF_WIDTHS, key=lambda x: abs(x - max(400, min(int(w), 2400))))
+    # the smallest size that is not smaller than what the screen will show:
+    # a picture the browser has to enlarge is a blurred picture
+    _want = max(400, min(int(w), _PDF_WIDTHS[-1]))
+    width = next(x for x in _PDF_WIDTHS if x >= _want)
     try:
         info = await asyncio.to_thread(_pdf_info, path)
         if not 1 <= n <= info["pages"]:
@@ -2628,7 +2631,7 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
 <div class="bar">
   <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
   <div class="ttl">__TITLE__</div>
-  <button id="wmBtn" title="redraw the pages without pale watermarks (the file is not changed)">Hide watermark</button>
+  <button id="wmBtn" title="on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.">Hide watermark</button>
   <button id="zOut" title="smaller (-)">A&minus;</button>
   <button id="zIn" title="larger (+)">A+</button>
   <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
@@ -2653,11 +2656,11 @@ let pages = 0, ratio = 1.414, cur = 1, els = [];
 let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.pdfreader") || "{}"); } catch (e) {}
 let book = {}; try { book = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
 let zoom = st.zoom || 1, theme = st.theme || "light";
-let clean = book.clean !== undefined ? book.clean : !!st.clean;
+let clean = book.clean !== undefined ? book.clean : (st.clean !== undefined ? !!st.clean : true);
 const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean})); } catch (e) {} };
 const saveBook = () => { try { localStorage.setItem(KEY, JSON.stringify({page: cur, clean})); } catch (e) {} };
 function pageW(){ return Math.round(Math.min(stage.clientWidth - 16, 980) * zoom); }
-function reqW(){ return Math.min(2400, Math.round(pageW() * Math.min(2, window.devicePixelRatio || 1))); }
+function reqW(){ return Math.min(3200, Math.round(pageW() * Math.min(3, window.devicePixelRatio || 1))); }
 function src(n){ return "/pdf/" + ID + "/page/" + n + "?w=" + reqW() + (clean ? "&clean=1" : ""); }
 function size(){
   const w = pageW();
