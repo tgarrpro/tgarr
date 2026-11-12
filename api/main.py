@@ -330,6 +330,10 @@ async def _migrate_schema():
                 dismissed BOOLEAN NOT NULL DEFAULT FALSE
             );
             CREATE INDEX IF NOT EXISTS idx_discovered_audience ON discovered (audience);
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS release_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS video_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS book_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS audio_files INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
@@ -3687,8 +3691,20 @@ async def page_channels(min_members: int = 500,
 # ════════════════════════════════════════════════════════════════════
 # Page: Discover (registry-pulled channels awaiting subscription)
 # ════════════════════════════════════════════════════════════════════
+def _profile_pills(r) -> str:
+    """Small pills saying what a discovered channel carries."""
+    out = []
+    for col, label in (("release_files", "🎬 {n} releases"),
+                       ("book_files", "📚 {n} books"),
+                       ("audio_files", "🎵 {n} tracks")):
+        n = r[col] or 0
+        if n > 0:
+            out.append(f'<span class="pill accent">{label.format(n=f"{n:,}")}</span>')
+    return "".join(out)
+
+
 @app.get("/discover", response_class=HTMLResponse)
-async def page_discover(audience: str = "sfw"):
+async def page_discover(audience: str = "sfw", kind: str = ""):
     async with db_pool.acquire() as conn:
         # Auth check
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
@@ -3703,13 +3719,24 @@ async def page_discover(audience: str = "sfw"):
         where = ["dismissed = FALSE"]
         if audience in ("sfw", "nsfw"):
             where.append(f"audience = '{audience}'")
+        # What the channel actually carries, per the registry's content
+        # profile. Default view leads with movie/TV release channels — the
+        # reason most people install tgarr — instead of with whatever the
+        # most instances happened to have seen.
+        kind = kind if kind in ("video", "books", "music") else ""
+        kind_col = {"video": "release_files", "books": "book_files",
+                    "music": "audio_files"}.get(kind)
+        if kind_col:
+            where.append(f"COALESCE({kind_col}, 0) > 0")
+        order = (f"COALESCE({kind_col}, 0) DESC, " if kind_col
+                 else "COALESCE(release_files, 0) DESC, ")
         rows = await conn.fetch(f"""
             SELECT username, title, members_count, media_count, audience,
                    language, category, distinct_contributors, verified,
-                   last_pulled_at
+                   last_pulled_at, release_files, video_files, book_files, audio_files
             FROM discovered
             WHERE {' AND '.join(where)}
-            ORDER BY verified DESC, distinct_contributors DESC,
+            ORDER BY {order} verified DESC, distinct_contributors DESC,
                      COALESCE(members_count, 0) DESC
             LIMIT 200
         """)
@@ -3755,6 +3782,7 @@ async def page_discover(audience: str = "sfw"):
             f'<div class="meta">'
             f'{verified_pill}'
             f'<span class="pill accent">👥 {members}</span>'
+            f'{_profile_pills(r)}'
             f'<span class="pill muted">{r["media_count"] or 0} media</span>'
             f'<span class="pill muted">{r["audience"]}</span>'
             f'<span>· seen by {r["distinct_contributors"] or 1} instances</span>'
@@ -3763,6 +3791,19 @@ async def page_discover(audience: str = "sfw"):
             f'</div>'
         )
 
+    def _kc(val, label):
+        on = kind == val
+        st = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
+              "border-color:var(--accent);") if on else ""
+        q = [f"kind={val}"] if val else []
+        if audience != "sfw":
+            q.append(f"audience={audience}")
+        href = "/discover" + ("?" + "&".join(q) if q else "")
+        return (f'<a class="btn ghost" href="{href}" '
+                f'style="{st}padding:5px 12px;font-size:12px">{label}</a>')
+    _kind_chips = (_kc("", "All") + _kc("video", "🎬 Movies &amp; TV")
+                   + _kc("books", "📚 Books") + _kc("music", "🎵 Music"))
+
     body = (
         f'<h2 class="section">Discover <span class="count">'
         f'{len(rows)} of {total} from registry.tgarr.me</span>'
@@ -3770,7 +3811,8 @@ async def page_discover(audience: str = "sfw"):
            f'last pull {_fmt_time(last_pull)}</span>'
            if last_pull else '')
         + '</h2>'
-        '<div style="margin-bottom:18px;display:flex;gap:8px">'
+        '<div style="margin-bottom:18px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        + _kind_chips +
         '  <button type="button" class="ghost" id="tgPullBtn" style="font-size:13px" onclick="tgRegistryPull(this)">↻ Pull now</button>'
         '  <span id="tgPullToast" style="font-size:13px;color:var(--muted);align-self:center;display:none"></span>'
         '</div>'

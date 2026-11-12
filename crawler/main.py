@@ -1012,6 +1012,10 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verify_cursor BIGINT")
+        # Content profile the registry sends for Discover ranking.
+        for _col in ("release_files", "video_files", "book_files", "audio_files"):
+            await conn.execute(
+                f"ALTER TABLE IF EXISTS discovered ADD COLUMN IF NOT EXISTS {_col} INTEGER")
     log.info("postgres pool ready")
 
 
@@ -3919,9 +3923,14 @@ async def registry_puller() -> None:
                     is_new = await conn.fetchval(
                         """INSERT INTO discovered
                              (username, title, members_count, media_count, audience,
-                              language, category, distinct_contributors, verified)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                              language, category, distinct_contributors, verified,
+                              release_files, video_files, book_files, audio_files)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                            ON CONFLICT (username) DO UPDATE SET
+                             release_files = EXCLUDED.release_files,
+                             video_files = EXCLUDED.video_files,
+                             book_files = EXCLUDED.book_files,
+                             audio_files = EXCLUDED.audio_files,
                              title = EXCLUDED.title,
                              members_count = EXCLUDED.members_count,
                              media_count = EXCLUDED.media_count,
@@ -3934,7 +3943,9 @@ async def registry_puller() -> None:
                            RETURNING (xmax = 0)""",
                         u, c.get("title"), c.get("members_count"), c.get("media_count"),
                         c.get("audience"), c.get("language"), c.get("category"),
-                        c.get("distinct_contributors", 0), c.get("verified", False))
+                        c.get("distinct_contributors", 0), c.get("verified", False),
+                        c.get("release_files"), c.get("video_files"),
+                        c.get("book_files"), c.get("audio_files"))
                     if is_new:
                         inserted += 1
                     else:

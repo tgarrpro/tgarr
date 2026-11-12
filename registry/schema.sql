@@ -103,3 +103,13 @@ ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS health_status TEXT;
 ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS health_checked_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_reg_health ON registry_channels (health_status, health_checked_at);
 CREATE INDEX IF NOT EXISTS idx_reg_seeded ON registry_channels (seeded) WHERE seeded;
+
+-- Per-channel content profile, recomputed daily from contributed file names
+-- (see _audience_classifier in main.py). Lets clients rank "Discover" by what
+-- a channel actually carries instead of by how many instances have seen it.
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS release_files INTEGER;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS video_files INTEGER;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS book_files INTEGER;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS audio_files INTEGER;
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS files_stats_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_reg_release_files ON registry_channels (release_files DESC NULLS LAST);

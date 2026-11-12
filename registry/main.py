@@ -50,6 +50,17 @@ ADULT_MIN_FILES = 20
 ADULT_MIN_HITS = 5
 ADULT_MIN_RATIO = 0.08
 
+# A file name that looks like a movie / TV release: SxxEyy, or a year together
+# with a resolution / source / codec tag (either order).
+_REL_TAG = "(2160p|1080p|720p|480p|blu-?ray|web-?dl|webrip|hdtv|bdrip|hdrip|remux|x26[45]|hevc)"
+RELEASE_RX = ("(s[0-9]{1,2}[ ._-]?e[0-9]{1,3}"
+              "|(19|20)[0-9]{2}.*" + _REL_TAG +
+              "|" + _REL_TAG + ".*(19|20)[0-9]{2})")
+BOOK_RX = "\\.(epub|mobi|azw3?|pdf|djvu|fb2|cbz|cbr)$"
+# A channel that has had this many release-looking files contributed is real
+# enough to list even before a second instance has confirmed it.
+DISCOVER_MIN_RELEASE_FILES = 100
+
 
 # Hard caps on request bodies. nginx already limits the wire size (5 MB) but
 # NOT what a gzip body inflates to — an unauthenticated few-MB gzip bomb could
@@ -177,15 +188,22 @@ async def _build_central_sketch():
                     "WHERE distinct_contributors >= $1 "
                     "  AND file_unique_id IS NOT NULL",
                     BLOOM_DC_THRESHOLD)
-            bits = bytearray(BLOOM_M_BYTES)
-            n = 0
-            for r in rows:
-                fuid = r["file_unique_id"]
-                if not fuid:
-                    continue
-                for idx in _bloom_indices(fuid):
-                    bits[idx >> 3] |= (1 << (idx & 7))
-                n += 1
+            # ~4M ids x 8 hashes is tens of seconds of pure Python. Run it in a
+            # worker thread: on the event loop it froze every request for the
+            # whole build, every 5 minutes.
+            fuids = [r["file_unique_id"] for r in rows if r["file_unique_id"]]
+            del rows
+
+            def _fill(ids):
+                b = bytearray(BLOOM_M_BYTES)
+                for fuid in ids:
+                    for idx in _bloom_indices(fuid):
+                        b[idx >> 3] |= (1 << (idx & 7))
+                return b
+
+            bits = await asyncio.to_thread(_fill, fuids)
+            n = len(fuids)
+            del fuids
             # 20-byte header: magic(4) + m_bits(4) + k(1) + reserved(3) + n(4) + built_at(4)
             header = struct.pack(
                 "<4sIB3xII",
@@ -267,6 +285,27 @@ async def _audience_classifier():
                     timeout=900)
             log.info("[audience] marked nsfw: %s by title, %s by file names",
                      n_title, n_files)
+            async with db_pool.acquire() as conn:
+                n_stats = await conn.fetchval(
+                    """WITH st AS (
+                         SELECT ch.channel_username AS u,
+                                count(*) FILTER (WHERE rr.media_type = 'video') AS v,
+                                count(*) FILTER (WHERE rr.file_name ~* $1) AS rel,
+                                count(*) FILTER (WHERE rr.file_name ~* $2) AS b,
+                                count(*) FILTER (WHERE rr.media_type = 'audio') AS a
+                         FROM registry_resource_channels ch
+                         JOIN registry_resources rr USING (file_unique_id)
+                         WHERE NOT rr.blocked
+                         GROUP BY 1),
+                       u AS (
+                         UPDATE registry_channels rc
+                            SET release_files = st.rel, video_files = st.v,
+                                book_files = st.b, audio_files = st.a,
+                                files_stats_at = NOW()
+                           FROM st WHERE rc.username = st.u
+                         RETURNING 1)
+                       SELECT count(*) FROM u""", RELEASE_RX, BOOK_RX, timeout=900)
+            log.info("[discover] content profile refreshed for %s channels", n_stats)
         except Exception as e:
             log.exception("[audience] classifier error: %s", e)
         await asyncio.sleep(24 * 3600)
@@ -449,8 +488,13 @@ async def contribute(request: Request):
                        VALUES ($1, $2, 'blocked_csam', TRUE, 'csam-keyword')
                        ON CONFLICT (username) DO UPDATE SET
                          blocked = TRUE, audience = 'blocked_csam',
-                         block_reason = 'csam-keyword'""",
-                    username, title)
+                         block_reason = 'csam-keyword'
+                       -- The title is whatever the submitter typed. If only
+                       -- the title matched, it may not override a channel
+                       -- that other instances have independently reported.
+                       WHERE $3 OR (registry_channels.distinct_contributors < 2
+                                    AND NOT registry_channels.verified)""",
+                    username, title, bool(CSAM_RX.search(username)))
                 continue
 
             # Federation-noise reject (news/escort/fan/meme singleton-hash junk).
@@ -463,8 +507,10 @@ async def contribute(request: Request):
                          (username, title, audience, blocked, block_reason)
                        VALUES ($1, $2, 'sfw', TRUE, 'noise-ingest')
                        ON CONFLICT (username) DO UPDATE SET
-                         blocked = TRUE, block_reason = 'noise-ingest'""",
-                    username, title)
+                         blocked = TRUE, block_reason = 'noise-ingest'
+                       WHERE $3 OR (registry_channels.distinct_contributors < 2
+                                    AND NOT registry_channels.verified)""",
+                    username, title, bool(NOISE_RX.search(username)))
                 continue
 
             audience = c.get("audience") or "sfw"
@@ -1172,7 +1218,8 @@ async def get_registry(
     if audience in ("sfw", "nsfw"):
         where.append(f"audience = '{audience}'")
     if only_verified:
-        where.append("verified = TRUE")
+        where.append(f"(verified = TRUE OR "
+                     f"COALESCE(release_files, 0) >= {DISCOVER_MIN_RELEASE_FILES})")
     # Always apply at least the consensus floor (defense vs poison-injection).
     # effective_min is int — injection-safe.
     effective_min = max(min_contributors, REGISTRY_MIN_CONSENSUS)
@@ -1183,7 +1230,7 @@ async def get_registry(
     limit = max(1, min(limit, 20000))
     base_cols = ("username, title, members_count, media_count, audience, "
                 "language, category, distinct_contributors, verified, "
-                "last_seen_at")
+                "last_seen_at, release_files, video_files, book_files, audio_files")
     async with db_pool.acquire() as conn:
         if honeypot_ratio > 0:
             # Suspicious tier: poison the well. Compute split, fetch separately,
@@ -1195,7 +1242,7 @@ async def get_registry(
             real = await conn.fetch(
                 f"SELECT {base_cols} FROM registry_channels "
                 f"WHERE {' AND '.join(where_real)} "
-                f"ORDER BY distinct_contributors DESC, "
+                f"ORDER BY COALESCE(release_files,0) DESC, distinct_contributors DESC, "
                 f"COALESCE(members_count,0) DESC LIMIT {n_real}")
             honey = await conn.fetch(
                 f"SELECT {base_cols} FROM registry_channels "
