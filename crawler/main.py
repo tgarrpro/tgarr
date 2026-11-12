@@ -4418,12 +4418,21 @@ async def dc_backfill_worker() -> None:
             await asyncio.sleep(60)
 
 
+# Files a person asked for are fetched several at a time. One at a time meant
+# a 2 GB film opened earlier held every later click - a 5 MB song included -
+# until it had finished. A slot is always kept for small files.
+ONDEMAND_SLOTS = 3
+ONDEMAND_BIG_BYTES = 200 * 1024 * 1024
+ONDEMAND_BIG_SLOTS = 2
+_ondemand_active: dict = {}        # message row id -> is it a big file
+
+
 async def on_demand_media_downloader() -> None:
     """Process messages marked local_path='__user_queued__' by API.
 
     Strictly user-driven: scans only for the queue marker, no proactive
-    backlog work. Same stream_media() path as the disabled proactive
-    worker, with FloodWait + short-download detection.
+    backlog work. Up to ONDEMAND_SLOTS files at once, small ones first, at
+    most ONDEMAND_BIG_SLOTS of them big.
     """
     log.info("[on-demand-media] started — processes __user_queued__ marker")
     os.makedirs(AUDIO_ROOT, exist_ok=True)
@@ -4431,79 +4440,98 @@ async def on_demand_media_downloader() -> None:
     os.makedirs(VIDEO_ROOT, exist_ok=True)
     while True:
         try:
+            if len(_ondemand_active) >= ONDEMAND_SLOTS:
+                await asyncio.sleep(1)
+                continue
+            big_ok = sum(1 for v in _ondemand_active.values() if v) < ONDEMAND_BIG_SLOTS
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow("""
                     SELECT m.id, m.tg_chat_id, m.tg_message_id, m.media_type,
                            m.file_name, m.file_size
                     FROM messages m
                     WHERE m.local_path = '__user_queued__'
-                    ORDER BY m.id DESC
+                      AND m.id <> ALL($1::bigint[])
+                      AND ($2 OR COALESCE(m.file_size, 0) < $3)
+                    ORDER BY (COALESCE(m.file_size, 0) >= $3), m.id DESC
                     LIMIT 1
-                """)
+                """, list(_ondemand_active), big_ok, ONDEMAND_BIG_BYTES)
             if not row:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1 if _ondemand_active else 2)
                 continue
-
-            mt = row["media_type"] or "document"
-            await _heartbeat("on_demand_media_downloader", f"streaming msg {row['id']} ({mt})")
-            root = (AUDIO_ROOT if mt == "audio"
-                    else VIDEO_ROOT if mt == "video"
-                    else LIBRARY_ROOT)
-            base = (row["file_name"] or f"item-{row['id']}")
-            safe = SAFE_NAME.sub("_", base)[:180]
-            target = os.path.join(root, safe)
-            rel = os.path.relpath(target, "/downloads")
-
-            try:
-                msg = await _mtproto_get_messages_with_auto_join(
-                    row["tg_chat_id"], row["tg_message_id"])
-                if not msg:
-                    raise RuntimeError("msg gone")
-                media = (msg.audio if mt == "audio"
-                         else msg.video if mt == "video"
-                         else msg.document)
-                if not media:
-                    raise RuntimeError("no media obj")
-
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET local_path=$1 WHERE id=$2",
-                        rel, row["id"])
-                log.info("[on-demand-media] %s id=%s → %s", mt, row["id"], rel)
-
-                expected = row["file_size"] or 0
-                written = 0
-                with open(target, "wb") as f:
-                    async for chunk in _stream_media_fast(msg, media):
-                        f.write(chunk)
-                        written += len(chunk)
-
-                if expected and written < expected * 0.95:
-                    log.warning("[on-demand-media] short download id=%s wrote=%s expected=%s",
-                                row["id"], written, expected)
-                    async with db_pool.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE messages SET local_path='__failed__' WHERE id=$1",
-                            row["id"])
-                else:
-                    log.info("[on-demand-media] complete id=%s wrote=%s", row["id"], written)
-            except FloodWait as e:
-                wait_s = getattr(e, "value", 30)
-                log.warning("[on-demand-media] FloodWait %ss id=%s", wait_s, row["id"])
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET local_path='__user_queued__' WHERE id=$1",
-                        row["id"])
-                await asyncio.sleep(wait_s + 5)
-            except Exception as e:
-                log.exception("[on-demand-media] id=%s error: %s", row["id"], e)
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET local_path='__failed__' WHERE id=$1",
-                        row["id"])
+            _ondemand_active[row["id"]] = (row["file_size"] or 0) >= ONDEMAND_BIG_BYTES
+            asyncio.create_task(_ondemand_run(row))
         except Exception:
             log.exception("[on-demand-media] outer loop")
             await asyncio.sleep(10)
+
+
+async def _ondemand_run(row) -> None:
+    try:
+        await _ondemand_fetch_one(row)
+    except Exception:
+        log.exception("[on-demand-media] id=%s", row["id"])
+    finally:
+        _ondemand_active.pop(row["id"], None)
+
+
+async def _ondemand_fetch_one(row) -> None:
+    mt = row["media_type"] or "document"
+    await _heartbeat("on_demand_media_downloader", f"streaming msg {row['id']} ({mt})")
+    root = (AUDIO_ROOT if mt == "audio"
+            else VIDEO_ROOT if mt == "video"
+            else LIBRARY_ROOT)
+    base = (row["file_name"] or f"item-{row['id']}")
+    safe = SAFE_NAME.sub("_", base)[:180]
+    target = os.path.join(root, safe)
+    rel = os.path.relpath(target, "/downloads")
+
+    try:
+        msg = await _mtproto_get_messages_with_auto_join(
+            row["tg_chat_id"], row["tg_message_id"])
+        if not msg:
+            raise RuntimeError("msg gone")
+        media = (msg.audio if mt == "audio"
+                 else msg.video if mt == "video"
+                 else msg.document)
+        if not media:
+            raise RuntimeError("no media obj")
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path=$1 WHERE id=$2",
+                rel, row["id"])
+        log.info("[on-demand-media] %s id=%s → %s", mt, row["id"], rel)
+
+        expected = row["file_size"] or 0
+        written = 0
+        with open(target, "wb") as f:
+            async for chunk in _stream_media_fast(msg, media):
+                f.write(chunk)
+                written += len(chunk)
+
+        if expected and written < expected * 0.95:
+            log.warning("[on-demand-media] short download id=%s wrote=%s expected=%s",
+                        row["id"], written, expected)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET local_path='__failed__' WHERE id=$1",
+                    row["id"])
+        else:
+            log.info("[on-demand-media] complete id=%s wrote=%s", row["id"], written)
+    except FloodWait as e:
+        wait_s = getattr(e, "value", 30)
+        log.warning("[on-demand-media] FloodWait %ss id=%s", wait_s, row["id"])
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path='__user_queued__' WHERE id=$1",
+                row["id"])
+        await asyncio.sleep(wait_s + 5)
+    except Exception as e:
+        log.exception("[on-demand-media] id=%s error: %s", row["id"], e)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path='__failed__' WHERE id=$1",
+                row["id"])
 
 
 DEEP_BACKFILL_ENABLED = os.environ.get("TGARR_DEEP_BACKFILL", "true").lower() == "true"
