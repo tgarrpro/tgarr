@@ -49,6 +49,9 @@ DB_DSN = os.environ["DB_DSN"]
 BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
+# Single source for the version this crawler reports to the registry.
+TGARR_VERSION = "0.5.5"
+TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
 app = Client(
     name="tgarr",
@@ -206,6 +209,69 @@ _MTPROTO_BUDGETS = {
 }
 _MTPROTO_CALL_LOG: dict = {}  # method → list[float] of recent call timestamps
 
+# Per-DAY ceilings for the two calls Telegram punishes hardest. The per-minute
+# buckets above reset on every restart and say nothing about the daily total:
+# join_chat is hard-capped around 20/day per account, username resolution
+# around 150-300/day, and blowing through either costs hours-to-days of
+# FloodWait on the user's own account. Counters are persisted in the config
+# table so a restart (or a watchtower update) does not hand out a fresh budget.
+_MTPROTO_DAILY_MAX = {
+    "join_chat":       int(os.environ.get("TGARR_JOIN_DAILY_MAX", "12")),
+    "resolveUsername": int(os.environ.get("TGARR_RESOLVE_DAILY_MAX", "200")),
+}
+_MTPROTO_DAILY: dict = {}   # method → [utc_day:str, count:int]
+
+
+class DailyBudgetExhausted(RuntimeError):
+    """Raised instead of making a call whose daily Telegram budget is spent."""
+
+
+def _utc_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _secs_to_utc_midnight() -> float:
+    now = time.time()
+    return 86400 - (now % 86400)
+
+
+async def _daily_budget_take(method_name: str) -> bool:
+    """Consume one unit of today's budget. False = exhausted. Persisted."""
+    cap = _MTPROTO_DAILY_MAX.get(method_name)
+    if not cap or cap <= 0:
+        return True   # uncapped (0 or negative disables the ceiling)
+    key = f"mtproto_daily:{method_name}"
+    today = _utc_day()
+    ent = _MTPROTO_DAILY.get(method_name)
+    if ent is None:
+        ent = [today, 0]
+        try:
+            if db_pool is not None:
+                async with db_pool.acquire() as conn:
+                    v = await conn.fetchval(
+                        "SELECT value FROM config WHERE key=$1", key)
+                if v and ":" in v:
+                    d, _, c = v.partition(":")
+                    ent = [d, int(c or 0)]
+        except Exception as e:
+            log.debug("[mtproto-rl] daily budget load %s: %s", method_name, e)
+        _MTPROTO_DAILY[method_name] = ent
+    if ent[0] != today:
+        ent[0], ent[1] = today, 0
+    if ent[1] >= cap:
+        return False
+    ent[1] += 1
+    try:
+        if db_pool is not None:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO config (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
+                    key, f"{ent[0]}:{ent[1]}")
+    except Exception as e:
+        log.debug("[mtproto-rl] daily budget save %s: %s", method_name, e)
+    return True
+
 
 async def _mtproto(method_name: str, coro_factory):
     """Gate Pyrogram calls: per-method rate limit + per-method halt + FloodWait observation.
@@ -221,6 +287,24 @@ async def _mtproto(method_name: str, coro_factory):
             log.info("[mtproto-rl] halt %s: %ds remaining → sleeping",
                      method_name, int(remaining))
             await asyncio.sleep(min(remaining + 1, 60))
+            continue
+        # 1b. Daily ceiling (persisted). join_chat fails fast — it sits on the
+        # user-click download path, so say so instead of hanging until
+        # midnight. Username resolution is background-only: park the method
+        # until the UTC day rolls over, exactly like a FloodWait halt.
+        if method_name in _MTPROTO_DAILY_MAX and not await _daily_budget_take(method_name):
+            cap = _MTPROTO_DAILY_MAX[method_name]
+            if method_name == "join_chat":
+                log.warning("[mtproto-rl] join_chat daily budget (%d) spent — refusing", cap)
+                raise DailyBudgetExhausted(
+                    f"daily join budget ({cap}) reached — protecting the Telegram "
+                    f"account; try again after 00:00 UTC")
+            wait = _secs_to_utc_midnight() + 5
+            async with _MTPROTO_LOCK:
+                _MTPROTO_HALT_UNTIL[method_name] = max(
+                    _MTPROTO_HALT_UNTIL.get(method_name, 0), time.time() + wait)
+            log.warning("[mtproto-rl] %s daily budget (%d) spent — parked %dh%02dm",
+                        method_name, cap, int(wait // 3600), int(wait % 3600 // 60))
             continue
         # 2. Per-method token bucket.
         limit, window = _MTPROTO_BUDGETS.get(method_name,
@@ -276,6 +360,42 @@ async def _mtproto_wait_clearance(method_name: str = "get_chat_history"):
         return
 
 
+async def _mtproto_aiter(method_name: str, agen):
+    """Drive a Pyrogram async generator (get_chat_history / get_dialogs) under
+    the same FloodWait discipline as _mtproto(): wait out an existing halt
+    before the first page, and if Telegram answers a later page with FloodWait,
+    REGISTER the halt before re-raising. Without this the generators bypassed
+    the limiter entirely — a FloodWait on one channel was swallowed as a
+    generic error and the caller moved straight on to hit the next channel.
+    """
+    await _mtproto_wait_clearance(method_name)
+    try:
+        async for item in agen:
+            yield item
+    except _REVOKED_AUTH_ERRORS as e:
+        await _mark_revoked(type(e).__name__)
+        raise
+    except FloodWait as fw:
+        fw_val = int(getattr(fw, "value", 60) or 60)
+        until = time.time() + fw_val + 5
+        async with _MTPROTO_LOCK:
+            if until > _MTPROTO_HALT_UNTIL.get(method_name, 0):
+                _MTPROTO_HALT_UNTIL[method_name] = until
+        log.warning("[mtproto-rl] %s FloodWait %ds mid-iteration → halt this method",
+                    method_name, fw_val)
+        raise
+
+
+def _hist(*a, **kw):
+    """app.get_chat_history under the limiter."""
+    return _mtproto_aiter("get_chat_history", app.get_chat_history(*a, **kw))
+
+
+def _dialogs(*a, **kw):
+    """app.get_dialogs under the limiter."""
+    return _mtproto_aiter("get_dialogs", app.get_dialogs(*a, **kw))
+
+
 async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
     """get_messages with auto-join on CHANNEL_INVALID — for restricted channels
     where the session isn't yet a member. join_chat is itself rate-limited;
@@ -291,7 +411,7 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
         # be wrapped in `await coro()`. Use clearance gate + iterate directly.
         try:
             await _mtproto_wait_clearance("get_chat_history")
-            async for _ in app.get_chat_history(chat_id, limit=1):
+            async for _ in _hist(chat_id, limit=1):
                 break
             return await _mtproto("get_messages",
                                    lambda: app.get_messages(chat_id, msg_id))
@@ -1074,7 +1194,7 @@ async def backfill_channel(chat_id: int, title: str, username: str | None = None
     count = 0
     media_count = 0
     await _mtproto_wait_clearance()
-    async for msg in app.get_chat_history(chat_id, limit=BACKFILL_LIMIT):
+    async for msg in _hist(chat_id, limit=BACKFILL_LIMIT):
         has_media = bool(msg.video or msg.document or msg.audio or msg.photo)
         try:
             await ingest_message(msg)
@@ -1118,7 +1238,7 @@ async def backfill_all() -> None:
 
     current_dialog_ids: set[int] = set()
     await _mtproto_wait_clearance()
-    async for dialog in app.get_dialogs():
+    async for dialog in _dialogs():
         ctype = dialog.chat.type.name
         if ctype in ("PRIVATE", "BOT"):
             continue
@@ -1613,7 +1733,10 @@ INSTANCE_UUID_ROTATE_DAYS = 7
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
 FEDERATION_VALIDATOR_ENABLED = os.environ.get("TGARR_FEDERATION_VALIDATOR", "true").lower() == "true"
-SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "20"))
+# 6 seeds per ~66 min cycle ≈ 130 username lookups/day — inside Telegram's
+# daily tolerance with room left for the user's own subscriptions. (The old
+# default of 20 worked out to ~360/day.)
+SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "6"))
 SEEDS_INTERVAL_SEC = int(os.environ.get("TGARR_SEEDS_INTERVAL_SEC", "3600"))  # 1h
 PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/seed -> 1/min resolveUsername
 AUDIO_ROOT = "/downloads/audio"
@@ -1707,7 +1830,7 @@ async def new_dialog_watcher() -> None:
                     "SELECT tg_chat_id FROM channels")}
             new_dialogs = []
             await _mtproto_wait_clearance()
-            async for dialog in app.get_dialogs(limit=NEW_DIALOG_SCAN_LIMIT):
+            async for dialog in _dialogs(limit=NEW_DIALOG_SCAN_LIMIT):
                 ctype = dialog.chat.type.name
                 if ctype in ("PRIVATE", "BOT"):
                     continue
@@ -2705,7 +2828,7 @@ async def subscription_poller() -> None:
             count = media_count = 0
             try:
                 await _mtproto_wait_clearance()
-                async for msg in app.get_chat_history(real_chat_id, limit=limit):
+                async for msg in _hist(real_chat_id, limit=limit):
                     try:
                         inserted = await ingest_message(msg)
                         count += 1
@@ -2864,7 +2987,7 @@ async def seed_validator() -> None:
             last_msg = None
             try:
                 await _mtproto_wait_clearance()
-                async for m in app.get_chat_history(chat.id, limit=1):
+                async for m in _hist(chat.id, limit=1):
                     last_msg = m.date
                     break
             except Exception:
@@ -2984,7 +3107,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.34 (+https://tgarr.me)",
+                    headers={"User-Agent": TGARR_UA,
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -3117,7 +3240,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.4",
+                "tgarr_version": TGARR_VERSION,
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3142,7 +3265,7 @@ async def contribute_to_registry() -> None:
                     headers={"Content-Type": "application/json",
                              "Content-Encoding": "gzip",
                              "Accept-Encoding": "gzip",
-                             "User-Agent": "tgarr/0.4.62 (+https://tgarr.me)"},
+                             "User-Agent": TGARR_UA},
                     method="POST")
                 def _post():
                     with urllib.request.urlopen(req, timeout=30) as r:
@@ -3215,7 +3338,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.34 (+https://tgarr.me)"})
+                    "User-Agent": TGARR_UA})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -3315,14 +3438,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.5.4",
+                        "tgarr_version": TGARR_VERSION,
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.34 (+https://tgarr.me)"},
+                                 "User-Agent": TGARR_UA},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -3899,7 +4022,7 @@ async def dialog_reconcile_worker() -> None:
             await _mtproto_wait_clearance()
             leavable = []   # (chat_id, username, title)
             real = protected = 0
-            async for dialog in app.get_dialogs():
+            async for dialog in _dialogs():
                 if dialog.chat.type.name not in ("CHANNEL", "SUPERGROUP"):
                     continue
                 real += 1
@@ -4104,7 +4227,7 @@ async def deep_backfill_worker() -> None:
             try:
                 await _mtproto_wait_clearance()
                 offset_kw = {"offset_id": cursor} if cursor else {}
-                async for msg in app.get_chat_history(
+                async for msg in _hist(
                         row["tg_chat_id"],
                         limit=DEEP_BACKFILL_PAGE_SIZE,
                         **offset_kw):
@@ -4278,7 +4401,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.4",
+                "tgarr_version": TGARR_VERSION,
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4302,7 +4425,7 @@ async def contribute_resources_worker() -> None:
                     headers={"Content-Type": "application/json",
                              "Content-Encoding": "gzip",
                              "Accept-Encoding": "gzip",
-                             "User-Agent": "tgarr/0.4.62 (+https://tgarr.me)"},
+                             "User-Agent": TGARR_UA},
                     method="POST")
                 def _post():
                     with urllib.request.urlopen(req, timeout=120) as r:
@@ -4361,7 +4484,7 @@ async def _central_post(path: str, payload: dict, timeout: int = 120) -> dict:
         REGISTRY_URL + path, data=body_gz,
         headers={"Content-Type": "application/json",
                  "Content-Encoding": "gzip", "Accept-Encoding": "gzip",
-                 "User-Agent": "tgarr/0.5.0 (+https://tgarr.me)"},
+                 "User-Agent": TGARR_UA},
         method="POST")
     def _post():
         with urllib.request.urlopen(req, timeout=timeout) as r:
