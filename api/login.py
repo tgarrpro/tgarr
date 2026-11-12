@@ -25,7 +25,10 @@ from pyrogram import Client
 # thumbnails, previews, downloads, backfill — died with "Peer id invalid".
 # Widen the range to the current MTProto limit.
 from pyrogram import utils as _pyro_utils
-if _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
+# (Only the original Pyrogram has this constant. Kurigram, the maintained fork
+# tgarr uses now, handles the larger ids by itself and does not define it.)
+if getattr(_pyro_utils, "MIN_CHANNEL_ID", None) is not None \
+        and _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
     _pyro_utils.MIN_CHANNEL_ID = -1007852516352
 from pyrogram.errors import (
     AuthTokenExpired,

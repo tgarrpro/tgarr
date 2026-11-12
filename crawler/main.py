@@ -44,7 +44,10 @@ from parser import (parse_filename, to_release_name, decide_release, is_video_fi
 # thumbnails, previews, downloads, backfill — died with "Peer id invalid".
 # Widen the range to the current MTProto limit.
 from pyrogram import utils as _pyro_utils
-if _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
+# (Only the original Pyrogram has this constant. Kurigram, the maintained fork
+# tgarr uses now, handles the larger ids by itself and does not define it.)
+if getattr(_pyro_utils, "MIN_CHANNEL_ID", None) is not None \
+        and _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
     _pyro_utils.MIN_CHANNEL_ID = -1007852516352
 
 logging.basicConfig(
@@ -2800,11 +2803,17 @@ async def _media_session(dc_id: int):
         if dc_id != my_dc:
             await _export_auth_reserve(dc_id)   # raises FloodWait, never waits
         test_mode = await app.storage.test_mode()
+        # Kurigram wants to be told where the data centre is (Pyrogram had
+        # the addresses built in): ask Telegram's own configuration, the way
+        # the library does for its own sessions.
+        ipv6 = bool(getattr(app, "ipv6", False))
         if dc_id != my_dc:
-            auth_key = await Auth(app, dc_id, test_mode).create()
+            opt = await app.get_dc_option(dc_id, ipv6=ipv6)
+            auth_key = await Auth(app, dc_id, opt.ip_address, opt.port, test_mode).create()
         else:
             auth_key = await app.storage.auth_key()
-        sess = Session(app, dc_id, auth_key, test_mode, is_media=True)
+        mopt = await app.get_dc_option(dc_id, is_media=True, ipv6=ipv6)
+        sess = Session(app, dc_id, mopt.ip_address, mopt.port, auth_key, test_mode, is_media=True)
         await sess.start()
         try:
             if dc_id != my_dc:
