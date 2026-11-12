@@ -1628,6 +1628,33 @@ async def _player_fetches() -> list:
     return out
 
 
+async def _player_saved(limit: int = 100) -> list:
+    """Files that were opened in a player and are here in full."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT ON (m.local_path) m.id, m.file_name, m.file_size, m.media_type,
+                      m.local_path, m.local_accessed_at,
+                      EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav
+               FROM messages m
+               WHERE m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
+               ORDER BY m.local_path, m.local_accessed_at DESC NULLS LAST""")
+    out = []
+    for r in rows:
+        lp = r["local_path"]
+        if not lp.startswith(_CACHE_PREFIXES):
+            continue
+        try:
+            st = os.stat(os.path.join("/downloads", lp))
+        except OSError:
+            continue
+        if r["file_size"] and st.st_size < r["file_size"]:
+            continue
+        used = max(st.st_mtime, r["local_accessed_at"].timestamp() if r["local_accessed_at"] else 0)
+        out.append({"r": r, "size": st.st_size, "used": used})
+    out.sort(key=lambda x: -x["used"])
+    return out[:limit]
+
+
 @app.post("/api/fetch/{msg_id}/cancel")
 async def fetch_cancel(msg_id: int):
     """Stop fetching a file someone opened, and forget what has arrived."""
@@ -6909,6 +6936,43 @@ async def page_downloads():
                ORDER BY d.finished_at DESC NULLS LAST LIMIT 100""")
 
     fetches = await _player_fetches()
+    saved = await _player_saved()
+
+    def _render_saved():
+        import datetime as _dt
+        head = (f'<h2 class="section">Saved from players <span class="count">{len(saved)}</span>'
+                f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
+                f'text-transform:none;letter-spacing:0;margin-left:10px">'
+                f'{_fmt_size(sum(x["size"] for x in saved)) or "0 MB"} · '
+                f'<a href="/settings#cache">clean-up rules</a></span></h2>')
+        if not saved:
+            return head + ('<div class="empty-state"><div class="icon">💾</div>'
+                           '<div>Films, songs and books you open are kept here so they open '
+                           'instantly next time.</div></div>')
+        ico = {"video": "🎬", "audio": "🎵"}
+        items = []
+        for it in saved:
+            r = it["r"]
+            when = _dt.datetime.fromtimestamp(it["used"], _dt.timezone.utc)
+            items.append(
+                f'<div class="dl-item"><div class="icon">{ico.get(r["media_type"], "📄")}</div>'
+                f'<div class="info"><div class="name">'
+                f'<a href="/watch/{r["id"]}" style="color:inherit;text-decoration:none">'
+                f'{html.escape(r["file_name"] or r["local_path"].rsplit("/", 1)[-1])}</a></div>'
+                f'<div class="meta"><span class="pill ok">saved</span>'
+                + ('<span class="pill" style="color:#e11d48">♥ favourite</span>' if r["fav"] else '')
+                + f'<span>· {_fmt_size(it["size"])}</span><span>· last opened {_fmt_time(when)}</span>'
+                f'</div></div><div class="right"><div class="dl-ctrls">'
+                f'<a class="dl-btn" href="/media/{r["id"]}" download '
+                f'title="download to this device">⬇</a>'
+                f'<button class="dl-btn bad" onclick="fetchRemove({r["id"]})">✗ Remove</button>'
+                f'</div></div></div>')
+        return head + f'<div class="dl-list">{"".join(items)}</div>'
+
+    _fetch_js = ('<script>function fetchCancel(id){fetch("/api/fetch/"+id+"/cancel",{method:"POST"})'
+                 '.then(()=>location.reload())}'
+                 'function fetchRemove(id){if(confirm("Remove this file from the server? '
+                 'It stays in the index and can be fetched again."))fetchCancel(id)}</script>')
 
     def _render_fetches():
         if not fetches:
@@ -6940,9 +7004,7 @@ async def page_downloads():
             '<div style="color:var(--muted);font-size:13px;margin:-6px 0 12px">'
             'Opening a film fetches it from Telegram. It keeps arriving while its player is open, '
             'stops when it is closed, and continues from the same point when it is opened again.</div>'
-            f'<div class="dl-list">{"".join(items)}</div>'
-            '<script>function fetchCancel(id){fetch("/api/fetch/"+id+"/cancel",{method:"POST"})'
-            '.then(()=>location.reload())}</script>')
+            f'<div class="dl-list">{"".join(items)}</div>')
 
     def _render(rows, show_finished):
         if not rows:
@@ -7055,10 +7117,13 @@ function dlAct(id, action){
 .dl-btn.bad:hover{background:#fee2e2}
 .dl-time{font-size:11px;color:#888;text-align:right;margin-top:2px}
 </style>'''
-    body = (f'{_render_fetches()}'
-           f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
+    body = (f'{_fetch_js}{_render_fetches()}{_render_saved()}'
+           f'<h2 class="section">Grabs: queue <span class="count">{len(active)}</span>'
+           f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
+           f'text-transform:none;letter-spacing:0;margin-left:10px">'
+           f'what Sonarr, Radarr or the Grab button asked for</span></h2>'
            f'{_render(active, show_finished=False)}'
-           f'<h2 class="section">History <span class="count">last 100</span></h2>'
+           f'<h2 class="section">Grabs: history <span class="count">last 100</span></h2>'
            f'{_render(done, show_finished=True)}'
            f'{ctrl_js}'
            f'{refresh_js}')
