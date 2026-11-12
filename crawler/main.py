@@ -7623,4 +7623,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    app.run(main())
+    # Kurigram's Client.run() no longer takes a coroutine to run (Pyrogram's
+    # did), and its client does not bind to a loop when it is created - so the
+    # plain asyncio entry point is the right one.
+    asyncio.run(main())
