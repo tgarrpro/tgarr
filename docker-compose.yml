@@ -72,6 +72,8 @@ services:
     # Lets tgarr reach Sonarr / Radarr published on this same host as
     # host.docker.internal (the default SONARR_URL / RADARR_URL) without
     # knowing the host's LAN address, so a DHCP change breaks nothing.
+    # an init process reaps what a stopped e-book conversion leaves behind
+    init: true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

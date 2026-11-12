@@ -232,6 +232,9 @@ async def _ebook_queue_restore() -> None:
                 mid = int(f.read().strip())
             src = marker[:-len(".queue")]
             pdf = src + ".pdf"
+            if src.lower().endswith(".epub"):
+                os.unlink(marker)       # EPUB is read directly now: nothing to convert
+                continue
             # If PDF already exists + newer than src, cleanup stale marker
             if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
                 os.unlink(marker)
@@ -284,6 +287,7 @@ async def _startup():
     asyncio.create_task(_stats_snapshot_worker())
     asyncio.create_task(_ebook_queue_restore())
     asyncio.create_task(_arr_alias_sync_worker())
+    asyncio.create_task(_cache_gc_worker())
 
 
 async def _migrate_schema():
@@ -450,6 +454,7 @@ async def _migrate_schema():
             -- grab_count for B (composite ranking) — derived from downloads table
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS grab_count INT NOT NULL DEFAULT 0;
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS part SMALLINT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_accessed_at TIMESTAMPTZ;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS detected_lang TEXT;
             CREATE INDEX IF NOT EXISTS idx_messages_lang ON messages (detected_lang) WHERE detected_lang IS NOT NULL;
             -- Per-download live progress (populated by Pyrogram callback in
@@ -1106,6 +1111,7 @@ async def serve_media(msg_id: int, request: Request):
     path = os.path.join("/downloads", row["local_path"])
     mime = _mime_for(row["media_type"], row["mime_type"])
     fn = row["file_name"]
+    await _touch_local(msg_id)
     total_size = row["file_size"] or 0  # TG-reported final size
 
     # Wait for the file to actually exist on disk
@@ -1199,6 +1205,222 @@ async def serve_media(msg_id: int, request: Request):
         headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
     return StreamingResponse(stream_range(), status_code=206,
                            media_type=mime, headers=headers)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Downloaded files (the on-demand cache)
+#
+# Opening a film, a song or a book fetches the file from Telegram into
+# /downloads/{video,audio,library}. Nothing ever removed them: a first user
+# who clicks through twenty films has silently spent 40 GB, and nothing in the
+# lists said which items were already there (and so open instantly).
+#   - lists mark what is saved and can show only that;
+#   - a file not opened for `cache_ttl_days` (default 30) is removed, and when
+#     the cache is over `cache_max_gb` (default 50) the least recently opened
+#     go first. 0 turns either rule off. The index entry stays: opening the
+#     item again simply fetches it again.
+# Only these three folders are touched - never what Sonarr/Radarr grabbed.
+# ════════════════════════════════════════════════════════════════════
+_CACHE_PREFIXES = ("video/", "audio/", "library/")
+_CACHE_SIDECARS = ("", ".tail", ".pdf", ".cover.jpg", ".queue", ".pdf.inprogress.pdf")
+_LOCAL_SQL = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
+CACHE_TTL_DAYS_DEFAULT = 30
+CACHE_MAX_GB_DEFAULT = 50
+
+
+def _is_local(lp) -> bool:
+    return bool(lp) and not lp.startswith("__")
+
+
+def _local_pill(lp) -> str:
+    if not _is_local(lp):
+        return ""
+    return ('<span class="pill ok" style="font-size:11px" '
+            'title="already downloaded: opens instantly">● saved</span>')
+
+
+async def _touch_local(msg_id: int) -> None:
+    """Remember that a downloaded file was just used (cleanup goes by this)."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE messages SET local_accessed_at = NOW()
+                   WHERE id = $1 AND (local_accessed_at IS NULL
+                                      OR local_accessed_at < NOW() - INTERVAL '10 minutes')""",
+                msg_id)
+    except Exception:
+        pass
+
+
+async def _cache_settings() -> tuple:
+    async with db_pool.acquire() as conn:
+        rows = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key IN ('cache_ttl_days', 'cache_max_gb')")}
+
+    def _num(key, default):
+        try:
+            return max(0, int(float(rows.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+    return _num("cache_ttl_days", CACHE_TTL_DAYS_DEFAULT), _num("cache_max_gb", CACHE_MAX_GB_DEFAULT)
+
+
+def _cache_stat(lp: str):
+    """(bytes on disk incl. sidecars, newest mtime) of one cached item; None if gone."""
+    base = os.path.join("/downloads", lp)
+    size, mtime, found = 0, 0.0, False
+    for suf in _CACHE_SIDECARS:
+        try:
+            st = os.stat(base + suf)
+        except OSError:
+            continue
+        size += st.st_size
+        if suf == "":
+            found, mtime = True, st.st_mtime
+    return (size, mtime) if found else None
+
+
+def _cache_unlink(lp: str) -> None:
+    base = os.path.join("/downloads", lp)
+    for suf in _CACHE_SIDECARS:
+        try:
+            os.unlink(base + suf)
+        except OSError:
+            pass
+
+
+async def _cache_sweep(clear_all: bool = False) -> tuple:
+    """Apply the rules (or remove everything). Returns (files removed, bytes freed)."""
+    import time as _time
+    ttl_days, max_gb = await _cache_settings()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT local_path, max(local_accessed_at) AS used, max(file_size) AS want
+               FROM messages
+               WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+               GROUP BY local_path""")
+    now = _time.time()
+    items, lost, partial = [], [], []
+    for r in rows:
+        lp = r["local_path"]
+        if not lp.startswith(_CACHE_PREFIXES) or ".." in lp:
+            continue
+        st = await asyncio.to_thread(_cache_stat, lp)
+        if st is None:
+            lost.append(lp)                 # the file is gone: forget the path
+            continue
+        size, mtime = st
+        if now - mtime < 180:
+            continue                        # still arriving, or just finished
+        used = max(mtime, r["used"].timestamp() if r["used"] else 0)
+        try:
+            have = os.path.getsize(os.path.join("/downloads", lp))
+        except OSError:
+            have = 0
+        if r["want"] and have < r["want"] * 0.95 and not clear_all:
+            partial.append((used, size, lp))    # a fetch that died half-way
+            continue
+        items.append((used, size, lp))
+    doomed = []
+    if clear_all:
+        doomed = items
+    else:
+        keep = []
+        for it in items:
+            (doomed if ttl_days and now - it[0] > ttl_days * 86400 else keep).append(it)
+        if max_gb:
+            keep.sort()                     # least recently used first
+            total = sum(x[1] for x in keep)
+            while keep and total > max_gb * 1024 ** 3:
+                it = keep.pop(0)
+                total -= it[1]
+                doomed.append(it)
+    doomed += partial
+    freed = 0
+    for used, size, lp in doomed:
+        await asyncio.to_thread(_cache_unlink, lp)
+        freed += size
+    gone = [x[2] for x in doomed] + lost
+    if gone:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path = NULL, local_accessed_at = NULL "
+                "WHERE local_path = ANY($1::text[])", gone)
+    return len(doomed), freed
+
+
+async def _cache_gc_worker():
+    await asyncio.sleep(600)
+    while True:
+        try:
+            n, freed = await _cache_sweep()
+            if n:
+                log.info("[cache] removed %d downloaded file(s) not opened lately, freed %s",
+                         n, _fmt_size(freed))
+        except Exception as e:
+            log.warning("[cache] sweep failed: %s", e)
+        await asyncio.sleep(3600)
+
+
+async def _cache_usage() -> list:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT split_part(local_path, '/', 1) AS kind, count(*) AS n,
+                      COALESCE(sum(sz), 0) AS bytes
+               FROM (SELECT local_path, max(file_size) AS sz FROM messages
+                     WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+                     GROUP BY local_path) x
+               WHERE split_part(local_path, '/', 1) IN ('video', 'audio', 'library')
+               GROUP BY 1 ORDER BY 3 DESC""")
+
+
+def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> str:
+    """'showing a-b of n' + prev / next. `qs(offset=...)` builds the query string."""
+    if not total or (offset == 0 and shown >= total):
+        return ""
+    links = []
+    if offset > 0:
+        prev = max(0, offset - size)
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=prev if prev else None)}">← prev</a>')
+    if offset + size < total:
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=offset + size)}">next →</a>')
+    return (
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'margin-top:18px;padding:12px 0 90px;border-top:1px solid var(--border, #e2e8f0)">'
+        f'<span style="color:var(--muted, #64748b);font-size:13px">'
+        f'showing {offset + 1 if shown else 0}–{offset + shown} of {total:,}</span>'
+        f'<div style="display:flex;gap:8px">{"".join(links)}</div></div>')
+
+
+def _saved_chip(path: str, qs, local: int) -> str:
+    style = ("background:rgba(16,185,129,0.15);color:#059669;border-color:#10b981;"
+             if local else "")
+    return (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
+            f'style="{style}padding:5px 12px;font-size:12px" '
+            f'title="only what is already downloaded">● saved</a>')
+
+
+@app.post("/api/settings/cache")
+async def settings_cache(ttl_days: str = Form("30"), max_gb: str = Form("50")):
+    def _n(v, d):
+        try:
+            return str(max(0, min(100000, int(float(v)))))
+        except (TypeError, ValueError):
+            return str(d)
+    async with db_pool.acquire() as conn:
+        for k, v in (("cache_ttl_days", _n(ttl_days, CACHE_TTL_DAYS_DEFAULT)),
+                     ("cache_max_gb", _n(max_gb, CACHE_MAX_GB_DEFAULT))):
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    return RedirectResponse("/settings#cache", status_code=302)
+
+
+@app.post("/api/settings/cache_clear")
+async def settings_cache_clear():
+    n, freed = await _cache_sweep(clear_all=True)
+    log.info("[cache] cleared on request: %d file(s), %s", n, _fmt_size(freed))
+    return RedirectResponse("/settings#cache", status_code=302)
 
 
 _MY_DC_CACHE: Optional[int] = None
@@ -1303,7 +1525,7 @@ def _ebook_semaphore():
     import asyncio
     global _EBOOK_CONVERT_SEMAPHORE
     if _EBOOK_CONVERT_SEMAPHORE is None:
-        _EBOOK_CONVERT_SEMAPHORE = asyncio.Semaphore(2)
+        _EBOOK_CONVERT_SEMAPHORE = asyncio.Semaphore(1)
     return _EBOOK_CONVERT_SEMAPHORE
 _EBOOK_JOBS: dict = {}  # msg_id -> {state, started_at}
 
@@ -1323,6 +1545,66 @@ def _ebook_paths(local_path: str):
     pdf = src + ".pdf"
     cover = src + ".cover.jpg"
     return src, pdf, cover
+
+
+# calibre renders a book to PDF through a headless Chromium. On some books it
+# does not stop growing: a 3 MB illustrated EPUB reached 7.4 GB and took the
+# whole host into swap until the kernel's OOM killer stepped in (the comment
+# here used to say "mem bound via container cgroup"; nothing sets one).
+# So the conversion is watched: its whole process group is killed once it
+# holds more memory than EBOOK_MAX_RSS_MB or runs longer than
+# EBOOK_MAX_SECONDS, and a conversion stopped this way is not retried.
+EBOOK_MAX_RSS_MB = int(os.environ.get("TGARR_EBOOK_MAX_RSS_MB", "1500"))
+EBOOK_MAX_SECONDS = int(os.environ.get("TGARR_EBOOK_MAX_SECONDS", "600"))
+
+
+def _pgroup_rss_mb(pgid: int) -> int:
+    """Resident memory of every process in a process group, in MB."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    total = 0
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return 0
+    for d in pids:
+        try:
+            with open(f"/proc/{d}/stat", "rb") as f:
+                st = f.read().decode("ascii", "replace")
+            rest = st[st.rindex(")") + 2:].split()
+            # after "pid (comm)": state ppid pgrp ... ; rss is field 24 of the line
+            if int(rest[2]) == pgid:
+                total += int(rest[21]) * page
+        except (OSError, ValueError, IndexError):
+            continue
+    return total // (1024 * 1024)
+
+
+async def _ebook_watchdog(proc, src: str) -> str:
+    """Wait for the conversion; kill its process group if it misbehaves.
+    Returns "" when it ended by itself, else why it was stopped."""
+    import signal
+    import time as _t
+    t0 = _t.time()
+    while True:
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=2)
+            return ""
+        except asyncio.TimeoutError:
+            pass
+        rss = await asyncio.to_thread(_pgroup_rss_mb, proc.pid)
+        why = ""
+        if rss > EBOOK_MAX_RSS_MB:
+            why = f"used {rss} MB of memory (limit {EBOOK_MAX_RSS_MB})"
+        elif _t.time() - t0 > EBOOK_MAX_SECONDS:
+            why = f"ran longer than {EBOOK_MAX_SECONDS} s"
+        if why:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            await proc.wait()
+            print(f"[ebook-convert] stopped: {why} src={src}", flush=True)
+            return why
 
 
 async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
@@ -1355,23 +1637,28 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         tmp = pdf + ".inprogress.pdf"
         # preexec_fn: RLIMIT_CPU 240s + RLIMIT_FSIZE 200MB; mem bound via container cgroup
         def _set_limits():
-            import resource
-            # RLIMIT_AS dropped: Chromium virt mem >> resident, container mem_limit is real bound
-            resource.setrlimit(resource.RLIMIT_CPU, (1800, 1800))  # 30 min CPU cap
-            # RLIMIT_FSIZE dropped: calibre temp files can be >200MB
+            # (an address-space limit is no use here: Chromium maps a terabyte
+            # and touches little of it - memory is watched by _ebook_watchdog)
+            try:
+                os.nice(15)          # never compete with playback or the UI
+            except OSError:
+                pass
         proc = await asyncio.create_subprocess_exec(
             "ebook-convert", src, tmp,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env, preexec_fn=_set_limits)
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
-        except asyncio.TimeoutError:
-            proc.kill()
-            print(f'[ebook-convert] TIMEOUT src={src}', flush=True)
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env, preexec_fn=_set_limits, start_new_session=True)
+        stopped = await _ebook_watchdog(proc, src)
+        if stopped:
+            for _f in (tmp, src + ".queue"):     # not retried: it would do the same again
+                try: os.unlink(_f)
+                except OSError: pass
+            _EBOOK_JOBS[msg_id] = {"state": "failed", "reason":
+                                   "this book is too heavy to convert here (" + stopped + ")",
+                                   "started_at": _EBOOK_JOBS.get(msg_id, {}).get("started_at", 0)}
             return False
         if proc.returncode != 0:
-            print(f'[ebook-convert] rc={proc.returncode} stderr={stderr.decode(errors="replace")[-500:]!r}', flush=True)
+            print(f'[ebook-convert] rc={proc.returncode} src={src}', flush=True)
         if proc.returncode == 0 and os.path.exists(tmp):
             os.rename(tmp, pdf)
             _EBOOK_JOBS.pop(msg_id, None)
@@ -1381,7 +1668,9 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         if os.path.exists(tmp):
             os.unlink(tmp)
         _EBOOK_JOBS[msg_id] = {"state": "failed", "started_at": _EBOOK_JOBS.get(msg_id, {}).get("started_at", 0)}
-        # Keep .queue marker so restart will retry
+        # A conversion that failed will fail again: do not retry it on every restart.
+        try: os.unlink(src + ".queue")
+        except OSError: pass
         return False
 
 
@@ -1451,7 +1740,8 @@ async def ebook_status(msg_id: int, request: Request):
                 "eta_s": int(60 + ahead * 90 + src_mb * 2),
                 "waited_s": int(_t.time() - job["queued_at"])}
     if job and job.get("state") == "failed":
-        return {"state": "failed", "reason": "conversion error — check api logs"}
+        return {"state": "failed",
+                "reason": job.get("reason") or "conversion error — check api logs"}
     # Not started — fire background task. Lock prevents duplicate work.
     free_gb = _disk_free_gb("/downloads")
     if free_gb < 1.0:
@@ -1481,6 +1771,7 @@ async def ebook_pdf(msg_id: int):
         return Response("source file missing", status_code=410)
     if row["file_size"] and os.path.getsize(src) < row["file_size"]:
         return Response("still downloading — retry in a moment", status_code=202)
+    await _touch_local(msg_id)
     # .pdf source: serve directly, no conversion
     if ext == "pdf":
         return FileResponse(src, media_type="application/pdf",
@@ -1803,6 +2094,22 @@ async def media_status(msg_id: int):
                             "tg_wait": await _tg_flood()})
     path = os.path.join("/downloads", lp)
     bytes_ = os.path.getsize(path) if os.path.exists(path) else 0
+    if total and bytes_ < total:
+        # Not growing any more: the fetch died half-way (the crawler was
+        # restarted). The person is asking for it right now - fetch it again.
+        import time as _time
+        try:
+            idle = _time.time() - os.path.getmtime(path)
+        except OSError:
+            idle = 1e9
+        if idle > 120:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET local_path = $$__user_queued__$$ "
+                    "WHERE id = $1 AND local_path = $2", msg_id, lp)
+            return JSONResponse({"status": "queued", "bytes": 0, "total": total,
+                                 "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc,
+                                 "tg_wait": await _tg_flood()})
     if total and bytes_ >= total:
         return JSONResponse({"status": "ready", "bytes": bytes_, "total": total,
                             "mime": row["mime_type"], "media_type": row["media_type"],
@@ -1903,7 +2210,12 @@ function renderPlayer() {{
     main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
     return;
   }}
-  if (["epub","mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
+  if (ext === "epub") {{
+    // Read in the built-in reader: instant, and no conversion to run.
+    main.innerHTML = `<iframe sandbox="allow-same-origin" src="/epub/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+    return;
+  }}
+  if (["mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
     // Calibre-converted PDF — poll status, swap to iframe on ready.
     const loader = document.createElement("div");
     loader.className = "loader";
@@ -4371,8 +4683,9 @@ def _fmt_dur(secs):
 
 
 @app.get("/music", response_class=HTMLResponse)
-async def page_music(limit: int = 200, q: Optional[str] = None,
-                     lang: Optional[str] = None, sort: str = "quality"):
+async def page_music(limit: int = 100, q: Optional[str] = None,
+                     lang: Optional[str] = None, sort: str = "quality",
+                     offset: int = 0, local: int = 0):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -4414,8 +4727,14 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
     if lang:
         params.append(lang)
         where_parts.append(f"m.detected_lang = ${len(params)}")
+    if local:
+        where_parts.append(_LOCAL_SQL)
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
 
     async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
         pending_n = await conn.fetchval(
             "SELECT count(*) FROM messages WHERE media_type='audio' AND local_path IS NULL")
         lang_dist = await conn.fetch(
@@ -4431,12 +4750,14 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
             WHERE {' AND '.join(where_parts)}
-            ORDER BY {sort_clause}
-            LIMIT {max(1, min(limit, 500))}
+            ORDER BY {sort_clause}, m.id
+            LIMIT {page_size} OFFSET {page_offset}
         """, *params)
 
     def _music_qs(**overrides):
-        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None}
+        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None,
+                    "local": 1 if local else None,
+                    "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
@@ -4470,7 +4791,8 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
         _music_sort_chip("quality", "★ Best") +
         _music_sort_chip("recent",  "Recent") +
         _music_sort_chip("longest", "Longest") +
-        _music_sort_chip("size",    "Largest"))
+        _music_sort_chip("size",    "Largest") +
+        '<span style="margin-left:10px"></span>' + _saved_chip("/music", _music_qs, local))
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
@@ -4496,7 +4818,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
         f'<tr data-id="{r["id"]}" onclick="tgMusicPlay(this)">'
         f'<td class="play-cell"><div class="play-ico">▶</div></td>'
         f'<td class="title-cell">'
-        f'<div class="t">{html.escape(r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)")}</div>'
+        f'<div class="t">{html.escape(r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)")} {_local_pill(r["local_path"])}</div>'
         f'<div class="a">{_dc_badge(r.get("file_dc"), _music_my_dc)} {html.escape((r["audio_performer"] or "") + ((" · " + (r["audio_album"] or r["ch_title"])) if (r["audio_album"] or r["ch_title"]) else ""))}{(" · " + str(r["audio_year"])) if r.get("audio_year") else ""}</div>'
         f'</td>'
         f'<td class="num">{_fmt_dur(r["audio_duration_sec"])}</td>'
@@ -4507,7 +4829,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
     )
 
     body = (
-        f'<h2 class="section">Music <span class="count">{len(rows)} of {sum(r["n"] for r in lang_dist):,}</span>'
+        f'<h2 class="section">Music <span class="count">{len(rows)} of {total:,}</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
@@ -4515,6 +4837,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
         '<table class="music-list">'
         '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th><th>posted</th></tr></thead>'
         f'<tbody>{rows_html}</tbody></table>'
+        + _page_nav("/music", _music_qs, page_offset, page_size, len(rows), total) +
         '<div class="player-bar">'
         '  <div class="np">'
         '    <div class="np-icon">🎵</div>'
@@ -4573,9 +4896,9 @@ _LANG_LABELS = {
 
 
 @app.get("/library", response_class=HTMLResponse)
-async def page_library(limit: int = 200, q: Optional[str] = None,
+async def page_library(limit: int = 100, q: Optional[str] = None,
                        lang: Optional[str] = None, sort: str = "quality",
-                       fmt: Optional[str] = None):
+                       fmt: Optional[str] = None, offset: int = 0, local: int = 0):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -4616,8 +4939,14 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
     if fmt:
         params.append(f".{fmt.lower()}$")
         where_parts.append(f"m.file_name ~* ${len(params)}")
+    if local:
+        where_parts.append(_LOCAL_SQL)
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
 
     async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
         pending_n = await conn.fetchval(
             r"""SELECT count(*) FROM messages
                WHERE media_type='document' AND local_path IS NULL
@@ -4636,8 +4965,8 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
             WHERE {' AND '.join(where_parts)}
-            ORDER BY {sort_clause}
-            LIMIT {max(1, min(limit, 500))}
+            ORDER BY {sort_clause}, m.id
+            LIMIT {page_size} OFFSET {page_offset}
         """, *params)
 
     def _ext(fn):
@@ -4659,7 +4988,9 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         return HTMLResponse(_layout("Library", "/library", body))
 
     def _qs(**overrides):
-        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None, "fmt": fmt}
+        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None, "fmt": fmt,
+                    "local": 1 if local else None,
+                    "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
@@ -4693,7 +5024,8 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         _sort_chip("quality", "★ Best") +
         _sort_chip("recent",  "Recent") +
         _sort_chip("size",    "Largest") +
-        _sort_chip("title",   "Title"))
+        _sort_chip("title",   "Title") +
+        '<span style="margin-left:10px"></span>' + _saved_chip("/library", _qs, local))
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">' +
@@ -4732,6 +5064,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         f'<div class="book-meta">'
         f'{_dc_badge(r.get("file_dc"), _lib_my_dc)}'
         f'{_lang_badge(r.get("detected_lang"))}'
+        f'{_local_pill(r["local_path"])}'
         f'<span class="pill accent">{_ext(r["file_name"])}</span>'
         f'<span class="pill muted">{_fmt_size(r["file_size"])}</span>'
         f'<span>· {html.escape(r["ch_title"] or "")}</span>'
@@ -4746,12 +5079,13 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
     )
 
     body = (
-        f'<h2 class="section">Library <span class="count">{len(rows)} of {sum(r["n"] for r in lang_dist):,}</span>'
+        f'<h2 class="section">Library <span class="count">{len(rows)} of {total:,}</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
         f'{toolbar}'
         f'<div class="book-grid">{items}</div>'
+        + _page_nav("/library", _qs, page_offset, page_size, len(rows), total)
     )
     return HTMLResponse(_layout("Library", "/library", body))
 
@@ -4762,7 +5096,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
 @app.get("/videos", response_class=HTMLResponse)
 async def page_videos(q: Optional[str] = None, limit: int = 120,
                       offset: int = 0, aud: str = "sfw",
-                      min_mb: int = 50):
+                      min_mb: int = 50, local: int = 0):
     if not login.session_exists():
         async with db_pool.acquire() as conn:
             n = await conn.fetchval("SELECT count(*) FROM channels")
@@ -4782,6 +5116,8 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         where.append("c.audience = 'nsfw'")
     if min_mb and min_mb > 0:
         where.append(f"COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024}")
+    if local:
+        where.append(_LOCAL_SQL)
 
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
@@ -4809,6 +5145,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         defaults = {"q": q,
                     "aud": aud if aud != "sfw" else None,
                     "min_mb": min_mb if min_mb != 50 else None,
+                    "local": 1 if local else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
         bits = []
@@ -4831,6 +5168,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         + _aud_chip("sfw", "SFW")
         + _aud_chip("nsfw", "NSFW")
         + _aud_chip("any", "all")
+        + '<span style="margin-left:6px"></span>' + _saved_chip("/videos", _qs, local)
         + '</div>'
     )
 
@@ -4855,6 +5193,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
             f'</div>'
             f'<div class="pills">'
             f'{_dc_badge(r.get("file_dc"), _vid_my_dc)}'
+            f'{_local_pill(r["local_path"])}'
             f'{parsed_pill}'
             + (f'<span class="pill accent" style="font-size:11px">{html.escape(r["quality"])}</span>'
                if r.get("quality") else '')
@@ -4995,6 +5334,7 @@ def _release_card(r, my_dc=None) -> str:
         f'<span class="pill {cat_pill}">{cat_label}</span>'
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
         f'{_part_pill(r)}'
+        f'{_local_pill(r["local_path"] if "local_path" in r.keys() else None)}'
         f'{_versions_pill(r)}'
         f'</div>'
         f'<div class="grab-row" style="display:flex;gap:6px">'
@@ -5060,7 +5400,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         _work_filter = f"WHERE wk = ${len(params)}"
     sql = (f"WITH base AS (SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
-          f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, r.part, "
+          f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, r.part, m.local_path, "
           f"{_WORK_KEY_SQL} AS wk, {_QUALITY_RANK_SQL} AS qr, {_same_dc} AS same_dc, "
           f"  (r.parse_score "
           f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikidata' THEN 1.2 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
@@ -5492,6 +5832,13 @@ async def page_settings(request: Request):
         version_pref = await conn.fetchval(
             "SELECT value FROM config WHERE key='version_preference'") or "quality"
     my_dc_disp = (await _get_my_dc()) or "?"
+    cache_ttl, cache_gb = await _cache_settings()
+    _usage = await _cache_usage()
+    _kind = {"video": "videos", "audio": "songs", "library": "books"}
+    cache_total = _fmt_size(sum(r["bytes"] for r in _usage)) or "0 MB"
+    cache_detail = " · ".join(
+        f'{r["n"]:,} {_kind.get(r["kind"], r["kind"])} ({_fmt_size(r["bytes"]) or "0"})'
+        for r in _usage) or "nothing downloaded yet"
     user_html = (
         f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
         f'<span class="pill ok">signed in</span></div>'
@@ -5578,6 +5925,33 @@ async def page_settings(request: Request):
         <div style="color:var(--muted);font-size:12px;margin-top:6px">
           While Telegram is rate-limiting cross-data-center access, tgarr leads with your data center regardless of this choice.
         </div>
+      </form>
+    </div>
+  </div>
+  <div class="dl-item" id="cache">
+    <div class="icon">💾</div>
+    <div class="info">
+      <div class="name">Downloaded files — <span class="pill ok">{cache_total}</span></div>
+      <div class="meta">
+        Opening a film, a song or a book downloads it here so it plays, and
+        opens instantly next time. Saved items carry a
+        <span class="pill ok" style="font-size:11px">● saved</span> mark in the lists.
+        Now on disk: {cache_detail}.<br/>
+        tgarr tidies up by itself: a file nobody opened for a while is removed
+        (it stays in the index; opening it again fetches it again). Files
+        grabbed through Sonarr/Radarr are never touched.
+      </div>
+      <form method="POST" action="/api/settings/cache" style="margin-top:12px;font-size:14px;line-height:2.2">
+        Remove a file not opened for
+        <input type="number" name="ttl_days" value="{cache_ttl}" min="0" style="width:70px" /> days,
+        and keep the total under
+        <input type="number" name="max_gb" value="{cache_gb}" min="0" style="width:70px" /> GB
+        <span style="color:var(--muted);font-size:12px">(0 = no limit)</span>
+        <button class="btn" type="submit" style="margin-left:8px">Save</button>
+      </form>
+      <form method="POST" action="/api/settings/cache_clear" style="margin-top:6px"
+            onsubmit="return confirm('Remove every downloaded film, song and book from this server? They stay in the index and can be fetched again.')">
+        <button class="ghost" type="submit">Remove all downloaded files now</button>
       </form>
     </div>
   </div>
