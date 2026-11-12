@@ -1,5 +1,5 @@
 # The tgarr.me registry server (the federation's central service). Not for
-# ordinary installs. It runs the database and the registry and NOTHING else:
+# ordinary installs. It runs the database, the registry and the site's own api:
 # no crawler, no Telegram account.
 #
 #   docker compose -f docker-compose.central.yml up -d --build
