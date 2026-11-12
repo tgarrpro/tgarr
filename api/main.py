@@ -81,6 +81,69 @@ def _cross_site(request) -> bool:
         return True
 
 
+# ── nobody signed in to Telegram ───────────────────────────────────────
+# What is already indexed from PUBLIC channels, and files already saved on
+# this machine, stay readable: none of that needed the account. Two things do
+# not stay open:
+#   * anything from a private chat or group (no public @username). It was
+#     readable only because the account was a member; with the account gone
+#     it is nobody's business. Lists leave it out (see _pub) and the
+#     by-id endpoints below answer 404 for it.
+#   * anything that acts through the account: follow, unfollow, grab, fetch,
+#     settings. The pages hide those buttons; this refuses the requests.
+_PRIVATE_ID_RX = re.compile(
+    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/lyrics|api/fav|"
+    r"ebook-pdf|ebook-cover|epub|pdf)/(\d+)(?:/|$)")
+_PUBLIC_MSG: dict = {}
+
+
+_SIGNED_IN = [0.0, False]
+
+
+def _signed_in() -> bool:
+    # asked many times while one page is built (every card, every list):
+    # look at the session file at most once a second
+    now = time.monotonic()
+    if now - _SIGNED_IN[0] > 1.0:
+        try:
+            _SIGNED_IN[1] = bool(login.session_exists() and not _is_revoked())
+        except Exception:
+            _SIGNED_IN[1] = False
+        _SIGNED_IN[0] = now
+    return _SIGNED_IN[1]
+
+
+def _pub(alias: str = "c") -> str:
+    """SQL to append to a WHERE: public channels only, when nobody is signed in."""
+    return "" if _signed_in() else f" AND {alias}.username IS NOT NULL"
+
+
+async def _signed_out_block(request: Request):
+    if _signed_in():
+        return None
+    path = request.url.path
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if path.startswith("/api/") and not path.startswith("/api/login"):
+            return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
+                                status_code=401)
+        return None
+    m = _PRIVATE_ID_RX.match(path)
+    if m and db_pool is not None:
+        mid = int(m.group(1))
+        ok = _PUBLIC_MSG.get(mid)
+        if ok is None:
+            async with db_pool.acquire() as conn:
+                ok = bool(await conn.fetchval(
+                    """SELECT c.username IS NOT NULL FROM messages m
+                       JOIN channels c ON c.id = m.channel_id WHERE m.id = $1""", mid))
+            if len(_PUBLIC_MSG) > 20000:
+                _PUBLIC_MSG.clear()
+            _PUBLIC_MSG[mid] = ok
+        if not ok:
+            return PlainTextResponse("not found", status_code=404)
+    return None
+
+
 def _ct_equal(a: str, b: str) -> bool:
     import hmac
     return hmac.compare_digest(a.encode(), b.encode())
@@ -114,6 +177,9 @@ async def _request_guard(request: Request, call_next):
         if not ok:
             return Response("authentication required", status_code=401,
                             headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
+    blocked = await _signed_out_block(request)
+    if blocked is not None:
+        return blocked
     return await call_next(request)
 
 
@@ -1591,6 +1657,14 @@ async def _update_banner() -> str:
             f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
             f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">How to make updates automatic again</a>')
     return box.format(bg="#fffbeb", bd="#fde68a", body=body, hide=hide)
+
+
+@app.get("/api/me/avatar")
+async def me_avatar():
+    if not _signed_in() or not os.path.isfile(login.AVATAR_FILE):
+        return Response(status_code=404)
+    return FileResponse(login.AVATAR_FILE, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.post("/api/update/dismiss")
@@ -4270,8 +4344,32 @@ aside.nav { width:260px; min-width:260px; background:var(--surface); border-righ
 .navlink:hover { background:#f1f5f9; color:var(--fg); }
 .navlink.active { color:var(--accent); background:#e0f2fe; border-left-color:var(--accent); font-weight:600; }
 .navlink svg { width:22px; height:22px; flex-shrink:0; }
-.user { padding:18px 22px; border-top:1px solid var(--border); font-size:14px; color:var(--muted); }
+.user { padding:10px 12px; border-top:1px solid var(--border); font-size:14px; color:var(--muted); }
 .user .name { color:var(--fg); font-weight:600; font-size:15px; }
+.ub-wrap { position:relative; }
+.ub { display:flex; align-items:center; gap:10px; width:100%; padding:8px 10px; border:0; background:none;
+      border-radius:10px; font:inherit; color:inherit; text-align:left; cursor:pointer; }
+button.ub:hover { background:rgba(127,127,127,.1); }
+div.ub { cursor:default; }
+.ub-av { width:38px; height:38px; border-radius:50%; flex:none; object-fit:cover; display:flex; align-items:center;
+         justify-content:center; color:#fff; font-weight:700; font-size:16px; background:var(--accent); }
+.ub-av.none { background:rgba(127,127,127,.25); color:var(--muted); }
+.ub-txt { flex:1; min-width:0; line-height:1.25; }
+.ub-txt b { display:block; color:var(--fg); font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden;
+            text-overflow:ellipsis; }
+.ub-txt small { display:block; font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden;
+                text-overflow:ellipsis; }
+.ub-ch { color:var(--muted); font-size:18px; line-height:1; padding:0 2px; }
+.ub-menu { position:absolute; left:0; right:0; bottom:calc(100% + 6px); background:var(--surface);
+           border:1px solid var(--border); border-radius:10px; box-shadow:0 10px 30px rgba(15,23,42,.16);
+           padding:6px; z-index:60; }
+.ub-menu a, .ub-menu button { display:block; width:100%; box-sizing:border-box; padding:9px 12px; border:0;
+           background:none; border-radius:7px; font:inherit; font-size:14px; color:var(--fg); text-align:left;
+           text-decoration:none; cursor:pointer; }
+.ub-menu a:hover, .ub-menu button:hover { background:rgba(127,127,127,.1); }
+.ub-menu button { color:#dc2626; border-top:1px solid var(--border); border-radius:0 0 7px 7px; margin-top:4px; }
+.ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
+         color:#fff; text-align:center; text-decoration:none; font-weight:600; font-size:13px; }
 .user a { color:var(--accent); text-decoration:none; font-size:14px; font-weight:600; }
 
 main.main { flex:1; display:flex; flex-direction:column; min-width:0; }
@@ -4658,11 +4756,39 @@ def _color_for(s: str) -> str:
 
 
 def _user_block() -> str:
-    if login.session_exists():
-        user = login.ensure_user_info() or {}
-        name = user.get("username") or user.get("first_name") or "anonymous"
-        return f'<div class="name">@{html.escape(str(name))}</div><div>signed in</div>'
-    return '<div class="name">not signed in</div><a href="/login">sign in →</a>'
+    """The account at the foot of the side menu: picture, name, a small menu."""
+    if not _signed_in():
+        return ('<div class="ub"><div class="ub-av none">?</div>'
+                '<div class="ub-txt"><b>Not signed in</b><small>browsing what is already indexed</small></div></div>'
+                '<a class="ub-in" href="/login">Sign in to Telegram</a>')
+    user = login.ensure_user_info() or {}
+    uname = user.get("username")
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or "Telegram account"
+    try:
+        av_v = int(os.path.getmtime(login.AVATAR_FILE))
+        av = f'<img class="ub-av" src="/api/me/avatar?v={av_v}" alt="">'
+    except OSError:
+        av = (f'<div class="ub-av" style="background:{_color_for(name)}">'
+              f'{html.escape(name[0].upper())}</div>')
+    return (
+        '<div class="ub-wrap">'
+        '<div class="ub-menu" id="tgUserMenu" hidden>'
+        '<a href="/settings">Settings</a>'
+        '<a href="/system">System status</a>'
+        + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
+           if uname else '')
+        + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
+        '<button type="button" class="ub" onclick="tgUserMenu(event)" title="account">'
+        f'{av}<span class="ub-txt"><b>{html.escape(name)}</b>'
+        f'<small>{("@" + html.escape(uname)) if uname else "signed in"}</small></span>'
+        '<span class="ub-ch">⋯</span></button></div>'
+        '<script>'
+        'function tgUserMenu(e){e.stopPropagation();var m=document.getElementById("tgUserMenu");m.hidden=!m.hidden}'
+        'document.addEventListener("click",function(){var m=document.getElementById("tgUserMenu");if(m)m.hidden=true});'
+        'function tgSignOut(){if(!confirm("Sign out of Telegram on this tgarr?\\n\\nPrivate chats are removed from '
+        'the index. Public channels and files already saved stay.")){return}'
+        'fetch("/api/login/logout",{method:"POST"}).then(function(){location.href="/"})}'
+        '</script>')
 
 
 # Phones / narrow windows: the 260px sidebar used to eat two thirds of the
@@ -5376,7 +5502,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                    JOIN messages m ON m.id = r.primary_msg_id
                    JOIN channels c ON c.id = m.channel_id
                    WHERE r.poster_url IS NOT NULL AND r.category IN ('movie', 'tv')
-                     AND COALESCE(c.audience, 'sfw') = 'sfw'
+                     AND COALESCE(c.audience, 'sfw') = 'sfw'""" + _pub() + """
                    ORDER BY r.created_at DESC, r.id DESC LIMIT 60""")
             _seen, _uniq = set(), []
             for _r in latest:                       # one poster per title
@@ -6164,13 +6290,18 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">clear</a>' if q else '')
         + '<span style="flex:1"></span>'
           '<span id="tgPullToast" style="font-size:13px;color:var(--muted);display:none"></span>'
-          '<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
-          'title="ask tgarr.me for its current list now">↻ Refresh list</button></form>')
+        + ('<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
+           'title="ask tgarr.me for its current list now">↻ Refresh list</button>' if _signed_in() else '')
+        + '</form>')
+
+    _in = _signed_in()
 
     def _card(r):
         u = r["username"]
         mine_ = known.get(u.lower())
-        btn = ('<button class="abtn" disabled>✓ Following</button>' if mine_ else
+        btn = ('<a class="abtn" href="/login" title="following a channel needs a Telegram account">'
+               'Sign in to follow</a>' if not _in else
+               '<button class="abtn" disabled>✓ Following</button>' if mine_ else
                f'<button class="abtn pri" data-uname="{html.escape(u, quote=True)}" '
                f'onclick="tgDiscoverSubscribe(this)" '
                f'title="tgarr reads this public channel without your account joining it">+ Follow</button>')
@@ -6348,6 +6479,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         # any chat, by its own id: a private chat has no @username to go by
         params.append(int(ch))
         where.append(f"c.id = ${len(params)}")
+    _in = _signed_in()
+    if not _in:
+        private = 0                       # no account, no private chats
+        where.append("c.username IS NOT NULL")
     if private:
         where.append("c.username IS NULL")
     if q:
@@ -6398,6 +6533,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                WHERE m.media_type = 'photo'
                  AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
                  {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}
+                 {"" if _in else "AND FALSE"}
                GROUP BY c.id
                ORDER BY count(*) DESC""")
         matched = await conn.fetchval(f"""
@@ -7074,7 +7210,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         "size":     "m.file_size DESC NULLS LAST",
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
-    where_parts = ["m.media_type = 'audio'"]
+    where_parts = ["m.media_type = 'audio'" + _pub()]
     params = []
     if q:
         params.append(f"%{q}%")
@@ -7268,7 +7404,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         "title":  "m.file_name ASC NULLS LAST",
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
-    where_parts = ["m.media_type = 'document'",
+    where_parts = ["m.media_type = 'document'" + _pub(),
                    "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"]
     params = []
     if q:
@@ -7444,7 +7580,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         if not n:
             return RedirectResponse("/login")
 
-    where = ["m.media_type = 'video'",
+    where = ["m.media_type = 'video'" + _pub(),
              "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
     params = []
     if q:
@@ -7644,7 +7780,9 @@ def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=No
                 f'title="other copies of this title: other resolutions or uploads">{versions} versions</a>')
     meta = [x for x in (_fmt_size(size), _fmt_dur_short(duration)) if x]
     acts = f'<a class="b pri" href="{watch}">▶ Play</a>'
-    if guid:
+    if not _signed_in():
+        fav = None                        # favourites and grabs belong to the account
+    if guid and _signed_in():
         acts += (f'<button class="b grab-btn" data-guid="{guid}" onclick="tgGrab(this)" '
                  f'title="save it to the download folder (the one Sonarr/Radarr read)">⬇ Grab</button>')
     else:
@@ -7711,8 +7849,11 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         offset: int = 0,
                         min_mb: int = 100, aud: str = "sfw",
                         work: Optional[str] = None, sort: str = "best"):
-    if not login.session_exists():
-        return RedirectResponse("/login")
+    if not _signed_in():
+        # readable without the account, as long as there is something to read
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT 1 FROM channels LIMIT 1"):
+                return RedirectResponse("/login")
     _sorts = {"best": "composite_score DESC NULLS LAST, posted_at DESC NULLS LAST",
               "new": "posted_at DESC NULLS LAST, id DESC",
               "size": "size_bytes DESC NULLS LAST, id DESC",
@@ -7720,6 +7861,8 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     if sort not in _sorts:
         sort = "best"
     where = ["1=1"]
+    if not _signed_in():
+        where.append("c.username IS NOT NULL")
     params = []
     if q:
         for w in q.split():
@@ -7740,7 +7883,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     # aud == "any" or anything else → no audience filter beyond csam
     def _qual(w):
         # audience refs already use c. prefix — pass through
-        if "c.audience" in w:
+        if "c.audience" in w or "c.username" in w:
             return w
         return (w.replace("name ILIKE", "r.name ILIKE")
                  .replace("category =", "r.category =")
@@ -8288,13 +8431,15 @@ function dlAct(id, action){
 @app.get("/search", response_class=HTMLResponse)
 async def page_search(q: Optional[str] = None,
                       scope: Optional[str] = None):
-    if not login.session_exists():
-        return RedirectResponse("/login")
+    if not _signed_in():
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT 1 FROM channels LIMIT 1"):
+                return RedirectResponse("/login")
     scope = scope if scope in ("releases", "messages", "channels") else "releases"
     nsfw_on = await _is_nsfw_enabled()
     # what may be shown: never the hard-blocked, adult only when switched on
     gate = ("COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
-            + ("" if nsfw_on else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"))
+            + ("" if nsfw_on else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'") + _pub())
     results_html, elapsed_ms, found = "", 0, 0
     if q:
         t0 = time.time()
@@ -8425,6 +8570,8 @@ async def page_search(q: Optional[str] = None,
 # ════════════════════════════════════════════════════════════════════
 @app.get("/settings", response_class=HTMLResponse)
 async def page_settings(request: Request):
+    if not _signed_in():
+        return RedirectResponse("/login")     # settings belong to the account
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
     async with db_pool.acquire() as conn:

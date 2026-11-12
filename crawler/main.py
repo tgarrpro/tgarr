@@ -266,6 +266,27 @@ _MTPROTO_BG_HALT_UNTIL: dict = {}     # method → epoch: background callers onl
 _MTPROTO_DAILY_BY: dict = {}          # method → [utc_day, {caller: count}]
 
 
+async def _profile_picture(me) -> None:
+    """The account's own profile picture, for the side menu. Fetched once at
+    start (one small file from the account's home data centre); removed if the
+    account has none."""
+    path = "/app/session/avatar.jpg"
+    try:
+        photo = getattr(me, "photo", None)
+        if not photo:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        await asyncio.sleep(20)                 # let start-up traffic through first
+        tmp = path + ".part"
+        got = await app.download_media(photo.big_file_id, file_name=tmp)
+        if got and os.path.getsize(tmp) > 0:
+            os.replace(tmp, path)
+            log.info("[profile] account picture saved")
+    except Exception as e:
+        log.info("[profile] account picture not fetched: %s", e)
+
+
 def _iso_or_none(v):
     """An ISO-8601 time from the registry as a datetime; None for anything else."""
     if not isinstance(v, str) or not v:
@@ -6993,9 +7014,10 @@ async def main() -> None:
         import json as _json
         with open("/app/session/user_info.json", "w", encoding="utf-8") as _f:
             _json.dump({"id": me.id, "username": me.username,
-                        "first_name": me.first_name}, _f)
+                        "first_name": me.first_name, "last_name": me.last_name}, _f)
     except Exception as _e:
         log.debug("[boot] persist user_info failed: %s", _e)
+    asyncio.create_task(_profile_picture(me))
     # Reset stale 'downloading' from previous crash/restart — worker is
     # single-task serial, so only one can really be in flight at a time.
     # Any leftover 'downloading' from a previous boot is dead state.

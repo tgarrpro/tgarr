@@ -51,6 +51,8 @@ REVOKED_MARKER = os.path.join(SESSION_DIR, ".revoked")
 # persists on the mounted volume. Persist the self-user beside it so the
 # sidebar doesn't fall back to @anonymous after a watchtower restart.
 USER_INFO_FILE = os.path.join(SESSION_DIR, "user_info.json")
+# the account's profile picture, written by the crawler (it holds the live client)
+AVATAR_FILE = os.path.join(SESSION_DIR, "avatar.jpg")
 
 # The crawler owns the LIVE session file (tgarr.session). The login flow never
 # opens it: every attempt runs against a scratch session and the result is
@@ -139,10 +141,19 @@ def ensure_user_info() -> Optional[dict]:
     session file — reload it here so callers (sidebar, settings) show the
     real username instead of @anonymous until a get_me re-populates it.
     """
-    if state.user_info:
-        return state.user_info
     if not session_exists():
         return None
+    # the crawler rewrites the file when it learns more (last name, a renamed
+    # account): take the newer copy rather than what sign-in left in memory
+    try:
+        mt = os.path.getmtime(USER_INFO_FILE)
+        if mt != getattr(state, "_user_info_mtime", None):
+            state._user_info_mtime = mt
+            state.user_info = None
+    except OSError:
+        pass
+    if state.user_info:
+        return state.user_info
     try:
         if os.path.exists(USER_INFO_FILE):
             with open(USER_INFO_FILE, "r", encoding="utf-8") as f:
@@ -460,7 +471,7 @@ def logout() -> dict:
     state.client = None
     removed = []
     _reset_scratch()
-    for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json"):
+    for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json", "avatar.jpg"):
         path = os.path.join(SESSION_DIR, fn)
         if os.path.exists(path):
             try:
