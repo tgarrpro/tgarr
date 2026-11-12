@@ -7414,6 +7414,32 @@ async def _session_change_watcher(boot_user_id: int):
         await asyncio.sleep(30)
 
 
+def _session_carry_usernames() -> None:
+    """After the switch from Pyrogram to Kurigram: keep the @usernames the
+    session already knew.
+
+    Kurigram upgrades an existing session file in place and keeps every
+    channel's access hash, but it stores usernames in a table of their own
+    and starts that table empty - the old ones stay behind, unread, in a
+    column it no longer looks at. Without this every followed channel would
+    have to be looked up by name again after the upgrade: the scarcest
+    allowance an account has, spent by every install on the same day."""
+    try:
+        conn = app.storage.conn
+        if "username" not in [r[1] for r in conn.execute("PRAGMA table_info(peers)")]:
+            return
+        n = conn.execute(
+            """INSERT INTO usernames (id, username)
+               SELECT p.id, lower(p.username) FROM peers p
+               WHERE p.username IS NOT NULL AND p.username <> ''
+                 AND NOT EXISTS (SELECT 1 FROM usernames u WHERE u.id = p.id)""").rowcount
+        conn.commit()
+        if n and n > 0:
+            log.info("[session] %d channel name(s) carried over from the old session format", n)
+    except Exception as e:
+        log.warning("[session] could not carry channel names over: %s", e)
+
+
 async def _session_saver() -> None:
     """Write what the session has learned to disk as we go.
 
@@ -7467,6 +7493,7 @@ async def main() -> None:
     # auth-revoke errors here to write the marker + clean exit.
     try:
         await app.start()
+        _session_carry_usernames()
         app.add_handler(RawUpdateHandler(on_raw_update))
         me = await app.get_me()
     except _REVOKED_AUTH_ERRORS as e:
