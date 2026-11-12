@@ -3395,6 +3395,9 @@ async def media_status(msg_id: int):
     total = row["file_size"] or 0
     file_dc = row["file_dc"] if (row["file_dc"] or 0) > 0 else None
     my_dc = await _get_my_dc()
+    if not _signed_in() and not _is_local(lp):
+        # nobody to fetch it: say so instead of waiting for a download that cannot start
+        return JSONResponse({"status": "signedout"})
     if lp != "__failed__":
         await _want_fetch(msg_id)
     cross_dc = bool(file_dc and my_dc and file_dc != my_dc)
@@ -3772,6 +3775,12 @@ async function poll() {{
           ? `<span style="color:#10b981">● file DC ${{j.file_dc}} = your DC ${{j.my_dc}} — fast path</span>`
           : `<span style="color:#f59e0b">● file DC ${{j.file_dc}} ≠ your DC ${{j.my_dc}} — cross-DC, may hit FloodWait</span>`;
       }}
+    }}
+    if (j.status === "signedout") {{
+      document.getElementById("status").textContent = "This file is not saved on this machine";
+      document.getElementById("hint").innerHTML =
+        'Fetching it needs a Telegram account. <a href="/login" style="color:#5eb6e5">Sign in</a> to play it.';
+      return;
     }}
     if (j.status === "failed") {{
       document.getElementById("status").textContent = "✗ could not fetch this file";
@@ -4375,6 +4384,8 @@ div.ub { cursor:default; }
            text-decoration:none; cursor:pointer; }
 .ub-menu a:hover, .ub-menu button:hover { background:rgba(127,127,127,.1); }
 .ub-menu button { color:#dc2626; border-top:1px solid var(--border); border-radius:0 0 7px 7px; margin-top:4px; }
+.user .ub-menu a { color:var(--fg); font-weight:400; }
+.user a.ub-in { color:#fff; }
 .ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
          color:#fff; text-align:center; text-decoration:none; font-weight:600; font-size:13px; }
 .user a { color:var(--accent); text-decoration:none; font-size:14px; font-weight:600; }
@@ -7792,7 +7803,8 @@ def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=No
     if guid and _signed_in():
         acts += (f'<button class="b grab-btn" data-guid="{guid}" onclick="tgGrab(this)" '
                  f'title="save it to the download folder (the one Sonarr/Radarr read)">⬇ Grab</button>')
-    else:
+    elif _signed_in() or saved:
+        # signed out, only a file that is already on this machine can be handed over
         acts += (f'<a class="b sq" href="/media/{msg_id}" download title="download to this device">⬇</a>')
     if fav is not None:
         acts += (f'<button class="b sq{" on" if fav else ""}" onclick="tgFavCard(this,{msg_id})" '
