@@ -36,6 +36,15 @@ from pyrogram.types import Message
 
 from parser import parse_filename, to_release_name
 
+# Pyrogram 2.0.106 hard-codes the pre-2024 channel-id range
+# (MIN_CHANNEL_ID = -1002147483647). Telegram now hands out channel ids above
+# 2^31, and for those every call that addresses the chat by id — get_messages,
+# thumbnails, previews, downloads, backfill — died with "Peer id invalid".
+# Widen the range to the current MTProto limit.
+from pyrogram import utils as _pyro_utils
+if _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
+    _pyro_utils.MIN_CHANNEL_ID = -1007852516352
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -49,6 +58,21 @@ DB_DSN = os.environ["DB_DSN"]
 BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
+# Single source for the version this crawler reports to the registry.
+TGARR_VERSION = "0.5.5"
+TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
+
+# ── adult (NSFW) classification ────────────────────────────────────────
+# PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,
+# registry) identical. A channel is NSFW when its title matches
+# ADULT_TITLE_RX, or when >= 8% of its named files / captions (at least
+# 20 of them, at least 5 hits) match ADULT_RX. On live data adult channels
+# score 10-90% and ordinary ones 0-3%.
+ADULT_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동)'
+ADULT_TITLE_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동|反差|熟女|糖心|麻豆|海角|伦理片|91国产|(^|[^a-z])av([^a-z]|$)|adult|erotic)'
+ADULT_MIN_FILES = 20
+ADULT_MIN_HITS = 5
+ADULT_MIN_RATIO = 0.08
 
 app = Client(
     name="tgarr",
@@ -199,12 +223,80 @@ _MTPROTO_BUDGETS = {
     "get_chat_history":  (30, 60),
     "get_messages":      (30, 60),
     "download_media":    (60, 60),
+    "download_thumb":    (120, 60),  # <=320px embedded thumbs, ~10 KB each
+    "download_preview":  (60, 60),   # full-size photos for the lightbox
     "join_chat":         (3, 60),    # rare; TG hard-caps ~20/day
     "leave_chat":        (3, 60),
     "search_messages_count": (10, 60),
     "default":           (30, 60),   # unclassified calls
 }
 _MTPROTO_CALL_LOG: dict = {}  # method → list[float] of recent call timestamps
+
+# Per-DAY ceilings for the two calls Telegram punishes hardest. The per-minute
+# buckets above reset on every restart and say nothing about the daily total:
+# join_chat is hard-capped around 20/day per account, username resolution
+# around 150-300/day, and blowing through either costs hours-to-days of
+# FloodWait on the user's own account. Counters are persisted in the config
+# table so a restart (or a watchtower update) does not hand out a fresh budget.
+_MTPROTO_DAILY_MAX = {
+    "join_chat":       int(os.environ.get("TGARR_JOIN_DAILY_MAX", "12")),
+    "resolveUsername": int(os.environ.get("TGARR_RESOLVE_DAILY_MAX", "200")),
+    # Cross-DC authorizations (auth.ExportAuthorization). With cached media
+    # sessions a healthy day needs a handful; this is the backstop.
+    "exportAuthorization": int(os.environ.get("TGARR_EXPORT_AUTH_DAILY_MAX", "40")),
+}
+_MTPROTO_DAILY: dict = {}   # method → [utc_day:str, count:int]
+
+
+class DailyBudgetExhausted(RuntimeError):
+    """Raised instead of making a call whose daily Telegram budget is spent."""
+
+
+def _utc_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _secs_to_utc_midnight() -> float:
+    now = time.time()
+    return 86400 - (now % 86400)
+
+
+async def _daily_budget_take(method_name: str) -> bool:
+    """Consume one unit of today's budget. False = exhausted. Persisted."""
+    cap = _MTPROTO_DAILY_MAX.get(method_name)
+    if not cap or cap <= 0:
+        return True   # uncapped (0 or negative disables the ceiling)
+    key = f"mtproto_daily:{method_name}"
+    today = _utc_day()
+    ent = _MTPROTO_DAILY.get(method_name)
+    if ent is None:
+        ent = [today, 0]
+        try:
+            if db_pool is not None:
+                async with db_pool.acquire() as conn:
+                    v = await conn.fetchval(
+                        "SELECT value FROM config WHERE key=$1", key)
+                if v and ":" in v:
+                    d, _, c = v.partition(":")
+                    ent = [d, int(c or 0)]
+        except Exception as e:
+            log.debug("[mtproto-rl] daily budget load %s: %s", method_name, e)
+        _MTPROTO_DAILY[method_name] = ent
+    if ent[0] != today:
+        ent[0], ent[1] = today, 0
+    if ent[1] >= cap:
+        return False
+    ent[1] += 1
+    try:
+        if db_pool is not None:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO config (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
+                    key, f"{ent[0]}:{ent[1]}")
+    except Exception as e:
+        log.debug("[mtproto-rl] daily budget save %s: %s", method_name, e)
+    return True
 
 
 async def _mtproto(method_name: str, coro_factory):
@@ -221,6 +313,24 @@ async def _mtproto(method_name: str, coro_factory):
             log.info("[mtproto-rl] halt %s: %ds remaining → sleeping",
                      method_name, int(remaining))
             await asyncio.sleep(min(remaining + 1, 60))
+            continue
+        # 1b. Daily ceiling (persisted). join_chat fails fast — it sits on the
+        # user-click download path, so say so instead of hanging until
+        # midnight. Username resolution is background-only: park the method
+        # until the UTC day rolls over, exactly like a FloodWait halt.
+        if method_name in _MTPROTO_DAILY_MAX and not await _daily_budget_take(method_name):
+            cap = _MTPROTO_DAILY_MAX[method_name]
+            if method_name == "join_chat":
+                log.warning("[mtproto-rl] join_chat daily budget (%d) spent — refusing", cap)
+                raise DailyBudgetExhausted(
+                    f"daily join budget ({cap}) reached — protecting the Telegram "
+                    f"account; try again after 00:00 UTC")
+            wait = _secs_to_utc_midnight() + 5
+            async with _MTPROTO_LOCK:
+                _MTPROTO_HALT_UNTIL[method_name] = max(
+                    _MTPROTO_HALT_UNTIL.get(method_name, 0), time.time() + wait)
+            log.warning("[mtproto-rl] %s daily budget (%d) spent — parked %dh%02dm",
+                        method_name, cap, int(wait // 3600), int(wait % 3600 // 60))
             continue
         # 2. Per-method token bucket.
         limit, window = _MTPROTO_BUDGETS.get(method_name,
@@ -257,7 +367,97 @@ async def _mtproto(method_name: str, coro_factory):
                 _MTPROTO_HALT_UNTIL[method_name] = until
         log.warning("[mtproto-rl] %s FloodWait %ds → halt this method only",
                     method_name, fw_val)
+        await _note_flood(method_name, until)
         raise
+
+
+async def _note_flood(what: str, until: float) -> None:
+    """Publish "Telegram asked us to wait" so the UI can say so truthfully
+    instead of showing a generic failure. Best effort."""
+    try:
+        if db_pool is None:
+            return
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('tg_flood', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                   WHERE split_part(config.value, '|', 1)::float < split_part(EXCLUDED.value, '|', 1)::float""",
+                f"{int(until)}|{what[:60]}")
+    except Exception as e:
+        log.debug("[mtproto-rl] note flood: %s", e)
+
+
+# ── cross-DC authorization: the scarce call ───────────────────────────
+# Reading a file that lives on another DC needs auth.ExportAuthorization.
+# Telegram tolerates only a few of these in a short window (a few dozen in
+# twenty minutes earns a ~30 minute FLOOD_WAIT for the whole account, during
+# which nothing off the home DC can be fetched). Every path that can cause
+# one — our cached media sessions AND Pyrogram's own downloader — must first
+# reserve it here. Reservation never waits: when the budget is spent or a
+# flood wait is active it raises FloodWait at once, callers keep the request
+# queued, and nothing is sent to Telegram.
+EXPORT_AUTH_MAX = int(os.environ.get("TGARR_EXPORT_AUTH_MAX", "4"))
+EXPORT_AUTH_WINDOW_SEC = int(os.environ.get("TGARR_EXPORT_AUTH_WINDOW_SEC", "600"))
+_export_auth_log: list = []
+
+
+async def _export_auth_reserve(dc_id: int) -> None:
+    now = time.time()
+    left = max(_media_dc_blocked_until.get(dc_id, 0),
+               _MTPROTO_HALT_UNTIL.get("exportAuthorization", 0)) - now
+    if left > 0:
+        raise FloodWait(value=int(left) + 1)
+    _export_auth_log[:] = [t for t in _export_auth_log if now - t < EXPORT_AUTH_WINDOW_SEC]
+    if len(_export_auth_log) >= EXPORT_AUTH_MAX:
+        wait = int(EXPORT_AUTH_WINDOW_SEC - (now - _export_auth_log[0])) + 1
+        log.info("[export-auth] local budget (%d per %ds) spent — holding cross-DC "
+                 "work %ds rather than asking Telegram", EXPORT_AUTH_MAX,
+                 EXPORT_AUTH_WINDOW_SEC, wait)
+        raise FloodWait(value=wait)
+    if not await _daily_budget_take("exportAuthorization"):
+        wait = int(_secs_to_utc_midnight()) + 5
+        _MTPROTO_HALT_UNTIL["exportAuthorization"] = now + wait
+        await _note_flood("daily cross-DC authorization budget", now + wait)
+        raise FloodWait(value=wait)
+    _export_auth_log.append(now)
+
+
+async def _export_auth_flooded(dc_id: int, wait: int, source: str) -> None:
+    """Telegram refused a cross-DC authorization: park all cross-DC work."""
+    until = time.time() + wait + 5
+    _media_dc_blocked_until[dc_id] = until
+    if until > _MTPROTO_HALT_UNTIL.get("exportAuthorization", 0):
+        _MTPROTO_HALT_UNTIL["exportAuthorization"] = until
+    log.warning("[export-auth] FLOOD_WAIT %ds on cross-DC authorization (%s, DC%s) — "
+                "all cross-DC fetches parked until it clears", wait, source, dc_id)
+    await _note_flood("cross-DC authorization", until)
+
+
+def _media_dc(media) -> int:
+    try:
+        return FileId.decode(media.file_id).dc_id
+    except Exception:
+        return 0
+
+
+async def _pyrogram_transfer_guard(media) -> int:
+    """Call before handing a file to Pyrogram's own download/stream. Pyrogram
+    authorizes cross-DC by itself, per file, and swallows the FloodWait (the
+    transfer just yields nothing), so the reservation has to happen here.
+    Returns the file's DC (0 = home DC / unknown, nothing reserved)."""
+    dc = _media_dc(media)
+    if dc and CURRENT_DC and dc != CURRENT_DC:
+        await _export_auth_reserve(dc)
+        return dc
+    return 0
+
+
+async def _pyrogram_transfer_empty(dc: int) -> None:
+    """A cross-DC Pyrogram transfer produced nothing. The usual cause is a
+    swallowed FLOOD_WAIT on the authorization; assume so and back off rather
+    than trying the next file."""
+    if dc:
+        await _export_auth_flooded(dc, 900, "empty Pyrogram transfer")
 
 
 async def _mtproto_wait_clearance(method_name: str = "get_chat_history"):
@@ -276,6 +476,42 @@ async def _mtproto_wait_clearance(method_name: str = "get_chat_history"):
         return
 
 
+async def _mtproto_aiter(method_name: str, agen):
+    """Drive a Pyrogram async generator (get_chat_history / get_dialogs) under
+    the same FloodWait discipline as _mtproto(): wait out an existing halt
+    before the first page, and if Telegram answers a later page with FloodWait,
+    REGISTER the halt before re-raising. Without this the generators bypassed
+    the limiter entirely — a FloodWait on one channel was swallowed as a
+    generic error and the caller moved straight on to hit the next channel.
+    """
+    await _mtproto_wait_clearance(method_name)
+    try:
+        async for item in agen:
+            yield item
+    except _REVOKED_AUTH_ERRORS as e:
+        await _mark_revoked(type(e).__name__)
+        raise
+    except FloodWait as fw:
+        fw_val = int(getattr(fw, "value", 60) or 60)
+        until = time.time() + fw_val + 5
+        async with _MTPROTO_LOCK:
+            if until > _MTPROTO_HALT_UNTIL.get(method_name, 0):
+                _MTPROTO_HALT_UNTIL[method_name] = until
+        log.warning("[mtproto-rl] %s FloodWait %ds mid-iteration → halt this method",
+                    method_name, fw_val)
+        raise
+
+
+def _hist(*a, **kw):
+    """app.get_chat_history under the limiter."""
+    return _mtproto_aiter("get_chat_history", app.get_chat_history(*a, **kw))
+
+
+def _dialogs(*a, **kw):
+    """app.get_dialogs under the limiter."""
+    return _mtproto_aiter("get_dialogs", app.get_dialogs(*a, **kw))
+
+
 async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
     """get_messages with auto-join on CHANNEL_INVALID — for restricted channels
     where the session isn't yet a member. join_chat is itself rate-limited;
@@ -291,12 +527,29 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
         # be wrapped in `await coro()`. Use clearance gate + iterate directly.
         try:
             await _mtproto_wait_clearance("get_chat_history")
-            async for _ in app.get_chat_history(chat_id, limit=1):
+            async for _ in _hist(chat_id, limit=1):
                 break
             return await _mtproto("get_messages",
                                    lambda: app.get_messages(chat_id, msg_id))
         except ChannelInvalid:
             pass
+        # A PUBLIC channel can be read without being a member. If we know its
+        # username, resolve it (one lookup, then cached in the session) and
+        # retry before spending a join — joins are capped at a handful per
+        # day and clutter the user's own Telegram.
+        try:
+            async with db_pool.acquire() as conn:
+                _uname = await conn.fetchval(
+                    "SELECT username FROM channels WHERE tg_chat_id=$1", chat_id)
+            if _uname:
+                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname))
+                return await _mtproto("get_messages",
+                                      lambda: app.get_messages(chat_id, msg_id))
+        except FloodWait:
+            raise
+        except Exception as e:
+            log.info("[mtproto] read-without-join failed for %s (%s) — will try join",
+                     chat_id, str(e)[:80])
         # Last resort: join the channel. join_chat(chat_id) only works if we
         # have access_hash. For a new account that never resolved this peer,
         # we need username lookup. Try chat_id first (cheap), fallback to
@@ -750,6 +1003,19 @@ async def init_db() -> None:
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_accessed_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview_accessed_at TIMESTAMPTZ")
+        # Stale-index cleanup bookkeeping (see stale_index_sweeper).
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS dead_at TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS dead_reason TEXT")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verify_cursor BIGINT")
+        # Content profile the registry sends for Discover ranking.
+        for _col in ("release_files", "video_files", "book_files", "audio_files"):
+            await conn.execute(
+                f"ALTER TABLE IF EXISTS discovered ADD COLUMN IF NOT EXISTS {_col} INTEGER")
     log.info("postgres pool ready")
 
 
@@ -954,7 +1220,9 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
         # === Caption-mention extraction (always; contribute gated separately) ===
         # Even text-only messages can contain @mention / invite links — those
         # are pure discovery signal independent of media payload.
-        if caption:
+        # Only from PUBLIC channels: links people share in a private group or a
+        # personal chat are not ours to forward to the registry.
+        if caption and getattr(msg.chat, "username", None):
             try:
                 mentions = _extract_mentions(caption)
                 invites = _extract_invites(caption)
@@ -1074,7 +1342,7 @@ async def backfill_channel(chat_id: int, title: str, username: str | None = None
     count = 0
     media_count = 0
     await _mtproto_wait_clearance()
-    async for msg in app.get_chat_history(chat_id, limit=BACKFILL_LIMIT):
+    async for msg in _hist(chat_id, limit=BACKFILL_LIMIT):
         has_media = bool(msg.video or msg.document or msg.audio or msg.photo)
         try:
             await ingest_message(msg)
@@ -1118,7 +1386,7 @@ async def backfill_all() -> None:
 
     current_dialog_ids: set[int] = set()
     await _mtproto_wait_clearance()
-    async for dialog in app.get_dialogs():
+    async for dialog in _dialogs():
         ctype = dialog.chat.type.name
         if ctype in ("PRIVATE", "BOT"):
             continue
@@ -1409,10 +1677,38 @@ async def _process_one_download(row_payload: dict) -> None:
             _safe = os.path.basename(
                 (getattr(_media, "file_name", None) or "").replace("\\", "/")
             ).strip().lstrip(".")
-            _dest = f"{target_dir}/{_safe}" if _safe else f"{target_dir}/"
-            local_path = await _mtproto("download_media",
-                lambda: app.download_media(msg, file_name=_dest,
-                                           progress=_progress))
+            if _safe:
+                os.makedirs(target_dir, exist_ok=True)
+                _final = os.path.join(target_dir, _safe)
+                _part = _final + ".part"
+                _total = int(getattr(_media, "file_size", 0) or 0)
+
+                async def _download():
+                    done = 0
+                    try:
+                        with open(_part, "wb") as f:
+                            async for part in _stream_media_fast(msg, _media):
+                                f.write(part)
+                                done += len(part)
+                                await _progress(done, _total or done)
+                        if _total and done < _total:
+                            raise RuntimeError(f"short download: {done} of {_total} bytes")
+                        os.replace(_part, _final)
+                        return _final
+                    except BaseException:
+                        try:
+                            os.remove(_part)
+                        except OSError:
+                            pass
+                        raise
+
+                local_path = await _mtproto("download_media", _download)
+            else:
+                # no usable file name on the message: let Pyrogram name it
+                await _pyrogram_transfer_guard(_media)
+                local_path = await _mtproto("download_media",
+                    lambda: app.download_media(msg, file_name=f"{target_dir}/",
+                                               progress=_progress))
         local_path = await _rename_for_arr(str(local_path), row)
         try:
             os.chmod(local_path, 0o666)
@@ -1450,6 +1746,25 @@ async def _process_one_download(row_payload: dict) -> None:
         except Exception:
             log.exception("[worker] cancel cleanup id=%s", row["dl_id"])
         raise  # propagate so the dispatcher's sem releases properly
+    except FloodWait as fw:
+        # Telegram (or our own cross-DC budget) says wait. That is not a failed
+        # download: put it back in the queue — a 'failed' here would make the
+        # *arr blocklist a perfectly good release — and hold this dispatcher
+        # slot so we do not immediately ask again.
+        wait = int(getattr(fw, "value", 60) or 60)
+        log.warning("[worker] id=%s deferred %ds by Telegram rate limit — requeued",
+                    row["dl_id"], wait)
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE downloads
+                       SET status='pending', speed_kbps=0, error_message=$1
+                       WHERE id=$2 AND status NOT IN ('cancelled','completed')""",
+                    f"Telegram rate limit — resumes automatically in ~{max(1, wait // 60)} min",
+                    row["dl_id"])
+        except Exception:
+            log.exception("[worker] failed to requeue id=%s", row["dl_id"])
+        await asyncio.sleep(min(wait + 5, 900))
     except Exception as e:
         log.exception("[worker] failed id=%s: %s", row["dl_id"], e)
         try:
@@ -1613,7 +1928,10 @@ INSTANCE_UUID_ROTATE_DAYS = 7
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
 FEDERATION_VALIDATOR_ENABLED = os.environ.get("TGARR_FEDERATION_VALIDATOR", "true").lower() == "true"
-SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "20"))
+# 6 seeds per ~66 min cycle ≈ 130 username lookups/day — inside Telegram's
+# daily tolerance with room left for the user's own subscriptions. (The old
+# default of 20 worked out to ~360/day.)
+SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "6"))
 SEEDS_INTERVAL_SEC = int(os.environ.get("TGARR_SEEDS_INTERVAL_SEC", "3600"))  # 1h
 PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/seed -> 1/min resolveUsername
 AUDIO_ROOT = "/downloads/audio"
@@ -1707,7 +2025,7 @@ async def new_dialog_watcher() -> None:
                     "SELECT tg_chat_id FROM channels")}
             new_dialogs = []
             await _mtproto_wait_clearance()
-            async for dialog in app.get_dialogs(limit=NEW_DIALOG_SCAN_LIMIT):
+            async for dialog in _dialogs(limit=NEW_DIALOG_SCAN_LIMIT):
                 ctype = dialog.chat.type.name
                 if ctype in ("PRIVATE", "BOT"):
                     continue
@@ -1910,110 +2228,677 @@ async def _fetch_thumb_https(username: str, tg_message_id: int) -> bytes | None:
 
 _THUMB_HTTPS_SEM = asyncio.Semaphore(10)
 _THUMB_MTPROTO_SEM = asyncio.Semaphore(1)
-_THUMB_BATCH = 20
+_THUMB_DL_SEM = asyncio.Semaphore(3)
+_THUMB_BATCH = 60
 
 
-async def _thumb_process_one(row) -> None:
-    """Fetch + write + md5-dedup one queued thumb row. Concurrency-safe via
-    semaphores: HTTPS path runs up to 10-wide, MTProto fallback serializes.
+# ── cached media sessions for small files (thumbnails) ─────────────────
+# Pyrogram's get_file opens a brand-new media session for every file and, when
+# the file lives on another DC, creates a new auth key and runs
+# auth.ExportAuthorization/ImportAuthorization each time: ~4s per thumbnail,
+# and ExportAuthorization is exactly the call Telegram flood-limits. Keep ONE
+# authorized media session per DC for the life of the process instead; a
+# thumbnail is then a single upload.GetFile round-trip.
+_media_sessions: dict = {}
+_media_sessions_lock = asyncio.Lock()
+# dc_id → epoch seconds until which Telegram refuses to authorize a session on
+# that DC (FLOOD_WAIT on auth.ExportAuthorization). While set, nothing even
+# asks Telegram again: every caller gets the FloodWait immediately. This is the
+# piece the method-level limiter could never provide — the export used to
+# happen inside Pyrogram, once per file, where its FloodWait was swallowed
+# (the download just produced 0 bytes) and so never reached the limiter.
+_media_dc_blocked_until: dict = {}
+
+
+async def _media_session(dc_id: int):
+    from pyrogram import raw
+    from pyrogram.session import Auth, Session
+    async with _media_sessions_lock:
+        sess = _media_sessions.get(dc_id)
+        if sess is not None:
+            return sess
+        my_dc = await app.storage.dc_id()
+        if dc_id != my_dc:
+            await _export_auth_reserve(dc_id)   # raises FloodWait, never waits
+        test_mode = await app.storage.test_mode()
+        if dc_id != my_dc:
+            auth_key = await Auth(app, dc_id, test_mode).create()
+        else:
+            auth_key = await app.storage.auth_key()
+        sess = Session(app, dc_id, auth_key, test_mode, is_media=True)
+        await sess.start()
+        try:
+            if dc_id != my_dc:
+                exported = await app.invoke(
+                    raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                await sess.invoke(raw.functions.auth.ImportAuthorization(
+                    id=exported.id, bytes=exported.bytes))
+        except BaseException as e:
+            try:
+                await sess.stop()
+            except Exception:
+                pass
+            if isinstance(e, FloodWait):
+                await _export_auth_flooded(
+                    dc_id, int(getattr(e, "value", 60) or 60), "media session")
+            raise
+        _media_sessions[dc_id] = sess
+        log.info("[media-session] opened DC%s (%s)", dc_id,
+                 "cross-DC, authorization exported once" if dc_id != my_dc else "home DC")
+        return sess
+
+
+async def _drop_media_session(dc_id: int) -> None:
+    async with _media_sessions_lock:
+        sess = _media_sessions.pop(dc_id, None)
+    if sess is not None:
+        try:
+            await sess.stop()
+        except Exception:
+            pass
+
+
+async def _fetch_file_bytes(media, max_total: int = 24 * 1024 * 1024):
+    """Bytes of a file via the cached media session of its DC, in 1 MB chunks.
+
+    Returns None when this fast path does not apply (CDN redirect, larger
+    than `max_total`, session trouble after one rebuild) — the caller then
+    falls back to another source. FloodWait propagates."""
+    from pyrogram import raw
+    from pyrogram.file_id import FileType
+    fid = FileId.decode(media.file_id)
+    if fid.file_type == FileType.CHAT_PHOTO:
+        return None
+    if fid.file_type == FileType.PHOTO:
+        location = raw.types.InputPhotoFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    else:
+        location = raw.types.InputDocumentFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    chunk = 1024 * 1024
+    for attempt in (1, 2):
+        sess = await _media_session(fid.dc_id)
+        out = bytearray()
+        offset = 0
+        try:
+            while True:
+                r = await sess.invoke(
+                    raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk),
+                    sleep_threshold=30)
+                if not isinstance(r, raw.types.upload.File):
+                    return None          # upload.FileCdnRedirect etc.
+                out += r.bytes
+                if len(r.bytes) < chunk:
+                    return bytes(out)
+                if len(out) >= max_total:
+                    return None
+                offset += chunk
+        except FloodWait:
+            raise
+        except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            # dead/idle-dropped session: rebuild once, then give up to fallback
+            log.info("[media-session] DC%s dropped (%s) — reopening", fid.dc_id,
+                     type(e).__name__)
+            await _drop_media_session(fid.dc_id)
+    return None
+
+
+class _FastPathUnavailable(Exception):
+    """The cached-media-session path cannot serve this file (e.g. Telegram
+    redirected it to a CDN). Nothing has been yielded; use Pyrogram's own
+    downloader instead."""
+
+
+async def _stream_file_cached(media):
+    """Yield a file's bytes in 1 MB chunks over the cached media session of
+    its DC.
+
+    Compared with Pyrogram's stream/download (a new media session per file,
+    plus a new auth key and auth.ExportAuthorization for every cross-DC file):
+    no per-file session setup, no per-file cross-DC authorization — which is
+    the call a multi-file grab used to hit FloodWait on — and a dropped
+    connection resumes at the current offset instead of failing the file.
+    Raises _FastPathUnavailable before the first byte if this path does not
+    apply. FloodWait propagates.
     """
+    from pyrogram import raw
+    from pyrogram.file_id import FileType
+    fid = FileId.decode(media.file_id)
+    if fid.file_type == FileType.CHAT_PHOTO:
+        raise _FastPathUnavailable("chat photo")
+    if fid.file_type == FileType.PHOTO:
+        location = raw.types.InputPhotoFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    else:
+        location = raw.types.InputDocumentFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    chunk = 1024 * 1024
+    offset = 0
+    reopened = 0
+    while True:
+        sess = await _media_session(fid.dc_id)
+        try:
+            r = await sess.invoke(
+                raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk),
+                sleep_threshold=30)
+        except FloodWait:
+            raise
+        except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            reopened += 1
+            await _drop_media_session(fid.dc_id)
+            if reopened > 3:
+                if offset == 0:
+                    raise _FastPathUnavailable(f"media session: {type(e).__name__}")
+                raise RuntimeError(f"media session kept dropping at offset {offset}: {e}")
+            log.info("[media-session] DC%s dropped at offset %d (%s) — resuming",
+                     fid.dc_id, offset, type(e).__name__)
+            continue
+        if not isinstance(r, raw.types.upload.File):
+            if offset == 0:
+                raise _FastPathUnavailable(type(r).__name__)
+            raise RuntimeError(f"unexpected {type(r).__name__} at offset {offset}")
+        if r.bytes:
+            yield r.bytes
+        if len(r.bytes) < chunk:
+            return
+        offset += chunk
+        reopened = 0
+
+
+async def _stream_media_fast(msg, media):
+    """Stream a message's file: cached media session first, Pyrogram's own
+    streamer when that path does not apply."""
+    try:
+        async for part in _stream_file_cached(media):
+            yield part
+        return
+    except _FastPathUnavailable as e:
+        log.info("[media-session] fast path n/a (%s) — using Pyrogram streamer", e)
+    dc = await _pyrogram_transfer_guard(media)
+    got = False
+    async for part in app.stream_media(msg):
+        got = True
+        yield part
+    if not got:
+        await _pyrogram_transfer_empty(dc)
+
+
+async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
+    """A one-chunk file (a thumbnail). None if it is not that small."""
+    return await _fetch_file_bytes(media, max_total=max_bytes)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Stale-index cleanup
+#
+# The index is a set of POINTERS to Telegram messages. Channels delete posts,
+# get banned, go private or disappear; the pointers stay behind and show up as
+# cards that can never produce a thumbnail, preview or download. Two ways a
+# dead pointer is found:
+#   - reactively: a user-requested thumbnail fetch comes back "message empty";
+#   - proactively: stale_index_sweeper re-checks indexed media in slow,
+#     200-id get_messages batches.
+# Rules: only an explicit answer from Telegram removes anything; a channel
+# that has become unreachable is first marked dead and only purged after a
+# grace period; personal chats, KwickPOS* channels, rows with a file the user
+# downloaded, and anything with an active download are never removed.
+# ════════════════════════════════════════════════════════════════════
+STALE_SWEEP_ENABLED = os.environ.get("TGARR_STALE_SWEEP", "true").lower() == "true"
+STALE_SWEEP_INTERVAL_SEC = int(os.environ.get("TGARR_STALE_SWEEP_INTERVAL_SEC", "120"))
+# ids per get_messages. Telegram allows 200, but several 200-id calls in a
+# row earn a ~30s flood wait on channels.GetMessages; 100 every 2 minutes
+# stays far below that.
+STALE_SWEEP_BATCH = int(os.environ.get("TGARR_STALE_SWEEP_BATCH", "100"))
+STALE_RECHECK_DAYS = int(os.environ.get("TGARR_STALE_RECHECK_DAYS", "30"))
+DEAD_CHANNEL_GRACE_DAYS = int(os.environ.get("TGARR_DEAD_CHANNEL_GRACE_DAYS", "7"))
+STALE_SWEEP_RESOLVE_PER_DAY = 30  # username lookups the sweeper may spend
+_GONE_CHANNEL_MARKS = ("CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID",
+                       "CHANNEL_BANNED", "CHAT_FORBIDDEN")
+_sweep_resolves = ["", 0]        # [utc day, count]
+
+
+async def _meili_delete(index: str, ids: list) -> None:
+    """Best-effort removal of documents from the search index."""
+    if not ids or not MEILI_KEY:
+        return
+    def _post():
+        req = urllib.request.Request(
+            f"{MEILI_URL}/indexes/{index}/documents/delete-batch",
+            data=json.dumps(ids).encode(), method="POST",
+            headers={"Authorization": f"Bearer {MEILI_KEY}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    try:
+        await asyncio.to_thread(_post)
+    except Exception as e:
+        log.debug("[meili] delete %s x%d failed: %s", index, len(ids), e)
+
+
+async def _drop_gone_messages(channel_id: int, msg_ids: list) -> int:
+    """Remove index rows whose Telegram message no longer exists. Keeps rows
+    that still have a file the user downloaded, and (via _purge_messages)
+    anything with an active download. Returns rows deleted."""
+    if not msg_ids:
+        return 0
+    async with db_pool.acquire() as conn:
+        keep = {r["id"] for r in await conn.fetch(
+            """SELECT id FROM messages WHERE id = ANY($1::bigint[])
+                 AND local_path IS NOT NULL AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'""",
+            msg_ids)}
+        ids = [i for i in msg_ids if i not in keep]
+        if not ids:
+            return 0
+        rel_ids = [r["id"] for r in await conn.fetch(
+            "SELECT id FROM releases WHERE primary_msg_id = ANY($1::bigint[])", ids)]
+    n = await _purge_messages(channel_id, ids)
+    if n:
+        await _meili_delete("messages", ids)
+        await _meili_delete("releases", rel_ids)
+    return n
+
+
+async def _mark_channel_dead(channel_id: int, reason: str) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE channels SET dead_at = COALESCE(dead_at, NOW()), dead_reason = $2
+               WHERE id = $1""", channel_id, reason[:120])
+
+
+async def _channel_gone(chat_id: int, username) -> "bool | None":
+    """Is the channel itself gone/unreachable for good?
+    True = Telegram said so explicitly. False = it answered normally.
+    None = could not tell (flood wait, missing peer, network)."""
+    try:
+        if username:
+            await _mtproto("resolveUsername", lambda: app.get_chat(username))
+        else:
+            await _mtproto("get_chat", lambda: app.get_chat(chat_id))
+        return False
+    except (FloodWait, DailyBudgetExhausted):
+        return None
+    except Exception as e:
+        return True if any(m in str(e) for m in _GONE_CHANNEL_MARKS) else None
+
+
+async def _reconcile_missing(channel_id: int, chat_id: int, username,
+                             requested: list, found: dict) -> tuple:
+    """Given index rows we asked Telegram about (`requested`: records with id +
+    tg_message_id) and what it returned (`found`: tg_message_id → Message),
+    drop the ones that no longer exist. Returns (removed, channel_dead).
+
+    If EVERYTHING in a real batch came back empty, don't trust it blindly:
+    confirm the channel still answers before deleting, and if it is gone mark
+    it dead instead (purged later, after the grace period)."""
+    missing = [r for r in requested if r["tg_message_id"] not in found]
+    if not missing:
+        return 0, False
+    if len(missing) == len(requested) and len(requested) >= 3:
+        gone = await _channel_gone(chat_id, username)
+        if gone is True:
+            await _mark_channel_dead(channel_id, "unreachable: all indexed messages empty")
+            return 0, True
+        if gone is None:
+            return 0, False          # can't confirm → change nothing
+    n = await _drop_gone_messages(channel_id, [r["id"] for r in missing])
+    return n, False
+
+
+async def stale_index_sweeper():
+    """Slowly re-verify that indexed media still exists on Telegram.
+
+    One get_messages call (100 message ids) per interval - about 72K
+    pointers/day at the default 120s — walking each channel once every
+    TGARR_STALE_RECHECK_DAYS. Also purges channels that have been dead for
+    longer than TGARR_DEAD_CHANNEL_GRACE_DAYS. Metadata calls only; nothing is
+    downloaded and nothing is joined. Opt-out: TGARR_STALE_SWEEP=false
+    """
+    if not STALE_SWEEP_ENABLED:
+        log.info("[stale] TGARR_STALE_SWEEP=false — disabled")
+        return
+    log.info("[stale] sweeper started; batch=%d every %ds, recheck %dd, dead grace %dd",
+             STALE_SWEEP_BATCH, STALE_SWEEP_INTERVAL_SEC, STALE_RECHECK_DAYS,
+             DEAD_CHANNEL_GRACE_DAYS)
+    await asyncio.sleep(600 + random.uniform(0, 300))
+    while True:
+        nap = STALE_SWEEP_INTERVAL_SEC
+        try:
+            # ── 0. retire channels that stayed dead through the grace period ──
+            async with db_pool.acquire() as conn:
+                dead = await conn.fetchrow(
+                    """SELECT c.id, c.username, c.dead_reason FROM channels c
+                       WHERE c.dead_at < NOW() - make_interval(days => $1)
+                         AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+                         AND COALESCE(c.category, '') <> 'personal'
+                         AND EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id
+                                     AND (m.local_path IS NULL
+                                          OR m.local_path LIKE '\\_\\_%' ESCAPE '\\'))
+                       ORDER BY c.dead_at LIMIT 1""", DEAD_CHANNEL_GRACE_DAYS)
+                dead_ids = []
+                if dead:
+                    dead_ids = [r["id"] for r in await conn.fetch(
+                        """SELECT id FROM messages WHERE channel_id = $1
+                             AND (local_path IS NULL
+                                  OR local_path LIKE '\\_\\_%' ESCAPE '\\')
+                           LIMIT 5000""", dead["id"])]
+            if dead and dead_ids:
+                n = await _drop_gone_messages(dead["id"], dead_ids)
+                log.info("[stale] dead channel @%s (%s): purged %d index rows",
+                         dead["username"] or dead["id"], dead["dead_reason"], n)
+                await _heartbeat("stale_index_sweeper",
+                                 f"dead @{dead['username'] or dead['id']}: purged {n}")
+                if n == 0:   # only protected rows left; don't re-pick it forever
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE channels SET dead_at = NOW() WHERE id = $1", dead["id"])
+                await asyncio.sleep(5)
+                continue
+
+            # ── 1. next channel + where we left off in it ──────────────────
+            async with db_pool.acquire() as conn:
+                ch = await conn.fetchrow(
+                    """SELECT c.id, c.tg_chat_id, c.username,
+                              COALESCE(c.verify_cursor, 0) AS cur
+                       FROM channels c
+                       WHERE c.dead_at IS NULL
+                         AND (c.account_user_id = $1 OR c.account_user_id IS NULL)
+                         AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+                         AND COALESCE(c.category, '') <> 'personal'
+                         AND (c.verified_at IS NULL
+                              OR c.verified_at < NOW() - make_interval(days => $2))
+                         AND EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id
+                                     AND m.file_unique_id IS NOT NULL)
+                       ORDER BY c.verified_at ASC NULLS FIRST, c.id
+                       LIMIT 1""", CURRENT_USER_ID, STALE_RECHECK_DAYS)
+                rows = []
+                if ch:
+                    rows = await conn.fetch(
+                        """SELECT id, tg_message_id FROM messages
+                           WHERE channel_id = $1 AND file_unique_id IS NOT NULL
+                             AND tg_message_id > $2
+                           ORDER BY tg_message_id LIMIT $3""",
+                        ch["id"], ch["cur"], STALE_SWEEP_BATCH)
+            if not ch:
+                await _heartbeat("stale_index_sweeper", "index fully verified")
+                await asyncio.sleep(3600)
+                continue
+            uname = ch["username"] or f"chat-{ch['id']}"
+            if not rows:      # reached the end of this channel
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE channels SET verified_at = NOW(), verify_cursor = 0 "
+                        "WHERE id = $1", ch["id"])
+                await asyncio.sleep(1)
+                continue
+
+            # ── 2. one round-trip ──────────────────────────────────────────
+            today = _utc_day()
+            if _sweep_resolves[0] != today:
+                _sweep_resolves[0], _sweep_resolves[1] = today, 0
+            may_resolve = (ch["username"] and _sweep_resolves[1] < STALE_SWEEP_RESOLVE_PER_DAY
+                           and ch["username"] not in _thumb_resolve_tried)
+            defer_sql = ("UPDATE channels SET verified_at = NOW() - make_interval(days => $2) "
+                         "WHERE id = $1")          # look again tomorrow
+            try:
+                if may_resolve:
+                    _sweep_resolves[1] += 1
+                found = await _thumb_get_messages(
+                    ch["tg_chat_id"], ch["username"] if may_resolve else None,
+                    [r["tg_message_id"] for r in rows])
+            except FloodWait as fw:
+                nap = min(int(getattr(fw, "value", 60) or 60) + 5, 3600)
+                log.warning("[stale] flood-wait %ds", nap)
+                await asyncio.sleep(nap)
+                continue
+            except DailyBudgetExhausted:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(defer_sql, ch["id"], STALE_RECHECK_DAYS - 1)
+                await asyncio.sleep(nap)
+                continue
+            except Exception as e:
+                es = str(e)
+                if any(m in es for m in _GONE_CHANNEL_MARKS):
+                    await _mark_channel_dead(ch["id"], es)
+                    log.info("[stale] @%s marked dead: %s", uname, es[:80])
+                else:
+                    # No usable peer / transient. Not evidence of anything.
+                    log.debug("[stale] @%s skipped: %s", uname, es[:80])
+                async with db_pool.acquire() as conn:
+                    await conn.execute(defer_sql, ch["id"], STALE_RECHECK_DAYS - 1)
+                await asyncio.sleep(nap)
+                continue
+
+            removed, is_dead = await _reconcile_missing(
+                ch["id"], ch["tg_chat_id"], ch["username"], rows, found)
+            async with db_pool.acquire() as conn:
+                if is_dead:
+                    await conn.execute(defer_sql, ch["id"], 0)
+                else:
+                    await conn.execute(
+                        "UPDATE channels SET verify_cursor = $2, dead_at = NULL, "
+                        "dead_reason = NULL WHERE id = $1",
+                        ch["id"], rows[-1]["tg_message_id"])
+            if removed or is_dead:
+                log.info("[stale] @%s: checked %d, removed %d%s", uname, len(rows),
+                         removed, " — channel marked dead" if is_dead else "")
+            await _heartbeat("stale_index_sweeper",
+                             f"@{uname}: checked {len(rows)}, removed {removed}"
+                             + (" (dead)" if is_dead else ""))
+        except Exception as e:
+            log.exception("[stale] sweeper error: %s", e)
+            await _heartbeat("stale_index_sweeper", error=str(e)[:200])
+        await asyncio.sleep(nap)
+
+
+def _pick_thumb_media(msg):
+    """The small embedded thumbnail of a message's media (never the original)."""
+    if msg.photo:
+        pthumbs = getattr(msg.photo, "thumbs", None) or []
+        return pthumbs[-1] if pthumbs else msg.photo
+    for kind in ("video", "document", "animation", "audio"):
+        m = getattr(msg, kind, None)
+        if m is not None and getattr(m, "thumbs", None):
+            return m.thumbs[-1]
+    return None
+
+
+def _thumb_target(row) -> tuple:
     safe_uid = SAFE_NAME.sub("_", row["file_unique_id"] or str(row["id"]))[:80]
     fname = f"{safe_uid}.jpg"
-    target = os.path.join(THUMBS_ROOT, fname)
-    try:
-        # ── Path 1: HTTPS scrape via t.me embed (public channels only). ──
-        # Avoids MTProto + cross-DC auth.ExportAuthorization FloodWait.
-        https_bytes = None
-        if row["channel_username"]:
-            async with _THUMB_HTTPS_SEM:
-                https_bytes = await _fetch_thumb_https(
-                    row["channel_username"], row["tg_message_id"])
-        if https_bytes:
-            with open(target, "wb") as f:
-                f.write(https_bytes)
+    return fname, os.path.join(THUMBS_ROOT, fname)
+
+
+async def _thumb_store(row, fname: str, target: str) -> None:
+    """md5-dedup the downloaded thumb across channels and record it."""
+    with open(target, "rb") as f:
+        md5 = hashlib.md5(f.read()).hexdigest()
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchval(
+            """SELECT thumb_path FROM messages
+               WHERE thumb_md5 = $1
+                 AND thumb_path IS NOT NULL
+                 AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                 AND id <> $2
+               LIMIT 1""", md5, row["id"])
+        if existing and existing != fname:
+            try:
+                os.remove(target)
+            except Exception:
+                pass
+            await conn.execute(
+                "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
+                "thumb_accessed_at=NOW() WHERE id=$3",
+                existing, md5, row["id"])
         else:
-            # THUMB-ONLY emergency mode: skip MTProto fallback entirely — these
-            # rows just stay '__failed__' until the cross-DC FloodWait clears
-            # and the mode flag is flipped off.
-            if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
-                raise RuntimeError("THUMB_ONLY mode: HTTPS scrape miss + MTProto disabled")
-            # ── Path 2: MTProto fallback through global rate limiter. ──
-            # NEVER auto-join for a thumbnail: join_chat is capped ~20/day +
-            # FloodWait-prone, and this queue is dominated by left/private
-            # channels whose peer won't resolve. Plain get_messages works for
-            # cached/joined peers and fails FAST for the rest (→ __failed__),
-            # instead of grinding the 3/60s join limiter (the slow-thumbnail
-            # cause). Re-acquiring a left channel happens on user grab, not here.
-            async with _THUMB_MTPROTO_SEM:
-                msg = await _mtproto("get_messages",
-                    lambda: app.get_messages(row["tg_chat_id"], row["tg_message_id"]))
-                if not msg:
-                    raise RuntimeError("message gone")
-                thumb_media = None
-                if msg.photo:
-                    pthumbs = getattr(msg.photo, "thumbs", None) or []
-                    thumb_media = pthumbs[-1] if pthumbs else msg.photo
-                elif msg.video and getattr(msg.video, "thumbs", None):
-                    thumb_media = msg.video.thumbs[-1]
-                elif msg.document and getattr(msg.document, "thumbs", None):
-                    thumb_media = msg.document.thumbs[-1]
-                if not thumb_media:
-                    raise RuntimeError("no thumbnail available on message")
-                await _mtproto("download_media",
-                    lambda: app.download_media(thumb_media, file_name=target))
-        # MD5 of the downloaded bytes → dedup across channels
-        with open(target, "rb") as f:
-            md5 = hashlib.md5(f.read()).hexdigest()
-        async with db_pool.acquire() as conn:
-            existing = await conn.fetchval(
-                """SELECT thumb_path FROM messages
-                   WHERE thumb_md5 = $1
-                     AND thumb_path IS NOT NULL
-                     AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
-                     AND id <> $2
-                   LIMIT 1""", md5, row["id"])
-            if existing and existing != fname:
-                try:
-                    os.remove(target)
-                except Exception:
-                    pass
-                await conn.execute(
-                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
-                    "thumb_accessed_at=NOW() WHERE id=$3",
-                    existing, md5, row["id"])
-                log.info("[thumbs] dedup id=%s → %s", row["id"], existing)
-            else:
-                await conn.execute(
-                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
-                    "thumb_accessed_at=NOW() WHERE id=$3",
-                    fname, md5, row["id"])
-    except FloodWait as fw:
-        wait = getattr(fw, "value", 60) + 5
-        log.warning("[thumbs] flood-wait %ds (id=%s) — leaving in queue", wait, row["id"])
-        await asyncio.sleep(min(wait, 3600))
-        # Row stays as __user_queued__; will be retried on next batch.
+            await conn.execute(
+                "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
+                "thumb_accessed_at=NOW() WHERE id=$3",
+                fname, md5, row["id"])
+
+
+_PEER_ERR_MARKS = ("CHANNEL_INVALID", "PEER_ID_INVALID", "Peer id invalid",
+                   "ID not found", "CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED",
+                   "USERNAME_INVALID")
+
+
+async def _thumb_fail(row, e, whole_channel: bool = False) -> None:
+    es = str(e)
+    channel_dead = whole_channel or any(m in es for m in _PEER_ERR_MARKS)
+    async with db_pool.acquire() as conn:
+        if channel_dead and row["tg_chat_id"]:
+            # Fail every queued thumb of an unreachable channel in one shot
+            # instead of grinding them one by one.
+            res = await conn.execute(
+                "UPDATE messages SET thumb_path='__failed__' "
+                "WHERE tg_chat_id=$1 AND thumb_path='__user_queued__'",
+                row["tg_chat_id"])
+            log.info("[thumbs] channel %s unreachable (%s) — failed queued batch %s",
+                     row["tg_chat_id"], es[:60], res)
+        else:
+            log.info("[thumbs] failed id=%s: %s", row["id"], es[:100])
+            await conn.execute(
+                "UPDATE messages SET thumb_path='__failed__' WHERE id=$1", row["id"])
+
+
+# Public channels we have already tried to re-resolve by username in this
+# process, so an unreachable one costs at most one lookup.
+_thumb_resolve_tried: set = set()
+
+
+async def _thumb_get_messages(chat_id: int, username, ids: list) -> dict:
+    """ONE get_messages round-trip for all queued thumbs of a channel.
+
+    If the session has no usable peer for the channel (fresh login, or a
+    public channel the account is not a member of), resolve it once by
+    username — reading a public channel needs no membership, and it never
+    joins anything — then retry.
+    """
+    async def _call():
+        return await _mtproto("get_messages",
+                              lambda: app.get_messages(chat_id, ids))
+    try:
+        msgs = await _call()
+    except FloodWait:
+        raise
     except Exception as e:
-        es = str(e)
-        log.warning("[thumbs] failed id=%s: %s", row["id"], es[:120])
-        # If the whole CHANNEL is unreachable (no username → no HTTPS, peer not
-        # resolvable), fail ALL its queued thumbs in one shot instead of
-        # grinding them one-by-one (~1s each on the single MTProto lane) — the
-        # main cause of a sluggish gallery full of un-fetchable channels.
-        channel_dead = any(s in es for s in (
-            "CHANNEL_INVALID", "PEER_ID_INVALID", "Peer id invalid",
-            "CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID"))
-        async with db_pool.acquire() as conn:
-            if channel_dead and row["tg_chat_id"]:
-                res = await conn.execute(
-                    "UPDATE messages SET thumb_path='__failed__' "
-                    "WHERE tg_chat_id=$1 AND thumb_path='__user_queued__'",
-                    row["tg_chat_id"])
-                log.info("[thumbs] channel %s unreachable — failed queued batch %s",
-                         row["tg_chat_id"], res)
-            else:
-                await conn.execute(
-                    "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
-                    row["id"])
+        if not (username and any(m in str(e) for m in _PEER_ERR_MARKS)
+                and username not in _thumb_resolve_tried):
+            raise
+        _thumb_resolve_tried.add(username)
+        log.info("[thumbs] no peer for %s — resolving @%s once", chat_id, username)
+        await _mtproto("resolveUsername", lambda: app.resolve_peer(username))
+        msgs = await _call()
+    if not isinstance(msgs, list):
+        msgs = [msgs]
+    return {m.id: m for m in msgs if m is not None and not getattr(m, "empty", False)}
+
+
+async def _thumb_process_batch(rows) -> None:
+    """Materialize a batch of user-requested thumbnails.
+
+    1. HTTPS scrape of the public t.me embed, in parallel — works for photo
+       posts and small native videos, costs no MTProto.
+    2. Everything else per channel: one get_messages for the whole group, then
+       the tiny embedded thumbs. (Large video *files* have no web preview at
+       all, so for a movie channel this is the only path — it used to be one
+       rate-limited get_messages per thumbnail.)
+    """
+    async def https_one(r) -> bool:
+        if not r["channel_username"]:
+            return False
+        fname, target = _thumb_target(r)
+        try:
+            async with _THUMB_HTTPS_SEM:
+                data = await _fetch_thumb_https(r["channel_username"], r["tg_message_id"])
+            if not data:
+                return False
+            with open(target, "wb") as f:
+                f.write(data)
+            await _thumb_store(r, fname, target)
+            return True
+        except Exception as e:
+            log.debug("[thumbs] https id=%s: %s", r["id"], e)
+            return False
+
+    got = await asyncio.gather(*[https_one(r) for r in rows])
+    rest = [r for r, ok in zip(rows, got) if not ok]
+    if not rest:
+        return
+    if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
+        for r in rest:
+            await _thumb_fail(r, RuntimeError("THUMB_ONLY mode: HTTPS miss + MTProto disabled"))
+        return
+
+    by_chat: dict = {}
+    for r in rest:
+        by_chat.setdefault(r["tg_chat_id"], []).append(r)
+
+    for chat_id, grp in by_chat.items():
+        try:
+            async with _THUMB_MTPROTO_SEM:
+                msgs = await _thumb_get_messages(
+                    chat_id, grp[0]["channel_username"],
+                    [r["tg_message_id"] for r in grp])
+        except FloodWait as fw:
+            wait = int(getattr(fw, "value", 60) or 60) + 5
+            log.warning("[thumbs] flood-wait %ds — leaving %d queued", wait, len(grp))
+            await asyncio.sleep(min(wait, 3600))
+            return          # rows stay __user_queued__ for the next pass
+        except DailyBudgetExhausted as e:
+            log.warning("[thumbs] %s — leaving channel %s queued", e, chat_id)
+            continue
+        except Exception as e:
+            await _thumb_fail(grp[0], e, whole_channel=True)
+            continue
+
+        # Telegram answered for this channel: any requested message that came
+        # back empty has been deleted at the source. Drop those pointers now
+        # rather than leaving dead cards behind.
+        try:
+            removed, is_dead = await _reconcile_missing(
+                grp[0]["channel_id"], chat_id, grp[0]["channel_username"], grp, msgs)
+            if removed or is_dead:
+                log.info("[thumbs] channel %s: %d stale pointer(s) removed%s", chat_id,
+                         removed, " — channel marked dead" if is_dead else "")
+        except Exception as e:
+            log.warning("[thumbs] stale reconcile for %s failed: %s", chat_id, e)
+
+        async def dl(r, msgs=msgs):
+            fname, target = _thumb_target(r)
+            try:
+                msg = msgs.get(r["tg_message_id"])
+                if msg is None:
+                    raise RuntimeError("message gone")
+                media = _pick_thumb_media(msg)
+                if media is None:
+                    raise RuntimeError("no thumbnail available on message")
+                async with _THUMB_DL_SEM:
+                    data = await _mtproto("download_thumb",
+                        lambda: _fetch_small_file(media))
+                    if data:
+                        with open(target, "wb") as f:
+                            f.write(data)
+                    else:
+                        # fast path not applicable → Pyrogram's own downloader
+                        _dc = await _pyrogram_transfer_guard(media)
+                        await _mtproto("download_thumb",
+                            lambda: app.download_media(media, file_name=target))
+                        if not os.path.exists(target) or os.path.getsize(target) == 0:
+                            await _pyrogram_transfer_empty(_dc)
+                if not os.path.exists(target) or os.path.getsize(target) == 0:
+                    raise RuntimeError("thumbnail download returned nothing")
+                await _thumb_store(r, fname, target)
+            except FloodWait as fw:
+                log.warning("[thumbs] flood-wait %ss on download (id=%s) — left queued",
+                            getattr(fw, "value", "?"), r["id"])
+            except Exception as e:
+                await _thumb_fail(r, e)
+
+        await asyncio.gather(*[dl(r) for r in grp])
 
 
 THUMB_TTL_HOURS = int(os.environ.get("TGARR_THUMB_TTL_HOURS", "5"))
@@ -2091,85 +2976,122 @@ async def thumb_cache_gc_worker() -> None:
 _PREVIEW_SEM = asyncio.Semaphore(5)  # concurrent HTTPS fetches
 
 
-async def _fetch_preview_mtproto(chat_id: int, msg_id: int) -> bytes | None:
-    """MTProto fallback for private-channel previews (NULL username can't
-    use t.me HTTPS scrape). Fetches the message, then downloads the photo
-    in-memory. download_media quota is generous (60/min) — safe for gallery
-    interaction rates.
+_PREVIEW_DL_SEM = asyncio.Semaphore(3)
+
+
+def _pick_preview_media(msg):
+    """What to show full-screen: the photo itself (largest size), or for a
+    non-photo message its best embedded thumbnail."""
+    if msg.photo:
+        return msg.photo
+    for kind in ("video", "animation", "document"):
+        m = getattr(msg, kind, None)
+        if m is not None and getattr(m, "thumbs", None):
+            return m.thumbs[-1]
+    return None
+
+
+async def _preview_store(row, blob: bytes) -> None:
+    safe_uid = SAFE_NAME.sub("_", row["file_unique_id"] or str(row["id"]))[:80]
+    fname = f"{safe_uid}.jpg"
+    with open(os.path.join(PREVIEWS_ROOT, fname), "wb") as f:
+        f.write(blob)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET preview_path=$1, preview_accessed_at=NOW() "
+            "WHERE id=$2", fname, row["id"])
+
+
+async def _preview_fail(row) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET preview_path='__failed__' WHERE id=$1", row["id"])
+
+
+async def _preview_process_batch(rows) -> None:
+    """Materialize the large images a user just opened.
+
+    Full resolution straight from Telegram, for every DC: one get_messages per
+    channel for the whole batch, then each photo over the cached media session
+    of its DC (one cross-DC authorization per DC for the life of the process).
+    This used to be one get_messages plus a brand-new media session per image,
+    and cross-DC images were limited to the ~450px t.me embed to avoid
+    re-authorizing each time. The embed stays as the fallback when MTProto
+    cannot answer (no usable peer, flood wait).
     """
-    try:
-        msg = await _mtproto("get_messages",
-            lambda: app.get_messages(chat_id, msg_id))
-    except Exception as e:
-        log.debug("[preview] mtproto get_messages chat=%s msg=%s: %s",
-                  chat_id, msg_id, e)
-        return None
-    if not msg or not msg.photo:
-        return None
-    try:
-        buf = await _mtproto("download_media",
-            lambda: app.download_media(msg.photo, in_memory=True))
-    except Exception as e:
-        log.debug("[preview] mtproto download chat=%s msg=%s: %s",
-                  chat_id, msg_id, e)
-        return None
-    if buf is None:
-        return None
-    data = buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
-    return data if data else None
+    by_chat: dict = {}
+    for r in rows:
+        by_chat.setdefault(r["tg_chat_id"], []).append(r)
 
+    for chat_id, grp in by_chat.items():
+        msgs = None
+        try:
+            async with _THUMB_MTPROTO_SEM:
+                msgs = await _thumb_get_messages(
+                    chat_id, grp[0]["channel_username"],
+                    [r["tg_message_id"] for r in grp])
+        except (FloodWait, DailyBudgetExhausted) as e:
+            log.info("[preview] channel %s: MTProto unavailable (%s) — embed fallback",
+                     chat_id, type(e).__name__)
+        except Exception as e:
+            log.debug("[preview] channel %s get_messages: %s", chat_id, str(e)[:100])
 
-async def _preview_process_one(row):
-    blob = None
-    # Same-DC → MTProto full-res FIRST. The t.me embed serves tiny ~240px
-    # grid-thumbs for ALBUMS (grouped media), which look blurry fullscreen;
-    # download_media gives the original. Gallery is same-DC by default so this
-    # is the common path. Cross-DC → HTTPS only (no cross-DC auth FloodWait).
-    same_dc = bool(row["file_dc"] and CURRENT_DC and row["file_dc"] == CURRENT_DC)
-    if same_dc:
-        blob = await _fetch_preview_mtproto(
-            row["tg_chat_id"], row["tg_message_id"])
-        if not blob and row["channel_username"]:
+        if msgs is not None:
             try:
-                async with _PREVIEW_SEM:
-                    blob = await _fetch_preview_https(
-                        row["channel_username"], row["tg_message_id"])
+                removed, is_dead = await _reconcile_missing(
+                    grp[0]["channel_id"], chat_id, grp[0]["channel_username"], grp, msgs)
+                if removed or is_dead:
+                    log.info("[preview] channel %s: %d stale pointer(s) removed%s", chat_id,
+                             removed, " — channel marked dead" if is_dead else "")
             except Exception as e:
-                log.debug("[preview] https err id=%s: %s", row["id"], e)
-    else:
-        if row["channel_username"]:
+                log.warning("[preview] stale reconcile for %s failed: %s", chat_id, e)
+
+        async def one(r, msgs=msgs):
+            blob = None
             try:
-                async with _PREVIEW_SEM:
-                    blob = await _fetch_preview_https(
-                        row["channel_username"], row["tg_message_id"])
+                msg = msgs.get(r["tg_message_id"]) if msgs is not None else None
+                if msgs is not None and msg is None:
+                    await _preview_fail(r)      # gone at the source
+                    return
+                media = _pick_preview_media(msg) if msg is not None else None
+                if media is not None:
+                    try:
+                        async with _PREVIEW_DL_SEM:
+                            blob = await _mtproto("download_preview",
+                                lambda: _fetch_file_bytes(media))
+                            if not blob:
+                                _dc = await _pyrogram_transfer_guard(media)
+                                buf = await _mtproto("download_media",
+                                    lambda: app.download_media(media, in_memory=True))
+                                if buf is not None:
+                                    blob = (buf.getvalue() if hasattr(buf, "getvalue")
+                                            else bytes(buf))
+                                if not blob:
+                                    await _pyrogram_transfer_empty(_dc)
+                    except FloodWait as fw:
+                        log.info("[preview] flood-wait %ss id=%s — embed fallback",
+                                 getattr(fw, "value", "?"), r["id"])
+                    except Exception as e:
+                        log.debug("[preview] mtproto id=%s: %s", r["id"], str(e)[:100])
+                if not blob and r["channel_username"]:
+                    try:
+                        async with _PREVIEW_SEM:
+                            blob = await _fetch_preview_https(
+                                r["channel_username"], r["tg_message_id"])
+                    except Exception as e:
+                        log.debug("[preview] https err id=%s: %s", r["id"], e)
+                if blob:
+                    await _preview_store(r, blob)
+                else:
+                    await _preview_fail(r)
             except Exception as e:
-                log.debug("[preview] https err id=%s: %s", row["id"], e)
-        if not blob:
-            blob = await _fetch_preview_mtproto(
-                row["tg_chat_id"], row["tg_message_id"])
-    if not blob:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
-                row["id"])
-        return
-    try:
-        safe_uid = SAFE_NAME.sub(
-            "_", row["file_unique_id"] or str(row["id"]))[:80]
-        fname = f"{safe_uid}.jpg"
-        target = os.path.join(PREVIEWS_ROOT, fname)
-        with open(target, "wb") as f:
-            f.write(blob)
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE messages SET preview_path=$1, preview_accessed_at=NOW() "
-                "WHERE id=$2", fname, row["id"])
-    except Exception as e:
-        log.warning("[preview] write failed id=%s: %s", row["id"], e)
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
-                row["id"])
+                log.warning("[preview] failed id=%s: %s", r["id"], str(e)[:120])
+                try:
+                    await _preview_fail(r)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[one(r) for r in grp])
 
 
 # On-demand wake signals. The API NOTIFYs the moment it queues a thumb/preview;
@@ -2205,10 +3127,10 @@ async def _ondemand_notify_listener() -> None:
 
 
 async def preview_downloader() -> None:
-    """450px+ JPEG preview fetcher — sem-capped 5 concurrent HTTPS scrapes.
-    LIFO batch (newest queued first) so user's just-opened slideshow is
-    prioritized over backlog. Same t.me embed source as thumb, takes the
-    larger CDN URL. Wakes instantly on preview_queued NOTIFY (no idle nap).
+    """Large-image fetcher for the lightbox / slideshow. LIFO batch (newest
+    queued first) so the image the user just opened beats any backlog. Wakes
+    instantly on preview_queued NOTIFY (no idle nap). See
+    _preview_process_batch for the fetch strategy.
     """
     log.info("[preview] dispatcher started; root=%s conc=5", PREVIEWS_ROOT)
     os.makedirs(PREVIEWS_ROOT, exist_ok=True)
@@ -2217,16 +3139,14 @@ async def preview_downloader() -> None:
             _preview_wake.clear()
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch(
-                    """SELECT m.id, m.tg_chat_id, m.tg_message_id,
+                    """SELECT m.id, m.channel_id, m.tg_chat_id, m.tg_message_id,
                               m.file_unique_id, m.file_dc,
                               c.username AS channel_username
                        FROM messages m JOIN channels c ON c.id = m.channel_id
                        WHERE m.preview_path = '__user_queued__'
                        ORDER BY m.id DESC LIMIT 20""")
             if rows:
-                await asyncio.gather(
-                    *[_preview_process_one(r) for r in rows],
-                    return_exceptions=True)
+                await _preview_process_batch(rows)
                 continue  # drain immediately, no nap
             try:
                 await asyncio.wait_for(_preview_wake.wait(),
@@ -2241,7 +3161,7 @@ async def preview_downloader() -> None:
 async def thumb_downloader() -> None:
     """Concurrent thumb-fetch dispatcher.
 
-    Pulls a batch of queued rows, fans out to _thumb_process_one in parallel,
+    Pulls a batch of queued rows, hands them to _thumb_process_batch,
     waits for the batch, repeats. HTTPS path is sem-capped at 10 concurrent;
     MTProto fallback at 1 (shared Pyrogram session).
 
@@ -2260,15 +3180,14 @@ async def thumb_downloader() -> None:
                 # /api/thumb's UPDATE). Drain them before old leftovers so the
                 # 12s polling timeout in /api/thumb is more likely to win.
                 rows = await conn.fetch(
-                    """SELECT m.id, m.tg_chat_id, m.tg_message_id, m.file_unique_id,
-                              c.username AS channel_username
+                    """SELECT m.id, m.channel_id, m.tg_chat_id, m.tg_message_id,
+                              m.file_unique_id, c.username AS channel_username
                        FROM messages m JOIN channels c ON c.id = m.channel_id
                        WHERE m.thumb_path = '__user_queued__'
                        ORDER BY m.id DESC
                        LIMIT $1""", _THUMB_BATCH)
             if rows:
-                tasks = [asyncio.create_task(_thumb_process_one(r)) for r in rows]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await _thumb_process_batch(rows)
                 continue  # drain immediately, no nap
             # queue empty → wake instantly on the next thumb_queued NOTIFY
             # (fallback re-check guards against a missed wakeup).
@@ -2705,7 +3624,7 @@ async def subscription_poller() -> None:
             count = media_count = 0
             try:
                 await _mtproto_wait_clearance()
-                async for msg in app.get_chat_history(real_chat_id, limit=limit):
+                async for msg in _hist(real_chat_id, limit=limit):
                     try:
                         inserted = await ingest_message(msg)
                         count += 1
@@ -2864,7 +3783,7 @@ async def seed_validator() -> None:
             last_msg = None
             try:
                 await _mtproto_wait_clearance()
-                async for m in app.get_chat_history(chat.id, limit=1):
+                async for m in _hist(chat.id, limit=1):
                     last_msg = m.date
                     break
             except Exception:
@@ -2984,7 +3903,7 @@ async def registry_puller() -> None:
             try:
                 req = urllib.request.Request(
                     url,
-                    headers={"User-Agent": "tgarr/0.4.34 (+https://tgarr.me)",
+                    headers={"User-Agent": TGARR_UA,
                              "Accept": "application/json"},
                 )
                 resp = await asyncio.to_thread(
@@ -3004,9 +3923,14 @@ async def registry_puller() -> None:
                     is_new = await conn.fetchval(
                         """INSERT INTO discovered
                              (username, title, members_count, media_count, audience,
-                              language, category, distinct_contributors, verified)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                              language, category, distinct_contributors, verified,
+                              release_files, video_files, book_files, audio_files)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                            ON CONFLICT (username) DO UPDATE SET
+                             release_files = EXCLUDED.release_files,
+                             video_files = EXCLUDED.video_files,
+                             book_files = EXCLUDED.book_files,
+                             audio_files = EXCLUDED.audio_files,
                              title = EXCLUDED.title,
                              members_count = EXCLUDED.members_count,
                              media_count = EXCLUDED.media_count,
@@ -3019,7 +3943,9 @@ async def registry_puller() -> None:
                            RETURNING (xmax = 0)""",
                         u, c.get("title"), c.get("members_count"), c.get("media_count"),
                         c.get("audience"), c.get("language"), c.get("category"),
-                        c.get("distinct_contributors", 0), c.get("verified", False))
+                        c.get("distinct_contributors", 0), c.get("verified", False),
+                        c.get("release_files"), c.get("video_files"),
+                        c.get("book_files"), c.get("audio_files"))
                     if is_new:
                         inserted += 1
                     else:
@@ -3117,7 +4043,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.4",
+                "tgarr_version": TGARR_VERSION,
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3142,7 +4068,7 @@ async def contribute_to_registry() -> None:
                     headers={"Content-Type": "application/json",
                              "Content-Encoding": "gzip",
                              "Accept-Encoding": "gzip",
-                             "User-Agent": "tgarr/0.4.62 (+https://tgarr.me)"},
+                             "User-Agent": TGARR_UA},
                     method="POST")
                 def _post():
                     with urllib.request.urlopen(req, timeout=30) as r:
@@ -3215,7 +4141,7 @@ async def federation_validator() -> None:
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
                 req = urllib.request.Request(url, headers={
-                    "User-Agent": "tgarr/0.4.34 (+https://tgarr.me)"})
+                    "User-Agent": TGARR_UA})
                 resp = await asyncio.to_thread(
                     lambda: urllib.request.urlopen(req, timeout=30).read())
                 doc = json.loads(resp.decode())
@@ -3315,14 +4241,14 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.5.4",
+                        "tgarr_version": TGARR_VERSION,
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
                         data=json.dumps(payload).encode(),
                         headers={"Content-Type": "application/json",
-                                 "User-Agent": "tgarr/0.4.34 (+https://tgarr.me)"},
+                                 "User-Agent": TGARR_UA},
                         method="POST")
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
@@ -3473,7 +4399,7 @@ async def on_demand_media_downloader() -> None:
                 expected = row["file_size"] or 0
                 written = 0
                 with open(target, "wb") as f:
-                    async for chunk in app.stream_media(msg):
+                    async for chunk in _stream_media_fast(msg, media):
                         f.write(chunk)
                         written += len(chunk)
 
@@ -3899,7 +4825,7 @@ async def dialog_reconcile_worker() -> None:
             await _mtproto_wait_clearance()
             leavable = []   # (chat_id, username, title)
             real = protected = 0
-            async for dialog in app.get_dialogs():
+            async for dialog in _dialogs():
                 if dialog.chat.type.name not in ("CHANNEL", "SUPERGROUP"):
                     continue
                 real += 1
@@ -4104,7 +5030,7 @@ async def deep_backfill_worker() -> None:
             try:
                 await _mtproto_wait_clearance()
                 offset_kw = {"offset_id": cursor} if cursor else {}
-                async for msg in app.get_chat_history(
+                async for msg in _hist(
                         row["tg_chat_id"],
                         limit=DEEP_BACKFILL_PAGE_SIZE,
                         **offset_kw):
@@ -4231,6 +5157,10 @@ async def contribute_resources_worker() -> None:
                       AND m.contributed_at IS NULL
                       AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
                       AND c.username IS NOT NULL AND c.username <> ''
+                      -- Photos carry no file name and are of no use to an
+                      -- index of movies / TV / books / music, yet they were
+                      -- ~63% of everything stored centrally.
+                      AND COALESCE(m.media_type, '') <> 'photo'
                     ORDER BY m.id DESC
                     LIMIT {CONTRIBUTE_RESOURCES_BATCH}
                 """)
@@ -4278,7 +5208,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.4",
+                "tgarr_version": TGARR_VERSION,
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
@@ -4302,7 +5232,7 @@ async def contribute_resources_worker() -> None:
                     headers={"Content-Type": "application/json",
                              "Content-Encoding": "gzip",
                              "Accept-Encoding": "gzip",
-                             "User-Agent": "tgarr/0.4.62 (+https://tgarr.me)"},
+                             "User-Agent": TGARR_UA},
                     method="POST")
                 def _post():
                     with urllib.request.urlopen(req, timeout=120) as r:
@@ -4361,7 +5291,7 @@ async def _central_post(path: str, payload: dict, timeout: int = 120) -> dict:
         REGISTRY_URL + path, data=body_gz,
         headers={"Content-Type": "application/json",
                  "Content-Encoding": "gzip", "Accept-Encoding": "gzip",
-                 "User-Agent": "tgarr/0.5.0 (+https://tgarr.me)"},
+                 "User-Agent": TGARR_UA},
         method="POST")
     def _post():
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -4668,16 +5598,175 @@ async def _session_revoke_watcher():
         await asyncio.sleep(60)
 
 
+MEMBERSHIP_SYNC_INTERVAL_SEC = int(os.environ.get("TGARR_MEMBERSHIP_SYNC_INTERVAL_SEC", "1800"))
+
+
+async def membership_sync_worker():
+    """Keep channels.is_joined equal to what the Telegram account is actually
+    a member of.
+
+    is_joined was only ever switched ON (when a dialog was seen or a message
+    arrived) and OFF by the leave worker. Channels the user left in the
+    Telegram app stayed "JOIN" forever: in the System page, in the
+    deep-backfill queue, and as a reason not to release their index.
+
+    Source of truth: the account dialog list, main list plus the Archive
+    folder (get_dialogs skips archived chats). Flags are only cleared after a
+    complete, error-free enumeration that found at least one chat, so a flood
+    wait or a network hiccup can never mass-clear them. This only corrects a
+    flag; it never joins or leaves anything. Personal chats are safe either
+    way: the leave worker acts only on auto_joined channels.
+    """
+    from pyrogram import raw
+    await asyncio.sleep(90)
+    while True:
+        try:
+            member: set = set()
+            complete = True
+            try:
+                async for d in _dialogs():
+                    if d.chat and d.chat.type.name in ("CHANNEL", "SUPERGROUP", "GROUP"):
+                        member.add(d.chat.id)
+            except Exception as e:
+                complete = False
+                log.info("[membership] dialog list incomplete (%s) - flags not cleared this round",
+                         str(e)[:80])
+            if complete:
+                try:
+                    r = await _mtproto("get_dialogs", lambda: app.invoke(
+                        raw.functions.messages.GetDialogs(
+                            offset_date=0, offset_id=0,
+                            offset_peer=raw.types.InputPeerEmpty(),
+                            limit=100, hash=0, folder_id=1)))
+                    for c in getattr(r, "chats", []) or []:
+                        if getattr(c, "left", False) or "Forbidden" in type(c).__name__:
+                            continue
+                        if type(c).__name__ == "Channel":
+                            member.add(int(f"-100{c.id}"))
+                        elif type(c).__name__ == "Chat":
+                            member.add(-c.id)
+                    if len(getattr(r, "dialogs", []) or []) >= 100:
+                        complete = False     # archive longer than one page: do not clear
+                except Exception as e:
+                    complete = False
+                    log.info("[membership] archive folder not readable (%s) - flags not cleared",
+                             str(e)[:80])
+            if member:
+                ids = list(member)
+                async with db_pool.acquire() as conn:
+                    on = await conn.fetch(
+                        """UPDATE channels SET is_joined = TRUE
+                           WHERE tg_chat_id = ANY($1::bigint[])
+                             AND NOT COALESCE(is_joined, FALSE)
+                           RETURNING COALESCE(username, title) AS n""", ids)
+                    off = []
+                    if complete:
+                        off = await conn.fetch(
+                            """UPDATE channels SET is_joined = FALSE
+                               WHERE COALESCE(is_joined, FALSE)
+                                 AND tg_chat_id <> ALL($1::bigint[])
+                                 AND (account_user_id = $2 OR account_user_id IS NULL)
+                               RETURNING COALESCE(username, title) AS n""",
+                            ids, CURRENT_USER_ID)
+                if on or off:
+                    log.info("[membership] account is in %d chats; now joined: +%d %s; "
+                             "no longer joined: -%d %s", len(member),
+                             len(on), [x["n"] for x in on][:8],
+                             len(off), [x["n"] for x in off][:8])
+                await _heartbeat("membership_sync_worker",
+                                 f"{len(member)} chats; +{len(on)} / -{len(off)}"
+                                 + ("" if complete else " (partial list, nothing cleared)"))
+            else:
+                await _heartbeat("membership_sync_worker", "dialog list empty - skipped")
+        except Exception as e:
+            log.exception("[membership] sync error: %s", e)
+            await _heartbeat("membership_sync_worker", error=str(e)[:200])
+        await asyncio.sleep(MEMBERSHIP_SYNC_INTERVAL_SEC)
+
+
+async def audience_classifier_worker():
+    """Mark adult channels as audience='nsfw' from what they actually post.
+
+    Channels used to keep whatever audience they were created with — in
+    practice 'sfw' — so adult channels filled the default (SFW) views, the
+    Newznab feed and the contributions sent to the registry. This is pure SQL
+    over the local index: no Telegram calls.
+
+    One-way and conservative: only sfw/NULL → nsfw. It never touches
+    blocked_csam, a manually set audience (audience_manual), personal chats or
+    KwickPOS* channels, and never flips a channel back.
+    Opt-out: TGARR_AUDIENCE_CLASSIFIER=false
+    """
+    if os.environ.get("TGARR_AUDIENCE_CLASSIFIER", "true").lower() != "true":
+        log.info("[audience] TGARR_AUDIENCE_CLASSIFIER=false — disabled")
+        return
+    await asyncio.sleep(300 + random.uniform(0, 300))
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH stats AS (
+                      SELECT channel_id, count(*) AS n,
+                             count(*) FILTER (
+                               WHERE COALESCE(file_name, '') ~* $1
+                                  OR COALESCE(caption, '')   ~* $1) AS hits
+                      FROM messages
+                      WHERE file_name IS NOT NULL
+                         OR (caption IS NOT NULL AND media_type IN ('video','document'))
+                      GROUP BY channel_id
+                    )
+                    UPDATE channels c SET audience = 'nsfw'
+                    FROM (SELECT c2.id, st.n, st.hits
+                          FROM channels c2 LEFT JOIN stats st ON st.channel_id = c2.id) x
+                    WHERE c.id = x.id
+                      AND COALESCE(c.audience, 'sfw') = 'sfw'
+                      AND NOT COALESCE(c.audience_manual, FALSE)
+                      AND COALESCE(c.category, '') <> 'personal'
+                      AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+                      AND ( COALESCE(c.title, '') ~* $2
+                         OR ( COALESCE(x.n, 0) >= $3 AND COALESCE(x.hits, 0) >= $4
+                              AND x.hits::float / x.n >= $5 ) )
+                    RETURNING c.username, c.title, x.n, x.hits
+                    """,
+                    ADULT_RX, ADULT_TITLE_RX, ADULT_MIN_FILES, ADULT_MIN_HITS,
+                    ADULT_MIN_RATIO)
+            for r in rows[:40]:
+                log.info("[audience] nsfw ← @%s %r (%s/%s adult-named files)",
+                         r["username"], (r["title"] or "")[:40],
+                         r["hits"] or 0, r["n"] or 0)
+            await _heartbeat("audience_classifier_worker",
+                             f"marked {len(rows)} channel(s) nsfw")
+        except Exception as e:
+            log.exception("[audience] classifier error: %s", e)
+            await _heartbeat("audience_classifier_worker", error=str(e)[:200])
+        await asyncio.sleep(6 * 3600)
+
+
 async def _session_change_watcher(boot_user_id: int):
     """Detect when /login QR-changes the underlying session to a different
     TG account. Crawler can't hot-swap Pyrogram client mid-flight; on change
     we self-exit and let docker's restart policy bring us back fresh.
     """
     import sqlite3
+    try:
+        boot_ino = os.stat(SESSION_PATH).st_ino
+    except OSError:
+        boot_ino = None
     await asyncio.sleep(60)  # initial settle
     while True:
         try:
             if os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0:
+                # /login installs a freshly authorized session by atomic
+                # rename, so a re-login (even as the SAME account) shows up as
+                # a new inode. We are still holding the old, now-unlinked file;
+                # restart to load the new auth key.
+                cur_ino = os.stat(SESSION_PATH).st_ino
+                if boot_ino is not None and cur_ino != boot_ino and _session_authed():
+                    log.warning("[session-watch] session file was replaced by a "
+                                "new login — self-exiting to load it")
+                    await asyncio.sleep(2)
+                    os._exit(0)
                 con = sqlite3.connect(f"file:{SESSION_PATH}?mode=ro",
                                       uri=True, timeout=2)
                 try:
@@ -4801,6 +5890,9 @@ async def main() -> None:
     asyncio.create_task(contribute_to_registry())
     asyncio.create_task(federation_validator())
     asyncio.create_task(registry_puller())
+    asyncio.create_task(audience_classifier_worker())
+    asyncio.create_task(stale_index_sweeper())
+    asyncio.create_task(membership_sync_worker())
     # seed_validator disabled on client: leftover from pre-federation split.
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)

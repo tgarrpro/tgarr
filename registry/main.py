@@ -36,7 +36,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("tgarr-registry")
 
 DB_DSN = os.environ["DB_DSN"]
-VERSION = "0.5.4"
+VERSION = "0.5.5"
+
+# ── adult (NSFW) classification ────────────────────────────────────────
+# PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,
+# registry) identical. A channel is NSFW when its title matches
+# ADULT_TITLE_RX, or when >= 8% of its named files / captions (at least
+# 20 of them, at least 5 hits) match ADULT_RX. On live data adult channels
+# score 10-90% and ordinary ones 0-3%.
+ADULT_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동)'
+ADULT_TITLE_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동|反差|熟女|糖心|麻豆|海角|伦理片|91国产|(^|[^a-z])av([^a-z]|$)|adult|erotic)'
+ADULT_MIN_FILES = 20
+ADULT_MIN_HITS = 5
+ADULT_MIN_RATIO = 0.08
+
+# A file name that looks like a movie / TV release: SxxEyy, or a year together
+# with a resolution / source / codec tag (either order).
+_REL_TAG = "(2160p|1080p|720p|480p|blu-?ray|web-?dl|webrip|hdtv|bdrip|hdrip|remux|x26[45]|hevc)"
+RELEASE_RX = ("(s[0-9]{1,2}[ ._-]?e[0-9]{1,3}"
+              "|(19|20)[0-9]{2}.*" + _REL_TAG +
+              "|" + _REL_TAG + ".*(19|20)[0-9]{2})")
+BOOK_RX = "\\.(epub|mobi|azw3?|pdf|djvu|fb2|cbz|cbr)$"
+# A channel that has had this many release-looking files contributed is real
+# enough to list even before a second instance has confirmed it.
+DISCOVER_MIN_RELEASE_FILES = 100
+
 
 # Hard caps on request bodies. nginx already limits the wire size (5 MB) but
 # NOT what a gzip body inflates to — an unauthenticated few-MB gzip bomb could
@@ -109,6 +133,7 @@ async def _startup():
             await conn.execute(f.read())
     await _seed_honeypots()
     asyncio.create_task(_build_central_sketch())
+    asyncio.create_task(_audience_classifier())
     log.info("registry up — schema applied + honeypots seeded + bloom builder scheduled")
 
 
@@ -163,15 +188,22 @@ async def _build_central_sketch():
                     "WHERE distinct_contributors >= $1 "
                     "  AND file_unique_id IS NOT NULL",
                     BLOOM_DC_THRESHOLD)
-            bits = bytearray(BLOOM_M_BYTES)
-            n = 0
-            for r in rows:
-                fuid = r["file_unique_id"]
-                if not fuid:
-                    continue
-                for idx in _bloom_indices(fuid):
-                    bits[idx >> 3] |= (1 << (idx & 7))
-                n += 1
+            # ~4M ids x 8 hashes is tens of seconds of pure Python. Run it in a
+            # worker thread: on the event loop it froze every request for the
+            # whole build, every 5 minutes.
+            fuids = [r["file_unique_id"] for r in rows if r["file_unique_id"]]
+            del rows
+
+            def _fill(ids):
+                b = bytearray(BLOOM_M_BYTES)
+                for fuid in ids:
+                    for idx in _bloom_indices(fuid):
+                        b[idx >> 3] |= (1 << (idx & 7))
+                return b
+
+            bits = await asyncio.to_thread(_fill, fuids)
+            n = len(fuids)
+            del fuids
             # 20-byte header: magic(4) + m_bits(4) + k(1) + reserved(3) + n(4) + built_at(4)
             header = struct.pack(
                 "<4sIB3xII",
@@ -209,6 +241,74 @@ async def known_resources_sketch(request: Request):
         media_type="application/octet-stream",
         headers={"ETag": f'"{_central_sketch_etag}"',
                  "Cache-Control": "public, max-age=300"})
+
+
+async def _audience_classifier():
+    """Daily: mark adult channels as audience='nsfw'.
+
+    Clients send an `audience` with every channel, and almost all of them
+    send 'sfw' (28 nsfw rows out of 580K), so the default SFW registry feed
+    was full of adult channels. Classify server-side from the channel title
+    and from the file names contributed for it. One-way (sfw → nsfw); never
+    touches blocked or blocked_csam rows.
+    """
+    await asyncio.sleep(900)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                n_title = await conn.fetchval(
+                    """WITH u AS (
+                         UPDATE registry_channels SET audience = 'nsfw'
+                         WHERE COALESCE(audience, 'sfw') = 'sfw' AND NOT blocked
+                           AND COALESCE(title, '') ~* $1
+                         RETURNING 1)
+                       SELECT count(*) FROM u""", ADULT_TITLE_RX, timeout=600)
+                n_files = await conn.fetchval(
+                    """WITH hit AS (
+                         SELECT ch.channel_username AS u
+                         FROM registry_resource_channels ch
+                         JOIN registry_resources rr USING (file_unique_id)
+                         WHERE rr.file_name IS NOT NULL
+                         GROUP BY 1
+                         HAVING count(*) >= $2
+                            AND count(*) FILTER (WHERE rr.file_name ~* $1) >= $3
+                            AND count(*) FILTER (WHERE rr.file_name ~* $1)::float
+                                / count(*) >= $4),
+                       u AS (
+                         UPDATE registry_channels rc SET audience = 'nsfw'
+                         FROM hit
+                         WHERE rc.username = hit.u
+                           AND COALESCE(rc.audience, 'sfw') = 'sfw' AND NOT rc.blocked
+                         RETURNING 1)
+                       SELECT count(*) FROM u""",
+                    ADULT_RX, ADULT_MIN_FILES, ADULT_MIN_HITS, ADULT_MIN_RATIO,
+                    timeout=900)
+            log.info("[audience] marked nsfw: %s by title, %s by file names",
+                     n_title, n_files)
+            async with db_pool.acquire() as conn:
+                n_stats = await conn.fetchval(
+                    """WITH st AS (
+                         SELECT ch.channel_username AS u,
+                                count(*) FILTER (WHERE rr.media_type = 'video') AS v,
+                                count(*) FILTER (WHERE rr.file_name ~* $1) AS rel,
+                                count(*) FILTER (WHERE rr.file_name ~* $2) AS b,
+                                count(*) FILTER (WHERE rr.media_type = 'audio') AS a
+                         FROM registry_resource_channels ch
+                         JOIN registry_resources rr USING (file_unique_id)
+                         WHERE NOT rr.blocked
+                         GROUP BY 1),
+                       u AS (
+                         UPDATE registry_channels rc
+                            SET release_files = st.rel, video_files = st.v,
+                                book_files = st.b, audio_files = st.a,
+                                files_stats_at = NOW()
+                           FROM st WHERE rc.username = st.u
+                         RETURNING 1)
+                       SELECT count(*) FROM u""", RELEASE_RX, BOOK_RX, timeout=900)
+            log.info("[discover] content profile refreshed for %s channels", n_stats)
+        except Exception as e:
+            log.exception("[audience] classifier error: %s", e)
+        await asyncio.sleep(24 * 3600)
 
 
 @app.on_event("shutdown")
@@ -388,8 +488,13 @@ async def contribute(request: Request):
                        VALUES ($1, $2, 'blocked_csam', TRUE, 'csam-keyword')
                        ON CONFLICT (username) DO UPDATE SET
                          blocked = TRUE, audience = 'blocked_csam',
-                         block_reason = 'csam-keyword'""",
-                    username, title)
+                         block_reason = 'csam-keyword'
+                       -- The title is whatever the submitter typed. If only
+                       -- the title matched, it may not override a channel
+                       -- that other instances have independently reported.
+                       WHERE $3 OR (registry_channels.distinct_contributors < 2
+                                    AND NOT registry_channels.verified)""",
+                    username, title, bool(CSAM_RX.search(username)))
                 continue
 
             # Federation-noise reject (news/escort/fan/meme singleton-hash junk).
@@ -402,8 +507,10 @@ async def contribute(request: Request):
                          (username, title, audience, blocked, block_reason)
                        VALUES ($1, $2, 'sfw', TRUE, 'noise-ingest')
                        ON CONFLICT (username) DO UPDATE SET
-                         blocked = TRUE, block_reason = 'noise-ingest'""",
-                    username, title)
+                         blocked = TRUE, block_reason = 'noise-ingest'
+                       WHERE $3 OR (registry_channels.distinct_contributors < 2
+                                    AND NOT registry_channels.verified)""",
+                    username, title, bool(NOISE_RX.search(username)))
                 continue
 
             audience = c.get("audience") or "sfw"
@@ -431,6 +538,7 @@ async def contribute(request: Request):
                        COALESCE(EXCLUDED.media_count, 0)),
                      audience = CASE
                        WHEN registry_channels.audience = 'blocked_csam' THEN 'blocked_csam'
+                       WHEN registry_channels.audience = 'nsfw' THEN 'nsfw'
                        ELSE EXCLUDED.audience END,
                      language = COALESCE(EXCLUDED.language, registry_channels.language),
                      category = COALESCE(EXCLUDED.category, registry_channels.category),
@@ -1110,7 +1218,8 @@ async def get_registry(
     if audience in ("sfw", "nsfw"):
         where.append(f"audience = '{audience}'")
     if only_verified:
-        where.append("verified = TRUE")
+        where.append(f"(verified = TRUE OR "
+                     f"COALESCE(release_files, 0) >= {DISCOVER_MIN_RELEASE_FILES})")
     # Always apply at least the consensus floor (defense vs poison-injection).
     # effective_min is int — injection-safe.
     effective_min = max(min_contributors, REGISTRY_MIN_CONSENSUS)
@@ -1121,7 +1230,7 @@ async def get_registry(
     limit = max(1, min(limit, 20000))
     base_cols = ("username, title, members_count, media_count, audience, "
                 "language, category, distinct_contributors, verified, "
-                "last_seen_at")
+                "last_seen_at, release_files, video_files, book_files, audio_files")
     async with db_pool.acquire() as conn:
         if honeypot_ratio > 0:
             # Suspicious tier: poison the well. Compute split, fetch separately,
@@ -1133,7 +1242,7 @@ async def get_registry(
             real = await conn.fetch(
                 f"SELECT {base_cols} FROM registry_channels "
                 f"WHERE {' AND '.join(where_real)} "
-                f"ORDER BY distinct_contributors DESC, "
+                f"ORDER BY COALESCE(release_files,0) DESC, distinct_contributors DESC, "
                 f"COALESCE(members_count,0) DESC LIMIT {n_real}")
             honey = await conn.fetch(
                 f"SELECT {base_cols} FROM registry_channels "

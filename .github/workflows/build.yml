@@ -52,12 +52,17 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/tgarr-${{ matrix.component }}
           tags: |
-            type=ref,event=branch
+            # Release channels:
+            #   main        -> :edge  (+ :sha-xxxxxxx)   what is being tested
+            #   tag vX.Y.Z  -> :latest, :X.Y.Z, :X.Y    what watchtower installs
+            # A push to main no longer reaches every install; cutting a tag
+            # does, and the previous :X.Y.Z stays available for rollback.
+            type=raw,value=edge,enable={{is_default_branch}}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -67,5 +72,5 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}

@@ -14,6 +14,7 @@ from the `config` table and passes it in via `tmdb_key=`.
 import asyncio
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +26,55 @@ TMDB_IMG = "https://image.tmdb.org/t/p"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 WIKI_REST = "https://en.wikipedia.org/api/rest_v1/page/summary"
 USER_AGENT = "tgarr/0.3 (+https://tgarr.me)"
+
+
+# Returned by lookup() when a source DID answer but nothing it offered is the
+# title we asked about. Distinct from None (nothing found at all): callers
+# should neither attach this metadata nor treat the release as fake.
+UNMATCHED = {"source": "unmatched"}
+
+_NOISE_TOKENS = re.compile(
+    r"(?i)(?<![a-z0-9])(2160p|1080p|1080i|720p|576p|480p|360p|4k|8k|uhd|fhd|hd|sd|hdr|"
+    r"hdr10|dv|web[ ._-]?dl|webrip|web|bluray|blu[ ._-]?ray|bdrip|brrip|hdtv|hdrip|"
+    r"dvdrip|dvd|remux|x264|x265|h264|h265|hevc|avc|av1|aac|ac3|dts|flac|mp4|mkv|avi|"
+    r"mov|ts|rmvb|wmv)(?![a-z0-9])")
+_SCREEN_WORK = re.compile(
+    r"(?i)\b(film|movie|television|tv series|tv show|miniseries|mini-series|anime|"
+    r"documentary|sitcom|web series|drama series|drama|telenovela|animated series|"
+    r"animation|soap opera|ova|short film|serial)\b")
+
+
+def is_junk_title(title: str) -> bool:
+    """True when a parsed 'title' carries no title at all — only resolution /
+    codec / container tokens, digits and punctuation (e.g. "1080P.1080p",
+    "720P.720p", "2026-01.01"). Looking these up finds unrelated works: TMDB
+    really does have a film called "1080p"."""
+    t = _NOISE_TOKENS.sub(" ", title or "")
+    letters = re.sub(r"[\W\d_]+", "", t, flags=re.UNICODE)
+    return len(letters) < 2
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[\W_]+", "", (s or "").lower(), flags=re.UNICODE)
+
+
+def title_matches(query: str, *candidates) -> bool:
+    """Is any candidate the same title as `query`? Equal after stripping
+    punctuation/case, or one contains the other and they are of similar length
+    (>= 60%). 'Kiki' does not match 'Kiki's Delivery Service'."""
+    q = _norm(re.sub(r"[ ._(\[-]+(19|20)\d{2}[)\]]?$", "", (query or "").strip()))
+    if not q:
+        return False
+    for c in candidates:
+        n = _norm(c)
+        if not n:
+            continue
+        if q == n:
+            return True
+        short, long_ = (q, n) if len(q) <= len(n) else (n, q)
+        if short in long_ and len(short) / len(long_) >= 0.6:
+            return True
+    return False
 
 
 class LookupFailed(Exception):
@@ -66,7 +116,14 @@ async def _tmdb_search(category: str, title: str, year: int | None,
     results = data.get("results") or []
     if not results:
         return None
-    hit = results[0]
+    # The first search result is not necessarily our title. Take the first of
+    # the top few whose (localized or original) title really matches.
+    hit = next((h for h in results[:5]
+                if title_matches(title, h.get("title"), h.get("name"),
+                                 h.get("original_title"), h.get("original_name"))),
+               None)
+    if hit is None:
+        return UNMATCHED
     return {
         "source": "tmdb",
         "tmdb_id": hit.get("id"),
@@ -111,6 +168,10 @@ async def _wiki_summary(title: str) -> dict | None:
         raise LookupFailed(f"wiki summary: {e}") from e
     if data.get("type") != "standard":
         return None
+    # Only pages about a screen work. Search happily returns universities,
+    # actors, phones and airports for arbitrary strings.
+    if not _SCREEN_WORK.search(data.get("description") or ""):
+        return UNMATCHED
     thumb = data.get("thumbnail") or {}
     orig = data.get("originalimage") or {}
     return {
@@ -138,14 +199,19 @@ async def _wiki_lookup(category: str, title: str,
         candidates.append(f"{title} {year}")
     candidates.append(title)
 
+    saw_page = False
     for q in candidates:
         wiki_title = await _wiki_search_title(q)
         if not wiki_title:
             continue
+        saw_page = True
+        # "Hibiscus Town (film)" → compare without the disambiguator
+        if not title_matches(title, re.sub(r"\s*\([^)]*\)\s*$", "", wiki_title)):
+            continue
         result = await _wiki_summary(wiki_title)
-        if result and result.get("poster_url"):
+        if result and result is not UNMATCHED and result.get("poster_url"):
             return result
-    return None
+    return UNMATCHED if saw_page else None
 
 
 # ─────────────── Unified entry point ──────────────────────────────────
@@ -160,16 +226,25 @@ async def lookup(category: str, title: str, year: int | None,
     if not title or len(title.strip()) < 2:
         return None
     title = title.strip()
+    if is_junk_title(title):
+        return UNMATCHED
     tmdb_err = None
+    unmatched = False
     if tmdb_key:
         try:
             out = await _tmdb_search(category, title, year, tmdb_key)
         except LookupFailed as e:
             tmdb_err = e
             out = None
-        if out:
+        if out is UNMATCHED:
+            unmatched = True
+        elif out:
             return out
     out = await _wiki_lookup(category, title, year)
-    if out is None and tmdb_err is not None:
+    if out is UNMATCHED:
+        unmatched, out = True, None
+    if out:
+        return out
+    if tmdb_err is not None:
         raise tmdb_err
-    return out
+    return UNMATCHED if unmatched else None

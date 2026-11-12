@@ -18,7 +18,17 @@ from typing import Optional
 
 import qrcode
 from pyrogram import Client
+
+# Pyrogram 2.0.106 hard-codes the pre-2024 channel-id range
+# (MIN_CHANNEL_ID = -1002147483647). Telegram now hands out channel ids above
+# 2^31, and for those every call that addresses the chat by id — get_messages,
+# thumbnails, previews, downloads, backfill — died with "Peer id invalid".
+# Widen the range to the current MTProto limit.
+from pyrogram import utils as _pyro_utils
+if _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
+    _pyro_utils.MIN_CHANNEL_ID = -1007852516352
 from pyrogram.errors import (
+    AuthTokenExpired,
     PhoneCodeInvalid,
     PhoneCodeExpired,
     SessionPasswordNeeded,
@@ -42,6 +52,48 @@ REVOKED_MARKER = os.path.join(SESSION_DIR, ".revoked")
 # sidebar doesn't fall back to @anonymous after a watchtower restart.
 USER_INFO_FILE = os.path.join(SESSION_DIR, "user_info.json")
 
+# The crawler owns the LIVE session file (tgarr.session). The login flow never
+# opens it: every attempt runs against a scratch session and the result is
+# moved into place only once Telegram has actually authorized a user. A QR that
+# is shown but never scanned, a DC migration, or an aborted SMS attempt can
+# therefore no longer rewrite (or half-initialize) the session the crawler is
+# running on.
+LIVE_SESSION = os.path.join(SESSION_DIR, "tgarr.session")
+LOGIN_NAME = "tgarr-login"
+LOGIN_SESSION = os.path.join(SESSION_DIR, LOGIN_NAME + ".session")
+_last_authed = False
+
+
+def _reset_scratch() -> None:
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        p = LOGIN_SESSION + suffix
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception as e:
+                log.warning("[login] remove scratch %s: %s", p, e)
+
+
+def _install_scratch_as_live() -> None:
+    """Atomically promote the authorized scratch session to the live path."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{LOGIN_SESSION}?mode=ro", uri=True, timeout=5)
+    try:
+        row = con.execute("SELECT user_id FROM sessions LIMIT 1").fetchone()
+    finally:
+        con.close()
+    if not (row and row[0]):
+        raise RuntimeError("scratch session has no user_id — not installing")
+    os.replace(LOGIN_SESSION, LIVE_SESSION)   # atomic on the same filesystem
+    for suffix in ("-journal", "-wal", "-shm"):
+        for base in (LIVE_SESSION, LOGIN_SESSION):
+            p = base + suffix
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
 # Singleton state — only one login attempt at a time.
 class LoginState:
     def __init__(self):
@@ -54,6 +106,7 @@ class LoginState:
         self.sms_phone: Optional[str] = None
         self.sms_phone_code_hash: Optional[str] = None
         self.user_info: Optional[dict] = None
+        self.qr_png: Optional[str] = None   # base64 PNG of the CURRENT token
 
     def reset(self):
         self.qr_token = None
@@ -64,6 +117,7 @@ class LoginState:
         self.sms_phone = None
         self.sms_phone_code_hash = None
         self.user_info = None
+        self.qr_png = None
 
 
 state = LoginState()
@@ -106,11 +160,14 @@ def session_exists() -> bool:
     A .revoked marker forces False — the session file may still parse fine
     but the upstream account is gone, so we must re-auth.
     """
+    global _last_authed
     if os.path.exists(REVOKED_MARKER):
+        _last_authed = False
         return False
     import sqlite3
-    path = os.path.join(SESSION_DIR, "tgarr.session")
+    path = LIVE_SESSION
     if not os.path.exists(path) or os.path.getsize(path) == 0:
+        _last_authed = False
         return False
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
@@ -118,69 +175,31 @@ def session_exists() -> bool:
             row = con.execute("SELECT user_id FROM sessions LIMIT 1").fetchone()
         finally:
             con.close()
-        return bool(row and row[0])
+        _last_authed = bool(row and row[0])
+        return _last_authed
+    except sqlite3.OperationalError as e:
+        # Busy/locked = the crawler is writing to it right now. That is not
+        # evidence of "signed out"; keep the last known answer.
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            return _last_authed
+        _last_authed = False
+        return False
     except Exception:
+        _last_authed = False
         return False
 
 
-def _clean_stale_session():
-    """Remove a half-formed/corrupt session file that would block Pyrogram.open().
-
-    Pyrogram's FileStorage.update() calls SELECT FROM version. If the file
-    is 0-byte or missing the version table, that fails and qr_start hangs.
-    Safe because we only run this when session_exists() == False.
-
-    Also purge when .revoked marker is present: file looks structurally
-    valid but its auth_key is dead upstream, so re-login must start clean.
-    """
-    import sqlite3
-    sf = os.path.join(SESSION_DIR, "tgarr.session")
-    if not os.path.exists(sf):
-        return
-    needs_purge = False
-    if os.path.exists(REVOKED_MARKER):
-        needs_purge = True
-    elif os.path.getsize(sf) == 0:
-        needs_purge = True
-    else:
-        try:
-            con = sqlite3.connect(f"file:{sf}?mode=ro", uri=True, timeout=2)
-            try:
-                tables = {r[0] for r in con.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'")}
-            finally:
-                con.close()
-            if "version" not in tables or "sessions" not in tables:
-                needs_purge = True
-        except sqlite3.OperationalError as e:
-            # "database is locked"/busy = the crawler is using the LIVE session
-            # right now. Deleting it here would log the crawler out. Only a
-            # structurally broken file may be purged.
-            needs_purge = "locked" not in str(e).lower() and "busy" not in str(e).lower()
-            if not needs_purge:
-                log.warning("[login] session file busy (%s) — not purging", e)
-        except sqlite3.DatabaseError:
-            needs_purge = True   # not a database / malformed
-        except Exception as e:
-            log.warning("[login] could not inspect session file (%s) — not purging", e)
-    if needs_purge:
-        for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json"):
-            p = os.path.join(SESSION_DIR, fn)
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception as e:
-                    log.warning("clean stale %s: %s", fn, e)
-        log.info("[login] cleaned stale session file before fresh login")
-
-
 async def _ensure_client() -> Client:
-    """Lazy-create + connect Pyrogram client (no auth required for connect)."""
-    # Auto-recover from corrupt empty session files left by aborted attempts
-    _clean_stale_session()
+    """Lazy-create + connect the LOGIN client on a scratch session.
+
+    Never touches the live session file — see LIVE_SESSION / LOGIN_SESSION.
+    """
+    if state.client is not None and not state.client.is_connected:
+        state.client = None
     if state.client is None:
+        _reset_scratch()   # every fresh attempt starts from a clean handshake
         state.client = Client(
-            name="tgarr",
+            name=LOGIN_NAME,
             api_id=API_ID,
             api_hash=API_HASH,
             workdir=SESSION_DIR,
@@ -197,9 +216,9 @@ async def _ensure_client() -> Client:
             except Exception:
                 pass
             state.client = None
-            _clean_stale_session()
+            _reset_scratch()
             state.client = Client(
-                name="tgarr",
+                name=LOGIN_NAME,
                 api_id=API_ID,
                 api_hash=API_HASH,
                 workdir=SESSION_DIR,
@@ -224,6 +243,14 @@ async def _save_user_and_disconnect(user_obj):
             await state.client.disconnect()
         except Exception:
             pass
+    state.client = None
+    try:
+        _install_scratch_as_live()
+    except Exception as e:
+        log.exception("[login] could not install new session: %s", e)
+        state.status = "error"
+        state.message = f"signed in, but saving the session failed: {e}"
+        return
     state.user_info = {
         "id": user_obj.id,
         "username": getattr(user_obj, "username", None),
@@ -244,6 +271,20 @@ async def _save_user_and_disconnect(user_obj):
 
 
 # ─────── QR LOGIN ───────────────────────────────────────────────────
+def _set_qr(token: bytes, expires: int) -> str:
+    """Record the current login token and render its QR. Tokens live ~30s;
+    the poll loop calls this again whenever Telegram hands out a new one so
+    the page can swap the image instead of showing a dead code."""
+    state.qr_token = token
+    state.qr_expires = expires
+    token_b64 = base64.urlsafe_b64encode(token).decode().rstrip("=")
+    img = qrcode.make(f"tg://login?token={token_b64}", box_size=8, border=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    state.qr_png = base64.b64encode(buf.getvalue()).decode()
+    return state.qr_png
+
+
 async def qr_start() -> dict:
     """Start a QR login. Returns base64 PNG of QR + status."""
     if session_exists():
@@ -260,14 +301,8 @@ async def qr_start() -> dict:
         return {"status": "error", "message": state.message}
 
     if isinstance(r, LoginToken):
-        state.qr_token = r.token
-        state.qr_expires = r.expires
-        token_b64 = base64.urlsafe_b64encode(r.token).decode().rstrip("=")
-        qr_url = f"tg://login?token={token_b64}"
-        img = qrcode.make(qr_url, box_size=8, border=2)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        png_b64 = base64.b64encode(buf.getvalue()).decode()
+        png_b64 = _set_qr(r.token, r.expires)
+        qr_url = "tg://login?token=" + base64.urlsafe_b64encode(r.token).decode().rstrip("=")
         state.status = "qr_pending"
         state.message = "scan with Telegram app → Settings → Devices → Link Desktop Device"
         if not state.polling:
@@ -287,6 +322,7 @@ async def qr_start() -> dict:
 async def _qr_poll_loop():
     """Poll ExportLoginToken until success/migrate/timeout. Runs in background."""
     client = state.client
+    restarts = 0
     try:
         for _ in range(120):  # ~4 min
             await asyncio.sleep(2)
@@ -295,6 +331,13 @@ async def _qr_poll_loop():
                     api_id=API_ID, api_hash=API_HASH, except_ids=[]))
             except Exception as e:
                 log.warning("[login] qr poll: %s", e)
+                continue
+            if isinstance(r, LoginToken):
+                # Still waiting. Tokens expire after ~30s and Telegram then
+                # issues a new one — publish it, or the page keeps showing a
+                # code that can no longer be accepted.
+                if r.token != state.qr_token:
+                    _set_qr(r.token, r.expires)
                 continue
             if isinstance(r, LoginTokenSuccess):
                 await _save_user_and_disconnect(r.authorization.user)
@@ -324,6 +367,35 @@ async def _qr_poll_loop():
                     if isinstance(r2, LoginTokenSuccess):
                         await _save_user_and_disconnect(r2.authorization.user)
                         return
+                except AuthTokenExpired:
+                    # The code that was scanned had already run out (typically
+                    # scanned in its last seconds). Don't dead-end the user:
+                    # start over on a clean handshake and show a fresh code.
+                    restarts += 1
+                    if restarts > 3:
+                        state.status = "error"
+                        state.message = "QR code expired — reload the page and scan again"
+                        return
+                    log.info("[login] scanned token had expired — issuing a new QR (%d/3)",
+                             restarts)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    state.client = None
+                    try:
+                        client = await _ensure_client()
+                        r0 = await client.invoke(ExportLoginToken(
+                            api_id=API_ID, api_hash=API_HASH, except_ids=[]))
+                        if isinstance(r0, LoginToken):
+                            _set_qr(r0.token, r0.expires)
+                            state.message = "that code had expired — scan the new one"
+                    except Exception as e:
+                        log.exception("[login] restart after expired token: %s", e)
+                        state.status = "error"
+                        state.message = f"could not issue a new QR: {e}"
+                        return
+                    continue
                 except Exception as e:
                     log.exception("[login] DC migration: %s", e)
                     state.status = "error"
@@ -335,12 +407,26 @@ async def _qr_poll_loop():
         if state.status == "qr_pending":
             state.status = "error"
             state.message = "QR code expired without scan"
+        if state.status != "success":
+            # Abandoned attempt: drop the scratch client + file so nothing
+            # half-authorized lingers on the session volume.
+            try:
+                if client is not None and client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                pass
+            if state.client is client:
+                state.client = None
+            _reset_scratch()
 
 
 def qr_status() -> dict:
-    return {"status": state.status, "message": state.message,
-            "user": state.user_info, "polling": state.polling,
-            "expires_at": state.qr_expires}
+    out = {"status": state.status, "message": state.message,
+           "user": state.user_info, "polling": state.polling,
+           "expires_at": state.qr_expires}
+    if state.status == "qr_pending" and state.qr_png:
+        out["qr_png_base64"] = state.qr_png   # current code; page swaps it in
+    return out
 
 
 # ─────── SMS LOGIN (fallback) ───────────────────────────────────────
@@ -368,6 +454,7 @@ def logout() -> dict:
     state.reset()
     state.client = None
     removed = []
+    _reset_scratch()
     for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json"):
         path = os.path.join(SESSION_DIR, fn)
         if os.path.exists(path):

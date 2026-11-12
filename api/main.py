@@ -28,6 +28,121 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 import login  # local module
 
 
+# ── adult (NSFW) classification ────────────────────────────────────────
+# PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,
+# registry) identical. A channel is NSFW when its title matches
+# ADULT_TITLE_RX, or when >= 8% of its named files / captions (at least
+# 20 of them, at least 5 hits) match ADULT_RX. On live data adult channels
+# score 10-90% and ordinary ones 0-3%.
+ADULT_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동)'
+ADULT_TITLE_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동|反差|熟女|糖心|麻豆|海角|伦理片|91国产|(^|[^a-z])av([^a-z]|$)|adult|erotic)'
+ADULT_MIN_FILES = 20
+ADULT_MIN_HITS = 5
+ADULT_MIN_RATIO = 0.08
+
+
+# ── request guard: cross-site protection + optional credentials ────────
+# tgarr listens on the LAN without a login. Two things follow from that:
+#  1. Any web page open in the user's browser could make that browser send
+#     requests here (sign out, queue downloads, drive Telegram fetches). Those
+#     cross-site requests are refused. Sonarr/Radarr and scripts are not
+#     browsers and are unaffected.
+#  2. Operators who want real access control can set TGARR_API_KEY (required
+#     as apikey= by the Newznab / SABnzbd endpoints the *arrs talk to) and/or
+#     TGARR_UI_PASSWORD (HTTP Basic for the web UI and its API). Both are off
+#     unless set, so an upgrade never locks anyone out.
+_API_KEY = os.environ.get("TGARR_API_KEY", "").strip()
+_UI_PASSWORD = os.environ.get("TGARR_UI_PASSWORD", "").strip()
+_GUARD_OPEN_PATHS = ("/health", "/favicon.svg", "/favicon.ico")
+
+
+def _is_arr_path(path: str) -> bool:
+    return (path == "/api" or path.startswith("/newznab")
+            or path.startswith("/sabnzbd"))
+
+
+def _cross_site(request) -> bool:
+    """True for a request a browser is making on behalf of ANOTHER site."""
+    h = request.headers
+    sfs = (h.get("sec-fetch-site") or "").lower()
+    if sfs:
+        if sfs != "cross-site":
+            return False          # same-origin / same-site / typed-in URL
+        # a plain cross-site link click (top-level navigation, GET) is fine
+        return not (request.method == "GET"
+                    and (h.get("sec-fetch-mode") or "").lower() == "navigate")
+    origin = h.get("origin")
+    if not origin or origin == "null":
+        return False              # non-browser client
+    host = (h.get("x-forwarded-host") or h.get("host") or "").split(",")[0].strip().lower()
+    try:
+        return urllib.parse.urlsplit(origin).netloc.lower() != host
+    except Exception:
+        return True
+
+
+def _ct_equal(a: str, b: str) -> bool:
+    import hmac
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+async def _request_guard(request: Request, call_next):
+    path = request.url.path
+    if path in _GUARD_OPEN_PATHS:
+        return await call_next(request)
+    if _cross_site(request):
+        return PlainTextResponse("cross-site request refused", status_code=403)
+    if _is_arr_path(path):
+        if _API_KEY:
+            given = (request.query_params.get("apikey")
+                     or request.headers.get("x-api-key") or "")
+            if not _ct_equal(given, _API_KEY):
+                return Response(
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<error code="100" description="Incorrect user credentials"/>',
+                    media_type="application/xml", status_code=401)
+    elif _UI_PASSWORD:
+        import base64 as _b64
+        ok = False
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("basic "):
+            try:
+                _user, _, pw = _b64.b64decode(auth[6:]).decode("utf-8", "replace").partition(":")
+                ok = _ct_equal(pw, _UI_PASSWORD)
+            except Exception:
+                ok = False
+        if not ok:
+            return Response("authentication required", status_code=401,
+                            headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
+    return await call_next(request)
+
+
+def _base_url(request) -> str:
+    """Public base URL for links we hand to Sonarr/Radarr/browsers.
+
+    Derived from the request itself (honouring reverse-proxy headers) so the
+    links always point back at whatever address the caller reached us on.
+    TGARR_BASE_URL is only a fallback for requests that carry no Host header:
+    a stale or unset env value used to produce dead or relative links, which
+    made every grab fail.
+    """
+    try:
+        h = request.headers
+        host = (h.get("x-forwarded-host") or h.get("host") or "").split(",")[0].strip()
+        if host and re.fullmatch(r"[A-Za-z0-9._\-\[\]:]+", host):
+            proto = (h.get("x-forwarded-proto") or request.url.scheme or "http")
+            proto = proto.split(",")[0].strip().lower()
+            if proto not in ("http", "https"):
+                proto = "http"
+            return f"{proto}://{host}"
+    except Exception:
+        pass
+    return (os.environ.get("TGARR_BASE_URL") or "").rstrip("/")
+
+
+_GUID_RX = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+
+
 def _js_str(v) -> str:
     """Serialize a Python value as a JS literal safe inside an inline <script>."""
     return (_json.dumps("" if v is None else str(v))
@@ -39,7 +154,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.4"
+TGARR_VERSION = "0.5.5"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -92,6 +207,7 @@ async def meili_search(index: str, q: str, *, limit: int = 60,
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
+app.middleware("http")(_request_guard)   # defined above, next to its helpers
 db_pool: Optional[asyncpg.Pool] = None
 
 
@@ -136,7 +252,20 @@ async def _ebook_queue_restore() -> None:
 async def _startup():
     global db_pool
     db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
-    await _migrate_schema()
+    # The migration takes brief exclusive locks; against a busy crawler it can
+    # lose a deadlock. Retry rather than failing startup.
+    for _attempt in range(1, 7):
+        try:
+            await _migrate_schema()
+            break
+        except (asyncpg.exceptions.DeadlockDetectedError,
+                asyncpg.exceptions.LockNotAvailableError) as e:
+            if _attempt == 6:
+                raise
+            logging.getLogger("tgarr").warning(
+                "schema migration lock conflict (%s) — retry %d/5",
+                type(e).__name__, _attempt)
+            await asyncio.sleep(2 * _attempt)
     # Restore self-user from the session volume so the sidebar shows the real
     # username (not @anonymous) immediately after a restart, before any get_me.
     login.ensure_user_info()
@@ -201,6 +330,10 @@ async def _migrate_schema():
                 dismissed BOOLEAN NOT NULL DEFAULT FALSE
             );
             CREATE INDEX IF NOT EXISTS idx_discovered_audience ON discovered (audience);
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS release_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS video_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS book_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS audio_files INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
@@ -324,6 +457,9 @@ async def _migrate_schema():
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS bytes_done BIGINT NOT NULL DEFAULT 0;
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS speed_kbps INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ;
+            -- category the *arr asked for on add (tv / movies / …); echoed back
+            -- in queue + history so each app only sees its own jobs.
+            ALTER TABLE downloads ADD COLUMN IF NOT EXISTS sab_cat TEXT;
             -- 450px gallery preview (~76KB JPEG) — bigger than 12KB thumb for
             -- lightbox/slideshow. Same lazy-fetch model: '__user_queued__'
             -- marker triggers preview_downloader on next /api/photo-preview hit.
@@ -342,6 +478,22 @@ async def _migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_releases_primary_msg ON releases (primary_msg_id);
             CREATE INDEX IF NOT EXISTS idx_downloads_release ON downloads (release_id);
             CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads (status);
+            -- One-time: metadata used to be taken from the first search result,
+            -- so releases carry posters/titles of unrelated things ("1080p",
+            -- a university, an actress). Clear every attached match and let
+            -- the worker look them up again under the stricter rules. The
+            -- +0.3 score boost a "hit" earned is taken back too.
+            DO $recheck$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM config WHERE key = 'meta_recheck_0_5_5') THEN
+                UPDATE releases
+                   SET metadata_source = NULL, metadata_lookup_at = NULL,
+                       poster_url = NULL, canonical_title = NULL, overview = NULL,
+                       parse_score = GREATEST(COALESCE(parse_score, 0) - 0.3, 0.30)
+                 WHERE metadata_source IN ('tmdb', 'wikipedia');
+                INSERT INTO config (key, value) VALUES ('meta_recheck_0_5_5', 'done')
+                  ON CONFLICT (key) DO NOTHING;
+              END IF;
+            END $recheck$;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -597,7 +749,16 @@ async def _metadata_worker():
                 continue
             current_score = float(row["parse_score"] or 0)
             async with db_pool.acquire() as conn:
-                if result:
+                if result is md.UNMATCHED:
+                    # The sources answered, but not with this title (or the
+                    # "title" is just "1080p"). Attach nothing and judge
+                    # nothing: no poster, no score change, no delete.
+                    await conn.execute("""
+                        UPDATE releases SET metadata_source='unmatched',
+                          metadata_lookup_at=NOW()
+                        WHERE id=$1
+                    """, row["id"])
+                elif result:
                     # TMDB hit — boost parse_score (this IS a real movie/show)
                     new_score = min(1.0, current_score + 0.3)
                     await conn.execute("""
@@ -727,7 +888,7 @@ async def _touch_preview(msg_id: int) -> None:
 async def lazy_thumb(msg_id: int):
     """On-demand thumb materialization. Cached -> serve. Uncached -> mark
     thumb_path='__user_queued__' so crawler thumb_downloader picks it up,
-    poll up to ~12s for the file to land, fallback to 202 + 1x1 GIF.
+    wait briefly (~2.5s) for the file to land, fallback to 202 + 1x1 GIF.
     """
     import asyncio
     async with db_pool.acquire() as conn:
@@ -753,7 +914,10 @@ async def lazy_thumb(msg_id: int):
             msg_id)
         # Wake the crawler's thumb dispatcher instantly (event-driven, no poll).
         await conn.execute("NOTIFY thumb_queued")
-    for _ in range(24):
+    # Short wait only: a browser has ~6 connections per host, and holding
+    # each for 12s made a page of uncached thumbnails feel frozen. The page
+    # script retries placeholders on its own.
+    for _ in range(5):
         await asyncio.sleep(0.5)
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -813,6 +977,9 @@ async def lazy_preview(msg_id: int):
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT preview_path FROM messages WHERE id=$1", msg_id)
+        if not row:      # removed while we waited (stale pointer cleaned up)
+            return Response(_TINY_TRANSPARENT_GIF, status_code=410,
+                            media_type="image/gif")
         pp = row["preview_path"]
         if pp and not pp.startswith("__"):
             fpath = os.path.join(PREVIEWS_DIR, pp)
@@ -1513,6 +1680,22 @@ async def epub_asset(msg_id: int, asset_path: str):
         headers={"Cache-Control": "public, max-age=3600"})
 
 
+async def _tg_flood() -> Optional[dict]:
+    """Active Telegram wait published by the crawler, if any."""
+    try:
+        async with db_pool.acquire() as conn:
+            v = await conn.fetchval("SELECT value FROM config WHERE key='tg_flood'")
+        if not v:
+            return None
+        until_s, _, what = v.partition("|")
+        left = int(float(until_s) - time.time())
+        if left <= 0:
+            return None
+        return {"seconds_left": left, "what": what}
+    except Exception:
+        return None
+
+
 @app.get("/api/media-status/{msg_id}")
 async def media_status(msg_id: int):
     """Lightweight status for /watch page polling.
@@ -1533,7 +1716,8 @@ async def media_status(msg_id: int):
                             "my_dc": my_dc, "cross_dc": cross_dc})
     if not lp or lp == "__user_queued__":
         return JSONResponse({"status": "queued", "bytes": 0, "total": total,
-                            "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
+                            "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc,
+                            "tg_wait": await _tg_flood()})
     path = os.path.join("/downloads", lp)
     bytes_ = os.path.getsize(path) if os.path.exists(path) else 0
     if total and bytes_ >= total:
@@ -1716,8 +1900,9 @@ async function poll() {{
       }}
     }}
     if (j.status === "failed") {{
-      document.getElementById("status").textContent = "✗ download failed";
-      document.getElementById("hint").textContent = "Telegram channel may be invalid or banned";
+      document.getElementById("status").textContent = "✗ could not fetch this file";
+      document.getElementById("hint").textContent =
+        "The source message may have been deleted or the channel is no longer reachable.";
       return;
     }}
     if (j.status === "ready") {{
@@ -1737,7 +1922,16 @@ async function poll() {{
         return;
       }}
     }} else if (j.status === "queued") {{
-      document.getElementById("status").textContent = "queued — waiting for crawler…";
+      if (j.tg_wait && j.tg_wait.seconds_left > 0) {{
+        const mins = Math.max(1, Math.round(j.tg_wait.seconds_left / 60));
+        document.getElementById("status").textContent =
+          "⏸ Telegram asked us to slow down — starts by itself in about " + mins + " min";
+        document.getElementById("hint").textContent =
+          "Your request stays queued. Nothing is wrong with the file or your account; " +
+          "tgarr is waiting instead of pushing, to keep your Telegram account in good standing.";
+      }} else {{
+        document.getElementById("status").textContent = "queued — waiting for crawler…";
+      }}
     }}
   }} catch(e) {{
     document.getElementById("status").textContent = "network error — retrying…";
@@ -1834,6 +2028,7 @@ async function qrStart() {
   window._qrStarted = true;
   const r = await fetch('/api/login/qr/start', {method: 'POST'}).then(r => r.json());
   if (r.qr_png_base64) {
+    window._qrPng = r.qr_png_base64;
     document.getElementById('qrimg').src = 'data:image/png;base64,' + r.qr_png_base64;
     setStatus('qr', r.message, '');
     qrPoll();
@@ -1847,7 +2042,16 @@ async function qrStart() {
 async function qrPoll() {
   while (true) {
     await new Promise(r => setTimeout(r, 2000));
-    const s = await fetch('/api/login/qr/status').then(r => r.json());
+    let s;
+    try {
+      s = await fetch('/api/login/qr/status').then(r => r.json());
+    } catch (e) { continue; }
+    // Login codes expire after ~30s; show whichever one is current.
+    if (s.qr_png_base64 && s.qr_png_base64 !== window._qrPng) {
+      window._qrPng = s.qr_png_base64;
+      document.getElementById('qrimg').src = 'data:image/png;base64,' + s.qr_png_base64;
+      if (s.message) setStatus('qr', s.message, '');
+    }
     if (s.status === 'success') {
       setStatus('qr', s.message + ' — redirecting…', 'ok');
       setTimeout(() => location.href = '/', 1500);
@@ -2440,6 +2644,42 @@ def _user_block() -> str:
     return '<div class="name">not signed in</div><a href="/login">sign in →</a>'
 
 
+# Phones / narrow windows: the 260px sidebar used to eat two thirds of the
+# screen. Below 820px it becomes a compact top bar with a horizontally
+# scrolling icon+label nav, and paddings / the search box shrink to fit.
+MOBILE_CSS = """
+@media (max-width: 820px) {
+  html, body { height:auto; }
+  body { flex-direction:column; font-size:15px; }
+  aside.nav { width:100%; min-width:0; flex-direction:row; align-items:center;
+              border-right:none; border-bottom:1px solid var(--border);
+              position:sticky; top:0; z-index:50; }
+  .brand { padding:8px 12px; border-bottom:none; flex-shrink:0; }
+  .brand .mark { width:26px; height:26px; }
+  .brand .logo { font-size:24px; letter-spacing:-1px; }
+  .brand .logo-row { gap:6px; }
+  .brand .ver { display:none; }
+  .navlinks { display:flex; flex:1; min-width:0; padding:0; overflow-x:auto; overflow-y:hidden;
+              -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+  .navlinks::-webkit-scrollbar { display:none; }
+  .navlink { flex-direction:column; gap:2px; padding:8px 11px; font-size:11px;
+             border-left:none; border-bottom:3px solid transparent; white-space:nowrap; }
+  .navlink.active { border-left-color:transparent; border-bottom-color:var(--accent); }
+  .navlink svg { width:20px; height:20px; }
+  aside.nav .user { display:none; }
+  main.main { min-height:0; }
+  .topbar { height:auto; padding:10px 14px; gap:10px; flex-wrap:wrap; }
+  .topbar h1 { font-size:20px; }
+  .topbar form { margin-left:0 !important; flex:1 1 100%; }
+  .topbar input.search { width:100%; padding:8px 12px; font-size:15px; }
+  .content { padding:16px 12px; overflow-y:visible; }
+  .stats { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; margin-bottom:20px; }
+  table { display:block; overflow-x:auto; max-width:100%; }
+  img, video { max-width:100%; }
+}
+"""
+
+
 def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str] = None,
             top_actions_html: Optional[str] = None) -> str:
     nav = "".join(
@@ -2468,8 +2708,9 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
 <html><head>
 <meta charset="utf-8">
 <title>{html.escape(title)} · tgarr</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-<style>{CSS}</style>
+<style>{CSS}{MOBILE_CSS}</style>
 </head><body>
 <aside class="nav">
   <div class="brand">
@@ -2515,6 +2756,26 @@ async function tgGrab(btn) {{
     setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
   }}
 }}
+</script>
+<script>
+// Thumbnails are fetched on demand. /api/thumb answers a not-ready image with
+// a 1x1 placeholder; keep asking (with backoff) until the real one arrives.
+// A failed thumbnail answers 410, which fires 'error' and shows the fallback.
+(() => {{
+  const MAX = 8;
+  document.addEventListener('load', ev => {{
+    const img = ev.target;
+    if (!(img instanceof HTMLImageElement)) return;
+    if (img.classList.contains('lazy-thumb')) return;   // gallery has its own hook
+    const base = (img.getAttribute('src') || '').split('?')[0];
+    if (!base.startsWith('/api/thumb/')) return;
+    if (img.naturalWidth > 1) {{ img.style.opacity = ''; return; }}
+    img._tgTry = (img._tgTry || 0) + 1;
+    img.style.opacity = '0';
+    if (img._tgTry > MAX) {{ img.dispatchEvent(new Event('error')); return; }}
+    setTimeout(() => {{ img.src = base + '?r=' + Date.now(); }}, 1500 + img._tgTry * 1000);
+  }}, true);
+}})();
 </script>
 </body></html>"""
 
@@ -2826,13 +3087,24 @@ function healthDot(h) {
 async function loadWorkers() {
   const r = await fetch("/api/workers");
   const j = await r.json();
-  const rows = (j.workers || []).map(w => `
-    <tr><td>${healthDot(w.health)}<b>${w.worker}</b></td>
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  // The error counter is lifetime-cumulative. Only an error from the last 24h
+  // is shown as a problem; older ones are greyed out with their age.
+  const rows = (j.workers || []).map(w => {
+    const recent = w.last_error_at &&
+      (Date.now() - new Date(w.last_error_at).getTime()) < 86400000;
+    const errColor = recent ? "#ef4444" : "#94a3b8";
+    const errText = !w.last_error ? "" :
+      (recent ? esc(w.last_error) : `${esc(w.last_error)} · ${fmtAgo(w.last_error_at)}`);
+    return `
+    <tr><td>${healthDot(w.health)}<b>${esc(w.worker)}</b></td>
         <td>${fmtAgo(w.last_seen)}</td>
-        <td style="color:#64748b;font-size:13px">${w.last_action || "—"}</td>
+        <td style="color:#64748b;font-size:13px">${esc(w.last_action) || "—"}</td>
         <td style="text-align:right;color:#64748b">${w.iter_count.toLocaleString()}</td>
-        <td style="text-align:right;color:${w.error_count?"#ef4444":"#64748b"}">${w.error_count}</td>
-        <td style="color:#ef4444;font-size:12px">${w.last_error || ""}</td></tr>`);
+        <td style="text-align:right;color:${w.error_count ? errColor : "#64748b"}"
+            title="lifetime total">${w.error_count}</td>
+        <td style="color:${errColor};font-size:12px">${errText}</td></tr>`; });
   document.getElementById("workersTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
     <th>Worker</th><th>Last seen</th><th>Last action</th>
@@ -2908,11 +3180,11 @@ async def health():
         return JSONResponse({"status": "db_down", "error": type(e).__name__},
                             status_code=503)
     return {"status": "ok", "tgarr": TGARR_VERSION,
-            "authed": login.session_exists()}
+            "authed": login.session_exists(), "tg_wait": await _tg_flood()}
 
 
 @app.get("/")
-async def root(accept: Optional[str] = Header(None)):
+async def root(request: Request, accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow(
             """SELECT (SELECT count(*) FROM channels)                AS channels,
@@ -3119,7 +3391,7 @@ async def root(accept: Optional[str] = Header(None)):
             '</div>'
         )
 
-    base_url = os.environ.get("TGARR_BASE_URL") or "http://&lt;host&gt;:8765"
+    base_url = html.escape(_base_url(request)) or "http://&lt;host&gt;:8765"
 
     body = f"""
 {worker_banner}
@@ -3419,8 +3691,20 @@ async def page_channels(min_members: int = 500,
 # ════════════════════════════════════════════════════════════════════
 # Page: Discover (registry-pulled channels awaiting subscription)
 # ════════════════════════════════════════════════════════════════════
+def _profile_pills(r) -> str:
+    """Small pills saying what a discovered channel carries."""
+    out = []
+    for col, label in (("release_files", "🎬 {n} releases"),
+                       ("book_files", "📚 {n} books"),
+                       ("audio_files", "🎵 {n} tracks")):
+        n = r[col] or 0
+        if n > 0:
+            out.append(f'<span class="pill accent">{label.format(n=f"{n:,}")}</span>')
+    return "".join(out)
+
+
 @app.get("/discover", response_class=HTMLResponse)
-async def page_discover(audience: str = "sfw"):
+async def page_discover(audience: str = "sfw", kind: str = ""):
     async with db_pool.acquire() as conn:
         # Auth check
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
@@ -3435,13 +3719,24 @@ async def page_discover(audience: str = "sfw"):
         where = ["dismissed = FALSE"]
         if audience in ("sfw", "nsfw"):
             where.append(f"audience = '{audience}'")
+        # What the channel actually carries, per the registry's content
+        # profile. Default view leads with movie/TV release channels — the
+        # reason most people install tgarr — instead of with whatever the
+        # most instances happened to have seen.
+        kind = kind if kind in ("video", "books", "music") else ""
+        kind_col = {"video": "release_files", "books": "book_files",
+                    "music": "audio_files"}.get(kind)
+        if kind_col:
+            where.append(f"COALESCE({kind_col}, 0) > 0")
+        order = (f"COALESCE({kind_col}, 0) DESC, " if kind_col
+                 else "COALESCE(release_files, 0) DESC, ")
         rows = await conn.fetch(f"""
             SELECT username, title, members_count, media_count, audience,
                    language, category, distinct_contributors, verified,
-                   last_pulled_at
+                   last_pulled_at, release_files, video_files, book_files, audio_files
             FROM discovered
             WHERE {' AND '.join(where)}
-            ORDER BY verified DESC, distinct_contributors DESC,
+            ORDER BY {order} verified DESC, distinct_contributors DESC,
                      COALESCE(members_count, 0) DESC
             LIMIT 200
         """)
@@ -3487,6 +3782,7 @@ async def page_discover(audience: str = "sfw"):
             f'<div class="meta">'
             f'{verified_pill}'
             f'<span class="pill accent">👥 {members}</span>'
+            f'{_profile_pills(r)}'
             f'<span class="pill muted">{r["media_count"] or 0} media</span>'
             f'<span class="pill muted">{r["audience"]}</span>'
             f'<span>· seen by {r["distinct_contributors"] or 1} instances</span>'
@@ -3495,6 +3791,19 @@ async def page_discover(audience: str = "sfw"):
             f'</div>'
         )
 
+    def _kc(val, label):
+        on = kind == val
+        st = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
+              "border-color:var(--accent);") if on else ""
+        q = [f"kind={val}"] if val else []
+        if audience != "sfw":
+            q.append(f"audience={audience}")
+        href = "/discover" + ("?" + "&".join(q) if q else "")
+        return (f'<a class="btn ghost" href="{href}" '
+                f'style="{st}padding:5px 12px;font-size:12px">{label}</a>')
+    _kind_chips = (_kc("", "All") + _kc("video", "🎬 Movies &amp; TV")
+                   + _kc("books", "📚 Books") + _kc("music", "🎵 Music"))
+
     body = (
         f'<h2 class="section">Discover <span class="count">'
         f'{len(rows)} of {total} from registry.tgarr.me</span>'
@@ -3502,7 +3811,8 @@ async def page_discover(audience: str = "sfw"):
            f'last pull {_fmt_time(last_pull)}</span>'
            if last_pull else '')
         + '</h2>'
-        '<div style="margin-bottom:18px;display:flex;gap:8px">'
+        '<div style="margin-bottom:18px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        + _kind_chips +
         '  <button type="button" class="ghost" id="tgPullBtn" style="font-size:13px" onclick="tgRegistryPull(this)">↻ Pull now</button>'
         '  <span id="tgPullToast" style="font-size:13px;color:var(--muted);align-self:center;display:none"></span>'
         '</div>'
@@ -3628,11 +3938,14 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     # CSAM hard-block — overrides every setting, always.
     where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
 
-    # Same-DC filter (DEFAULT ON): the photo library is huge and cross-DC
-    # fetches are slow + FloodWait-prone, so by default show only images on the
-    # client's own DC (fast path). ?dc=all shows every DC.
+    # Every DC by default. Restricting the gallery to the account's own DC used
+    # to be the default because each cross-DC image cost a fresh media session
+    # and authorization; with cached per-DC sessions that cost is gone, and the
+    # restriction hid most of the library (about 9 in 10 photos on a typical
+    # install). ?dc=mine is the opt-in "my DC only" filter.
     my_dc = await _get_my_dc()
-    same_dc_only = (dc != "all") and bool(my_dc)
+    same_dc_only = (dc == "mine") and bool(my_dc)
+    _dc_q = "&dc=mine" if same_dc_only else ""
     if same_dc_only:
         params.append(my_dc)
         where.append(f"m.file_dc = ${len(params)}")
@@ -3694,12 +4007,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         label = title or f"@{uname}"
         if len(label) > 18:
             label = label[:16] + '…'
-        return (f'<a class="btn ghost" href="/gallery?channel={uname}" '
+        return (f'<a class="btn ghost" href="/gallery?channel={_q(uname or "")}{_dc_q}" '
                 f'style="{bg}padding:5px 12px;font-size:12px">'
                 f'{html.escape(label)} <span style="opacity:0.6">{n:,}</span></a>')
 
     ch_chips = (
-        '<a class="btn ghost" href="/gallery" style="' +
+        f'<a class="btn ghost" href="/gallery{"?dc=mine" if same_dc_only else ""}" style="' +
         ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
          'border-color:var(--accent);' if not channel else '') +
         'padding:5px 12px;font-size:12px">all</a>' +
@@ -3708,20 +4021,19 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     # DC toggle: same-DC (fast) ⇄ all DCs. Preserves the channel filter.
     dc_toggle = ''
     if my_dc:
-        _ch = f"&channel={channel}" if channel else ""
+        _ch = f"&channel={_q(channel)}" if channel else ""
         if same_dc_only:
             dc_toggle = (
                 f'<a class="btn ghost" href="/gallery?dc=all{_ch}" '
                 f'style="padding:5px 12px;font-size:12px;'
                 f'background:rgba(16,185,129,0.15);color:#10b981;border-color:#10b981" '
-                f'title="showing only your DC {my_dc} (fast). Click to show all DCs.">'
+                f'title="showing only your DC {my_dc}. Click to show all DCs.">'
                 f'● DC {my_dc} only</a>')
         else:
-            _ch2 = f"?channel={channel}" if channel else ""
             dc_toggle = (
-                f'<a class="btn ghost" href="/gallery{_ch2}" '
+                f'<a class="btn ghost" href="/gallery?dc=mine{_ch}" '
                 f'style="padding:5px 12px;font-size:12px" '
-                f'title="showing all DCs. Click to show only your DC {my_dc} (fast).">'
+                f'title="showing all DCs. Click to show only your DC {my_dc}.">'
                 f'all DCs</a>')
     ch_chips_html = (
         '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">'
@@ -3940,6 +4252,16 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
             " * CASE WHEN m.audio_cover_url IS NOT NULL THEN 1.2 ELSE 1.0 END "
             " * CASE WHEN m.audio_duration_sec >= 60 THEN 1.0 "
             "        WHEN m.audio_duration_sec >= 20 THEN 0.5 ELSE 0.2 END "
+            # Actual audio quality: lossless containers first, then the
+            # average bitrate implied by size / duration (kbit/s).
+            " * CASE WHEN m.file_name ~* '\.(flac|ape|wav|alac|aiff?|dsf|wv)$' "
+            "             OR m.mime_type ~* '(flac|wav|x-ape|aiff)' THEN 1.25 "
+            "        WHEN COALESCE(m.audio_duration_sec, 0) < 20 "
+            "             OR COALESCE(m.file_size, 0) = 0 THEN 1.0 "
+            "        WHEN m.file_size * 8.0 / 1000 / m.audio_duration_sec >= 256 THEN 1.15 "
+            "        WHEN m.file_size * 8.0 / 1000 / m.audio_duration_sec >= 160 THEN 1.0 "
+            "        WHEN m.file_size * 8.0 / 1000 / m.audio_duration_sec >= 96  THEN 0.85 "
+            "        ELSE 0.7 END "
             ") DESC NULLS LAST, m.posted_at DESC NULLS LAST"
         ),
         "recent":   "m.posted_at DESC NULLS LAST",
@@ -4011,7 +4333,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips_html = (
-        _music_sort_chip("quality", "★ Quality") +
+        _music_sort_chip("quality", "★ Best") +
         _music_sort_chip("recent",  "Recent") +
         _music_sort_chip("longest", "Longest") +
         _music_sort_chip("size",    "Largest"))
@@ -4234,7 +4556,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips = (
-        _sort_chip("quality", "★ Quality") +
+        _sort_chip("quality", "★ Best") +
         _sort_chip("recent",  "Recent") +
         _sort_chip("size",    "Largest") +
         _sort_chip("title",   "Title"))
@@ -4966,7 +5288,7 @@ async def page_search(q: Optional[str] = None,
 # Page: Settings
 # ════════════════════════════════════════════════════════════════════
 @app.get("/settings", response_class=HTMLResponse)
-async def page_settings():
+async def page_settings(request: Request):
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
     async with db_pool.acquire() as conn:
@@ -5033,7 +5355,7 @@ async def page_settings():
     <div class="icon">🔌</div>
     <div class="info"><div class="name">Newznab indexer URL</div>
       <div class="meta">Paste into Sonarr / Radarr → Settings → Indexers → ➕ Newznab</div></div>
-    <div class="right"><code>{os.environ.get("TGARR_BASE_URL","")}/newznab/</code></div>
+    <div class="right"><code>{html.escape(_base_url(request))}/newznab/</code></div>
   </div>
   <div class="dl-item">
     <div class="icon">⬇</div>
@@ -5166,8 +5488,8 @@ CAPS_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
   <limits max="200" default="50"/>
   <searching>
     <search          available="yes" supportedParams="q"/>
-    <tv-search       available="yes" supportedParams="q,season,ep,tvdbid,rid"/>
-    <movie-search    available="yes" supportedParams="q,imdbid,tmdbid"/>
+    <tv-search       available="yes" supportedParams="q,season,ep"/>
+    <movie-search    available="yes" supportedParams="q"/>
     <audio-search    available="no"  supportedParams="q"/>
     <book-search     available="no"  supportedParams="q"/>
   </searching>
@@ -5183,6 +5505,9 @@ CAPS_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
       <subcat id="5040" name="TV/HD"/>
       <subcat id="5045" name="TV/UHD"/>
       <subcat id="5070" name="TV/Anime"/>
+    </category>
+    <category id="8000" name="Other">
+      <subcat id="8010" name="Other/Misc"/>
     </category>
   </categories>
 </caps>"""
@@ -5203,7 +5528,29 @@ def _category_id(rel) -> str:
         if "1080" in q or "720" in q:
             return "5040"
         return "5030"
-    return "0"
+    return "8010"   # not classified as movie/tv → Other/Misc (0 is not a category)
+
+
+def _cats_to_filter(cat: Optional[str]):
+    """Map a Newznab `cat=` list to (allow_movie, allow_tv, allow_other).
+    None = caller did not restrict categories."""
+    if not cat:
+        return None
+    movie = tv = other = False
+    for c in cat.split(","):
+        c = c.strip()
+        if not c.isdigit():
+            continue
+        n = int(c)
+        if 2000 <= n < 3000:
+            movie = True
+        elif 5000 <= n < 6000:
+            tv = True
+        elif n >= 7000 or n == 0:
+            other = True
+    if not (movie or tv or other):
+        return None
+    return movie, tv, other
 
 
 # Series alias map: rewrite non-English release names to the canonical
@@ -5212,8 +5559,38 @@ def _category_id(rel) -> str:
 #
 # `_series_aliases_cache` is loaded from DB on first use + refreshed every
 # 60s. Lookup is substring match against release.name; first hit wins.
-_series_aliases_cache: list = []  # list of (alias_text, canonical_title, season)
+_series_aliases_cache: list = []  # list of (alias_text, canonical_title, season, kind)
 _series_aliases_loaded_at: float = 0.0
+
+
+def _alias_ok(alias: str) -> bool:
+    """Is this alias specific enough to be matched against release names?
+
+    Sonarr/Radarr alternateTitles contain junk ("1", "2", "U", "T2", "Ov").
+    Matched as plain substrings they renamed almost every release in the feed
+    (anything containing a "2" became "Swapped"). Reject: empty, digits-only,
+    and short aliases — under 4 chars when ASCII-only, under 2 otherwise.
+    """
+    a = (alias or "").strip()
+    if not a or a.isdigit():
+        return False
+    if a.isascii():
+        return len(re.sub(r"[^A-Za-z0-9]", "", a)) >= 4
+    return len(a) >= 2
+
+
+def _alias_in_name(alias: str, raw: str) -> bool:
+    """True if `alias` occurs in `raw` as a whole token run — not glued to a
+    neighbouring letter/digit/CJK character on either side."""
+    i = raw.find(alias)
+    while i != -1:
+        before = raw[i - 1] if i > 0 else ""
+        j = i + len(alias)
+        after = raw[j] if j < len(raw) else ""
+        if not (before.isalnum() or after.isalnum()):
+            return True
+        i = raw.find(alias, i + 1)
+    return False
 
 
 async def _refresh_series_aliases():
@@ -5224,10 +5601,11 @@ async def _refresh_series_aliases():
         return
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT alias_text, canonical_title, season FROM series_aliases "
+            "SELECT alias_text, canonical_title, season, kind FROM series_aliases "
             "ORDER BY length(alias_text) DESC")  # longest first → specific beats general
     _series_aliases_cache = [
-        (r["alias_text"], r["canonical_title"], r["season"]) for r in rows]
+        (r["alias_text"], r["canonical_title"], r["season"], r["kind"] or "tv")
+        for r in rows if _alias_ok(r["alias_text"])]
     _series_aliases_loaded_at = time.time()
 
 
@@ -5238,12 +5616,28 @@ def _rewrite_release_title_sync(r, my_dc=None) -> str:
     raw = r["name"] or ""
     file_dc = r["file_dc"] if hasattr(r, "__getitem__") and "file_dc" in (r.keys() if hasattr(r, "keys") else []) else None
     dc_tag = f"-dc{file_dc}" if file_dc else ""
-    for alias_text, canonical, season in _series_aliases_cache:
-        if alias_text in raw:
-            ep = r["episode"] or 1
+    for alias_text, canonical, season, kind in _series_aliases_cache:
+        if alias_text in raw and _alias_in_name(alias_text, raw):
+            if kind == "movie" and r["category"] == "tv":
+                continue   # a movie's alias must not rename a TV episode
+            if kind != "movie" and r["category"] == "movie":
+                continue
+            # Only state what the release actually told us. A missing quality
+            # is left out (the *arr parses it as Unknown) rather than being
+            # advertised as 1080p.
+            qual = f".{r['quality']}" if r["quality"] else ""
+            canon = re.sub(r"\s+", ".", canonical.strip())
+            if kind == "movie" or r["category"] == "movie":
+                yr = r["movie_year"] if "movie_year" in r.keys() else None
+                yr_s = f".{int(yr)}" if yr else ""
+                return f"{canon}{yr_s}{qual}.WEBRip-tgarr{dc_tag}"
+            if r["episode"] is None:
+                # An alias hit with no parsed episode is not a single episode;
+                # don't claim E01. Expose it under its own name instead.
+                break
             seas = season if season is not None else (r["season"] or 1)
-            qual = r["quality"] or "1080p"
-            return f"{canonical}.S{int(seas):02d}E{int(ep):02d}.{qual}.WEBRip-tgarr{dc_tag}"
+            return (f"{canon}.S{int(seas):02d}E{int(r['episode']):02d}"
+                    f"{qual}.WEBRip-tgarr{dc_tag}")
     # No alias match — append DC tag to raw name so multi-DC duplicates differ
     if dc_tag and file_dc:
         return f"{raw}.tgarr{dc_tag}"
@@ -5254,9 +5648,14 @@ def _expand_inbound_query(q: str) -> list:
     """Inbound: Sonarr searches 'A Bite of China'. Return all alias variants
     so SQL ILIKE matches Chinese releases too. Always includes the original."""
     variants = {q}
-    ql = q.lower()
-    for alias_text, canonical, _ in _series_aliases_cache:
-        if canonical.lower() in ql or ql in canonical.lower():
+    ql = " ".join(q.lower().split())
+    # The canonical title must BE the query (optionally followed by a year).
+    # Substring matching in either direction made short queries ("her", "up",
+    # "it") pull in the aliases of every title containing those letters.
+    ql_noyear = re.sub(r"\s+(19|20)\d{2}$", "", ql)
+    for alias_text, canonical, _s, _k in _series_aliases_cache:
+        cl = " ".join(canonical.lower().split())
+        if cl == ql or cl == ql_noyear:
             variants.add(alias_text)
     return list(variants)
 
@@ -5306,7 +5705,8 @@ async def _arr_alias_sync_worker():
                         season = alt.get("seasonNumber")
                         if season is not None and season < 0:
                             season = None
-                        aliases.append((alias_text, canonical, season, kind, app_name, ext_id))
+                        if _alias_ok(alias_text):
+                            aliases.append((alias_text, canonical, season, kind, app_name, ext_id))
                 if aliases:
                     async with db_pool.acquire() as conn:
                         await conn.executemany(
@@ -5338,7 +5738,8 @@ def _item_xml(r, base_url: str, apikey: str, my_dc=None) -> str:
     link_text = html.escape(link)
     link_attr = html.escape(link, quote=True)
     pubdate = (r["posted_at"].strftime("%a, %d %b %Y %H:%M:%S +0000")
-               if r["posted_at"] else "")
+               if r["posted_at"]
+               else time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(0)))
     size = r["size_bytes"] or 0
     cat_id = _category_id(r)
     title = html.escape(_rewrite_release_title_sync(r, my_dc=my_dc))
@@ -5360,7 +5761,16 @@ def _item_xml(r, base_url: str, apikey: str, my_dc=None) -> str:
     )
 
 
-def _feed_envelope(items_xml: str, title: str, base_url: str) -> str:
+def _newznab_error(code: int, desc: str, status: int = 200) -> Response:
+    """Newznab-style error document (the *arrs expect XML, not plain text)."""
+    return Response(
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<error code="{code}" description="{html.escape(desc, quote=True)}"/>',
+        media_type="application/xml", status_code=status)
+
+
+def _feed_envelope(items_xml: str, title: str, base_url: str,
+                   offset: int = 0, total: int = 0) -> str:
     return (
         f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         f"<rss version=\"2.0\" xmlns:newznab=\"http://www.newznab.com/DTD/2010/feeds/attributes/\">\n"
@@ -5368,6 +5778,7 @@ def _feed_envelope(items_xml: str, title: str, base_url: str) -> str:
         f"    <title>tgarr</title>\n"
         f"    <description>{html.escape(title)}</description>\n"
         f"    <link>{base_url}/newznab/api</link>\n"
+        f"    <newznab:response offset=\"{offset}\" total=\"{total}\"/>\n"
         f"{items_xml}\n"
         f"  </channel>\n"
         f"</rss>"
@@ -5377,6 +5788,7 @@ def _feed_envelope(items_xml: str, title: str, base_url: str) -> str:
 @app.get("/newznab/api", response_class=PlainTextResponse)
 @app.get("/newznab", response_class=PlainTextResponse)
 async def newznab_api(
+    request: Request,
     t: str = Query("search"),
     q: Optional[str] = Query(None),
     season: Optional[int] = None,
@@ -5390,9 +5802,11 @@ async def newznab_api(
     apikey: Optional[str] = "tgarr",
     id: Optional[str] = None,
 ):
-    base_url = os.environ.get("TGARR_BASE_URL", "")
+    base_url = _base_url(request)
     if t == "caps":
         return Response(CAPS_XML, media_type="application/xml")
+    if t not in ("search", "tvsearch", "movie", "get"):
+        return _newznab_error(202, f"No such function ({t})")
 
     if t == "get":
         return await _handle_grab(id)
@@ -5403,14 +5817,25 @@ async def newznab_api(
 
     # If Sonarr/Radarr passed tvdbid/tmdbid (the canonical way they query),
     # resolve to canonical_title via series_aliases.external_id then synthesize q.
-    if not q and (tvdbid or tmdbid):
+    # IDs are no longer advertised in caps (so the *arrs send q=<title>), but
+    # still honoured when a client sends one. An ID we cannot resolve must
+    # return an EMPTY feed — falling through used to return the newest
+    # releases of the whole category as if they matched.
+    if not q and (tvdbid or tmdbid or imdbid):
+        canonical = None
         ext_id = tvdbid or tmdbid
-        async with db_pool.acquire() as conn:
-            canonical = await conn.fetchval(
-                "SELECT canonical_title FROM series_aliases "
-                "WHERE external_id = $1 LIMIT 1", int(ext_id))
-        if canonical:
-            q = canonical
+        if ext_id and str(ext_id).isdigit():
+            kind = "tv" if tvdbid else "movie"
+            async with db_pool.acquire() as conn:
+                canonical = await conn.fetchval(
+                    "SELECT canonical_title FROM series_aliases "
+                    "WHERE external_id = $1 AND kind = $2 LIMIT 1",
+                    int(ext_id), kind)
+        if not canonical:
+            return Response(
+                _feed_envelope("", f"search t={t} (unresolved id)", base_url),
+                media_type="application/xml")
+        q = canonical
 
     where_parts = ["1=1"]
     params = []
@@ -5441,6 +5866,29 @@ async def newznab_api(
             where_parts.append(f"r.episode = ${len(params)}")
     elif t == "movie":
         where_parts.append("r.category = 'movie'")
+    else:
+        # Generic search / RSS sync. Honour the categories the client asked
+        # for. With no cat= at all, serve movies + TV only: unclassified
+        # releases are opt-in (cat=8000) so they don't flood an *arr's feed.
+        cf = _cats_to_filter(cat) or (True, True, False)
+        allowed = [c for c, on in zip(("movie", "tv"), cf[:2]) if on]
+        conds = []
+        if allowed:
+            conds.append("r.category IN (" + ",".join(f"'{c}'" for c in allowed) + ")")
+        if cf[2]:
+            conds.append("(r.category IS NULL OR r.category NOT IN ('movie','tv'))")
+        where_parts.append("(" + " OR ".join(conds) + ")")
+
+    # Adult content never goes to an *arr unless the operator opts in
+    # (config key newznab_nsfw=true). Two layers: the channel's audience, and
+    # the release name itself for adult posts inside otherwise mixed channels.
+    async with db_pool.acquire() as conn:
+        _nz_nsfw = (await conn.fetchval(
+            "SELECT value FROM config WHERE key='newznab_nsfw'") or "").lower() == "true"
+    if not _nz_nsfw:
+        where_parts.append("COALESCE(c.audience, 'sfw') NOT IN ('nsfw', 'blocked_csam')")
+        params.append(ADULT_RX)
+        where_parts.append(f"r.name !~* ${len(params)}")
 
     limit_val = max(1, min(limit, 200))
     _release_my_dc = await _get_my_dc()
@@ -5450,8 +5898,9 @@ async def newznab_api(
     # by file_unique_id — each is a valid alternative source).
     sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, "
           f"r.quality, r.source, r.codec, r.size_bytes, r.posted_at, "
-          f"m.file_dc "
+          f"r.movie_year, m.file_dc, count(*) OVER() AS _total "
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
+          f"LEFT JOIN channels c ON c.id = m.channel_id "
           f"WHERE {' AND '.join(where_parts)} "
           f"ORDER BY (CASE WHEN m.file_dc = ${len(params)+1} THEN 0 ELSE 1 END), "
           f"  r.posted_at DESC NULLS LAST "
@@ -5462,20 +5911,24 @@ async def newznab_api(
 
     items = "\n".join(_item_xml(r, base_url, apikey or "tgarr",
                                  my_dc=_release_my_dc) for r in rows)
+    total = rows[0]["_total"] if rows else 0
     return Response(
-        _feed_envelope(items, f"search t={t} q={q or ''}", base_url),
+        _feed_envelope(items, f"search t={t} q={q or ''}", base_url,
+                       offset=max(0, offset), total=total),
         media_type="application/xml",
     )
 
 
 async def _handle_grab(guid: Optional[str]) -> Response:
     if not guid:
-        return Response("missing id", status_code=400)
+        return _newznab_error(200, "Missing parameter (id)", 400)
+    if not _GUID_RX.fullmatch(guid):
+        return _newznab_error(300, "No such item", 404)
     async with db_pool.acquire() as conn:
         rel = await conn.fetchrow(
             "SELECT id, name FROM releases WHERE guid = $1", guid)
         if not rel:
-            return Response("release not found", status_code=404)
+            return _newznab_error(300, "No such item", 404)
         await conn.execute(
             """INSERT INTO downloads (release_id, status)
                SELECT $1, 'pending'
@@ -5586,7 +6039,9 @@ async def _sab_queue():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT d.id, d.status, r.name, r.size_bytes, r.guid,
-                      d.bytes_done, d.speed_kbps, d.last_progress_at
+                      d.bytes_done, d.speed_kbps, d.last_progress_at,
+                      COALESCE(d.sab_cat,
+                               CASE r.category WHEN 'movie' THEN 'movies' ELSE 'tv' END) AS sab_cat
                FROM downloads d JOIN releases r ON r.id = d.release_id
                WHERE d.status IN ('pending','downloading')
                ORDER BY d.requested_at""")
@@ -5606,7 +6061,7 @@ async def _sab_queue():
         slots.append({
             "nzo_id": f"tgarr-{r['guid']}",
             "filename": r["name"],
-            "cat": "tv",
+            "cat": r["sab_cat"],
             "status": "Downloading" if r["status"] == "downloading" else "Queued",
             "mb": f"{size_b/1048576:.1f}",
             "mbleft": f"{left_b/1048576:.1f}",
@@ -5646,14 +6101,22 @@ async def _sab_history():
         # is newer — once a release has been successfully downloaded, that's
         # the authoritative state for CDH. Otherwise newer failure wins.
         rows = await conn.fetch(
-            """SELECT DISTINCT ON (d.release_id)
-                      d.id, d.status, d.local_path, d.finished_at,
-                      r.name, r.size_bytes, r.guid, d.error_message
-               FROM downloads d JOIN releases r ON r.id = d.release_id
-               WHERE d.status IN ('completed','failed')
-               ORDER BY d.release_id,
-                        CASE d.status WHEN 'completed' THEN 0 ELSE 1 END,
-                        d.id DESC NULLS LAST
+            """SELECT * FROM (
+                 SELECT DISTINCT ON (d.release_id)
+                        d.id, d.status, d.local_path, d.finished_at,
+                        r.name, r.size_bytes, r.guid, d.error_message,
+                        COALESCE(d.sab_cat,
+                                 CASE r.category WHEN 'movie' THEN 'movies' ELSE 'tv' END) AS sab_cat
+                 FROM downloads d JOIN releases r ON r.id = d.release_id
+                 WHERE d.status IN ('completed','failed')
+                 ORDER BY d.release_id,
+                          CASE d.status WHEN 'completed' THEN 0 ELSE 1 END,
+                          d.id DESC NULLS LAST
+               ) h
+               -- newest first: the old LIMIT ran over release_id order, so
+               -- once there were 200+ rows new completions never appeared and
+               -- were never imported.
+               ORDER BY h.finished_at DESC NULLS LAST, h.id DESC
                LIMIT 200""")
     slots = []
     for r in rows:
@@ -5666,7 +6129,7 @@ async def _sab_history():
             storage = "/downloads/tgarr"
         slots.append({
             "nzo_id": f"tgarr-{r['guid']}",
-            "name": r["name"], "category": "tv",
+            "name": r["name"], "category": r["sab_cat"],
             "storage": storage,
             "status": "Completed" if r["status"] == "completed" else "Failed",
             "size": f"{size_mb:.1f} MB",
@@ -5691,25 +6154,26 @@ async def _sab_addurl(url: str, nzbname: Optional[str], cat: Optional[str]):
     elif re.fullmatch(r"[0-9a-f-]{36}", url or ""):
         # Caller passed bare guid (from addfile NZB-body parse path).
         guid = url
-    if not guid:
+    if not guid or not _GUID_RX.fullmatch(guid):
         return {"status": False, "error": "no guid in url"}
+    sab_cat = (cat or "").strip()[:40] or None
     async with db_pool.acquire() as conn:
         rel = await conn.fetchrow("SELECT id FROM releases WHERE guid = $1", guid)
         if not rel:
             return {"status": False, "error": "release not found"}
         await conn.execute(
-            """INSERT INTO downloads (release_id, status)
-               SELECT $1, 'pending'
+            """INSERT INTO downloads (release_id, status, sab_cat)
+               SELECT $1, 'pending', $2
                WHERE NOT EXISTS (
                  SELECT 1 FROM downloads
                  WHERE release_id = $1
                    AND status IN ('pending','downloading','completed')
-               )""", rel["id"])
+               )""", rel["id"], sab_cat)
     return {"status": True, "nzo_ids": [f"tgarr-{guid}"]}
 
 
 async def _sab_delete(nzo_id: str):
-    if not nzo_id.startswith("tgarr-"):
+    if not nzo_id.startswith("tgarr-") or not _GUID_RX.fullmatch(nzo_id[6:]):
         return {"status": False, "error": "bad nzo_id"}
     guid = nzo_id[6:]
     async with db_pool.acquire() as conn:
