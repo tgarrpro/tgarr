@@ -975,19 +975,37 @@ async def channel_resources(request: Request):
     if not channel or not USERNAME_RX.match(channel):
         raise HTTPException(400, "invalid channel_username")
     try:
-        limit = min(int(body.get("limit") or 50000), 100000)
+        limit = min(int(body.get("limit") or CHANNEL_LIST_MAX), CHANNEL_LIST_MAX)
     except (TypeError, ValueError):
-        limit = 50000
+        limit = CHANNEL_LIST_MAX
+    return await _channel_file_list(channel, limit)
+
+
+# How many files one answer may carry. The median channel has ~1,400; a few
+# have over 100,000, and one such answer is ~20 MB. The newest few thousand
+# are what a new follower looks at; the rest arrives when the channel is read.
+CHANNEL_LIST_MAX = int(os.environ.get("CHANNEL_LIST_MAX", "5000"))
+
+
+async def _channel_file_list(channel: str, limit: int) -> dict:
+    """The newest files installs have reported for a public channel. Nothing
+    from a blocked channel, and no blocked file, is ever handed out."""
+    limit = max(1, min(int(limit), CHANNEL_LIST_MAX))
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT rc.file_unique_id, rc.msg_id, rc.posted_at,
-                   r.file_name, r.file_size, r.mime_type, r.media_type
-            FROM registry_resource_channels rc
-            JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
-            WHERE rc.channel_username = $1 AND rc.msg_id IS NOT NULL
-            ORDER BY rc.msg_id DESC
-            LIMIT $2
-        """, channel, limit)
+        if await conn.fetchval(
+                "SELECT 1 FROM registry_channels WHERE lower(username) = lower($1) "
+                "AND (blocked OR audience = 'blocked_csam')", channel):
+            rows = []
+        else:
+            rows = await conn.fetch("""
+                SELECT rc.file_unique_id, rc.msg_id, rc.posted_at,
+                       r.file_name, r.file_size, r.mime_type, r.media_type
+                FROM registry_resource_channels rc
+                JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
+                WHERE rc.channel_username = $1 AND rc.msg_id IS NOT NULL AND NOT r.blocked
+                ORDER BY rc.msg_id DESC
+                LIMIT $2
+            """, channel, limit)
     return {"status": "ok", "channel_username": channel, "count": len(rows),
             "resources": [{
                 "file_unique_id": r["file_unique_id"],
@@ -998,6 +1016,20 @@ async def channel_resources(request: Request):
                 "media_type": r["media_type"],
                 "posted_at": r["posted_at"].isoformat() if r["posted_at"] else None,
             } for r in rows]}
+
+
+@app.get("/api/v1/channel_resources")
+async def channel_resources_get(channel: str = Query(""), limit: int = Query(0)):
+    """The same list as a plain GET: no body, nothing about the caller, so
+    the CDN in front of the registry can answer it. A popular channel is then
+    read from the database a few times a day however many installs follow it,
+    instead of once per install."""
+    channel = (channel or "").strip().lstrip("@")
+    if not channel or not USERNAME_RX.match(channel):
+        raise HTTPException(400, "invalid channel")
+    data = await _channel_file_list(channel, limit or CHANNEL_LIST_MAX)
+    return JSONResponse(data, headers={
+        "Cache-Control": "public, max-age=21600, stale-while-revalidate=86400"})
 
 
 

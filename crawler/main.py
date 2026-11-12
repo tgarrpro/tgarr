@@ -6830,15 +6830,23 @@ async def _central_channel_resources(username: str) -> list:
     """Fetch a channel's full resource index from central (for rehydrate)."""
     if not username:
         return []
+    # A plain GET: it says nothing about this install, and the CDN in front
+    # of tgarr.me answers most of them without the registry being asked.
+    def _get():
+        import urllib.parse
+        url = (REGISTRY_URL + "/api/v1/channel_resources?channel="
+               + urllib.parse.quote(username.lstrip("@")))
+        req = urllib.request.Request(url, headers={"User-Agent": TGARR_UA, "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read(32 * 1024 * 1024)
+            if r.headers.get("content-encoding", "").lower() == "gzip":
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode())
     try:
-        uuid_val = await _instance_uuid_val()
-        result = await _central_post("/api/v1/channel_resources",
-                                     {"instance_uuid": uuid_val or "",
-                                      "channel_username": username.lstrip("@"),
-                                      "limit": 100000})
+        result = await asyncio.to_thread(_get)
         return result.get("resources", []) or []
     except Exception as e:
-        log.warning("[rehydrate] channel_resources @%s failed: %s", username, e)
+        log.info("[rehydrate] tgarr.me has no list for @%s right now (%s)", username, str(e)[:80])
         return []
 
 
