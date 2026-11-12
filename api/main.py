@@ -1628,31 +1628,88 @@ async def _player_fetches() -> list:
     return out
 
 
-async def _player_saved(limit: int = 100) -> list:
-    """Files that were opened in a player and are here in full."""
+_SAVED_KINDS = {"video": "m.media_type = 'video'", "audio": "m.media_type = 'audio'",
+                "book": "m.media_type NOT IN ('video', 'audio')"}
+_SAVED_SORTS = {
+    "recent": "COALESCE(m.local_accessed_at, m.indexed_at) DESC NULLS LAST, m.id DESC",
+    "size": "m.file_size DESC NULLS LAST, m.id DESC",
+    "name": "m.file_name ASC NULLS LAST, m.id",
+    "oldest": "COALESCE(m.local_accessed_at, m.indexed_at) ASC NULLS FIRST, m.id",
+}
+
+
+async def _player_saved(q=None, kind=None, sort="recent", fav=0, limit=50, offset=0) -> dict:
+    """One page of the files that were opened in a player and kept.
+
+    Everything comes from the database (the partial index on local_path
+    makes "what is saved" cheap however large the index is); the disk is
+    looked at only for the rows on the page, to mark one that is not whole.
+    A library of tens of thousands of saved files costs the same as ten."""
+    where = ["m.local_path IS NOT NULL", "left(m.local_path, 2) <> '__'",
+             "split_part(m.local_path, '/', 1) IN ('video', 'audio', 'library')"]
+    params = []
+    if q:
+        for w in q.split()[:6]:
+            params.append(f"%{w}%")
+            where.append(f"m.file_name ILIKE ${len(params)}")
+    if kind in _SAVED_KINDS:
+        where.append(_SAVED_KINDS[kind])
+    if fav:
+        where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
+    wsql = " AND ".join(where)
+    order = _SAVED_SORTS.get(sort, _SAVED_SORTS["recent"])
+    async with db_pool.acquire() as conn:
+        tot = await conn.fetchrow(
+            f"SELECT count(*) AS n, COALESCE(sum(m.file_size), 0) AS bytes FROM messages m WHERE {wsql}",
+            *params)
+        kinds = await conn.fetch(
+            """SELECT split_part(local_path, '/', 1) AS k, count(*) AS n
+               FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+                 AND split_part(local_path, '/', 1) IN ('video', 'audio', 'library')
+               GROUP BY 1""")
+        rows = await conn.fetch(
+            f"""SELECT m.id, m.file_name, m.file_size, m.media_type, m.local_path,
+                       COALESCE(m.local_accessed_at, m.indexed_at) AS used,
+                       EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav
+                FROM messages m WHERE {wsql}
+                ORDER BY {order} LIMIT {int(limit)} OFFSET {int(offset)}""", *params)
+
+    def _stat(rows_):
+        out = []
+        for r in rows_:
+            try:
+                have = os.path.getsize(os.path.join("/downloads", r["local_path"]))
+            except OSError:
+                have = None
+            out.append(have)
+        return out
+    have = await asyncio.to_thread(_stat, rows)
+    return {"rows": rows, "have": have, "total": tot["n"], "bytes": tot["bytes"],
+            "kinds": {r["k"]: r["n"] for r in kinds}}
+
+
+@app.post("/api/fetch/remove")
+async def fetch_remove_many(request: Request):
+    """Remove several saved files at once (they stay in the index)."""
+    try:
+        ids = [int(x) for x in (await request.json()).get("ids", [])][:500]
+    except Exception:
+        return JSONResponse({"error": "bad request"}, status_code=400)
+    if not ids:
+        return {"removed": 0}
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT DISTINCT ON (m.local_path) m.id, m.file_name, m.file_size, m.media_type,
-                      m.local_path, m.local_accessed_at,
-                      EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav
-               FROM messages m
-               WHERE m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
-               ORDER BY m.local_path, m.local_accessed_at DESC NULLS LAST""")
-    out = []
+            """UPDATE messages m SET local_path = NULL, local_accessed_at = NULL,
+                      fetch_wanted_at = 'epoch'
+               FROM (SELECT id, local_path FROM messages WHERE id = ANY($1::bigint[])) o
+               WHERE m.id = o.id RETURNING o.local_path""", ids)
+    n = 0
     for r in rows:
         lp = r["local_path"]
-        if not lp.startswith(_CACHE_PREFIXES):
-            continue
-        try:
-            st = os.stat(os.path.join("/downloads", lp))
-        except OSError:
-            continue
-        if r["file_size"] and st.st_size < r["file_size"]:
-            continue
-        used = max(st.st_mtime, r["local_accessed_at"].timestamp() if r["local_accessed_at"] else 0)
-        out.append({"r": r, "size": st.st_size, "used": used})
-    out.sort(key=lambda x: -x["used"])
-    return out[:limit]
+        if _is_local(lp) and lp.startswith(_CACHE_PREFIXES) and ".." not in lp:
+            await asyncio.to_thread(_cache_unlink, lp)
+            n += 1
+    return {"removed": n}
 
 
 @app.post("/api/fetch/{msg_id}/cancel")
@@ -6911,9 +6968,14 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 # Page: Downloads (queue + history)
 # ════════════════════════════════════════════════════════════════════
 @app.get("/downloads", response_class=HTMLResponse)
-async def page_downloads():
+async def page_downloads(tab: str = "players", q: Optional[str] = None,
+                         kind: Optional[str] = None, sort: str = "recent",
+                         fav: int = 0, offset: int = 0, limit: int = 50):
     if not login.session_exists():
         return RedirectResponse("/login")
+    tab = "grabs" if tab == "grabs" else "players"
+    page_size = max(10, min(limit, 200))
+    page_offset = max(0, offset)
     _my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         active = await conn.fetch(
@@ -6936,38 +6998,119 @@ async def page_downloads():
                ORDER BY d.finished_at DESC NULLS LAST LIMIT 100""")
 
     fetches = await _player_fetches()
-    saved = await _player_saved()
+    saved = (await _player_saved(q, kind, sort, fav, page_size, page_offset)
+             if tab == "players" else None)
+
+    def _dqs(**over):
+        cur = {"tab": None if tab == "players" else tab, "q": q, "kind": kind,
+               "sort": sort if sort != "recent" else None, "fav": 1 if fav else None,
+               "limit": limit if limit != 50 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
 
     def _render_saved():
-        import datetime as _dt
-        head = (f'<h2 class="section">Saved from players <span class="count">{len(saved)}</span>'
+        if saved is None:
+            return ""
+        kinds = saved["kinds"]
+        all_n = sum(kinds.values())
+
+        def chip(label, href, on, extra=""):
+            style = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
+                     "border-color:var(--accent);" if on else "")
+            return (f'<a class="btn ghost" href="/downloads{href}" '
+                    f'style="{style}padding:5px 12px;font-size:12px">{label}{extra}</a>')
+
+        def cnt(n):
+            return f' <span style="opacity:.6">{n:,}</span>'
+        chips = (
+            chip("all", _dqs(kind=None, offset=None), not kind, cnt(all_n))
+            + chip("🎬 films", _dqs(kind="video", offset=None), kind == "video", cnt(kinds.get("video", 0)))
+            + chip("🎵 songs", _dqs(kind="audio", offset=None), kind == "audio", cnt(kinds.get("audio", 0)))
+            + chip("📄 books", _dqs(kind="book", offset=None), kind == "book", cnt(kinds.get("library", 0)))
+            + '<span style="margin-left:8px"></span>'
+            + chip("♥ favourites", _dqs(fav=None if fav else 1, offset=None), bool(fav))
+            + '<span style="margin-left:14px;color:var(--muted);font-size:12px">Sort:</span>'
+            + chip("last opened", _dqs(sort=None, offset=None), sort == "recent")
+            + chip("oldest", _dqs(sort="oldest", offset=None), sort == "oldest")
+            + chip("largest", _dqs(sort="size", offset=None), sort == "size")
+            + chip("name", _dqs(sort="name", offset=None), sort == "name"))
+        search = (
+            '<form method="GET" action="/downloads" style="display:flex;gap:8px;margin:0 0 12px">'
+            + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
+                      for k, v in (("kind", kind), ("sort", sort if sort != "recent" else None),
+                                   ("fav", 1 if fav else None)) if v)
+            + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+              'placeholder="find a saved file by name…" style="flex:1;max-width:420px"/>'
+              '<button class="btn" type="submit">Search</button>'
+            + (f'<a class="btn ghost" href="/downloads{_dqs(q=None, offset=None)}">clear</a>' if q else '')
+            + '</form>')
+        head = (f'<h2 class="section">Saved from players <span class="count">{saved["total"]:,}</span>'
                 f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
                 f'text-transform:none;letter-spacing:0;margin-left:10px">'
-                f'{_fmt_size(sum(x["size"] for x in saved)) or "0 MB"} · '
-                f'<a href="/settings#cache">clean-up rules</a></span></h2>')
-        if not saved:
-            return head + ('<div class="empty-state"><div class="icon">💾</div>'
-                           '<div>Films, songs and books you open are kept here so they open '
-                           'instantly next time.</div></div>')
+                f'{_fmt_size(saved["bytes"]) or "0 MB"} · '
+                f'<a href="/settings#cache">clean-up rules</a></span></h2>'
+                f'{search}'
+                f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
+        if not saved["rows"]:
+            return head + ('<div class="empty-state"><div class="icon">💾</div><div>'
+                           + ("Nothing saved matches." if (q or kind or fav or page_offset) else
+                              "Films, songs and books you open are kept here so they open "
+                              "instantly next time.") + '</div></div>')
         ico = {"video": "🎬", "audio": "🎵"}
-        items = []
-        for it in saved:
-            r = it["r"]
-            when = _dt.datetime.fromtimestamp(it["used"], _dt.timezone.utc)
-            items.append(
-                f'<div class="dl-item"><div class="icon">{ico.get(r["media_type"], "📄")}</div>'
-                f'<div class="info"><div class="name">'
-                f'<a href="/watch/{r["id"]}" style="color:inherit;text-decoration:none">'
-                f'{html.escape(r["file_name"] or r["local_path"].rsplit("/", 1)[-1])}</a></div>'
-                f'<div class="meta"><span class="pill ok">saved</span>'
-                + ('<span class="pill" style="color:#e11d48">♥ favourite</span>' if r["fav"] else '')
-                + f'<span>· {_fmt_size(it["size"])}</span><span>· last opened {_fmt_time(when)}</span>'
-                f'</div></div><div class="right"><div class="dl-ctrls">'
-                f'<a class="dl-btn" href="/media/{r["id"]}" download '
-                f'title="download to this device">⬇</a>'
-                f'<button class="dl-btn bad" onclick="fetchRemove({r["id"]})">✗ Remove</button>'
-                f'</div></div></div>')
-        return head + f'<div class="dl-list">{"".join(items)}</div>'
+        trs = []
+        for r, have in zip(saved["rows"], saved["have"]):
+            total = r["file_size"] or 0
+            if have is None:
+                state = '<span class="pill bad" title="the file is no longer on disk">missing</span>'
+            elif total and have < total:
+                state = (f'<span class="pill warn" title="not all of it has arrived">'
+                         f'{have * 100 // total}%</span>')
+            else:
+                state = ""
+            trs.append(
+                f'<tr data-id="{r["id"]}">'
+                f'<td class="ck"><input type="checkbox" class="sv"/></td>'
+                f'<td class="ic">{ico.get(r["media_type"], "📄")}</td>'
+                f'<td class="nm"><a href="/watch/{r["id"]}">'
+                f'{html.escape(r["file_name"] or r["local_path"].rsplit("/", 1)[-1])}</a> '
+                f'{"<span style=color:#e11d48>♥</span>" if r["fav"] else ""} {state}</td>'
+                f'<td class="num">{_fmt_size(total)}</td>'
+                f'<td class="num">{_fmt_time(r["used"]) if r["used"] else ""}</td>'
+                f'<td class="ac"><a class="dl-btn" href="/media/{r["id"]}" download '
+                f'title="download to this device">⬇</a> '
+                f'<button class="dl-btn bad" onclick="fetchRemove({r["id"]})" '
+                f'title="remove from the server">✗</button></td></tr>')
+        table = (
+            '<style>.sv-list{width:100%;border-collapse:collapse;background:var(--surface);'
+            'border:1px solid var(--border);border-radius:10px;overflow:hidden}'
+            '.sv-list th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);'
+            'text-align:left;padding:9px 10px;border-bottom:1px solid var(--border)}'
+            '.sv-list td{padding:7px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}'
+            '.sv-list tr:last-child td{border-bottom:none}.sv-list tr:hover td{background:rgba(127,127,127,.06)}'
+            '.sv-list .ck{width:30px}.sv-list .ic{width:30px}.sv-list .num{white-space:nowrap;color:var(--muted);'
+            'font-size:13px}.sv-list .ac{white-space:nowrap;text-align:right}'
+            '.sv-list .nm a{color:var(--fg);text-decoration:none;word-break:break-all}'
+            '.sv-list .nm a:hover{color:var(--accent)}</style>'
+            '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
+            '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
+            '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()">✗ Remove selected</button>'
+            '<span id="svN" style="color:var(--muted)"></span></div>'
+            '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
+            '<th>last opened</th><th></th></tr></thead>'
+            f'<tbody>{"".join(trs)}</tbody></table>'
+            + _page_nav("/downloads", _dqs, page_offset, page_size, len(saved["rows"]), saved["total"])
+            + '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
+              'n=document.getElementById("svN");const boxes=()=>[...document.querySelectorAll(".sv")];'
+              'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;n.textContent=c?c+" selected":""}'
+              'all.onchange=()=>{boxes().forEach(b=>b.checked=all.checked);upd()};'
+              'boxes().forEach(b=>b.onchange=upd);'
+              'window.svRemove=function(){const ids=boxes().filter(b=>b.checked).map(b=>+b.closest("tr").dataset.id);'
+              'if(!ids.length||!confirm("Remove "+ids.length+" file(s) from the server? They stay in the index '
+              'and can be fetched again."))return;'
+              'fetch("/api/fetch/remove",{method:"POST",headers:{"Content-Type":"application/json"},'
+              'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>')
+        return head + table
 
     _fetch_js = ('<script>function fetchCancel(id){fetch("/api/fetch/"+id+"/cancel",{method:"POST"})'
                  '.then(()=>location.reload())}'
@@ -7097,7 +7240,9 @@ async def page_downloads():
     # Auto-refresh while any download is in flight, so progress bar updates
     # without manual reload. Stops refreshing when queue empties.
     refresh_js = ('<script>setTimeout(()=>location.reload(),5000)</script>'
-                  if (active or any(f["state"] != "stopped" for f in fetches)) else '')
+                  if ((tab == "grabs" and active) or
+                      (tab == "players" and any(f["state"] != "stopped" for f in fetches)
+                       and not page_offset and not q)) else '')
     ctrl_js = '''<script>
 function dlAct(id, action){
   if(action==='delete' && !confirm('Delete this download?')) return;
@@ -7117,16 +7262,27 @@ function dlAct(id, action){
 .dl-btn.bad:hover{background:#fee2e2}
 .dl-time{font-size:11px;color:#888;text-align:right;margin-top:2px}
 </style>'''
-    body = (f'{_fetch_js}{_render_fetches()}{_render_saved()}'
-           f'<h2 class="section">Grabs: queue <span class="count">{len(active)}</span>'
-           f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
-           f'text-transform:none;letter-spacing:0;margin-left:10px">'
-           f'what Sonarr, Radarr or the Grab button asked for</span></h2>'
-           f'{_render(active, show_finished=False)}'
-           f'<h2 class="section">Grabs: history <span class="count">last 100</span></h2>'
-           f'{_render(done, show_finished=True)}'
-           f'{ctrl_js}'
-           f'{refresh_js}')
+    def _tab(key, label, n):
+        on = tab == key
+        style = ("border-bottom:2px solid var(--accent);color:var(--accent-hi);font-weight:600;"
+                 if on else "border-bottom:2px solid transparent;color:var(--muted);")
+        href = "/downloads" if key == "players" else "/downloads?tab=grabs"
+        return (f'<a href="{href}" style="{style}padding:8px 4px;margin-right:22px;'
+                f'text-decoration:none;font-size:15px">{label}'
+                + (f' <span style="font-size:12px;opacity:.7">{n}</span>' if n else '') + '</a>')
+    tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
+            + _tab("players", "Opened in players", len(fetches))
+            + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active)) + '</div>')
+    if tab == "players":
+        body = f'{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
+    else:
+        body = (f'{tabs}'
+                f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
+                f'{_render(active, show_finished=False)}'
+                f'<h2 class="section">History <span class="count">last 100</span></h2>'
+                f'{_render(done, show_finished=True)}'
+                f'{ctrl_js}'
+                f'{refresh_js}')
     return HTMLResponse(_layout("Downloads", "/downloads", body))
 
 
