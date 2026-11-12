@@ -28,6 +28,32 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 import login  # local module
 
 
+def _base_url(request) -> str:
+    """Public base URL for links we hand to Sonarr/Radarr/browsers.
+
+    Derived from the request itself (honouring reverse-proxy headers) so the
+    links always point back at whatever address the caller reached us on.
+    TGARR_BASE_URL is only a fallback for requests that carry no Host header:
+    a stale or unset env value used to produce dead or relative links, which
+    made every grab fail.
+    """
+    try:
+        h = request.headers
+        host = (h.get("x-forwarded-host") or h.get("host") or "").split(",")[0].strip()
+        if host and re.fullmatch(r"[A-Za-z0-9._\-\[\]:]+", host):
+            proto = (h.get("x-forwarded-proto") or request.url.scheme or "http")
+            proto = proto.split(",")[0].strip().lower()
+            if proto not in ("http", "https"):
+                proto = "http"
+            return f"{proto}://{host}"
+    except Exception:
+        pass
+    return (os.environ.get("TGARR_BASE_URL") or "").rstrip("/")
+
+
+_GUID_RX = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+
+
 def _js_str(v) -> str:
     """Serialize a Python value as a JS literal safe inside an inline <script>."""
     return (_json.dumps("" if v is None else str(v))
@@ -324,6 +350,9 @@ async def _migrate_schema():
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS bytes_done BIGINT NOT NULL DEFAULT 0;
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS speed_kbps INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMPTZ;
+            -- category the *arr asked for on add (tv / movies / …); echoed back
+            -- in queue + history so each app only sees its own jobs.
+            ALTER TABLE downloads ADD COLUMN IF NOT EXISTS sab_cat TEXT;
             -- 450px gallery preview (~76KB JPEG) — bigger than 12KB thumb for
             -- lightbox/slideshow. Same lazy-fetch model: '__user_queued__'
             -- marker triggers preview_downloader on next /api/photo-preview hit.
@@ -2912,7 +2941,7 @@ async def health():
 
 
 @app.get("/")
-async def root(accept: Optional[str] = Header(None)):
+async def root(request: Request, accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow(
             """SELECT (SELECT count(*) FROM channels)                AS channels,
@@ -3119,7 +3148,7 @@ async def root(accept: Optional[str] = Header(None)):
             '</div>'
         )
 
-    base_url = os.environ.get("TGARR_BASE_URL") or "http://&lt;host&gt;:8765"
+    base_url = html.escape(_base_url(request)) or "http://&lt;host&gt;:8765"
 
     body = f"""
 {worker_banner}
@@ -4966,7 +4995,7 @@ async def page_search(q: Optional[str] = None,
 # Page: Settings
 # ════════════════════════════════════════════════════════════════════
 @app.get("/settings", response_class=HTMLResponse)
-async def page_settings():
+async def page_settings(request: Request):
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
     async with db_pool.acquire() as conn:
@@ -5033,7 +5062,7 @@ async def page_settings():
     <div class="icon">🔌</div>
     <div class="info"><div class="name">Newznab indexer URL</div>
       <div class="meta">Paste into Sonarr / Radarr → Settings → Indexers → ➕ Newznab</div></div>
-    <div class="right"><code>{os.environ.get("TGARR_BASE_URL","")}/newznab/</code></div>
+    <div class="right"><code>{html.escape(_base_url(request))}/newznab/</code></div>
   </div>
   <div class="dl-item">
     <div class="icon">⬇</div>
@@ -5166,8 +5195,8 @@ CAPS_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
   <limits max="200" default="50"/>
   <searching>
     <search          available="yes" supportedParams="q"/>
-    <tv-search       available="yes" supportedParams="q,season,ep,tvdbid,rid"/>
-    <movie-search    available="yes" supportedParams="q,imdbid,tmdbid"/>
+    <tv-search       available="yes" supportedParams="q,season,ep"/>
+    <movie-search    available="yes" supportedParams="q"/>
     <audio-search    available="no"  supportedParams="q"/>
     <book-search     available="no"  supportedParams="q"/>
   </searching>
@@ -5183,6 +5212,9 @@ CAPS_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
       <subcat id="5040" name="TV/HD"/>
       <subcat id="5045" name="TV/UHD"/>
       <subcat id="5070" name="TV/Anime"/>
+    </category>
+    <category id="8000" name="Other">
+      <subcat id="8010" name="Other/Misc"/>
     </category>
   </categories>
 </caps>"""
@@ -5203,7 +5235,29 @@ def _category_id(rel) -> str:
         if "1080" in q or "720" in q:
             return "5040"
         return "5030"
-    return "0"
+    return "8010"   # not classified as movie/tv → Other/Misc (0 is not a category)
+
+
+def _cats_to_filter(cat: Optional[str]):
+    """Map a Newznab `cat=` list to (allow_movie, allow_tv, allow_other).
+    None = caller did not restrict categories."""
+    if not cat:
+        return None
+    movie = tv = other = False
+    for c in cat.split(","):
+        c = c.strip()
+        if not c.isdigit():
+            continue
+        n = int(c)
+        if 2000 <= n < 3000:
+            movie = True
+        elif 5000 <= n < 6000:
+            tv = True
+        elif n >= 7000 or n == 0:
+            other = True
+    if not (movie or tv or other):
+        return None
+    return movie, tv, other
 
 
 # Series alias map: rewrite non-English release names to the canonical
@@ -5212,8 +5266,38 @@ def _category_id(rel) -> str:
 #
 # `_series_aliases_cache` is loaded from DB on first use + refreshed every
 # 60s. Lookup is substring match against release.name; first hit wins.
-_series_aliases_cache: list = []  # list of (alias_text, canonical_title, season)
+_series_aliases_cache: list = []  # list of (alias_text, canonical_title, season, kind)
 _series_aliases_loaded_at: float = 0.0
+
+
+def _alias_ok(alias: str) -> bool:
+    """Is this alias specific enough to be matched against release names?
+
+    Sonarr/Radarr alternateTitles contain junk ("1", "2", "U", "T2", "Ov").
+    Matched as plain substrings they renamed almost every release in the feed
+    (anything containing a "2" became "Swapped"). Reject: empty, digits-only,
+    and short aliases — under 4 chars when ASCII-only, under 2 otherwise.
+    """
+    a = (alias or "").strip()
+    if not a or a.isdigit():
+        return False
+    if a.isascii():
+        return len(re.sub(r"[^A-Za-z0-9]", "", a)) >= 4
+    return len(a) >= 2
+
+
+def _alias_in_name(alias: str, raw: str) -> bool:
+    """True if `alias` occurs in `raw` as a whole token run — not glued to a
+    neighbouring letter/digit/CJK character on either side."""
+    i = raw.find(alias)
+    while i != -1:
+        before = raw[i - 1] if i > 0 else ""
+        j = i + len(alias)
+        after = raw[j] if j < len(raw) else ""
+        if not (before.isalnum() or after.isalnum()):
+            return True
+        i = raw.find(alias, i + 1)
+    return False
 
 
 async def _refresh_series_aliases():
@@ -5224,10 +5308,11 @@ async def _refresh_series_aliases():
         return
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT alias_text, canonical_title, season FROM series_aliases "
+            "SELECT alias_text, canonical_title, season, kind FROM series_aliases "
             "ORDER BY length(alias_text) DESC")  # longest first → specific beats general
     _series_aliases_cache = [
-        (r["alias_text"], r["canonical_title"], r["season"]) for r in rows]
+        (r["alias_text"], r["canonical_title"], r["season"], r["kind"] or "tv")
+        for r in rows if _alias_ok(r["alias_text"])]
     _series_aliases_loaded_at = time.time()
 
 
@@ -5238,12 +5323,28 @@ def _rewrite_release_title_sync(r, my_dc=None) -> str:
     raw = r["name"] or ""
     file_dc = r["file_dc"] if hasattr(r, "__getitem__") and "file_dc" in (r.keys() if hasattr(r, "keys") else []) else None
     dc_tag = f"-dc{file_dc}" if file_dc else ""
-    for alias_text, canonical, season in _series_aliases_cache:
-        if alias_text in raw:
-            ep = r["episode"] or 1
+    for alias_text, canonical, season, kind in _series_aliases_cache:
+        if alias_text in raw and _alias_in_name(alias_text, raw):
+            if kind == "movie" and r["category"] == "tv":
+                continue   # a movie's alias must not rename a TV episode
+            if kind != "movie" and r["category"] == "movie":
+                continue
+            # Only state what the release actually told us. A missing quality
+            # is left out (the *arr parses it as Unknown) rather than being
+            # advertised as 1080p.
+            qual = f".{r['quality']}" if r["quality"] else ""
+            canon = re.sub(r"\s+", ".", canonical.strip())
+            if kind == "movie" or r["category"] == "movie":
+                yr = r["movie_year"] if "movie_year" in r.keys() else None
+                yr_s = f".{int(yr)}" if yr else ""
+                return f"{canon}{yr_s}{qual}.WEBRip-tgarr{dc_tag}"
+            if r["episode"] is None:
+                # An alias hit with no parsed episode is not a single episode;
+                # don't claim E01. Expose it under its own name instead.
+                break
             seas = season if season is not None else (r["season"] or 1)
-            qual = r["quality"] or "1080p"
-            return f"{canonical}.S{int(seas):02d}E{int(ep):02d}.{qual}.WEBRip-tgarr{dc_tag}"
+            return (f"{canon}.S{int(seas):02d}E{int(r['episode']):02d}"
+                    f"{qual}.WEBRip-tgarr{dc_tag}")
     # No alias match — append DC tag to raw name so multi-DC duplicates differ
     if dc_tag and file_dc:
         return f"{raw}.tgarr{dc_tag}"
@@ -5254,9 +5355,14 @@ def _expand_inbound_query(q: str) -> list:
     """Inbound: Sonarr searches 'A Bite of China'. Return all alias variants
     so SQL ILIKE matches Chinese releases too. Always includes the original."""
     variants = {q}
-    ql = q.lower()
-    for alias_text, canonical, _ in _series_aliases_cache:
-        if canonical.lower() in ql or ql in canonical.lower():
+    ql = " ".join(q.lower().split())
+    # The canonical title must BE the query (optionally followed by a year).
+    # Substring matching in either direction made short queries ("her", "up",
+    # "it") pull in the aliases of every title containing those letters.
+    ql_noyear = re.sub(r"\s+(19|20)\d{2}$", "", ql)
+    for alias_text, canonical, _s, _k in _series_aliases_cache:
+        cl = " ".join(canonical.lower().split())
+        if cl == ql or cl == ql_noyear:
             variants.add(alias_text)
     return list(variants)
 
@@ -5306,7 +5412,8 @@ async def _arr_alias_sync_worker():
                         season = alt.get("seasonNumber")
                         if season is not None and season < 0:
                             season = None
-                        aliases.append((alias_text, canonical, season, kind, app_name, ext_id))
+                        if _alias_ok(alias_text):
+                            aliases.append((alias_text, canonical, season, kind, app_name, ext_id))
                 if aliases:
                     async with db_pool.acquire() as conn:
                         await conn.executemany(
@@ -5338,7 +5445,8 @@ def _item_xml(r, base_url: str, apikey: str, my_dc=None) -> str:
     link_text = html.escape(link)
     link_attr = html.escape(link, quote=True)
     pubdate = (r["posted_at"].strftime("%a, %d %b %Y %H:%M:%S +0000")
-               if r["posted_at"] else "")
+               if r["posted_at"]
+               else time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(0)))
     size = r["size_bytes"] or 0
     cat_id = _category_id(r)
     title = html.escape(_rewrite_release_title_sync(r, my_dc=my_dc))
@@ -5360,7 +5468,16 @@ def _item_xml(r, base_url: str, apikey: str, my_dc=None) -> str:
     )
 
 
-def _feed_envelope(items_xml: str, title: str, base_url: str) -> str:
+def _newznab_error(code: int, desc: str, status: int = 200) -> Response:
+    """Newznab-style error document (the *arrs expect XML, not plain text)."""
+    return Response(
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<error code="{code}" description="{html.escape(desc, quote=True)}"/>',
+        media_type="application/xml", status_code=status)
+
+
+def _feed_envelope(items_xml: str, title: str, base_url: str,
+                   offset: int = 0, total: int = 0) -> str:
     return (
         f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         f"<rss version=\"2.0\" xmlns:newznab=\"http://www.newznab.com/DTD/2010/feeds/attributes/\">\n"
@@ -5368,6 +5485,7 @@ def _feed_envelope(items_xml: str, title: str, base_url: str) -> str:
         f"    <title>tgarr</title>\n"
         f"    <description>{html.escape(title)}</description>\n"
         f"    <link>{base_url}/newznab/api</link>\n"
+        f"    <newznab:response offset=\"{offset}\" total=\"{total}\"/>\n"
         f"{items_xml}\n"
         f"  </channel>\n"
         f"</rss>"
@@ -5377,6 +5495,7 @@ def _feed_envelope(items_xml: str, title: str, base_url: str) -> str:
 @app.get("/newznab/api", response_class=PlainTextResponse)
 @app.get("/newznab", response_class=PlainTextResponse)
 async def newznab_api(
+    request: Request,
     t: str = Query("search"),
     q: Optional[str] = Query(None),
     season: Optional[int] = None,
@@ -5390,9 +5509,11 @@ async def newznab_api(
     apikey: Optional[str] = "tgarr",
     id: Optional[str] = None,
 ):
-    base_url = os.environ.get("TGARR_BASE_URL", "")
+    base_url = _base_url(request)
     if t == "caps":
         return Response(CAPS_XML, media_type="application/xml")
+    if t not in ("search", "tvsearch", "movie", "get"):
+        return _newznab_error(202, f"No such function ({t})")
 
     if t == "get":
         return await _handle_grab(id)
@@ -5403,14 +5524,25 @@ async def newznab_api(
 
     # If Sonarr/Radarr passed tvdbid/tmdbid (the canonical way they query),
     # resolve to canonical_title via series_aliases.external_id then synthesize q.
-    if not q and (tvdbid or tmdbid):
+    # IDs are no longer advertised in caps (so the *arrs send q=<title>), but
+    # still honoured when a client sends one. An ID we cannot resolve must
+    # return an EMPTY feed — falling through used to return the newest
+    # releases of the whole category as if they matched.
+    if not q and (tvdbid or tmdbid or imdbid):
+        canonical = None
         ext_id = tvdbid or tmdbid
-        async with db_pool.acquire() as conn:
-            canonical = await conn.fetchval(
-                "SELECT canonical_title FROM series_aliases "
-                "WHERE external_id = $1 LIMIT 1", int(ext_id))
-        if canonical:
-            q = canonical
+        if ext_id and str(ext_id).isdigit():
+            kind = "tv" if tvdbid else "movie"
+            async with db_pool.acquire() as conn:
+                canonical = await conn.fetchval(
+                    "SELECT canonical_title FROM series_aliases "
+                    "WHERE external_id = $1 AND kind = $2 LIMIT 1",
+                    int(ext_id), kind)
+        if not canonical:
+            return Response(
+                _feed_envelope("", f"search t={t} (unresolved id)", base_url),
+                media_type="application/xml")
+        q = canonical
 
     where_parts = ["1=1"]
     params = []
@@ -5441,6 +5573,18 @@ async def newznab_api(
             where_parts.append(f"r.episode = ${len(params)}")
     elif t == "movie":
         where_parts.append("r.category = 'movie'")
+    else:
+        # Generic search / RSS sync. Honour the categories the client asked
+        # for. With no cat= at all, serve movies + TV only: unclassified
+        # releases are opt-in (cat=8000) so they don't flood an *arr's feed.
+        cf = _cats_to_filter(cat) or (True, True, False)
+        allowed = [c for c, on in zip(("movie", "tv"), cf[:2]) if on]
+        conds = []
+        if allowed:
+            conds.append("r.category IN (" + ",".join(f"'{c}'" for c in allowed) + ")")
+        if cf[2]:
+            conds.append("(r.category IS NULL OR r.category NOT IN ('movie','tv'))")
+        where_parts.append("(" + " OR ".join(conds) + ")")
 
     limit_val = max(1, min(limit, 200))
     _release_my_dc = await _get_my_dc()
@@ -5450,7 +5594,7 @@ async def newznab_api(
     # by file_unique_id — each is a valid alternative source).
     sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, "
           f"r.quality, r.source, r.codec, r.size_bytes, r.posted_at, "
-          f"m.file_dc "
+          f"r.movie_year, m.file_dc, count(*) OVER() AS _total "
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
           f"WHERE {' AND '.join(where_parts)} "
           f"ORDER BY (CASE WHEN m.file_dc = ${len(params)+1} THEN 0 ELSE 1 END), "
@@ -5462,20 +5606,24 @@ async def newznab_api(
 
     items = "\n".join(_item_xml(r, base_url, apikey or "tgarr",
                                  my_dc=_release_my_dc) for r in rows)
+    total = rows[0]["_total"] if rows else 0
     return Response(
-        _feed_envelope(items, f"search t={t} q={q or ''}", base_url),
+        _feed_envelope(items, f"search t={t} q={q or ''}", base_url,
+                       offset=max(0, offset), total=total),
         media_type="application/xml",
     )
 
 
 async def _handle_grab(guid: Optional[str]) -> Response:
     if not guid:
-        return Response("missing id", status_code=400)
+        return _newznab_error(200, "Missing parameter (id)", 400)
+    if not _GUID_RX.fullmatch(guid):
+        return _newznab_error(300, "No such item", 404)
     async with db_pool.acquire() as conn:
         rel = await conn.fetchrow(
             "SELECT id, name FROM releases WHERE guid = $1", guid)
         if not rel:
-            return Response("release not found", status_code=404)
+            return _newznab_error(300, "No such item", 404)
         await conn.execute(
             """INSERT INTO downloads (release_id, status)
                SELECT $1, 'pending'
@@ -5586,7 +5734,9 @@ async def _sab_queue():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT d.id, d.status, r.name, r.size_bytes, r.guid,
-                      d.bytes_done, d.speed_kbps, d.last_progress_at
+                      d.bytes_done, d.speed_kbps, d.last_progress_at,
+                      COALESCE(d.sab_cat,
+                               CASE r.category WHEN 'movie' THEN 'movies' ELSE 'tv' END) AS sab_cat
                FROM downloads d JOIN releases r ON r.id = d.release_id
                WHERE d.status IN ('pending','downloading')
                ORDER BY d.requested_at""")
@@ -5606,7 +5756,7 @@ async def _sab_queue():
         slots.append({
             "nzo_id": f"tgarr-{r['guid']}",
             "filename": r["name"],
-            "cat": "tv",
+            "cat": r["sab_cat"],
             "status": "Downloading" if r["status"] == "downloading" else "Queued",
             "mb": f"{size_b/1048576:.1f}",
             "mbleft": f"{left_b/1048576:.1f}",
@@ -5646,14 +5796,22 @@ async def _sab_history():
         # is newer — once a release has been successfully downloaded, that's
         # the authoritative state for CDH. Otherwise newer failure wins.
         rows = await conn.fetch(
-            """SELECT DISTINCT ON (d.release_id)
-                      d.id, d.status, d.local_path, d.finished_at,
-                      r.name, r.size_bytes, r.guid, d.error_message
-               FROM downloads d JOIN releases r ON r.id = d.release_id
-               WHERE d.status IN ('completed','failed')
-               ORDER BY d.release_id,
-                        CASE d.status WHEN 'completed' THEN 0 ELSE 1 END,
-                        d.id DESC NULLS LAST
+            """SELECT * FROM (
+                 SELECT DISTINCT ON (d.release_id)
+                        d.id, d.status, d.local_path, d.finished_at,
+                        r.name, r.size_bytes, r.guid, d.error_message,
+                        COALESCE(d.sab_cat,
+                                 CASE r.category WHEN 'movie' THEN 'movies' ELSE 'tv' END) AS sab_cat
+                 FROM downloads d JOIN releases r ON r.id = d.release_id
+                 WHERE d.status IN ('completed','failed')
+                 ORDER BY d.release_id,
+                          CASE d.status WHEN 'completed' THEN 0 ELSE 1 END,
+                          d.id DESC NULLS LAST
+               ) h
+               -- newest first: the old LIMIT ran over release_id order, so
+               -- once there were 200+ rows new completions never appeared and
+               -- were never imported.
+               ORDER BY h.finished_at DESC NULLS LAST, h.id DESC
                LIMIT 200""")
     slots = []
     for r in rows:
@@ -5666,7 +5824,7 @@ async def _sab_history():
             storage = "/downloads/tgarr"
         slots.append({
             "nzo_id": f"tgarr-{r['guid']}",
-            "name": r["name"], "category": "tv",
+            "name": r["name"], "category": r["sab_cat"],
             "storage": storage,
             "status": "Completed" if r["status"] == "completed" else "Failed",
             "size": f"{size_mb:.1f} MB",
@@ -5691,25 +5849,26 @@ async def _sab_addurl(url: str, nzbname: Optional[str], cat: Optional[str]):
     elif re.fullmatch(r"[0-9a-f-]{36}", url or ""):
         # Caller passed bare guid (from addfile NZB-body parse path).
         guid = url
-    if not guid:
+    if not guid or not _GUID_RX.fullmatch(guid):
         return {"status": False, "error": "no guid in url"}
+    sab_cat = (cat or "").strip()[:40] or None
     async with db_pool.acquire() as conn:
         rel = await conn.fetchrow("SELECT id FROM releases WHERE guid = $1", guid)
         if not rel:
             return {"status": False, "error": "release not found"}
         await conn.execute(
-            """INSERT INTO downloads (release_id, status)
-               SELECT $1, 'pending'
+            """INSERT INTO downloads (release_id, status, sab_cat)
+               SELECT $1, 'pending', $2
                WHERE NOT EXISTS (
                  SELECT 1 FROM downloads
                  WHERE release_id = $1
                    AND status IN ('pending','downloading','completed')
-               )""", rel["id"])
+               )""", rel["id"], sab_cat)
     return {"status": True, "nzo_ids": [f"tgarr-{guid}"]}
 
 
 async def _sab_delete(nzo_id: str):
-    if not nzo_id.startswith("tgarr-"):
+    if not nzo_id.startswith("tgarr-") or not _GUID_RX.fullmatch(nzo_id[6:]):
         return {"status": False, "error": "bad nzo_id"}
     guid = nzo_id[6:]
     async with db_pool.acquire() as conn:
