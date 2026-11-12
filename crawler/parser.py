@@ -118,6 +118,100 @@ RX_WS = re.compile(r"\s+")
 _RES_NORM = {"4k": "2160p", "uhd": "2160p", "fhd": "1080p", "hd": "720p"}
 
 
+def quality_from_dims(width, height):
+    """Resolution label from the real frame size Telegram reports for a video.
+    Width decides (a 1920x804 scope film is 1080p); height is the fallback
+    for portrait or unusual frames."""
+    try:
+        w, h = int(width or 0), int(height or 0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    if w < h:                      # portrait: compare the long side
+        w, h = h, w
+    if w >= 3800 or h >= 2000:
+        return "2160p"
+    if w >= 2500 or h >= 1400:
+        return "1440p"
+    if w >= 1900 or h >= 1000:
+        return "1080p"
+    if w >= 1270 or h >= 700:
+        return "720p"
+    if h >= 560:
+        return "576p"
+    if h >= 460:
+        return "480p"
+    return "360p"
+
+
+CLIP_SECONDS = 5 * 60          # shorter than this is never a release
+SHORT_SECONDS = 20 * 60        # under this, a bare name is not enough
+FEATURE_SECONDS = 60 * 60      # feature length
+
+
+def decide_release(parsed: dict, *, file_size=None, duration=None, width=None,
+                   height=None, min_score: float = 0.30,
+                   min_movie_bytes: int = 100 * 1024 * 1024,
+                   min_tv_bytes: int = 30 * 1024 * 1024) -> dict:
+    """Should this file become a release, and as what?
+
+    The file name alone cannot tell a film from a five-minute clip: any name
+    with three CJK characters used to clear the bar. When Telegram reports the
+    running time and frame size (it does for every message sent as a video),
+    use them:
+      - under 5 minutes: a clip, never a release;
+      - under 20 minutes with nothing but a name (no year, season, episode or
+        quality in it): not enough, score - 0.15;
+      - 20 minutes or more: + 0.05; an hour or more: + 0.15, and a titled file
+        of unknown type is a movie;
+      - the real resolution fills in a quality the name did not state.
+    With no duration (documents, old rows) the name-only score stands.
+
+    Returns {"create": bool, "reason": str, "score": float, "type": str,
+             "quality": str | None}.
+    """
+    score = float(parsed.get("score") or 0.0)
+    type_ = parsed.get("type") or "unknown"
+    quality = parsed.get("quality") or quality_from_dims(width, height)
+    has_meta = (parsed.get("year") is not None or parsed.get("season") is not None
+                or parsed.get("episode") is not None or bool(parsed.get("quality")))
+    out = {"create": False, "reason": "", "score": score, "type": type_, "quality": quality}
+    if duration is not None:
+        try:
+            duration = int(duration)
+        except (TypeError, ValueError):
+            duration = None
+    if duration is not None:
+        if duration < CLIP_SECONDS:
+            out["reason"] = "clip"
+            return out
+        if duration < SHORT_SECONDS and not has_meta:
+            score -= 0.15
+        elif duration >= FEATURE_SECONDS:
+            score += 0.15
+            if type_ == "unknown" and parsed.get("has_title"):
+                type_ = "movie"
+        elif duration >= SHORT_SECONDS:
+            score += 0.05
+        if not parsed.get("quality") and quality and duration >= SHORT_SECONDS:
+            score += 0.05
+    score = round(min(max(score, 0.0), 1.0), 2)
+    out.update(score=score, type=type_)
+    if score < min_score:
+        out["reason"] = "score"
+        return out
+    if file_size:
+        if type_ == "movie" and file_size < min_movie_bytes:
+            out["reason"] = "too small for a movie"
+            return out
+        if type_ == "tv" and file_size < min_tv_bytes:
+            out["reason"] = "too small for an episode"
+            return out
+    out["create"] = True
+    return out
+
+
 def parse_filename(name: str) -> dict:
     """Parse a release-style filename into structured fields.
 

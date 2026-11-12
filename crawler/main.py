@@ -34,7 +34,7 @@ from pyrogram.errors import (
 )
 from pyrogram.types import Message
 
-from parser import parse_filename, to_release_name
+from parser import parse_filename, to_release_name, decide_release
 
 # Pyrogram 2.0.106 hard-codes the pre-2024 channel-id range
 # (MIN_CHANNEL_ID = -1002147483647). Telegram now hands out channel ids above
@@ -1012,6 +1012,20 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verify_cursor BIGINT")
+        # What Telegram reports for a video message: running time + frame size.
+        for _col in ("duration_sec", "width", "height"):
+            await conn.execute(
+                f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {_col} INTEGER")
+        # Existing rows were indexed without them. The stale-index sweeper
+        # already re-reads every indexed message in batches; restart its walk
+        # once so it fills these in as it goes (no extra Telegram calls).
+        if not await conn.fetchval(
+                "SELECT 1 FROM config WHERE key='dims_backfill_0_5_6'"):
+            await conn.execute(
+                "UPDATE channels SET verified_at = NULL, verify_cursor = 0")
+            await conn.execute(
+                "INSERT INTO config (key, value) VALUES ('dims_backfill_0_5_6', 'started') "
+                "ON CONFLICT (key) DO NOTHING")
         # Content profile the registry sends for Discover ranking.
         for _col in ("release_files", "video_files", "book_files", "audio_files"):
             await conn.execute(
@@ -1054,23 +1068,27 @@ MIN_MOVIE_BYTES = 100 * 1024 * 1024   # 100 MB — anything smaller is sample/tr
 MIN_TV_BYTES = 30 * 1024 * 1024       # 30 MB — short TV ep can be 50MB at 480p
 
 
-async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at):
-    """Parse filename + insert release row if score is high enough."""
+async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at,
+                               duration=None, width=None, height=None):
+    """Parse the file name and insert a release row if it qualifies. The
+    decision (see parser.decide_release) also weighs the running time and
+    frame size Telegram reported, when it did."""
     parsed = parse_filename(file_name or "")
-    score = parsed.get("score", 0.0)
-    if score < PARSE_SCORE_MIN:
+    verdict = decide_release(parsed, file_size=file_size, duration=duration,
+                             width=width, height=height,
+                             min_score=PARSE_SCORE_MIN,
+                             min_movie_bytes=MIN_MOVIE_BYTES,
+                             min_tv_bytes=MIN_TV_BYTES)
+    if not verdict["create"]:
         return None
+    score = verdict["score"]
+    type_ = verdict["type"]
+    if verdict["quality"] and not parsed.get("quality"):
+        parsed["quality"] = verdict["quality"]
+    parsed["type"] = type_
     rname = to_release_name(parsed, fallback=file_name or "")
     if not rname:
         return None
-    type_ = parsed.get("type", "unknown")
-    # Size sanity: filename-only parse calls trailers/samples "movie".
-    # Real video files exceed these floors. Skip junk before it pollutes releases.
-    if file_size:
-        if type_ == "movie" and file_size < MIN_MOVIE_BYTES:
-            return None
-        if type_ == "tv" and file_size < MIN_TV_BYTES:
-            return None
     rel_id = await conn.fetchval(
         """INSERT INTO releases
              (name, category, series_title, season, episode,
@@ -1160,10 +1178,14 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
     audio_title = None
     audio_performer = None
     audio_duration_sec = None
+    duration_sec = width = height = None
 
     # Identify the media kind explicitly so /gallery can find photos cleanly.
     if msg.video:
         media, media_type = msg.video, "video"
+        duration_sec = getattr(msg.video, "duration", None) or None
+        width = getattr(msg.video, "width", None) or None
+        height = getattr(msg.video, "height", None) or None
     elif msg.document:
         media, media_type = msg.document, "document"
     elif msg.audio:
@@ -1179,6 +1201,8 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
     file_dc = None
     if media:
         file_name = getattr(media, "file_name", None)
+        if file_name:
+            file_name = file_name.replace("\x00", "")   # NUL breaks the INSERT
         file_size = getattr(media, "file_size", None)
         mime_type = getattr(media, "mime_type", None)
         file_unique_id = getattr(media, "file_unique_id", None)
@@ -1270,19 +1294,20 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
                  (channel_id, tg_message_id, tg_chat_id,
                   file_unique_id, file_name, caption, file_size, mime_type,
                   media_type, audio_title, audio_performer, audio_duration_sec,
-                  posted_at, file_dc, detected_lang)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                  posted_at, file_dc, detected_lang, duration_sec, width, height)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
             (caption.replace("\x00", "")[:1024] or None), file_size, mime_type, media_type,
             audio_title, audio_performer, audio_duration_sec, msg.date,
-            file_dc, detected_lang,
+            file_dc, detected_lang, duration_sec, width, height,
         )
 
         if new_msg_id and file_name:
             try:
-                await maybe_create_release(conn, new_msg_id, file_name, file_size, msg.date)
+                await maybe_create_release(conn, new_msg_id, file_name, file_size, msg.date,
+                                           duration=duration_sec, width=width, height=height)
             except Exception as e:
                 log.warning("[parse] failed msg_id=%s file=%s err=%s", new_msg_id, file_name, e)
 
@@ -2671,6 +2696,27 @@ async def stale_index_sweeper():
                     await conn.execute(defer_sql, ch["id"], STALE_RECHECK_DAYS - 1)
                 await asyncio.sleep(nap)
                 continue
+
+            # Same round-trip, extra value: record the running time and frame
+            # size of every video we just looked at.
+            try:
+                _dims = [(mid, getattr(m.video, "duration", None) or None,
+                          getattr(m.video, "width", None) or None,
+                          getattr(m.video, "height", None) or None)
+                         for mid, m in found.items() if getattr(m, "video", None)]
+                if _dims:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE messages m
+                                  SET duration_sec = v.d, width = v.w, height = v.h
+                                 FROM unnest($2::bigint[], $3::int[], $4::int[], $5::int[])
+                                      AS v(mid, d, w, h)
+                                WHERE m.channel_id = $1 AND m.tg_message_id = v.mid
+                                  AND m.duration_sec IS NULL""",
+                            ch["id"], [x[0] for x in _dims], [x[1] for x in _dims],
+                            [x[2] for x in _dims], [x[3] for x in _dims])
+            except Exception as e:
+                log.warning("[stale] could not record video attributes for @%s: %s", uname, e)
 
             removed, is_dead = await _reconcile_missing(
                 ch["id"], ch["tg_chat_id"], ch["username"], rows, found)

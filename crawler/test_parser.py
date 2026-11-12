@@ -6,7 +6,7 @@ one) that the parser has gotten wrong at some point.
 """
 import sys
 
-from parser import parse_filename
+from parser import decide_release, parse_filename, quality_from_dims
 
 # (file name, {field: expected}) — only the listed fields are checked.
 CASES = [
@@ -59,8 +59,51 @@ CASES = [
 ]
 
 
+# (width, height) -> label. Real frame sizes reported by Telegram.
+DIMS = [
+    ((1920, 804), "1080p"), ((1920, 1080), "1080p"), ((1280, 720), "720p"),
+    ((3840, 1600), "2160p"), ((1280, 536), "720p"), ((854, 480), "480p"),
+    ((720, 576), "576p"), ((1080, 1920), "1080p"), ((640, 360), "360p"),
+    ((0, 0), None), ((None, None), None),
+]
+
+MB = 1024 * 1024
+# (file name, kwargs for decide_release, {field: expected})
+VERDICTS = [
+    # a 3-CJK-character name used to be enough on its own
+    ("某个短片段.mp4", dict(file_size=40 * MB, duration=150), {"create": False, "reason": "clip"}),
+    ("某个短片段.mp4", dict(file_size=300 * MB, duration=14 * 60), {"create": False}),
+    ("某个短片段.mp4", dict(file_size=600 * MB, duration=35 * 60), {"create": True}),
+    # no duration known (document, old row): the name-only score stands
+    ("南方车站的聚会.mkv", dict(file_size=2000 * MB), {"create": True}),
+    # feature length + a real title => a movie even without a year; real resolution fills quality
+    ("赌神.mp4", dict(file_size=810 * MB, duration=125 * 60, width=1280, height=720),
+     {"create": True, "type": "movie", "quality": "720p"}),
+    # a normal release is unaffected, and a short episode is still an episode
+    ("Scream.7.2026.1080p.WEB-DL.mkv", dict(file_size=2300 * MB, duration=114 * 60, width=1920, height=800),
+     {"create": True, "type": "movie", "quality": "1080p"}),
+    ("Some.Show.S02E05.720p.mkv", dict(file_size=180 * MB, duration=11 * 60), {"create": True, "type": "tv"}),
+    # trailers / samples
+    ("Scream.7.2026.1080p.TRAILER.mkv", dict(file_size=60 * MB, duration=140), {"create": False, "reason": "clip"}),
+    ("Scream.7.2026.1080p.mkv", dict(file_size=40 * MB), {"create": False}),
+    # names with no title never qualify, however long the video
+    ("2024-08-18 21.mp4", dict(file_size=900 * MB, duration=90 * 60), {"create": False}),
+    ("01_0.mp4", dict(file_size=900 * MB, duration=40 * 60), {"create": False}),
+]
+
+
 def main() -> int:
     failures = []
+    for dims, want in DIMS:
+        have = quality_from_dims(*dims)
+        if have != want:
+            failures.append(f"quality_from_dims{dims} = {have!r}, expected {want!r}")
+    for name, kw, expected in VERDICTS:
+        got = decide_release(parse_filename(name), **kw)
+        for field, want in expected.items():
+            if got.get(field) != want:
+                failures.append(f"decide {name!r} {kw}: {field} = {got.get(field)!r}, "
+                                f"expected {want!r} (verdict {got})")
     for name, expected in CASES:
         got = parse_filename(name)
         for field, want in expected.items():
@@ -69,11 +112,11 @@ def main() -> int:
                 failures.append(f"{name!r}: {field} = {have!r}, expected {want!r}")
     if failures:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        print(f"FAILED {len(failures)} check(s) in {len(CASES)} cases:")
+        print(f"FAILED {len(failures)} check(s) in {len(CASES) + len(DIMS) + len(VERDICTS)} cases:")
         for f in failures:
             print("  -", f)
         return 1
-    print(f"parser: {len(CASES)} cases OK")
+    print(f"parser: {len(CASES)} name cases, {len(DIMS)} frame sizes, {len(VERDICTS)} release verdicts OK")
     return 0
 
 

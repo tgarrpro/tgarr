@@ -460,6 +460,10 @@ async def _migrate_schema():
             -- category the *arr asked for on add (tv / movies / …); echoed back
             -- in queue + history so each app only sees its own jobs.
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS sab_cat TEXT;
+            -- running time + frame size as reported by Telegram for videos
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS duration_sec INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS width INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS height INTEGER;
             -- 450px gallery preview (~76KB JPEG) — bigger than 12KB thumb for
             -- lightbox/slideshow. Same lazy-fetch model: '__user_queued__'
             -- marker triggers preview_downloader on next /api/photo-preview hit.
