@@ -455,6 +455,11 @@ async def _migrate_schema():
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS grab_count INT NOT NULL DEFAULT 0;
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS part SMALLINT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_accessed_at TIMESTAMPTZ;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_lyrics TEXT;
+            CREATE TABLE IF NOT EXISTS favorites (
+              msg_id BIGINT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS detected_lang TEXT;
             CREATE INDEX IF NOT EXISTS idx_messages_lang ON messages (detected_lang) WHERE detected_lang IS NOT NULL;
             -- Per-download live progress (populated by Pyrogram callback in
@@ -1295,7 +1300,8 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
     ttl_days, max_gb = await _cache_settings()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT local_path, max(local_accessed_at) AS used, max(file_size) AS want
+            """SELECT local_path, max(local_accessed_at) AS used, max(file_size) AS want,
+                      bool_or(EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = messages.id)) AS fav
                FROM messages
                WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
                GROUP BY local_path""")
@@ -1320,6 +1326,8 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
         if r["want"] and have < r["want"] * 0.95 and not clear_all:
             partial.append((used, size, lp))    # a fetch that died half-way
             continue
+        if r["fav"] and not clear_all:
+            continue                            # a favourite stays until un-favourited
         items.append((used, size, lp))
     doomed = []
     if clear_all:
@@ -1398,6 +1406,148 @@ def _saved_chip(path: str, qs, local: int) -> str:
     return (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
             f'style="{style}padding:5px 12px;font-size:12px" '
             f'title="only what is already downloaded">● saved</a>')
+
+
+@app.post("/api/fav/{msg_id}")
+async def fav_toggle(msg_id: int):
+    """Toggle a favourite. Favourites get their own filter, and their
+    downloaded file is never tidied away."""
+    async with db_pool.acquire() as conn:
+        gone = await conn.fetchval(
+            "DELETE FROM favorites WHERE msg_id = $1 RETURNING msg_id", msg_id)
+        if gone is None:
+            try:
+                await conn.execute(
+                    "INSERT INTO favorites (msg_id) VALUES ($1) ON CONFLICT DO NOTHING", msg_id)
+            except asyncpg.ForeignKeyViolationError:
+                return JSONResponse({"error": "no such item"}, status_code=404)
+    return {"fav": gone is None}
+
+
+_LRC_LINE = _re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+
+
+def _lyrics_payload(raw: str) -> dict:
+    """LRC text -> timed lines; anything else -> plain text."""
+    lines = []
+    for ln in (raw or "").splitlines():
+        stamps = list(_LRC_LINE.finditer(ln))
+        if not stamps:
+            continue
+        text = _LRC_LINE.sub("", ln).strip()
+        for m in stamps:
+            frac = m.group(3) or "0"
+            t = int(m.group(1)) * 60 + int(m.group(2)) + int(frac) / (10 ** len(frac))
+            lines.append([round(t, 2), text])
+    if len(lines) >= 3:
+        lines.sort(key=lambda x: x[0])
+        return {"found": True, "synced": True, "lines": lines}
+    text = _re.sub(r"\[[^\]\n]{0,24}\]", "", raw or "").strip()
+    if text:
+        return {"found": True, "synced": False, "text": text[:20000]}
+    return {"found": False}
+
+
+def _flac_embedded_lyrics(path: str):
+    """LYRICS / UNSYNCEDLYRICS from a FLAC's Vorbis comments, if any."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"fLaC":
+                return None
+            while True:
+                h = f.read(4)
+                if len(h) < 4:
+                    return None
+                ln = int.from_bytes(h[1:], "big")
+                if (h[0] & 0x7F) != 4:
+                    if h[0] & 0x80:
+                        return None
+                    f.seek(ln, 1)
+                    continue
+                b = f.read(min(ln, 2 * 1024 * 1024))
+                off = 4 + int.from_bytes(b[:4], "little")
+                n = int.from_bytes(b[off:off + 4], "little")
+                off += 4
+                for _ in range(min(n, 500)):
+                    cl = int.from_bytes(b[off:off + 4], "little")
+                    c = b[off + 4:off + 4 + cl].decode("utf-8", "replace")
+                    off += 4 + cl
+                    k, _, v = c.partition("=")
+                    if k.upper() in ("LYRICS", "UNSYNCEDLYRICS", "SYNCEDLYRICS") and v.strip():
+                        return v
+                return None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _lrclib_lookup(title: str, artist: str, duration) -> str:
+    """Lyrics from lrclib.net (free, no key). '' when it has none.
+    Sends the track title, artist and length - nothing about the user."""
+    import json
+    import urllib.parse
+    import urllib.request
+    ua = {"User-Agent": f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"}
+
+    def _get(url):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=ua), timeout=8) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:
+            return None
+    q = {"track_name": title}
+    if artist:
+        q["artist_name"] = artist
+    if artist and duration:
+        j = _get("https://lrclib.net/api/get?" + urllib.parse.urlencode({**q, "duration": int(duration)}))
+        if isinstance(j, dict) and (j.get("syncedLyrics") or j.get("plainLyrics")):
+            return j.get("syncedLyrics") or j.get("plainLyrics") or ""
+    j = _get("https://lrclib.net/api/search?" + urllib.parse.urlencode(q))
+    if isinstance(j, list):
+        best = None
+        for it in j[:20]:
+            if not isinstance(it, dict):
+                continue
+            if duration and it.get("duration") and abs(float(it["duration"]) - float(duration)) > 8:
+                continue
+            if it.get("syncedLyrics"):
+                return it["syncedLyrics"]
+            best = best or it.get("plainLyrics")
+        return best or ""
+    return ""
+
+
+@app.get("/api/lyrics/{msg_id}")
+async def lyrics(msg_id: int):
+    """Lyrics for a track: the file's own tag first, then lrclib.net. Looked
+    up once (when someone opens the lyrics) and kept."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow(
+            """SELECT audio_lyrics, audio_title, audio_canonical_title, audio_performer,
+                      audio_duration_sec, file_name, local_path
+               FROM messages WHERE id = $1 AND media_type = 'audio'""", msg_id)
+    if not r:
+        return JSONResponse({"found": False}, status_code=404)
+    raw = r["audio_lyrics"]
+    if raw is None:
+        raw = ""
+        if _is_local(r["local_path"]) and (r["local_path"] or "").lower().endswith(".flac"):
+            raw = await asyncio.to_thread(
+                _flac_embedded_lyrics, os.path.join("/downloads", r["local_path"])) or ""
+        if not raw:
+            title = (r["audio_canonical_title"] or r["audio_title"] or "").strip()
+            artist = (r["audio_performer"] or "").strip()
+            if not title and r["file_name"]:
+                stem = r["file_name"].rsplit(".", 1)[0]
+                if " - " in stem:
+                    artist, _, title = stem.partition(" - ")
+                else:
+                    title = stem
+            if title:
+                raw = await asyncio.to_thread(
+                    _lrclib_lookup, title.strip(), artist.strip(), r["audio_duration_sec"])
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE messages SET audio_lyrics = $2 WHERE id = $1", msg_id, raw)
+    return JSONResponse(_lyrics_payload(raw))
 
 
 @app.post("/api/settings/cache")
@@ -5028,10 +5178,260 @@ def _fmt_dur(secs):
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
+# ── Music player ─────────────────────────────────────────────────────
+# The bar at the bottom plays; "Now playing" opens a panel with the cover,
+# the lyrics (timed when lrclib.net has them, highlighted as the song goes)
+# and a spectrum. The spectrum can be switched off: it routes the sound
+# through Web Audio, which a few browsers / Bluetooth setups dislike, so with
+# it off playback is the plain <audio> element.
+_MUSIC_PLAYER_HTML = r"""
+<style>
+.music-list .act { white-space:nowrap; text-align:right; }
+.mbtn { display:inline-block; border:1px solid transparent; background:transparent; color:var(--muted);
+  font-size:16px; line-height:1; padding:6px 8px; border-radius:8px; cursor:pointer; text-decoration:none; }
+.mbtn:hover { border-color:var(--border); color:var(--accent); }
+.mbtn.fav.on { color:#e11d48; }
+.player-bar { gap:12px; padding:10px 18px; }
+.player-bar .np { cursor:pointer; min-width:0; flex:0 1 300px; }
+.player-bar .np-icon { overflow:hidden; flex:none; }
+.player-bar .np-icon img { width:100%; height:100%; object-fit:cover; display:block; }
+.player-bar .ctl { display:flex; gap:6px; align-items:center; flex:none; }
+.player-bar .ctl button, .player-bar .ctl a { padding:8px 11px; font-size:16px; line-height:1; }
+.player-bar #pp { font-size:20px; padding:9px 15px; }
+.player-bar #mini { width:110px; height:38px; flex:none; }
+.player-bar .seek { flex:1; min-width:80px; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+.player-bar .seek input { flex:1; accent-color:var(--accent); }
+.player-bar audio { display:none; }
+.np-panel { position:fixed; left:260px; right:0; bottom:66px; top:0; z-index:99; display:none; color:#e5e7eb;
+  background:linear-gradient(160deg,#0b1220 0%,#111a2e 55%,#1b1033 100%); overflow:hidden; }
+.np-panel.open { display:flex; flex-direction:column; }
+.np-panel .bgimg { position:absolute; inset:-40px; background-size:cover; background-position:center;
+  filter:blur(46px) brightness(.38); opacity:.9; }
+.np-panel .top { position:relative; display:flex; justify-content:flex-end; gap:8px; padding:14px 18px; }
+.np-panel .top button { background:rgba(255,255,255,.08); color:#e5e7eb; border:1px solid rgba(255,255,255,.16);
+  border-radius:18px; padding:7px 14px; font-size:13px; cursor:pointer; }
+.np-panel .top button.on { background:rgba(96,165,250,.28); border-color:#60a5fa; }
+.np-panel .mid { position:relative; flex:1; min-height:0; display:flex; gap:44px; padding:6px 48px 0; align-items:center; }
+.np-panel .art { flex:none; width:min(300px,28vw); text-align:center; }
+.np-panel .art .cv { width:100%; aspect-ratio:1; border-radius:14px; background:rgba(255,255,255,.07);
+  display:flex; align-items:center; justify-content:center; font-size:84px; overflow:hidden;
+  box-shadow:0 18px 50px rgba(0,0,0,.5); }
+.np-panel .art .cv img { width:100%; height:100%; object-fit:cover; }
+.np-panel .art .t { font-size:20px; font-weight:700; margin-top:18px; color:#fff; }
+.np-panel .art .a { font-size:14px; color:#9ca3af; margin-top:6px; }
+.np-panel .lyr { flex:1; min-width:0; height:100%; overflow-y:auto; scrollbar-width:none; padding:38vh 0;
+  -webkit-mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent);
+  mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent); }
+.np-panel .lyr::-webkit-scrollbar { display:none; }
+.np-panel .lyr div { font-size:19px; line-height:1.5; padding:9px 0; color:#6b7280; transition:color .25s,transform .25s;
+  transform-origin:left center; cursor:pointer; }
+.np-panel .lyr div.on { color:#fff; font-weight:700; transform:scale(1.08); }
+.np-panel .lyr.plain { padding:20px 0; }
+.np-panel .lyr.plain div { cursor:default; color:#cbd5e1; font-size:16px; padding:3px 0; }
+.np-panel .lyr .none { color:#6b7280; font-size:15px; cursor:default; }
+.np-panel canvas#viz { position:relative; width:100%; height:120px; flex:none; display:block; }
+@media (max-width:900px){ .np-panel{ left:0 } .np-panel .mid{ flex-direction:column; gap:14px; padding:0 20px }
+  .np-panel .art{ width:150px } .np-panel .art .t{ font-size:16px; margin-top:10px } .np-panel .lyr{ width:100%; padding:20vh 0 }
+  .player-bar #mini, .player-bar .seek span { display:none } .player-bar .np { flex:1 1 120px } }
+</style>
+<div class="np-panel" id="npPanel">
+  <div class="bgimg" id="npBg"></div>
+  <div class="top">
+    <button id="vizBtn" title="moving spectrum on / off">Spectrum</button>
+    <button id="lyrBtn" title="lyrics on / off">Lyrics</button>
+    <button id="npClose">Close ✕</button>
+  </div>
+  <div class="mid">
+    <div class="art"><div class="cv" id="npCover">🎵</div><div class="t" id="npT2"></div><div class="a" id="npA2"></div></div>
+    <div class="lyr" id="lyr"></div>
+  </div>
+  <canvas id="viz"></canvas>
+</div>
+<div class="player-bar">
+  <div class="np" id="npOpen" title="open the now-playing view">
+    <div class="np-icon" id="npIcon">🎵</div>
+    <div class="np-text"><div class="np-t" id="npT">— select a track —</div><div class="np-a" id="npA"></div></div>
+  </div>
+  <div class="ctl">
+    <button class="ghost" id="prevBtn" title="previous (p)">⏮</button>
+    <button id="pp" title="play / pause (space)">▶</button>
+    <button class="ghost" id="nextBtn" title="next (n)">⏭</button>
+  </div>
+  <div class="seek"><span id="tCur">0:00</span><input type="range" id="seek" min="0" max="1000" value="0"><span id="tDur">0:00</span></div>
+  <canvas id="mini"></canvas>
+  <div class="ctl">
+    <button class="ghost" id="shuffleBtn" title="shuffle">🔀</button>
+    <button class="ghost" id="favBtn" title="favourite (f)">♥</button>
+    <a class="btn ghost" id="dlBtn" title="download this file" download>⬇</a>
+    <button class="ghost" id="npBtn" title="cover, lyrics and spectrum (l)">♪ Now playing</button>
+  </div>
+  <audio id="audio" preload="metadata"></audio>
+</div>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const rows = [...document.querySelectorAll(".music-list tbody tr")];
+  const audio = $("audio");
+  let cur = -1, shuffled = false, lines = null, lineEls = [], lineIdx = -1;
+  let prefs = {}; try { prefs = JSON.parse(localStorage.getItem("tgarr.music") || "{}"); } catch (e) {}
+  if (prefs.viz === undefined) prefs.viz = true;
+  if (prefs.lyr === undefined) prefs.lyr = true;
+  const save = () => { try { localStorage.setItem("tgarr.music", JSON.stringify(prefs)); } catch (e) {} };
+  const fmt = s => { s = Math.max(0, Math.floor(s || 0)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+  // ── spectrum ──
+  let ctx = null, an = null, data = null, raf = 0;
+  function vizStart(){
+    if (!prefs.viz) return;
+    try {
+      if (!ctx) {
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        an = ctx.createAnalyser(); an.fftSize = 256; an.smoothingTimeConstant = 0.82;
+        ctx.createMediaElementSource(audio).connect(an); an.connect(ctx.destination);
+        data = new Uint8Array(an.frequencyBinCount);
+      }
+      if (ctx.state === "suspended") ctx.resume();
+      if (!raf) raf = requestAnimationFrame(draw);
+    } catch (e) { prefs.viz = false; vizUi(); }
+  }
+  function bars(cv, n, big){
+    const w = cv.clientWidth, h = cv.clientHeight; if (!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    const bw = w / n, used = Math.floor(data.length * 0.72);
+    for (let i = 0; i < n; i++) {
+      let v = 0; const a = Math.floor(i * used / n), b = Math.max(a + 1, Math.floor((i + 1) * used / n));
+      for (let j = a; j < b; j++) v = Math.max(v, data[j]);
+      const bh = Math.max(2, (v / 255) * h * (big ? 0.95 : 0.9));
+      if (big) { const gr = g.createLinearGradient(0, h - bh, 0, h); gr.addColorStop(0, "rgba(167,139,250,.95)"); gr.addColorStop(1, "rgba(56,189,248,.35)"); g.fillStyle = gr; }
+      else g.fillStyle = "rgba(56,160,220,.85)";
+      g.fillRect(i * bw + bw * 0.18, h - bh, bw * 0.64, bh);
+    }
+  }
+  function draw(){
+    raf = 0;
+    if (!prefs.viz || !an || audio.paused) { clear(); return; }
+    an.getByteFrequencyData(data);
+    bars($("mini"), 18, false);
+    if ($("npPanel").classList.contains("open")) bars($("viz"), 72, true);
+    raf = requestAnimationFrame(draw);
+  }
+  function clear(){ for (const id of ["mini", "viz"]) { const c = $(id); const g = c.getContext("2d"); g.clearRect(0, 0, c.width, c.height); } }
+  function vizUi(){ $("vizBtn").classList.toggle("on", !!prefs.viz); $("viz").style.display = prefs.viz ? "block" : "none";
+    $("mini").style.visibility = prefs.viz ? "visible" : "hidden"; }
+  $("vizBtn").onclick = () => { prefs.viz = !prefs.viz; save(); vizUi();
+    if (prefs.viz && !audio.paused) vizStart();
+    else if (!prefs.viz && ctx) { clear(); } };
+
+  // ── lyrics ──
+  function lyrUi(){ $("lyrBtn").classList.toggle("on", !!prefs.lyr); $("lyr").style.visibility = prefs.lyr ? "visible" : "hidden"; }
+  $("lyrBtn").onclick = () => { prefs.lyr = !prefs.lyr; save(); lyrUi(); if (prefs.lyr && cur >= 0 && lines === null) loadLyrics(rows[cur].dataset.id); };
+  function loadLyrics(id){
+    const box = $("lyr"); lines = null; lineEls = []; lineIdx = -1;
+    box.className = "lyr"; box.innerHTML = '<div class="none">looking for lyrics…</div>';
+    if (!prefs.lyr) return;
+    fetch("/api/lyrics/" + id).then(r => r.json()).then(j => {
+      if (cur < 0 || rows[cur].dataset.id !== String(id)) return;
+      if (!j.found) { lines = []; box.innerHTML = '<div class="none">No lyrics found for this track.</div>'; return; }
+      if (j.synced) {
+        lines = j.lines;
+        box.innerHTML = lines.map((l, i) => '<div data-i="' + i + '">' + (esc(l[1]) || "♪") + "</div>").join("");
+        lineEls = [...box.children];
+        lineEls.forEach(el => el.onclick = () => { audio.currentTime = lines[+el.dataset.i][0]; });
+      } else {
+        lines = []; box.className = "lyr plain";
+        box.innerHTML = j.text.split("\n").map(t => "<div>" + (esc(t) || "&nbsp;") + "</div>").join("");
+      }
+    }).catch(() => { lines = []; box.innerHTML = '<div class="none">Could not load lyrics.</div>'; });
+  }
+  function lyrTick(){
+    if (!lines || !lines.length || !lineEls.length) return;
+    const t = audio.currentTime + 0.15; let lo = 0, hi = lines.length - 1, k = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (lines[m][0] <= t) { k = m; lo = m + 1; } else hi = m - 1; }
+    if (k === lineIdx) return;
+    if (lineIdx >= 0 && lineEls[lineIdx]) lineEls[lineIdx].classList.remove("on");
+    lineIdx = k;
+    if (k >= 0) { lineEls[k].classList.add("on");
+      if ($("npPanel").classList.contains("open")) lineEls[k].scrollIntoView({block: "center", behavior: "smooth"}); }
+  }
+
+  // ── playing ──
+  function setCover(url){
+    const img = url ? '<img src="' + esc(url) + '" alt="" onerror="this.replaceWith(document.createTextNode(\'🎵\'))">' : "🎵";
+    $("npIcon").innerHTML = img; $("npCover").innerHTML = img;
+    $("npBg").style.backgroundImage = url ? 'url("' + url.replace(/"/g, "%22") + '")' : "none";
+  }
+  function favUi(){ const on = cur >= 0 && rows[cur].dataset.fav === "1"; $("favBtn").style.color = on ? "#e11d48" : ""; }
+  window.tgMusicPlay = function(row){
+    cur = rows.indexOf(row);
+    rows.forEach(r => r.classList.remove("playing")); row.classList.add("playing");
+    const d = row.dataset;
+    audio.src = "/media/" + d.id;
+    $("npT").textContent = $("npT2").textContent = d.title;
+    $("npA").textContent = $("npA2").textContent = d.artist;
+    $("dlBtn").href = "/media/" + d.id; $("dlBtn").setAttribute("download", d.file || "");
+    setCover(d.cover); favUi(); loadLyrics(d.id);
+    if ("mediaSession" in navigator) { try { navigator.mediaSession.metadata = new MediaMetadata({title: d.title, artist: d.artist,
+      artwork: d.cover ? [{src: d.cover}] : []}); } catch (e) {} }
+    vizStart();
+    audio.play().catch(() => {});
+  };
+  window.tgMusicNext = function(){ if (!rows.length) return;
+    tgMusicPlay(rows[shuffled ? Math.floor(Math.random() * rows.length) : (cur + 1) % rows.length]); };
+  function prev(){ if (!rows.length) return; if (audio.currentTime > 4) { audio.currentTime = 0; return; }
+    tgMusicPlay(rows[(cur - 1 + rows.length) % rows.length]); }
+  function toggle(){ if (cur < 0) { if (rows.length) tgMusicPlay(rows[0]); return; } audio.paused ? audio.play() : audio.pause(); }
+  window.tgFav = function(row){
+    fetch("/api/fav/" + row.dataset.id, {method: "POST"}).then(r => r.json()).then(j => {
+      if (j.fav === undefined) return;
+      row.dataset.fav = j.fav ? "1" : "0";
+      const b = row.querySelector(".mbtn.fav"); if (b) b.classList.toggle("on", j.fav);
+      favUi();
+    });
+  };
+  $("pp").onclick = toggle; $("nextBtn").onclick = tgMusicNext; $("prevBtn").onclick = prev;
+  $("favBtn").onclick = () => { if (cur >= 0) tgFav(rows[cur]); };
+  $("shuffleBtn").onclick = e => { shuffled = !shuffled; const b = e.currentTarget;
+    b.style.background = shuffled ? "var(--accent)" : ""; b.style.color = shuffled ? "#fff" : ""; };
+  const panel = on => { $("npPanel").classList.toggle("open", on); $("npBtn").classList.toggle("on", on);
+    if (on) { lineIdx = -1; lyrTick(); if (!audio.paused) vizStart(); } };
+  $("npBtn").onclick = () => panel(!$("npPanel").classList.contains("open"));
+  $("npOpen").onclick = () => panel(true); $("npClose").onclick = () => panel(false);
+  audio.addEventListener("play", () => { $("pp").textContent = "⏸"; vizStart(); });
+  audio.addEventListener("pause", () => { $("pp").textContent = "▶"; });
+  audio.addEventListener("ended", tgMusicNext);
+  audio.addEventListener("error", () => { if (cur >= 0) $("npA").textContent = "could not play this file — try the next one"; });
+  audio.addEventListener("timeupdate", () => {
+    $("tCur").textContent = fmt(audio.currentTime); $("tDur").textContent = fmt(audio.duration);
+    if (audio.duration && !seeking) $("seek").value = Math.round(audio.currentTime / audio.duration * 1000);
+    lyrTick();
+  });
+  let seeking = false;
+  $("seek").addEventListener("input", () => { seeking = true; });
+  $("seek").addEventListener("change", e => { seeking = false; if (audio.duration) audio.currentTime = e.target.value / 1000 * audio.duration; });
+  document.addEventListener("keydown", e => {
+    if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) && e.target.type !== "range") return;
+    if (e.key === "n") tgMusicNext();
+    else if (e.key === "p") prev();
+    else if (e.key === "f" && cur >= 0) tgFav(rows[cur]);
+    else if (e.key === "l") panel(!$("npPanel").classList.contains("open"));
+    else if (e.key === "Escape") panel(false);
+    else if (e.key === " ") { e.preventDefault(); toggle(); }
+  });
+  vizUi(); lyrUi();
+  // /music#now opens the now-playing view on the first track
+  if (location.hash === "#now" && rows.length) { tgMusicPlay(rows[0]); panel(true); }
+})();
+</script>
+"""
+
+
 @app.get("/music", response_class=HTMLResponse)
 async def page_music(limit: int = 100, q: Optional[str] = None,
                      lang: Optional[str] = None, sort: str = "quality",
-                     offset: int = 0, local: int = 0):
+                     offset: int = 0, local: int = 0, fav: int = 0):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -5075,6 +5475,8 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         where_parts.append(f"m.detected_lang = ${len(params)}")
     if local:
         where_parts.append(_LOCAL_SQL)
+    if fav:
+        where_parts.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
 
@@ -5092,6 +5494,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
                    m.file_name, m.file_size, m.posted_at, m.file_dc,
                    m.audio_canonical_title, m.audio_album, m.audio_year,
                    m.audio_cover_url, m.local_path, m.detected_lang,
+                   EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav,
                    c.title AS ch_title, c.username AS ch_user
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
@@ -5102,7 +5505,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
 
     def _music_qs(**overrides):
         defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None,
-                    "local": 1 if local else None,
+                    "local": 1 if local else None, "fav": 1 if fav else None,
                     "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
@@ -5138,7 +5541,10 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         _music_sort_chip("recent",  "Recent") +
         _music_sort_chip("longest", "Longest") +
         _music_sort_chip("size",    "Largest") +
-        '<span style="margin-left:10px"></span>' + _saved_chip("/music", _music_qs, local))
+        '<span style="margin-left:10px"></span>' + _saved_chip("/music", _music_qs, local) +
+        f'<a class="btn ghost" href="/music{_music_qs(fav=None if fav else 1)}" '
+        f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
+        f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
@@ -5160,19 +5566,36 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         )
         return HTMLResponse(_layout("Music", "/music", body))
 
-    rows_html = "".join(
-        f'<tr data-id="{r["id"]}" onclick="tgMusicPlay(this)">'
-        f'<td class="play-cell"><div class="play-ico">▶</div></td>'
-        f'<td class="title-cell">'
-        f'<div class="t">{html.escape(r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)")} {_local_pill(r["local_path"])}</div>'
-        f'<div class="a">{_dc_badge(r.get("file_dc"), _music_my_dc)} {html.escape((r["audio_performer"] or "") + ((" · " + (r["audio_album"] or r["ch_title"])) if (r["audio_album"] or r["ch_title"]) else ""))}{(" · " + str(r["audio_year"])) if r.get("audio_year") else ""}</div>'
-        f'</td>'
-        f'<td class="num">{_fmt_dur(r["audio_duration_sec"])}</td>'
-        f'<td class="num">{_fmt_size(r["file_size"])}</td>'
-        f'<td class="num">{_fmt_time(r["posted_at"])[:10]}</td>'
-        f'</tr>'
-        for r in rows
-    )
+    def _row(r):
+        title = r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)"
+        artist = r["audio_performer"] or ""
+        album = r["audio_album"] or r["ch_title"] or ""
+        sub = artist + ((" · " + album) if album else "") + \
+            ((" · " + str(r["audio_year"])) if r.get("audio_year") else "")
+        return (
+            f'<tr data-id="{r["id"]}" data-title="{html.escape(title, quote=True)}" '
+            f'data-artist="{html.escape(artist, quote=True)}" '
+            f'data-cover="{html.escape(r["audio_cover_url"] or "", quote=True)}" '
+            f'data-fav="{1 if r["fav"] else 0}" '
+            f'data-file="{html.escape(r["file_name"] or "", quote=True)}" onclick="tgMusicPlay(this)">'
+            f'<td class="play-cell"><div class="play-ico">▶</div></td>'
+            f'<td class="title-cell">'
+            f'<div class="t">{html.escape(title)} {_local_pill(r["local_path"])}</div>'
+            f'<div class="a">{_dc_badge(r.get("file_dc"), _music_my_dc)} {html.escape(sub)}</div>'
+            f'</td>'
+            f'<td class="num">{_fmt_dur(r["audio_duration_sec"])}</td>'
+            f'<td class="num">{_fmt_size(r["file_size"])}</td>'
+            f'<td class="num">{_fmt_time(r["posted_at"])[:10]}</td>'
+            f'<td class="act">'
+            f'<button class="mbtn fav{" on" if r["fav"] else ""}" title="favourite" '
+            f'onclick="event.stopPropagation();tgFav(this.closest(\'tr\'))">♥</button>'
+            f'<a class="mbtn" title="download this file" href="/media/{r["id"]}" '
+            f'download="{html.escape(r["file_name"] or "", quote=True)}" '
+            f'onclick="event.stopPropagation()">⬇</a>'
+            f'</td>'
+            f'</tr>')
+
+    rows_html = "".join(_row(r) for r in rows)
 
     body = (
         f'<h2 class="section">Music <span class="count">{len(rows)} of {total:,}</span>'
@@ -5181,51 +5604,11 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         + '</h2>'
         f'{toolbar}'
         '<table class="music-list">'
-        '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th><th>posted</th></tr></thead>'
+        '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th>'
+        '<th>posted</th><th style="width:84px"></th></tr></thead>'
         f'<tbody>{rows_html}</tbody></table>'
-        + _page_nav("/music", _music_qs, page_offset, page_size, len(rows), total) +
-        '<div class="player-bar">'
-        '  <div class="np">'
-        '    <div class="np-icon">🎵</div>'
-        '    <div class="np-text"><div class="np-t" id="npT">— select a track —</div><div class="np-a" id="npA"></div></div>'
-        '  </div>'
-        '  <audio id="audio" controls preload="metadata" style="flex:1;min-width:0"></audio>'
-        '  <button class="ghost" onclick="tgMusicNext()" title="next (n)">⏭</button>'
-        '  <button class="ghost" id="shuffleBtn" onclick="tgMusicShuffle(this)" title="shuffle">🔀</button>'
-        '</div>'
-        '<script>'
-        '(() => {'
-        '  const rows = [...document.querySelectorAll(".music-list tbody tr")];'
-        '  const ids = rows.map(r => r.dataset.id);'
-        '  const audio = document.getElementById("audio");'
-        '  let cur = -1, shuffled = false;'
-        '  window.tgMusicPlay = function(row) {'
-        '    cur = rows.indexOf(row);'
-        '    rows.forEach(r => r.classList.remove("playing"));'
-        '    row.classList.add("playing");'
-        '    audio.src = "/media/" + row.dataset.id;'
-        '    document.getElementById("npT").textContent = row.querySelector(".t").textContent;'
-        '    document.getElementById("npA").textContent = row.querySelector(".a").textContent;'
-        '    audio.play().catch(() => {});'
-        '  };'
-        '  window.tgMusicNext = function() {'
-        '    if (!rows.length) return;'
-        '    let nxt = shuffled ? Math.floor(Math.random()*rows.length) : (cur+1) % rows.length;'
-        '    tgMusicPlay(rows[nxt]);'
-        '  };'
-        '  window.tgMusicShuffle = function(btn) {'
-        '    shuffled = !shuffled;'
-        '    btn.style.background = shuffled ? "var(--accent)" : "";'
-        '    btn.style.color = shuffled ? "#fff" : "";'
-        '  };'
-        '  audio.addEventListener("ended", tgMusicNext);'
-        '  document.addEventListener("keydown", e => {'
-        '    if (e.target.tagName === "INPUT") return;'
-        '    if (e.key === "n") tgMusicNext();'
-        '    else if (e.key === " " && audio.src) { e.preventDefault(); audio.paused ? audio.play() : audio.pause(); }'
-        '  });'
-        '})();'
-        '</script>'
+        + _page_nav("/music", _music_qs, page_offset, page_size, len(rows), total)
+        + _MUSIC_PLAYER_HTML
     )
     return HTMLResponse(_layout("Music", "/music", body))
 
