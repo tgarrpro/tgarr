@@ -77,6 +77,98 @@ def title_matches(query: str, *candidates) -> bool:
     return False
 
 
+# Script of the query -> TMDB language. Asking in the query's own language makes
+# TMDB return the localized title, which is the only thing a translated title
+# ("福尔摩斯小姐2" for Enola Holmes 2) can be compared against: such a film's
+# title and original_title are both English.
+_SCRIPT_LANG = (
+    ("[\u3040-\u30ff]", "ja-JP"),
+    ("[\uac00-\ud7af]", "ko-KR"),
+    ("[\u4e00-\u9fff]", "zh-CN"),
+    ("[\u0400-\u04ff]", "ru-RU"),
+    ("[\u0590-\u05ff]", "he-IL"),
+    ("[\u0600-\u06ff]", "ar-SA"),
+    ("[\u0900-\u097f]", "hi-IN"),
+)
+
+
+_AD_SUFFIX = re.compile(
+    r"\s*[-\u2013\u2014~\uff5e|\uff5c]+\s*\S*(TG|tg|\u7535\u62a5|\u9891\u9053|\u5f71\u9662|\u8d44\u6e90|@).*$")
+
+
+def clean_query_title(title: str) -> str:
+    """Strip posting decorations that are not part of the title before asking
+    a metadata source: a leading '#', a list index ("1 La La Land"), a channel
+    advert after a dash ("Title -TG cinema ~ hot movies"), and a dangling
+    opening bracket left by the parser."""
+    t = (title or "").strip()
+    t = re.sub(r"^[#\uff03\s]+", "", t)
+    t = _AD_SUFFIX.sub("", t)
+    t = re.sub(r"^\d{1,2}\s+(?=\D)", "", t)
+    t = re.sub(r"[\s(\[{<\uff08\u3010\u300a\u300c\u300e]+$", "", t)
+    return t.strip() or (title or "").strip()
+
+
+def query_language(title: str):
+    for rx, lang in _SCRIPT_LANG:
+        if re.search(rx, title or ""):
+            return lang
+    return None
+
+
+def _shared_prefix(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _hit_year(hit: dict):
+    d = (hit.get("release_date") or hit.get("first_air_date") or "")[:4]
+    return int(d) if d.isdigit() else None
+
+
+def pick_tmdb_hit(title: str, year, results: list, lang):
+    """Choose the search result that is really `title`, or None.
+
+    1. A result whose title / original title equals the query (any script).
+    2. Non-Latin query: a result whose LOCALIZED title starts the same way
+       (>= 2 characters and at least half of the shorter one) — sequels and
+       subtitles differ after the common stem.
+    3. Non-Latin query with a year: the top result, if its year is within one
+       of ours. TMDB search matches translated/alternative titles we cannot
+       see, and the year is independent confirmation.
+    Latin queries stay strict (rule 1 only): that is where the wrong posters
+    came from ("Kiki" -> "Kiki's Delivery Service").
+    """
+    top = results[:5]
+    for h in top:
+        if title_matches(title, h.get("title"), h.get("name"),
+                         h.get("original_title"), h.get("original_name")):
+            return h
+    if not lang:
+        return None
+    q = _norm(re.sub(r"[ ._(\[-]+(19|20)\d{2}[)\]]?$", "", (title or "").strip()))
+    for h in top:
+        for cand in (h.get("title"), h.get("name")):
+            c = _norm(cand)
+            if not c or not q:
+                continue
+            k = _shared_prefix(q, c)
+            short = min(len(q), len(c))
+            # a real common stem (>= 3 chars and at least half), or one title
+            # is entirely the beginning of the other
+            if (k >= 3 and k * 2 >= short) or (k >= 2 and k == short):
+                return h
+    if year and top:
+        hy = _hit_year(top[0])
+        if hy is not None and abs(hy - int(year)) <= 1 and len(q) >= 2:
+            return top[0]
+    return None
+
+
 class LookupFailed(Exception):
     """A metadata source errored (network, 5xx, bad key). NOT a miss."""
 
@@ -96,6 +188,9 @@ def _fetch(url: str, params: dict | None = None, timeout: int = 12) -> dict:
 async def _tmdb_search(category: str, title: str, year: int | None,
                        key: str) -> dict | None:
     params = {"query": title, "include_adult": "false", "api_key": key}
+    lang = query_language(title)
+    if lang:
+        params["language"] = lang
     if category == "tv" and year:
         params["first_air_date_year"] = year
         path = "/search/tv"
@@ -116,12 +211,8 @@ async def _tmdb_search(category: str, title: str, year: int | None,
     results = data.get("results") or []
     if not results:
         return None
-    # The first search result is not necessarily our title. Take the first of
-    # the top few whose (localized or original) title really matches.
-    hit = next((h for h in results[:5]
-                if title_matches(title, h.get("title"), h.get("name"),
-                                 h.get("original_title"), h.get("original_name"))),
-               None)
+    # The first search result is not necessarily our title.
+    hit = pick_tmdb_hit(title, year, results, lang)
     if hit is None:
         return UNMATCHED
     return {
@@ -225,7 +316,7 @@ async def lookup(category: str, title: str, year: int | None,
     """
     if not title or len(title.strip()) < 2:
         return None
-    title = title.strip()
+    title = clean_query_title(title)
     if is_junk_title(title):
         return UNMATCHED
     tmdb_err = None

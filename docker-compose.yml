@@ -69,6 +69,11 @@ services:
     restart: unless-stopped
     depends_on: [db]
     logging: *tgarr-logging
+    # Lets tgarr reach Sonarr / Radarr published on this same host as
+    # host.docker.internal (the default SONARR_URL / RADARR_URL) without
+    # knowing the host's LAN address, so a DHCP change breaks nothing.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
       TGARR_BASE_URL: ${TGARR_BASE_URL:-}

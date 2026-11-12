@@ -154,7 +154,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.5"
+TGARR_VERSION = "0.5.6"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -494,6 +494,18 @@ async def _migrate_schema():
                   ON CONFLICT (key) DO NOTHING;
               END IF;
             END $recheck$;
+            -- 0.5.5 judged translated titles too strictly (a foreign film under
+            -- its Chinese / Russian / ... title has only English titles in
+            -- TMDB, so nothing "matched"). Give every 'unmatched' release one
+            -- more look under the 0.5.6 rules. No score is touched.
+            DO $recheck2$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM config WHERE key = 'meta_recheck_0_5_6') THEN
+                UPDATE releases SET metadata_source = NULL, metadata_lookup_at = NULL
+                 WHERE metadata_source = 'unmatched';
+                INSERT INTO config (key, value) VALUES ('meta_recheck_0_5_6', 'done')
+                  ON CONFLICT (key) DO NOTHING;
+              END IF;
+            END $recheck2$;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
