@@ -26,12 +26,20 @@ from fastapi import FastAPI, Form, Header, Query, Response, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 import login  # local module
+
+
+def _js_str(v) -> str:
+    """Serialize a Python value as a JS literal safe inside an inline <script>."""
+    return (_json.dumps("" if v is None else str(v))
+            .replace("</", "<\\/").replace("<!--", "<\\!--")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
 import metadata as md  # local module
 
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.3"
+TGARR_VERSION = "0.5.4"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -198,6 +206,7 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_dc INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_accessed_at TIMESTAMPTZ;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview_accessed_at TIMESTAMPTZ;
             CREATE INDEX IF NOT EXISTS idx_messages_thumb_accessed ON messages (thumb_accessed_at) WHERE thumb_path IS NOT NULL;
@@ -326,11 +335,13 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS account_user_id BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS is_joined BOOLEAN NOT NULL DEFAULT FALSE;
             CREATE INDEX IF NOT EXISTS idx_channels_account ON channels (account_user_id);
-            -- One-shot backfill: existing rows discovered before per-account
-            -- tracking get assigned to @tjin09 (id=7506176065). Idempotent —
-            -- only fills NULL.
-            UPDATE channels SET account_user_id = 7506176065
-              WHERE account_user_id IS NULL;
+            -- NULL account_user_id = "not yet claimed by an account"; the crawler
+            -- treats it as visible to whichever account is logged in.
+            -- FK-lookup indexes: releases.primary_msg_id is hit by every message
+            -- delete + several NOT IN subqueries; downloads by the queue workers.
+            CREATE INDEX IF NOT EXISTS idx_releases_primary_msg ON releases (primary_msg_id);
+            CREATE INDEX IF NOT EXISTS idx_downloads_release ON downloads (release_id);
+            CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads (status);
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -556,18 +567,34 @@ async def _metadata_worker():
                            movie_year
                     FROM releases
                     WHERE metadata_source IS NULL
+                      AND (metadata_lookup_at IS NULL
+                           OR metadata_lookup_at < NOW() - INTERVAL '6 hours')
                     ORDER BY posted_at DESC NULLS LAST
                     LIMIT 1
                 """)
             if not row:
                 await asyncio.sleep(30)
                 continue
-            result = await md.lookup(
-                row["category"] or "movie",
-                row["title"] or "",
-                row["movie_year"],
-                tmdb_key=tmdb_key,
-            )
+            try:
+                result = await md.lookup(
+                    row["category"] or "movie",
+                    row["title"] or "",
+                    row["movie_year"],
+                    tmdb_key=tmdb_key,
+                )
+            except md.LookupFailed as e:
+                # Source unreachable/errored. This says NOTHING about whether
+                # the release is real — leave it untouched (metadata_source
+                # stays NULL), park it for 6h, and back off so an outage can't
+                # chew through the table.
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE releases SET metadata_lookup_at=NOW() WHERE id=$1",
+                        row["id"])
+                wlog.warning("[meta] lookup failed id=%s (%s) — retry in 6h",
+                             row["id"], e)
+                await asyncio.sleep(60)
+                continue
             current_score = float(row["parse_score"] or 0)
             async with db_pool.acquire() as conn:
                 if result:
@@ -582,8 +609,9 @@ async def _metadata_worker():
                     """, result.get("poster_url"), result.get("canonical_title"),
                          result.get("overview"), result.get("source"),
                          new_score, row["id"])
-                elif re.search(r"[一-鿿぀-ヿ가-힯]", row["title"] or ""):
-                    # CJK title + TMDB miss. TMDB has poor coverage of Chinese/
+                elif re.search(r"[^\x00-\u024f]", row["title"] or ""):
+                    # Non-Latin-script title (CJK, Cyrillic, Arabic, Indic, …)
+                    # + TMDB miss. TMDB has poor coverage of Chinese/
                     # Japanese/Korean indie content (docs, regional films), so a
                     # miss is NOT evidence the release is fake — it's just not in
                     # TMDB. KEEP it (no metadata) instead of deleting; otherwise
@@ -598,7 +626,10 @@ async def _metadata_worker():
                     # Drop parse_score. If < 0.30 threshold → delete the release
                     # (not a real release, just looked release-shaped).
                     new_score = max(0.0, current_score - 0.3)
-                    if new_score < 0.30:
+                    has_dl = await conn.fetchval(
+                        "SELECT 1 FROM downloads WHERE release_id=$1 LIMIT 1",
+                        row["id"])
+                    if new_score < 0.30 and not has_dl:
                         await conn.execute(
                             "DELETE FROM releases WHERE id=$1", row["id"])
                         wlog.info("[meta] TMDB miss → deleted weak release id=%s '%s'",
@@ -1494,7 +1525,7 @@ async def media_status(msg_id: int):
         return JSONResponse({"status": "missing"}, status_code=404)
     lp = row["local_path"]
     total = row["file_size"] or 0
-    file_dc = row["file_dc"]
+    file_dc = row["file_dc"] if (row["file_dc"] or 0) > 0 else None
     my_dc = await _get_my_dc()
     cross_dc = bool(file_dc and my_dc and file_dc != my_dc)
     if lp == "__failed__":
@@ -1579,8 +1610,8 @@ audio {{ width:600px; max-width:96vw; }}
 </main>
 <script>
 const MSG_ID = {msg_id};
-const MEDIA_TYPE = {repr(mt)};
-const MEDIA_FILE_NAME = {repr(row["file_name"] or "")};
+const MEDIA_TYPE = {_js_str(mt)};
+const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
 let started = false;
 function fmtBytes(b) {{
   if (!b) return "0 B";
@@ -2867,6 +2898,19 @@ setInterval(loadDeepBackfill, 60000);
     return HTMLResponse(_layout("System", "/system", body))
 
 
+@app.get("/health")
+async def health():
+    """Liveness/readiness: one trivial DB round-trip, no table scans."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+    except Exception as e:
+        return JSONResponse({"status": "db_down", "error": type(e).__name__},
+                            status_code=503)
+    return {"status": "ok", "tgarr": TGARR_VERSION,
+            "authed": login.session_exists()}
+
+
 @app.get("/")
 async def root(accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
@@ -3331,7 +3375,7 @@ async def page_channels(min_members: int = 500,
                + filter_bar +
                '<div class="empty-state">'
                '<div class="icon">📡</div>'
-               f'<div>No channels with ≥{min_msgs} messages.</div>'
+               f'<div>No channels with ≥{min_members} members match this filter.</div>'
                '<div style="margin-top:8px;font-size:13px">Try a lower threshold above, or join more active channels in Telegram.</div>'
                '</div>')
     else:
@@ -3596,10 +3640,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
             "SELECT count(*) FROM messages WHERE thumb_path IS NOT NULL "
-            "AND thumb_path NOT LIKE '__%'")
+            "AND thumb_path NOT LIKE '\\_\\_%'")
         unique_total = await conn.fetchval(
             "SELECT count(DISTINCT thumb_md5) FROM messages "
-            "WHERE thumb_path IS NOT NULL AND thumb_path NOT LIKE '__%' "
+            "WHERE thumb_path IS NOT NULL AND thumb_path NOT LIKE '\\_\\_%' "
             "AND thumb_md5 IS NOT NULL")
         pending = await conn.fetchval(
             """SELECT count(*) FROM messages
@@ -4096,7 +4140,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
             " * CASE WHEN m.file_size BETWEEN 100000 AND 50000000 THEN 1.0 "
             "        WHEN m.file_size BETWEEN 50000 AND 200000000 THEN 0.7 "
             "        ELSE 0.4 END "
-            " * CASE WHEN m.local_path IS NOT NULL AND m.local_path NOT LIKE '__%' THEN 1.2 ELSE 1.0 END "
+            " * CASE WHEN m.local_path IS NOT NULL AND m.local_path NOT LIKE '\\_\\_%' THEN 1.2 ELSE 1.0 END "
             ") DESC NULLS LAST, m.posted_at DESC NULLS LAST"
         ),
         "recent": "m.posted_at DESC NULLS LAST",

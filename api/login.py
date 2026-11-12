@@ -152,8 +152,17 @@ def _clean_stale_session():
                 con.close()
             if "version" not in tables or "sessions" not in tables:
                 needs_purge = True
-        except Exception:
-            needs_purge = True
+        except sqlite3.OperationalError as e:
+            # "database is locked"/busy = the crawler is using the LIVE session
+            # right now. Deleting it here would log the crawler out. Only a
+            # structurally broken file may be purged.
+            needs_purge = "locked" not in str(e).lower() and "busy" not in str(e).lower()
+            if not needs_purge:
+                log.warning("[login] session file busy (%s) — not purging", e)
+        except sqlite3.DatabaseError:
+            needs_purge = True   # not a database / malformed
+        except Exception as e:
+            log.warning("[login] could not inspect session file (%s) — not purging", e)
     if needs_purge:
         for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json"):
             p = os.path.join(SESSION_DIR, fn)

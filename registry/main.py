@@ -19,6 +19,7 @@ Defense in depth:
 """
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -35,7 +36,42 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("tgarr-registry")
 
 DB_DSN = os.environ["DB_DSN"]
-VERSION = "0.4.34"
+VERSION = "0.5.4"
+
+# Hard caps on request bodies. nginx already limits the wire size (5 MB) but
+# NOT what a gzip body inflates to — an unauthenticated few-MB gzip bomb could
+# expand to GBs and OOM the registry host.
+MAX_BODY_WIRE_BYTES = int(os.environ.get("MAX_BODY_WIRE_BYTES", str(8 * 1024 * 1024)))
+MAX_BODY_INFLATED_BYTES = int(os.environ.get("MAX_BODY_INFLATED_BYTES", str(32 * 1024 * 1024)))
+
+
+async def _read_body(request: "Request") -> bytes:
+    """Read the request body with wire + inflated size caps (gzip-aware)."""
+    import zlib as _zlib
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > MAX_BODY_WIRE_BYTES:
+        raise HTTPException(413, "body too large")
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > MAX_BODY_WIRE_BYTES:
+            raise HTTPException(413, "body too large")
+    raw = bytes(buf)
+    if request.headers.get("content-encoding", "").lower() != "gzip":
+        return raw
+    d = _zlib.decompressobj(16 + _zlib.MAX_WBITS)
+    try:
+        out = d.decompress(raw, MAX_BODY_INFLATED_BYTES + 1)
+    except Exception:
+        raise HTTPException(400, "invalid gzip body")
+    if len(out) > MAX_BODY_INFLATED_BYTES or d.unconsumed_tail:
+        raise HTTPException(413, "inflated body too large")
+    if not d.eof:
+        raise HTTPException(400, "invalid gzip body")
+    return out
 USERNAME_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 # Same as client — defense in depth
 CSAM_RX = re.compile(
@@ -292,13 +328,7 @@ async def _instance_rate_check(conn, instance_hash_v: str):
 @app.post("/api/v1/contribute")
 async def contribute(request: Request):
     # Accept gzip-encoded body (parity with /contribute_resources). 10x bandwidth save.
-    raw = await request.body()
-    if request.headers.get("content-encoding", "").lower() == "gzip":
-        import gzip as _gzip
-        try:
-            raw = _gzip.decompress(raw)
-        except Exception:
-            raise HTTPException(400, "invalid gzip body")
+    raw = await _read_body(request)
     try:
         body = json.loads(raw)
     except Exception:
@@ -515,13 +545,7 @@ async def contribute(request: Request):
 @app.post("/api/v1/contribute_resources")
 async def contribute_resources(request: Request):
     # Accept gzip-encoded body (client compresses large batches for bandwidth).
-    raw = await request.body()
-    if request.headers.get("content-encoding", "").lower() == "gzip":
-        import gzip as _gzip
-        try:
-            raw = _gzip.decompress(raw)
-        except Exception:
-            raise HTTPException(400, "invalid gzip body")
+    raw = await _read_body(request)
     try:
         body = json.loads(raw)
     except Exception:
@@ -776,13 +800,7 @@ async def resolve_resources(request: Request):
     Only fuids with a usable (channel_username + msg_id) pointer are returned;
     unknown ones are omitted so the caller keeps them locally.
     """
-    raw = await request.body()
-    if request.headers.get("content-encoding", "").lower() == "gzip":
-        import gzip as _gzip
-        try:
-            raw = _gzip.decompress(raw)
-        except Exception:
-            raise HTTPException(400, "invalid gzip body")
+    raw = await _read_body(request)
     try:
         body = json.loads(raw)
     except Exception:
@@ -1332,8 +1350,9 @@ async def status_page():
             ORDER BY distinct_contributors DESC, COALESCE(members_count,0) DESC
             LIMIT 25""")
     rows = "".join(
-        f"<tr><td>@{r['username']}</td><td>{(r['title'] or '')[:60]}</td>"
-        f"<td>{r['members_count'] or '-':,}</td>"
+        f"<tr><td>@{html.escape(r['username'] or '')}</td>"
+        f"<td>{html.escape((r['title'] or '')[:60])}</td>"
+        f"<td>{(format(r['members_count'], ',') if r['members_count'] else '-')}</td>"
         f"<td>{r['distinct_contributors']}</td></tr>"
         for r in top
     )
