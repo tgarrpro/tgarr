@@ -38,6 +38,19 @@ log = logging.getLogger("tgarr-registry")
 DB_DSN = os.environ["DB_DSN"]
 VERSION = "0.5.4"
 
+# ── adult (NSFW) classification ────────────────────────────────────────
+# PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,
+# registry) identical. A channel is NSFW when its title matches
+# ADULT_TITLE_RX, or when >= 8% of its named files / captions (at least
+# 20 of them, at least 5 hits) match ADULT_RX. On live data adult channels
+# score 10-90% and ordinary ones 0-3%.
+ADULT_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동)'
+ADULT_TITLE_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동|反差|熟女|糖心|麻豆|海角|伦理片|91国产|(^|[^a-z])av([^a-z]|$)|adult|erotic)'
+ADULT_MIN_FILES = 20
+ADULT_MIN_HITS = 5
+ADULT_MIN_RATIO = 0.08
+
+
 # Hard caps on request bodies. nginx already limits the wire size (5 MB) but
 # NOT what a gzip body inflates to — an unauthenticated few-MB gzip bomb could
 # expand to GBs and OOM the registry host.
@@ -109,6 +122,7 @@ async def _startup():
             await conn.execute(f.read())
     await _seed_honeypots()
     asyncio.create_task(_build_central_sketch())
+    asyncio.create_task(_audience_classifier())
     log.info("registry up — schema applied + honeypots seeded + bloom builder scheduled")
 
 
@@ -209,6 +223,53 @@ async def known_resources_sketch(request: Request):
         media_type="application/octet-stream",
         headers={"ETag": f'"{_central_sketch_etag}"',
                  "Cache-Control": "public, max-age=300"})
+
+
+async def _audience_classifier():
+    """Daily: mark adult channels as audience='nsfw'.
+
+    Clients send an `audience` with every channel, and almost all of them
+    send 'sfw' (28 nsfw rows out of 580K), so the default SFW registry feed
+    was full of adult channels. Classify server-side from the channel title
+    and from the file names contributed for it. One-way (sfw → nsfw); never
+    touches blocked or blocked_csam rows.
+    """
+    await asyncio.sleep(900)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                n_title = await conn.fetchval(
+                    """WITH u AS (
+                         UPDATE registry_channels SET audience = 'nsfw'
+                         WHERE COALESCE(audience, 'sfw') = 'sfw' AND NOT blocked
+                           AND COALESCE(title, '') ~* $1
+                         RETURNING 1)
+                       SELECT count(*) FROM u""", ADULT_TITLE_RX, timeout=600)
+                n_files = await conn.fetchval(
+                    """WITH hit AS (
+                         SELECT ch.channel_username AS u
+                         FROM registry_resource_channels ch
+                         JOIN registry_resources rr USING (file_unique_id)
+                         WHERE rr.file_name IS NOT NULL
+                         GROUP BY 1
+                         HAVING count(*) >= $2
+                            AND count(*) FILTER (WHERE rr.file_name ~* $1) >= $3
+                            AND count(*) FILTER (WHERE rr.file_name ~* $1)::float
+                                / count(*) >= $4),
+                       u AS (
+                         UPDATE registry_channels rc SET audience = 'nsfw'
+                         FROM hit
+                         WHERE rc.username = hit.u
+                           AND COALESCE(rc.audience, 'sfw') = 'sfw' AND NOT rc.blocked
+                         RETURNING 1)
+                       SELECT count(*) FROM u""",
+                    ADULT_RX, ADULT_MIN_FILES, ADULT_MIN_HITS, ADULT_MIN_RATIO,
+                    timeout=900)
+            log.info("[audience] marked nsfw: %s by title, %s by file names",
+                     n_title, n_files)
+        except Exception as e:
+            log.exception("[audience] classifier error: %s", e)
+        await asyncio.sleep(24 * 3600)
 
 
 @app.on_event("shutdown")
@@ -431,6 +492,7 @@ async def contribute(request: Request):
                        COALESCE(EXCLUDED.media_count, 0)),
                      audience = CASE
                        WHEN registry_channels.audience = 'blocked_csam' THEN 'blocked_csam'
+                       WHEN registry_channels.audience = 'nsfw' THEN 'nsfw'
                        ELSE EXCLUDED.audience END,
                      language = COALESCE(EXCLUDED.language, registry_channels.language),
                      category = COALESCE(EXCLUDED.category, registry_channels.category),

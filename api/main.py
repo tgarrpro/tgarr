@@ -28,6 +28,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 import login  # local module
 
 
+# ── adult (NSFW) classification ────────────────────────────────────────
+# PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,
+# registry) identical. A channel is NSFW when its title matches
+# ADULT_TITLE_RX, or when >= 8% of its named files / captions (at least
+# 20 of them, at least 5 hits) match ADULT_RX. On live data adult channels
+# score 10-90% and ordinary ones 0-3%.
+ADULT_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동)'
+ADULT_TITLE_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동|反差|熟女|糖心|麻豆|海角|伦理片|91国产|(^|[^a-z])av([^a-z]|$)|adult|erotic)'
+ADULT_MIN_FILES = 20
+ADULT_MIN_HITS = 5
+ADULT_MIN_RATIO = 0.08
+
+
 def _base_url(request) -> str:
     """Public base URL for links we hand to Sonarr/Radarr/browsers.
 
@@ -5586,6 +5599,17 @@ async def newznab_api(
             conds.append("(r.category IS NULL OR r.category NOT IN ('movie','tv'))")
         where_parts.append("(" + " OR ".join(conds) + ")")
 
+    # Adult content never goes to an *arr unless the operator opts in
+    # (config key newznab_nsfw=true). Two layers: the channel's audience, and
+    # the release name itself for adult posts inside otherwise mixed channels.
+    async with db_pool.acquire() as conn:
+        _nz_nsfw = (await conn.fetchval(
+            "SELECT value FROM config WHERE key='newznab_nsfw'") or "").lower() == "true"
+    if not _nz_nsfw:
+        where_parts.append("COALESCE(c.audience, 'sfw') NOT IN ('nsfw', 'blocked_csam')")
+        params.append(ADULT_RX)
+        where_parts.append(f"r.name !~* ${len(params)}")
+
     limit_val = max(1, min(limit, 200))
     _release_my_dc = await _get_my_dc()
     # JOIN messages to get file_dc; same-DC releases ranked higher so Sonarr's
@@ -5596,6 +5620,7 @@ async def newznab_api(
           f"r.quality, r.source, r.codec, r.size_bytes, r.posted_at, "
           f"r.movie_year, m.file_dc, count(*) OVER() AS _total "
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
+          f"LEFT JOIN channels c ON c.id = m.channel_id "
           f"WHERE {' AND '.join(where_parts)} "
           f"ORDER BY (CASE WHEN m.file_dc = ${len(params)+1} THEN 0 ELSE 1 END), "
           f"  r.posted_at DESC NULLS LAST "

@@ -53,6 +53,18 @@ DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 TGARR_VERSION = "0.5.5"
 TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
+# ── adult (NSFW) classification ────────────────────────────────────────
+# PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,
+# registry) identical. A channel is NSFW when its title matches
+# ADULT_TITLE_RX, or when >= 8% of its named files / captions (at least
+# 20 of them, at least 5 hits) match ADULT_RX. On live data adult channels
+# score 10-90% and ordinary ones 0-3%.
+ADULT_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동)'
+ADULT_TITLE_RX = '(约炮|外围女|外围小|探花|口交|抽插|内射|无码|無碼|有码|啪啪|做爱|做愛|性爱|性愛|自慰|巨乳|爆乳|美乳|大奶|奶子|福利姬|淫|骚货|骚逼|骚穴|小骚|少妇|人妻|嫩穴|嫩逼|操逼|肉棒|后入|後入|颜射|潮吹|调教|援交|楼凤|包养|裸聊|裸舞|黄片|黄油|成人视频|成人影片|色情|情色|乱伦|亂倫|强奸|迷奸|偷拍|换妻|群交|约啪|反差婊|母狗|国产自拍|麻豆传媒|天美传媒|91大神|porn|xxx|onlyfans|only fans|hentai|brazzers|blowjob|creampie|milf|nsfw|18\\+|uncensored|порно|секс|эротик|хентай|سکس|سكس|پورن|بورن|ポルノ|無修正|야동|反差|熟女|糖心|麻豆|海角|伦理片|91国产|(^|[^a-z])av([^a-z]|$)|adult|erotic)'
+ADULT_MIN_FILES = 20
+ADULT_MIN_HITS = 5
+ADULT_MIN_RATIO = 0.08
+
 app = Client(
     name="tgarr",
     api_id=API_ID,
@@ -4791,6 +4803,65 @@ async def _session_revoke_watcher():
         await asyncio.sleep(60)
 
 
+async def audience_classifier_worker():
+    """Mark adult channels as audience='nsfw' from what they actually post.
+
+    Channels used to keep whatever audience they were created with — in
+    practice 'sfw' — so adult channels filled the default (SFW) views, the
+    Newznab feed and the contributions sent to the registry. This is pure SQL
+    over the local index: no Telegram calls.
+
+    One-way and conservative: only sfw/NULL → nsfw. It never touches
+    blocked_csam, a manually set audience (audience_manual), personal chats or
+    KwickPOS* channels, and never flips a channel back.
+    Opt-out: TGARR_AUDIENCE_CLASSIFIER=false
+    """
+    if os.environ.get("TGARR_AUDIENCE_CLASSIFIER", "true").lower() != "true":
+        log.info("[audience] TGARR_AUDIENCE_CLASSIFIER=false — disabled")
+        return
+    await asyncio.sleep(300 + random.uniform(0, 300))
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    WITH stats AS (
+                      SELECT channel_id, count(*) AS n,
+                             count(*) FILTER (
+                               WHERE COALESCE(file_name, '') ~* $1
+                                  OR COALESCE(caption, '')   ~* $1) AS hits
+                      FROM messages
+                      WHERE file_name IS NOT NULL
+                         OR (caption IS NOT NULL AND media_type IN ('video','document'))
+                      GROUP BY channel_id
+                    )
+                    UPDATE channels c SET audience = 'nsfw'
+                    FROM (SELECT c2.id, st.n, st.hits
+                          FROM channels c2 LEFT JOIN stats st ON st.channel_id = c2.id) x
+                    WHERE c.id = x.id
+                      AND COALESCE(c.audience, 'sfw') = 'sfw'
+                      AND NOT COALESCE(c.audience_manual, FALSE)
+                      AND COALESCE(c.category, '') <> 'personal'
+                      AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+                      AND ( COALESCE(c.title, '') ~* $2
+                         OR ( COALESCE(x.n, 0) >= $3 AND COALESCE(x.hits, 0) >= $4
+                              AND x.hits::float / x.n >= $5 ) )
+                    RETURNING c.username, c.title, x.n, x.hits
+                    """,
+                    ADULT_RX, ADULT_TITLE_RX, ADULT_MIN_FILES, ADULT_MIN_HITS,
+                    ADULT_MIN_RATIO)
+            for r in rows[:40]:
+                log.info("[audience] nsfw ← @%s %r (%s/%s adult-named files)",
+                         r["username"], (r["title"] or "")[:40],
+                         r["hits"] or 0, r["n"] or 0)
+            await _heartbeat("audience_classifier_worker",
+                             f"marked {len(rows)} channel(s) nsfw")
+        except Exception as e:
+            log.exception("[audience] classifier error: %s", e)
+            await _heartbeat("audience_classifier_worker", error=str(e)[:200])
+        await asyncio.sleep(6 * 3600)
+
+
 async def _session_change_watcher(boot_user_id: int):
     """Detect when /login QR-changes the underlying session to a different
     TG account. Crawler can't hot-swap Pyrogram client mid-flight; on change
@@ -4938,6 +5009,7 @@ async def main() -> None:
     asyncio.create_task(contribute_to_registry())
     asyncio.create_task(federation_validator())
     asyncio.create_task(registry_puller())
+    asyncio.create_task(audience_classifier_worker())
     # seed_validator disabled on client: leftover from pre-federation split.
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
