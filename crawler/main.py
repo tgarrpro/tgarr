@@ -1118,6 +1118,27 @@ async def init_db() -> None:
             "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS unfollowed_at TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_retry_after TIMESTAMPTZ")
+        # Channels marked "read to the end" by the old error handling without
+        # one page ever having been read (see deep_backfill_worker): ask again.
+        # A channel that really is at its end costs one more page and is marked
+        # done properly; the others finally get their history.
+        try:
+            if not await conn.fetchval(
+                    "SELECT 1 FROM config WHERE key = 'deep_done_recheck_0_5_7'"):
+                res = await conn.execute(
+                    """UPDATE channels SET deep_backfilled = FALSE
+                       WHERE deep_backfilled = TRUE AND deep_oldest_tg_id IS NULL
+                         AND (subscribed = TRUE OR is_joined = TRUE)
+                         AND dead_at IS NULL""")
+                log.info("[deep-backfill] one-time recheck of channels marked done "
+                         "without a page read: %s", res)
+                await conn.execute(
+                    "INSERT INTO config (key, value) VALUES ('deep_done_recheck_0_5_7', 'done') "
+                    "ON CONFLICT (key) DO NOTHING")
+        except asyncpg.PostgresError as e:
+            log.warning("[deep-backfill] one-time recheck skipped: %s", e)
         # Every job waits a while after a start before its first round (up to
         # ~15 min, on purpose, so installs do not all act at once). Until then
         # its last report is from before the restart; the System page showed
@@ -5890,12 +5911,17 @@ async def deep_backfill_worker() -> None:
                       AND c.tg_chat_id > -2000000000000  -- exclude placeholder ids
                       AND (c.account_user_id = $2 OR c.account_user_id IS NULL)
                       AND (
-                        -- explicit tgarr subscription resolved via TG API
-                        (c.subscribed = TRUE AND c.last_polled_at IS NOT NULL)
+                        -- a followed channel the poller can currently read (one
+                        -- still waiting for its first lookup cannot be paged)
+                        (c.subscribed = TRUE AND c.last_polled_at IS NOT NULL
+                         AND c.subscribe_error IS NULL)
                         OR
-                        -- channel Tom joined directly in TG (chat_id known real)
-                        (c.enabled = TRUE AND c.subscribed = FALSE)
+                        -- a channel the account itself is a member of
+                        (c.enabled = TRUE AND c.subscribed = FALSE
+                         AND COALESCE(c.is_joined, FALSE) = TRUE)
                       )
+                      -- not one that just failed: see the error handling below
+                      AND (c.deep_retry_after IS NULL OR c.deep_retry_after < NOW())
                       -- skip resource-poor channels (only if remote counts known)
                       AND NOT (
                         c.remote_counts_refreshed_at IS NOT NULL
@@ -6036,23 +6062,43 @@ async def deep_backfill_worker() -> None:
                 # so it will NEVER deep-backfill. Mark done so the worker stops
                 # re-selecting it every cycle — 300 such phantom subs were
                 # thrashing the queue at ~30s each, burning resolveUsername quota.
+                # Two different things used to be treated as one:
+                #   gone      - Telegram says the channel is private to us or its
+                #               name no longer exists. It will never be read:
+                #               marked done (and dead, so it is cleaned up).
+                #   unknown   - "channel / peer invalid": this session does not
+                #               (yet) hold a valid handle for the channel. That
+                #               is the normal state of a followed channel before
+                #               its first lookup, and of every such channel on a
+                #               day the lookup allowance is spent. Marking these
+                #               "done" told tgarr the channel had been read to
+                #               the end when it had not been read at all - its
+                #               history was then never fetched.
+                # Unknown ones are put aside for a few hours instead (the reason
+                # they were made "permanent" was that a channel that keeps
+                # failing is picked again at once and starves the others).
                 es = str(e)
-                permanent = isinstance(e, (ChannelInvalid, ChannelPrivate)) or any(
-                    s in es for s in ("CHAT_ID_INVALID", "PEER_ID_INVALID",
-                                      "CHANNEL_INVALID", "CHANNEL_PRIVATE",
-                                      "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID"))
+                gone = isinstance(e, ChannelPrivate) or any(
+                    s in es for s in ("CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID"))
+                unknown = not gone and (isinstance(e, ChannelInvalid) or any(
+                    s in es for s in ("CHAT_ID_INVALID", "PEER_ID_INVALID", "CHANNEL_INVALID")))
                 async with db_pool.acquire() as conn:
-                    if permanent:
+                    if gone:
                         await conn.execute(
                             "UPDATE channels SET deep_backfilled=TRUE, "
                             "deep_last_run_at=NOW() WHERE id=$1", row["id"])
                     else:
                         await conn.execute(
-                            "UPDATE channels SET deep_last_run_at=NOW() WHERE id=$1",
-                            row["id"])
+                            "UPDATE channels SET deep_last_run_at=NOW(), "
+                            "deep_retry_after = NOW() + make_interval(mins => $2) WHERE id=$1",
+                            row["id"], 360 if unknown else 15)
+                if gone:
+                    await _mark_channel_dead(row["id"], type(e).__name__)
                 log.warning("[deep-backfill] @%s page error%s: %s", uname,
-                            " (permanent — marked done)" if permanent else "", e)
-                await asyncio.sleep(2 if permanent else 30)
+                            " (gone — marked done)" if gone else
+                            " (not reachable right now — tried again in 6 h)" if unknown else
+                            " (tried again in 15 min)", e)
+                await asyncio.sleep(2)
                 continue
 
             log.info("[deep-backfill] @%s page done: ingested=%d oldest=%s",
