@@ -2432,6 +2432,318 @@ async def epub_render(msg_id: int):
                         .replace("__TITLE__", html.escape(title)))
 
 
+# ════════════════════════════════════════════════════════════════════
+# PDF reader
+#
+# /pdf/{id}                 the reader (same controls as the e-book reader)
+# /pdf/{id}/info            page count and shape
+# /pdf/{id}/page/{n}        one page as a picture (?w=width&clean=1)
+#
+# Pages are drawn on the server (poppler) and sent as pictures, so the reader
+# is the same on every browser and phone, and so a page can be cleaned on the
+# way: many PDFs passed around on Telegram carry a channel's address printed
+# across every page. When the watermark is part of a scanned page there is
+# nothing to delete from the file - but it is always pale and usually tinted,
+# and the text is always dark. "Hide watermark" redraws the page in grey,
+# turns pale and tinted pixels white, and darkens what is left so thin
+# strokes survive. The file itself is never changed; "Original" opens it
+# untouched in the browser's own viewer (text selection, search, printing).
+# ════════════════════════════════════════════════════════════════════
+_PDF_INFO_CACHE: dict = {}            # path -> (mtime, info)
+_PDF_PAGE_CACHE: "collections.OrderedDict" = None
+_PDF_PAGE_CACHE_MAX = 48
+_PDF_RENDER_SEM = None
+_PDF_WIDTHS = (800, 1200, 1600, 2000, 2400)
+
+
+def _pdf_source(row):
+    """The PDF to show for a library item: the file itself, or the PDF an
+    e-book in another format was converted to."""
+    if not row or not _is_local(row["local_path"]):
+        return None
+    src = os.path.join("/downloads", row["local_path"])
+    if (row["local_path"] or "").lower().endswith(".pdf"):
+        return src if os.path.exists(src) else None
+    conv = src + ".pdf"
+    return conv if os.path.exists(conv) else None
+
+
+def _pdf_info(path: str) -> dict:
+    import subprocess
+    mtime = os.path.getmtime(path)
+    hit = _PDF_INFO_CACHE.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    out = subprocess.run(["pdfinfo", path], capture_output=True, timeout=30).stdout.decode(
+        "utf-8", "replace")
+    m = _re.search(r"^Pages:\s+(\d+)", out, _re.MULTILINE)
+    if not m:
+        raise RuntimeError("not a readable PDF")
+    sz = _re.search(r"^Page size:\s+([\d.]+) x ([\d.]+)", out, _re.MULTILINE)
+    ratio = (float(sz.group(2)) / float(sz.group(1))) if sz and float(sz.group(1)) else 1.414
+    rot = _re.search(r"^Page rot:\s+(\d+)", out, _re.MULTILINE)
+    if rot and int(rot.group(1)) in (90, 270):
+        ratio = 1 / ratio
+    info = {"pages": int(m.group(1)), "ratio": round(ratio, 4)}
+    if len(_PDF_INFO_CACHE) > 64:
+        _PDF_INFO_CACHE.clear()
+    _PDF_INFO_CACHE[path] = (mtime, info)
+    return info
+
+
+def _pdf_clean(im):
+    """Pale and tinted pixels to white, the rest to strong grey (see above)."""
+    from PIL import ImageChops
+    r, g, b = im.split()
+    mx = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    mn = ImageChops.darker(ImageChops.darker(r, g), b)
+    tinted = ImageChops.multiply(
+        ImageChops.subtract(mx, mn).point(lambda v: 255 if v > 30 else 0),
+        mx.point(lambda v: 255 if v > 150 else 0))
+    grey = ImageChops.lighter(mn, tinted)
+    return grey.point([255 if v >= 205 else int(255 * (v / 205) ** 1.5) for v in range(256)])
+
+
+def _pdf_render(path: str, n: int, width: int, clean: bool) -> bytes:
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        base = os.path.join(td, "p")
+
+        def _nice():
+            try:
+                os.nice(10)
+            except OSError:
+                pass
+        r = subprocess.run(
+            ["pdftoppm", "-f", str(n), "-l", str(n), "-singlefile",
+             "-scale-to-x", str(width), "-scale-to-y", "-1",
+             "-jpeg", "-jpegopt", "quality=84", path, base],
+            capture_output=True, timeout=60, preexec_fn=_nice)
+        out = base + ".jpg"
+        if r.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError("could not draw this page")
+        if not clean:
+            with open(out, "rb") as f:
+                return f.read()
+        import io as _io
+        from PIL import Image
+        buf = _io.BytesIO()
+        with Image.open(out) as im:
+            _pdf_clean(im.convert("RGB")).save(buf, "JPEG", quality=84)
+        return buf.getvalue()
+
+
+@app.get("/pdf/{msg_id}/info")
+async def pdf_info(msg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    path = _pdf_source(row)
+    if not path:
+        return JSONResponse({"error": "not downloaded yet"}, status_code=404)
+    try:
+        info = await asyncio.to_thread(_pdf_info, path)
+    except Exception as e:
+        return JSONResponse({"error": f"cannot read this PDF: {e}"}, status_code=422)
+    return JSONResponse(info)
+
+
+@app.get("/pdf/{msg_id}/page/{n}")
+async def pdf_page(msg_id: int, n: int, w: int = 1200, clean: int = 0):
+    global _PDF_PAGE_CACHE, _PDF_RENDER_SEM
+    import collections
+    if _PDF_PAGE_CACHE is None:
+        _PDF_PAGE_CACHE = collections.OrderedDict()
+        _PDF_RENDER_SEM = asyncio.Semaphore(2)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    path = _pdf_source(row)
+    if not path:
+        return Response("not downloaded yet", status_code=404)
+    width = min(_PDF_WIDTHS, key=lambda x: abs(x - max(400, min(int(w), 2400))))
+    try:
+        info = await asyncio.to_thread(_pdf_info, path)
+        if not 1 <= n <= info["pages"]:
+            return Response("no such page", status_code=404)
+        key = (path, os.path.getmtime(path), n, width, bool(clean))
+        data = _PDF_PAGE_CACHE.get(key)
+        if data is None:
+            async with _PDF_RENDER_SEM:
+                data = _PDF_PAGE_CACHE.get(key)
+                if data is None:
+                    data = await asyncio.to_thread(_pdf_render, path, n, width, bool(clean))
+            _PDF_PAGE_CACHE[key] = data
+            while len(_PDF_PAGE_CACHE) > _PDF_PAGE_CACHE_MAX:
+                _PDF_PAGE_CACHE.popitem(last=False)
+        else:
+            _PDF_PAGE_CACHE.move_to_end(key)
+    except Exception as e:
+        return Response(f"cannot draw this page: {e}", status_code=500)
+    if n == 1:
+        await _touch_local(msg_id)
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=86400"})
+
+
+_PDF_READER_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--fg);
+  --bg:#eef1f5;--fg:#1f2937;--bar:#f8fafc;--line:#e2e8f0;--mut:#64748b;--acc:#2563eb}
+body[data-theme=dark]{--bg:#0f1115;--fg:#c9d1d9;--bar:#1c2128;--line:#30363d;--mut:#8b949e;--acc:#58a6ff}
+.bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bar);
+  border-bottom:1px solid var(--line);flex:none;min-height:50px}
+.bar.bottom{border-bottom:none;border-top:1px solid var(--line)}
+.ttl{flex:1;min-width:0;font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+button,.btn{font:inherit;font-size:14px;color:var(--fg);background:transparent;border:1px solid var(--line);
+  border-radius:8px;padding:7px 12px;cursor:pointer;text-decoration:none;white-space:nowrap;line-height:1.2}
+button:hover,.btn:hover{border-color:var(--acc);color:var(--acc)}
+button:disabled{opacity:.35;cursor:default}
+button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.big{font-size:15px;font-weight:600;padding:9px 18px;background:var(--acc);color:#fff;border-color:var(--acc)}
+button.big:hover{color:#fff;filter:brightness(1.1)}
+button.big:disabled{background:transparent;color:var(--fg);border-color:var(--line)}
+.stage{flex:1;overflow:auto;min-height:0;padding:14px 0 30px;-webkit-overflow-scrolling:touch}
+.pg{margin:0 auto 14px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.14);position:relative}
+.pg img{display:block;width:100%;height:100%}
+body[data-theme=sepia]{--bg:#e9dfc6;--fg:#433422;--bar:#efe6cf;--line:#dccfae;--mut:#8a7a5c;--acc:#a0522d}
+body[data-theme=sepia] .pg{background:#f6efdc}
+body[data-theme=sepia] .pg img{mix-blend-mode:multiply}
+body[data-theme=dark] .pg{background:#1b1d22}
+body[data-theme=dark] .pg img{filter:invert(.92) hue-rotate(180deg)}
+.pg .no{position:absolute;right:8px;bottom:6px;font-size:11px;color:#94a3b8;pointer-events:none}
+.pos{flex:1;min-width:0;text-align:center;font-size:13px;color:var(--mut)}
+.pos b{color:var(--fg)}
+.pos input[type=number]{width:64px;font:inherit;text-align:center;border:1px solid var(--line);border-radius:6px;
+  padding:3px;background:transparent;color:var(--fg)}
+input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
+.msg{padding:60px 20px;text-align:center;color:var(--mut)}
+@media (max-width:640px){.hide-s{display:none}.bar{gap:5px;padding:6px 8px}button,.btn{padding:7px 9px}}
+</style></head>
+<body data-theme="light">
+<div class="bar">
+  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
+  <div class="ttl">__TITLE__</div>
+  <button id="wmBtn" title="redraw the pages without pale watermarks (the file is not changed)">Hide watermark</button>
+  <button id="zOut" title="smaller (-)">A&minus;</button>
+  <button id="zIn" title="larger (+)">A+</button>
+  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
+  <a class="btn hide-s" href="/media/__ID__" target="_blank" title="the untouched file in the browser's own viewer: select text, search, print">Original</a>
+  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+</div>
+<div class="stage" id="stage"><div class="msg" id="msg">opening…</div></div>
+<div class="bar bottom">
+  <button class="big" id="prev">&lsaquo; Prev</button>
+  <div class="pos">
+    page <input type="number" id="pno" min="1" value="1"> of <b id="ptotal">…</b>
+    <input type="range" id="slider" min="1" max="1" value="1">
+  </div>
+  <button class="big" id="next">Next &rsaquo;</button>
+</div>
+<script>
+(function(){
+const ID = __ID__, KEY = "tgarr.pdf." + ID;
+const $ = id => document.getElementById(id);
+const stage = $("stage");
+let pages = 0, ratio = 1.414, cur = 1, els = [];
+let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.pdfreader") || "{}"); } catch (e) {}
+let book = {}; try { book = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
+let zoom = st.zoom || 1, theme = st.theme || "light";
+let clean = book.clean !== undefined ? book.clean : !!st.clean;
+const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean})); } catch (e) {} };
+const saveBook = () => { try { localStorage.setItem(KEY, JSON.stringify({page: cur, clean})); } catch (e) {} };
+function pageW(){ return Math.round(Math.min(stage.clientWidth - 16, 980) * zoom); }
+function reqW(){ return Math.min(2400, Math.round(pageW() * Math.min(2, window.devicePixelRatio || 1))); }
+function src(n){ return "/pdf/" + ID + "/page/" + n + "?w=" + reqW() + (clean ? "&clean=1" : ""); }
+function size(){
+  const w = pageW();
+  els.forEach(el => { el.style.width = w + "px"; el.style.height = Math.round(w * (el._ratio || ratio)) + "px"; });
+}
+const io = new IntersectionObserver(es => es.forEach(e => {
+  if (!e.isIntersecting) return;
+  const el = e.target, img = el.firstChild, want = src(+el.dataset.n);
+  if (img.dataset.src !== want) { img.dataset.src = want; img.src = want; }
+}), {root: stage, rootMargin: "1200px 0px"});
+function refresh(){ els.forEach(el => { io.unobserve(el); io.observe(el); }); }
+function build(){
+  const f = document.createDocumentFragment();
+  for (let n = 1; n <= pages; n++) {
+    const el = document.createElement("div"); el.className = "pg"; el.dataset.n = n;
+    const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+    img.onload = () => { if (img.naturalWidth) { const r = img.naturalHeight / img.naturalWidth;
+      if (Math.abs(r - (el._ratio || ratio)) > 0.01) { el._ratio = r; el.style.height = Math.round(pageW() * r) + "px"; } } };
+    const no = document.createElement("span"); no.className = "no"; no.textContent = n;
+    el.appendChild(img); el.appendChild(no); f.appendChild(el); els.push(el);
+  }
+  stage.innerHTML = ""; stage.appendChild(f); size(); refresh();
+}
+function go(n, smooth){
+  n = Math.max(1, Math.min(pages, n | 0)); if (!els[n - 1]) return;
+  stage.scrollTo({top: els[n - 1].offsetTop - 8, behavior: smooth ? "smooth" : "auto"});
+}
+function track(){
+  const mid = stage.scrollTop + stage.clientHeight * 0.35; let lo = 0, hi = els.length - 1, k = 0;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (els[m].offsetTop <= mid) { k = m; lo = m + 1; } else hi = m - 1; }
+  if (k + 1 !== cur) { cur = k + 1; ui(); saveBook(); }
+}
+function ui(){
+  if (document.activeElement !== $("pno")) $("pno").value = cur;
+  $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur >= pages;
+  $("wmBtn").classList.toggle("on", clean); document.body.dataset.theme = theme;
+}
+let tt = null; stage.addEventListener("scroll", () => { clearTimeout(tt); tt = setTimeout(track, 60); }, {passive: true});
+$("prev").onclick = () => go(cur - 1, true); $("next").onclick = () => go(cur + 1, true);
+$("pno").addEventListener("change", e => go(+e.target.value));
+$("slider").addEventListener("input", e => { $("pno").value = e.target.value; });
+$("slider").addEventListener("change", e => go(+e.target.value));
+function rezoom(z){ const keep = cur; zoom = Math.max(0.5, Math.min(2.5, z)); saveSt(); size(); refresh(); go(keep); }
+$("zIn").onclick = () => rezoom(zoom * 1.2); $("zOut").onclick = () => rezoom(zoom / 1.2);
+$("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); ui(); };
+$("wmBtn").onclick = () => { clean = !clean; saveSt(); saveBook(); ui(); refresh(); };
+window.addEventListener("resize", () => { const keep = cur; size(); refresh(); go(keep); });
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" && e.target.type === "number") return;
+  const k = e.key;
+  if (k === "ArrowRight" || k === "PageDown") { e.preventDefault(); go(cur + 1, true); }
+  else if (k === "ArrowLeft" || k === "PageUp") { e.preventDefault(); go(cur - 1, true); }
+  else if (k === "Home") go(1); else if (k === "End") go(pages);
+  else if (k === "+" || k === "=") rezoom(zoom * 1.2); else if (k === "-") rezoom(zoom / 1.2);
+});
+if (document.referrer && document.referrer.indexOf(location.host) > 0 && history.length > 1)
+  $("back").onclick = e => { e.preventDefault(); history.back(); };
+ui();
+fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
+  if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
+  pages = j.pages; ratio = j.ratio || 1.414;
+  $("ptotal").textContent = pages; $("slider").max = pages; $("pno").max = pages;
+  build();
+  const h = parseInt((location.hash || "").slice(1), 10);
+  cur = (h >= 1 && h <= pages) ? h : Math.min(pages, book.page || 1);
+  go(cur); ui();
+}).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
+})();
+</script>
+</body></html>"""
+
+
+@app.get("/pdf/{msg_id}", response_class=HTMLResponse)
+async def pdf_reader(msg_id: int):
+    """The PDF reader (see the block comment above)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    if not _pdf_source(row):
+        return HTMLResponse(
+            f'<p>This file is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            status_code=404)
+    title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
+    return HTMLResponse(_PDF_READER_HTML.replace("__ID__", str(int(msg_id)))
+                        .replace("__TITLE__", html.escape(title)))
+
+
 @app.get("/epub/{msg_id}/cover")
 async def epub_cover(msg_id: int):
     """Extract + serve the cover image from an .epub. Tries:
@@ -2703,7 +3015,7 @@ function renderPlayer() {{
   // document — pick by extension
   const ext = (MEDIA_FILE_NAME || "").toLowerCase().split(".").pop();
   if (ext === "pdf") {{
-    main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+    location.replace("/pdf/" + MSG_ID);
     return;
   }}
   if (ext === "epub") {{
@@ -2734,7 +3046,7 @@ function renderPlayer() {{
         const elapsed = ((Date.now()-startedAt)/1000).toFixed(0);
         document.getElementById("ebookElapsed").textContent = `elapsed: ${{elapsed}}s`;
         if (j.state === "ready") {{
-          main.innerHTML = `<iframe src="${{j.url}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+          location.replace("/pdf/" + MSG_ID);
           return;
         }}
         if (j.state === "failed") {{
