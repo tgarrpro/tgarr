@@ -2418,6 +2418,52 @@ async def _is_nsfw_enabled() -> bool:
     return v == "true"
 
 
+# Which copy of a work to show first when there are several.
+#   quality (default): the higher resolution wins; among equal resolutions the
+#                      copy on the account's own Telegram data center wins.
+#   dc:                a copy on the account's own data center wins outright,
+#                      then resolution.
+# "Best" is per user: a file on DC5 is the fast path for a DC5 account and a
+# cross-DC fetch for everyone else, so this is decided here, on each install,
+# never centrally. Nothing is hidden for good - every version stays reachable.
+async def _version_pref() -> str:
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval("SELECT value FROM config WHERE key='version_preference'")
+    pref = v if v in ("quality", "dc") else "quality"
+    # While Telegram is refusing cross-DC work, another DC's copy cannot be
+    # fetched at all: lead with what can.
+    fl = await _tg_flood()
+    if fl and ("cross-DC" in (fl.get("what") or "") or "export" in (fl.get("what") or "").lower()):
+        return "dc"
+    return pref
+
+
+_QUALITY_RANK_SQL = ("(CASE r.quality WHEN '2160p' THEN 5 WHEN '1440p' THEN 4 WHEN '1080p' THEN 3 "
+                     "WHEN '720p' THEN 2 WHEN '576p' THEN 1 WHEN '480p' THEN 1 ELSE 0 END)")
+# Identity of a work, for grouping its versions: normalized title + year for a
+# movie, title + season + episode for an episode. NULL = not groupable.
+_WORK_KEY_SQL = (
+    "(CASE WHEN r.category = 'movie' AND COALESCE(NULLIF(r.canonical_title, ''), NULLIF(r.movie_title, '')) IS NOT NULL "
+    "      THEN 'm:' || lower(regexp_replace(COALESCE(NULLIF(r.canonical_title, ''), r.movie_title), "
+    "                         '[[:space:][:punct:]]+', '', 'g')) || ':' || COALESCE(r.movie_year::text, '') "
+    "      WHEN r.category = 'tv' AND r.season IS NOT NULL "
+    "           AND COALESCE(NULLIF(r.canonical_title, ''), NULLIF(r.series_title, '')) IS NOT NULL "
+    "      THEN 't:' || lower(regexp_replace(COALESCE(NULLIF(r.canonical_title, ''), r.series_title), "
+    "                         '[[:space:][:punct:]]+', '', 'g')) || ':s' || r.season::text "
+    "           || 'e' || COALESCE(r.episode::text, 'x') "
+    " END)")
+
+
+@app.post("/api/settings/version_preference")
+async def settings_version_preference(value: str = Form("quality")):
+    val = "dc" if value == "dc" else "quality"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('version_preference', $1)
+               ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""", val)
+    return RedirectResponse("/settings", status_code=302)
+
+
 @app.post("/api/settings/nsfw_enabled")
 async def settings_nsfw_enabled(value: str = Form("false")):
     val = "true" if value == "true" else "false"
@@ -4847,6 +4893,18 @@ def _dc_badge(file_dc, my_dc) -> str:
     return f'<span class="pill warn" title="cross-DC ({file_dc} vs your {my_dc}) — may hit FloodWait" style="font-size:11px">🟡 DC{file_dc}</span>'
 
 
+def _versions_pill(r) -> str:
+    try:
+        n = r["versions"] if "versions" in r.keys() else 1
+        wk = r["wk"] if "wk" in r.keys() else None
+    except Exception:
+        return ""
+    if not wk or not n or n < 2:
+        return ""
+    return (f'<a class="pill accent" href="/releases?work={_q(wk)}" '
+            f'title="all versions of this title" style="text-decoration:none">{n} versions</a>')
+
+
 def _release_card(r, my_dc=None) -> str:
     """Sonarr/Radarr-style poster card with 3-tier fallback +
     DC badge (so users can pick same-DC items without clicking)."""
@@ -4895,6 +4953,7 @@ def _release_card(r, my_dc=None) -> str:
         f'{_dc_badge(r.get("file_dc") if hasattr(r,"get") else r["file_dc"], my_dc)}'
         f'<span class="pill {cat_pill}">{cat_label}</span>'
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
+        f'{_versions_pill(r)}'
         f'</div>'
         f'<div class="grab-row" style="display:flex;gap:6px">'
         f'<button class="btn play-btn" onclick="window.open(\'/watch/{r["primary_msg_id"]}\', \'_blank\')">▶ Play</button>'
@@ -4908,7 +4967,8 @@ def _release_card(r, my_dc=None) -> str:
 async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         view: str = "grid", limit: int = 120,
                         offset: int = 0,
-                        min_mb: int = 100, aud: str = "sfw"):
+                        min_mb: int = 100, aud: str = "sfw",
+                        work: Optional[str] = None):
     if not login.session_exists():
         return RedirectResponse("/login")
     where = ["1=1"]
@@ -4941,9 +5001,25 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     page_offset = max(0, offset)
     # Composite quality score: parse confidence × tmdb verification × quality tier
     # × grab popularity × recency. Show "best version of any content" first.
-    sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
+    # Several files can be the same work (a 1080p and a 2160p, or the same
+    # film uploaded by different people to different data centers). Show one
+    # card per work - the copy that is best FOR THIS ACCOUNT - with the number
+    # of versions; ?work=<key> lists them all. Nothing is removed.
+    _release_my_dc = await _get_my_dc()
+    _pref = await _version_pref()
+    _count_params = list(params)        # the count query takes the text filters only
+    params.append(_release_my_dc or -1)
+    _same_dc = f"(CASE WHEN m.file_dc = ${len(params)} THEN 1 ELSE 0 END)"
+    _order = (f"same_dc DESC, qr DESC" if _pref == "dc" else f"qr DESC, same_dc DESC")
+    _order += ", size_bytes DESC NULLS LAST, id"
+    _work_filter = ""
+    if work:
+        params.append(work[:300])
+        _work_filter = f"WHERE wk = ${len(params)}"
+    sql = (f"WITH base AS (SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
           f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, "
+          f"{_WORK_KEY_SQL} AS wk, {_QUALITY_RANK_SQL} AS qr, {_same_dc} AS same_dc, "
           f"  (r.parse_score "
           f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikidata' THEN 1.2 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
           f"   * (CASE r.quality WHEN '2160p' THEN 1.4 WHEN '1080p' THEN 1.2 WHEN '720p' THEN 1.0 ELSE 0.8 END) "
@@ -4952,17 +5028,27 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
           f"  ) AS composite_score "
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
           f"LEFT JOIN channels c ON c.id = m.channel_id "
-          f"WHERE {' AND '.join([_qual(w) for w in where])} "
-          f"ORDER BY composite_score DESC NULLS LAST, r.posted_at DESC NULLS LAST "
-          f"LIMIT {page_size} OFFSET {page_offset}")
-    count_sql = (f"SELECT count(*) FROM releases r "
+          f"WHERE {' AND '.join([_qual(w) for w in where])}), "
+          f"ranked AS (SELECT *, "
+          f"  row_number() OVER (PARTITION BY COALESCE(wk, 'id:' || id::text) ORDER BY {_order}) AS rn, "
+          f"  count(*) OVER (PARTITION BY COALESCE(wk, 'id:' || id::text)) AS versions "
+          f"  FROM base {_work_filter}) "
+          + (f"SELECT * FROM ranked ORDER BY {_order} "
+             if work else
+             f"SELECT * FROM ranked WHERE rn = 1 "
+             f"ORDER BY composite_score DESC NULLS LAST, posted_at DESC NULLS LAST ")
+          + f"LIMIT {page_size} OFFSET {page_offset}")
+    count_sql = (f"WITH base AS (SELECT r.id, {_WORK_KEY_SQL} AS wk FROM releases r "
                  f"LEFT JOIN messages m ON m.id = r.primary_msg_id "
                  f"LEFT JOIN channels c ON c.id = m.channel_id "
-                 f"WHERE {' AND '.join([_qual(w) for w in where])}")
-    _release_my_dc = await _get_my_dc()
+                 f"WHERE {' AND '.join([_qual(w) for w in where])}) "
+                 + (f"SELECT count(*) FROM base WHERE wk = ${len(_count_params) + 1}" if work else
+                    f"SELECT count(DISTINCT COALESCE(wk, 'id:' || id::text)) FROM base"))
+    if work:
+        _count_params.append(work[:300])
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
-        total_matched = await conn.fetchval(count_sql, *params)
+        total_matched = await conn.fetchval(count_sql, *_count_params)
 
     def _qs(**overrides) -> str:
         defaults = {"q": q, "cat": cat, "view": view,
@@ -5360,6 +5446,10 @@ async def page_settings(request: Request):
         """)
     tmdb_masked = (tmdb_raw[:6] + "…" + tmdb_raw[-4:]) if tmdb_raw else ""
     nsfw_on = await _is_nsfw_enabled()
+    async with db_pool.acquire() as conn:
+        version_pref = await conn.fetchval(
+            "SELECT value FROM config WHERE key='version_preference'") or "quality"
+    my_dc_disp = (await _get_my_dc()) or "?"
     user_html = (
         f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
         f'<span class="pill ok">signed in</span></div>'
@@ -5423,6 +5513,32 @@ async def page_settings(request: Request):
 
 <h2 class="section">Content policy</h2>
 <div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🎯</div>
+    <div class="info">
+      <div class="name">When a title has several versions, show first — <span class="pill ok">{'my data center' if version_pref == 'dc' else 'best quality'}</span></div>
+      <div class="meta">
+        The same film is often posted more than once: different resolutions, or
+        the same file uploaded to different Telegram data centers. tgarr shows
+        one card per title and keeps every version one click away.
+        Your account is on <strong>DC {my_dc_disp}</strong>; a copy on that data
+        center is your fastest path.
+      </div>
+      <form method="POST" action="/api/settings/version_preference" style="margin-top:12px;font-size:14px;line-height:1.7">
+        <label style="display:block;cursor:pointer">
+          <input type="radio" name="value" value="quality" {'checked' if version_pref != 'dc' else ''} onchange="this.form.submit()" />
+          <strong>Best quality first</strong> — higher resolution wins; between equal resolutions, the copy on my data center wins.
+        </label>
+        <label style="display:block;cursor:pointer">
+          <input type="radio" name="value" value="dc" {'checked' if version_pref == 'dc' else ''} onchange="this.form.submit()" />
+          <strong>My data center first</strong> — a copy on my data center wins, then resolution.
+        </label>
+        <div style="color:var(--muted);font-size:12px;margin-top:6px">
+          While Telegram is rate-limiting cross-data-center access, tgarr leads with your data center regardless of this choice.
+        </div>
+      </form>
+    </div>
+  </div>
   <div class="dl-item">
     <div class="icon">🔞</div>
     <div class="info">
