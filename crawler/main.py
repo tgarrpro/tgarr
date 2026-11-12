@@ -5598,6 +5598,92 @@ async def _session_revoke_watcher():
         await asyncio.sleep(60)
 
 
+MEMBERSHIP_SYNC_INTERVAL_SEC = int(os.environ.get("TGARR_MEMBERSHIP_SYNC_INTERVAL_SEC", "1800"))
+
+
+async def membership_sync_worker():
+    """Keep channels.is_joined equal to what the Telegram account is actually
+    a member of.
+
+    is_joined was only ever switched ON (when a dialog was seen or a message
+    arrived) and OFF by the leave worker. Channels the user left in the
+    Telegram app stayed "JOIN" forever: in the System page, in the
+    deep-backfill queue, and as a reason not to release their index.
+
+    Source of truth: the account dialog list, main list plus the Archive
+    folder (get_dialogs skips archived chats). Flags are only cleared after a
+    complete, error-free enumeration that found at least one chat, so a flood
+    wait or a network hiccup can never mass-clear them. This only corrects a
+    flag; it never joins or leaves anything. Personal chats are safe either
+    way: the leave worker acts only on auto_joined channels.
+    """
+    from pyrogram import raw
+    await asyncio.sleep(90)
+    while True:
+        try:
+            member: set = set()
+            complete = True
+            try:
+                async for d in _dialogs():
+                    if d.chat and d.chat.type.name in ("CHANNEL", "SUPERGROUP", "GROUP"):
+                        member.add(d.chat.id)
+            except Exception as e:
+                complete = False
+                log.info("[membership] dialog list incomplete (%s) - flags not cleared this round",
+                         str(e)[:80])
+            if complete:
+                try:
+                    r = await _mtproto("get_dialogs", lambda: app.invoke(
+                        raw.functions.messages.GetDialogs(
+                            offset_date=0, offset_id=0,
+                            offset_peer=raw.types.InputPeerEmpty(),
+                            limit=100, hash=0, folder_id=1)))
+                    for c in getattr(r, "chats", []) or []:
+                        if getattr(c, "left", False) or "Forbidden" in type(c).__name__:
+                            continue
+                        if type(c).__name__ == "Channel":
+                            member.add(int(f"-100{c.id}"))
+                        elif type(c).__name__ == "Chat":
+                            member.add(-c.id)
+                    if len(getattr(r, "dialogs", []) or []) >= 100:
+                        complete = False     # archive longer than one page: do not clear
+                except Exception as e:
+                    complete = False
+                    log.info("[membership] archive folder not readable (%s) - flags not cleared",
+                             str(e)[:80])
+            if member:
+                ids = list(member)
+                async with db_pool.acquire() as conn:
+                    on = await conn.fetch(
+                        """UPDATE channels SET is_joined = TRUE
+                           WHERE tg_chat_id = ANY($1::bigint[])
+                             AND NOT COALESCE(is_joined, FALSE)
+                           RETURNING COALESCE(username, title) AS n""", ids)
+                    off = []
+                    if complete:
+                        off = await conn.fetch(
+                            """UPDATE channels SET is_joined = FALSE
+                               WHERE COALESCE(is_joined, FALSE)
+                                 AND tg_chat_id <> ALL($1::bigint[])
+                                 AND (account_user_id = $2 OR account_user_id IS NULL)
+                               RETURNING COALESCE(username, title) AS n""",
+                            ids, CURRENT_USER_ID)
+                if on or off:
+                    log.info("[membership] account is in %d chats; now joined: +%d %s; "
+                             "no longer joined: -%d %s", len(member),
+                             len(on), [x["n"] for x in on][:8],
+                             len(off), [x["n"] for x in off][:8])
+                await _heartbeat("membership_sync_worker",
+                                 f"{len(member)} chats; +{len(on)} / -{len(off)}"
+                                 + ("" if complete else " (partial list, nothing cleared)"))
+            else:
+                await _heartbeat("membership_sync_worker", "dialog list empty - skipped")
+        except Exception as e:
+            log.exception("[membership] sync error: %s", e)
+            await _heartbeat("membership_sync_worker", error=str(e)[:200])
+        await asyncio.sleep(MEMBERSHIP_SYNC_INTERVAL_SEC)
+
+
 async def audience_classifier_worker():
     """Mark adult channels as audience='nsfw' from what they actually post.
 
@@ -5806,6 +5892,7 @@ async def main() -> None:
     asyncio.create_task(registry_puller())
     asyncio.create_task(audience_classifier_worker())
     asyncio.create_task(stale_index_sweeper())
+    asyncio.create_task(membership_sync_worker())
     # seed_validator disabled on client: leftover from pre-federation split.
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
