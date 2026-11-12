@@ -14,6 +14,7 @@ from the `config` table and passes it in via `tmdb_key=`.
 import asyncio
 import json
 import logging
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -24,6 +25,10 @@ TMDB_IMG = "https://image.tmdb.org/t/p"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 WIKI_REST = "https://en.wikipedia.org/api/rest_v1/page/summary"
 USER_AGENT = "tgarr/0.3 (+https://tgarr.me)"
+
+
+class LookupFailed(Exception):
+    """A metadata source errored (network, 5xx, bad key). NOT a miss."""
 
 
 def _fetch(url: str, params: dict | None = None, timeout: int = 12) -> dict:
@@ -56,7 +61,7 @@ async def _tmdb_search(category: str, title: str, year: int | None,
         data = await asyncio.to_thread(_fetch, TMDB_BASE + path, params)
     except Exception as e:
         log.warning("tmdb %s %r %s: %s", path, title, year, e)
-        return None
+        raise LookupFailed(f"tmdb: {e}") from e
 
     results = data.get("results") or []
     if not results:
@@ -86,7 +91,7 @@ async def _wiki_search_title(query: str) -> str | None:
         })
     except Exception as e:
         log.warning("wiki search %r: %s", query, e)
-        return None
+        raise LookupFailed(f"wiki search: {e}") from e
     hits = (data.get("query") or {}).get("search") or []
     return hits[0]["title"] if hits else None
 
@@ -96,9 +101,14 @@ async def _wiki_summary(title: str) -> dict | None:
     url = WIKI_REST + "/" + urllib.parse.quote(title.replace(" ", "_"), safe="")
     try:
         data = await asyncio.to_thread(_fetch, url, None)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None  # page genuinely absent = a real miss
+        log.warning("wiki summary %r: %s", title, e)
+        raise LookupFailed(f"wiki summary: {e}") from e
     except Exception as e:
         log.warning("wiki summary %r: %s", title, e)
-        return None
+        raise LookupFailed(f"wiki summary: {e}") from e
     if data.get("type") != "standard":
         return None
     thumb = data.get("thumbnail") or {}
@@ -141,12 +151,25 @@ async def _wiki_lookup(category: str, title: str,
 # ─────────────── Unified entry point ──────────────────────────────────
 async def lookup(category: str, title: str, year: int | None,
                  tmdb_key: str | None = None) -> dict | None:
-    """Try TMDB first if key configured, then Wikipedia. Returns None on miss."""
+    """Try TMDB first if key configured, then Wikipedia.
+
+    Returns None ONLY on a genuine miss (both sources answered and had nothing).
+    Raises LookupFailed when a source could not be reached / errored, so callers
+    never mistake an outage for "this title does not exist".
+    """
     if not title or len(title.strip()) < 2:
         return None
     title = title.strip()
+    tmdb_err = None
     if tmdb_key:
-        out = await _tmdb_search(category, title, year, tmdb_key)
+        try:
+            out = await _tmdb_search(category, title, year, tmdb_key)
+        except LookupFailed as e:
+            tmdb_err = e
+            out = None
         if out:
             return out
-    return await _wiki_lookup(category, title, year)
+    out = await _wiki_lookup(category, title, year)
+    if out is None and tmdb_err is not None:
+        raise tmdb_err
+    return out

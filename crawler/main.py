@@ -1405,8 +1405,13 @@ async def _process_one_download(row_payload: dict) -> None:
                             int(current), kbps, dl_id)
                 except Exception:
                     pass
+            _media = msg.video or msg.document or msg.audio
+            _safe = os.path.basename(
+                (getattr(_media, "file_name", None) or "").replace("\\", "/")
+            ).strip().lstrip(".")
+            _dest = f"{target_dir}/{_safe}" if _safe else f"{target_dir}/"
             local_path = await _mtproto("download_media",
-                lambda: app.download_media(msg, file_name=f"{target_dir}/",
+                lambda: app.download_media(msg, file_name=_dest,
                                            progress=_progress))
         local_path = await _rename_for_arr(str(local_path), row)
         try:
@@ -3112,7 +3117,7 @@ async def contribute_to_registry() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.3",
+                "tgarr_version": "0.5.4",
                 "channels": [{
                     "username": r["username"],
                     "title": r["title"],
@@ -3251,8 +3256,9 @@ async def federation_validator() -> None:
                         chat = await _mtproto("resolveUsername",
                             lambda: app.get_chat(uname))
                     members = getattr(chat, "members_count", None)
-                    title = chat.title or (chat.username or uname)
-                    real_username = chat.username or uname
+                    _cu = getattr(chat, "username", None)
+                    title = getattr(chat, "title", None) or (_cu or uname)
+                    real_username = _cu or uname
                     # News/TV/escort/fan-club/sticker junk = singleton-hash
                     # noise, federation value 0. The subscribe path already
                     # rejects these; the validator must too, or it just feeds
@@ -3309,7 +3315,7 @@ async def federation_validator() -> None:
                             uuid_val = row["value"]
                     payload = {
                         "instance_uuid": uuid_val,
-                        "tgarr_version": "0.5.3",
+                        "tgarr_version": "0.5.4",
                         "channels": verified_alive,
                     }
                     req = urllib.request.Request(
@@ -3373,10 +3379,14 @@ async def dc_backfill_worker() -> None:
                 await asyncio.sleep(min(wait, 1800))
                 continue
             except Exception as e:
-                # Mark with sentinel so we don't retry forever
+                # Mark with sentinel -1 so we don't retry forever. (0/NULL mean
+                # "not looked up yet" and are what the selector above picks.)
                 async with db_pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE messages SET file_dc = 0 WHERE id=$1", row["id"])
+                        "UPDATE messages SET file_dc = -1 WHERE id=$1", row["id"])
+                log.debug("[dc-backfill] msg %s unreadable (%s) → -1",
+                          row["id"], type(e).__name__)
+                await asyncio.sleep(2)
                 continue
             media = (msg and (msg.video or msg.audio or msg.document or msg.photo))
             dc = None
@@ -3391,7 +3401,7 @@ async def dc_backfill_worker() -> None:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE messages SET file_dc=$1 WHERE id=$2",
-                    dc or 0, row["id"])
+                    dc or -1, row["id"])
                 # Propagate within channel: all media in a TG channel is
                 # almost always on the same DC. Saves 99% of get_messages
                 # calls on the worker.
@@ -3758,9 +3768,10 @@ async def dialog_leave_worker() -> None:
             async with db_pool.acquire() as conn:
                 active = await conn.fetchval(
                     "SELECT value FROM config WHERE key='dialog_leave_active'")
-                if (active or "").lower() != "true":
-                    await asyncio.sleep(300)
-                    continue
+            if (active or "").lower() != "true":
+                await asyncio.sleep(300)
+                continue
+            async with db_pool.acquire() as conn:
                 # ── Release SUBSCRIBED channels (no TG call, local only). tgarr
                 # "subscribe" is poll-only membership we created — never Tom's
                 # personal joins — so once a subscribed channel is fully crawled
@@ -4219,6 +4230,7 @@ async def contribute_resources_worker() -> None:
                     WHERE m.file_unique_id IS NOT NULL
                       AND m.contributed_at IS NULL
                       AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+                      AND c.username IS NOT NULL AND c.username <> ''
                     ORDER BY m.id DESC
                     LIMIT {CONTRIBUTE_RESOURCES_BATCH}
                 """)
@@ -4266,7 +4278,7 @@ async def contribute_resources_worker() -> None:
 
             payload = {
                 "instance_uuid": uuid_val,
-                "tgarr_version": "0.5.3",
+                "tgarr_version": "0.5.4",
                 "resources": [{
                     "file_unique_id": r["file_unique_id"],
                     "file_name": r["file_name"],
