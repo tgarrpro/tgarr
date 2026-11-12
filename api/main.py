@@ -714,7 +714,7 @@ async def _stats_snapshot_worker():
 
 
 async def _metadata_worker():
-    """Continuously enrich releases with TMDB (if key) or Wikipedia metadata.
+    """Continuously enrich releases with TMDB (if key) and Wikidata metadata.
     Picks oldest-unfilled release, looks it up, persists. Sleeps 30s when no
     work. Short delay between lookups to respect rate limits.
     """
@@ -2398,11 +2398,11 @@ async def settings_tmdb_key(value: str = Form("")):
                 INSERT INTO config (key, value) VALUES ('tmdb_api_key', $1)
                 ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()
             """, value)
-        # Reset wikipedia/miss results so the next worker pass retries with new key
+        # Reset keyless / negative results so the next worker pass retries with the new key
         await conn.execute("""
             UPDATE releases SET metadata_source=NULL, poster_url=NULL,
                    canonical_title=NULL, overview=NULL, metadata_lookup_at=NULL
-            WHERE metadata_source IN ('miss', 'wikipedia')
+            WHERE metadata_source IN ('miss', 'wikipedia', 'wikidata', 'unmatched')
         """)
     return RedirectResponse("/settings", status_code=302)
 
@@ -4901,7 +4901,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
           f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, "
           f"  (r.parse_score "
-          f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
+          f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikidata' THEN 1.2 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
           f"   * (CASE r.quality WHEN '2160p' THEN 1.4 WHEN '1080p' THEN 1.2 WHEN '720p' THEN 1.0 ELSE 0.8 END) "
           f"   * (1 + LEAST(LOG(r.grab_count + 1) / 3.0, 1.0)) "
           f"   * (1.0 / (1 + EXTRACT(EPOCH FROM (NOW() - COALESCE(r.posted_at, NOW())))/86400 * 0.005)) "
@@ -5309,7 +5309,7 @@ async def page_settings(request: Request):
         meta_stats = await conn.fetchrow("""
             SELECT count(*) AS total,
                    count(*) FILTER (WHERE metadata_source='tmdb') AS tmdb,
-                   count(*) FILTER (WHERE metadata_source='wikipedia') AS wiki,
+                   count(*) FILTER (WHERE metadata_source IN ('wikidata', 'wikipedia')) AS wiki,
                    count(*) FILTER (WHERE metadata_source='miss') AS missed,
                    count(*) FILTER (WHERE metadata_source IS NULL) AS pending
             FROM releases
@@ -5438,7 +5438,7 @@ async def page_settings(request: Request):
       <div class="name">Enrichment progress</div>
       <div class="meta">
         <span class="pill accent">TMDB {meta_stats['tmdb']:,}</span>
-        <span class="pill ok">Wikipedia {meta_stats['wiki']:,}</span>
+        <span class="pill ok">Wikidata {meta_stats['wiki']:,}</span>
         <span class="pill warn">Not found {meta_stats['missed']:,}</span>
         <span class="pill muted">Pending {meta_stats['pending']:,}</span>
         / total {meta_stats['total']:,}
