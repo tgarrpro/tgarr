@@ -300,10 +300,17 @@ async def _daily_budget_take(method_name: str) -> bool:
     return True
 
 
-async def _mtproto(method_name: str, coro_factory):
+async def _mtproto(method_name: str, coro_factory, wait: bool = True):
     """Gate Pyrogram calls: per-method rate limit + per-method halt + FloodWait observation.
     Halt is per-method: TG flood-waits specific endpoints (e.g. resolveUsername)
     rather than the whole session, so other methods stay unblocked.
+
+    wait=False is for work a person is waiting on (a thumbnail, a preview, a
+    film they opened): a method that is parked - by a flood wait or because
+    its daily allowance is spent - raises DailyBudgetExhausted at once instead
+    of sleeping. A background job can sit out twelve hours; the thumbnail
+    dispatcher sleeping twelve hours inside one channel's lookup meant no
+    thumbnail at all, for anything, until midnight.
     """
     while True:
         # 1. Honor THIS method's halt (set by prior FloodWait on same method).
@@ -311,6 +318,9 @@ async def _mtproto(method_name: str, coro_factory):
         halt_until = _MTPROTO_HALT_UNTIL.get(method_name, 0)
         if halt_until > now:
             remaining = halt_until - now
+            if not wait and remaining > 3:
+                raise DailyBudgetExhausted(
+                    f"{method_name} is paused for another {int(remaining)}s")
             log.info("[mtproto-rl] halt %s: %ds remaining → sleeping",
                      method_name, int(remaining))
             await asyncio.sleep(min(remaining + 1, 60))
@@ -326,12 +336,12 @@ async def _mtproto(method_name: str, coro_factory):
                 raise DailyBudgetExhausted(
                     f"daily join budget ({cap}) reached — protecting the Telegram "
                     f"account; try again after 00:00 UTC")
-            wait = _secs_to_utc_midnight() + 5
+            _park = _secs_to_utc_midnight() + 5
             async with _MTPROTO_LOCK:
                 _MTPROTO_HALT_UNTIL[method_name] = max(
-                    _MTPROTO_HALT_UNTIL.get(method_name, 0), time.time() + wait)
+                    _MTPROTO_HALT_UNTIL.get(method_name, 0), time.time() + _park)
             log.warning("[mtproto-rl] %s daily budget (%d) spent — parked %dh%02dm",
-                        method_name, cap, int(wait // 3600), int(wait % 3600 // 60))
+                        method_name, cap, int(_park // 3600), int(_park % 3600 // 60))
             continue
         # 2. Per-method token bucket.
         limit, window = _MTPROTO_BUDGETS.get(method_name,
@@ -543,7 +553,7 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
                 _uname = await conn.fetchval(
                     "SELECT username FROM channels WHERE tg_chat_id=$1", chat_id)
             if _uname:
-                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname))
+                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname), wait=False)
                 return await _mtproto("get_messages",
                                       lambda: app.get_messages(chat_id, msg_id))
         except FloodWait:
@@ -3353,9 +3363,15 @@ async def _thumb_get_messages(chat_id: int, username, ids: list) -> dict:
         if not (username and any(m in str(e) for m in _PEER_ERR_MARKS)
                 and username not in _thumb_resolve_tried):
             raise
-        _thumb_resolve_tried.add(username)
         log.info("[thumbs] no peer for %s — resolving @%s once", chat_id, username)
-        await _mtproto("resolveUsername", lambda: app.resolve_peer(username))
+        try:
+            await _mtproto("resolveUsername", lambda: app.resolve_peer(username), wait=False)
+        except DailyBudgetExhausted:
+            raise                        # not this channel's fault: try again another day
+        except Exception:
+            _thumb_resolve_tried.add(username)
+            raise
+        _thumb_resolve_tried.add(username)
         msgs = await _call()
     if not isinstance(msgs, list):
         msgs = [msgs]
@@ -3427,7 +3443,15 @@ async def _thumb_process_batch(rows) -> None:
             await asyncio.sleep(min(wait, 3600))
             return          # rows stay __user_queued__ for the next pass
         except DailyBudgetExhausted as e:
-            log.warning("[thumbs] %s — leaving channel %s queued", e, chat_id)
+            # Cannot reach this channel right now. Take its rows out of the
+            # queue (they are asked for again the next time someone looks) -
+            # left queued they would be picked up again at once, for ever.
+            log.info("[thumbs] %s — channel %s skipped for now (%d thumbnails)", e, chat_id, len(grp))
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET thumb_path = NULL "
+                    "WHERE id = ANY($1::bigint[]) AND thumb_path = '__user_queued__'",
+                    [r["id"] for r in grp])
             continue
         except Exception as e:
             await _thumb_fail(grp[0], e, whole_channel=True)
