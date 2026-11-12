@@ -36,6 +36,15 @@ from pyrogram.types import Message
 
 from parser import parse_filename, to_release_name
 
+# Pyrogram 2.0.106 hard-codes the pre-2024 channel-id range
+# (MIN_CHANNEL_ID = -1002147483647). Telegram now hands out channel ids above
+# 2^31, and for those every call that addresses the chat by id — get_messages,
+# thumbnails, previews, downloads, backfill — died with "Peer id invalid".
+# Widen the range to the current MTProto limit.
+from pyrogram import utils as _pyro_utils
+if _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
+    _pyro_utils.MIN_CHANNEL_ID = -1007852516352
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -214,6 +223,7 @@ _MTPROTO_BUDGETS = {
     "get_chat_history":  (30, 60),
     "get_messages":      (30, 60),
     "download_media":    (60, 60),
+    "download_thumb":    (120, 60),  # <=320px embedded thumbs, ~10 KB each
     "join_chat":         (3, 60),    # rare; TG hard-caps ~20/day
     "leave_chat":        (3, 60),
     "search_messages_count": (10, 60),
@@ -2045,110 +2055,296 @@ async def _fetch_thumb_https(username: str, tg_message_id: int) -> bytes | None:
 
 _THUMB_HTTPS_SEM = asyncio.Semaphore(10)
 _THUMB_MTPROTO_SEM = asyncio.Semaphore(1)
-_THUMB_BATCH = 20
+_THUMB_DL_SEM = asyncio.Semaphore(3)
+_THUMB_BATCH = 60
 
 
-async def _thumb_process_one(row) -> None:
-    """Fetch + write + md5-dedup one queued thumb row. Concurrency-safe via
-    semaphores: HTTPS path runs up to 10-wide, MTProto fallback serializes.
-    """
+# ── cached media sessions for small files (thumbnails) ─────────────────
+# Pyrogram's get_file opens a brand-new media session for every file and, when
+# the file lives on another DC, creates a new auth key and runs
+# auth.ExportAuthorization/ImportAuthorization each time: ~4s per thumbnail,
+# and ExportAuthorization is exactly the call Telegram flood-limits. Keep ONE
+# authorized media session per DC for the life of the process instead; a
+# thumbnail is then a single upload.GetFile round-trip.
+_media_sessions: dict = {}
+_media_sessions_lock = asyncio.Lock()
+
+
+async def _media_session(dc_id: int):
+    from pyrogram import raw
+    from pyrogram.session import Auth, Session
+    async with _media_sessions_lock:
+        sess = _media_sessions.get(dc_id)
+        if sess is not None:
+            return sess
+        my_dc = await app.storage.dc_id()
+        test_mode = await app.storage.test_mode()
+        if dc_id != my_dc:
+            auth_key = await Auth(app, dc_id, test_mode).create()
+        else:
+            auth_key = await app.storage.auth_key()
+        sess = Session(app, dc_id, auth_key, test_mode, is_media=True)
+        await sess.start()
+        try:
+            if dc_id != my_dc:
+                exported = await app.invoke(
+                    raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                await sess.invoke(raw.functions.auth.ImportAuthorization(
+                    id=exported.id, bytes=exported.bytes))
+        except BaseException:
+            try:
+                await sess.stop()
+            except Exception:
+                pass
+            raise
+        _media_sessions[dc_id] = sess
+        log.info("[media-session] opened DC%s (%s)", dc_id,
+                 "cross-DC, authorization exported once" if dc_id != my_dc else "home DC")
+        return sess
+
+
+async def _drop_media_session(dc_id: int) -> None:
+    async with _media_sessions_lock:
+        sess = _media_sessions.pop(dc_id, None)
+    if sess is not None:
+        try:
+            await sess.stop()
+        except Exception:
+            pass
+
+
+async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
+    """Bytes of a small file (a thumbnail) via the cached media session of its
+    DC. Returns None when this fast path does not apply (CDN redirect, file
+    larger than one chunk, session trouble) — the caller then falls back to
+    app.download_media. FloodWait propagates."""
+    from pyrogram import raw
+    from pyrogram.file_id import FileType
+    fid = FileId.decode(media.file_id)
+    if fid.file_type == FileType.CHAT_PHOTO:
+        return None
+    if fid.file_type == FileType.PHOTO:
+        location = raw.types.InputPhotoFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    else:
+        location = raw.types.InputDocumentFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    for attempt in (1, 2):
+        sess = await _media_session(fid.dc_id)
+        try:
+            r = await sess.invoke(
+                raw.functions.upload.GetFile(location=location, offset=0, limit=max_bytes),
+                sleep_threshold=30)
+        except FloodWait:
+            raise
+        except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            # dead/idle-dropped session: rebuild once, then give up to fallback
+            log.info("[media-session] DC%s dropped (%s) — reopening", fid.dc_id,
+                     type(e).__name__)
+            await _drop_media_session(fid.dc_id)
+            if attempt == 2:
+                return None
+            continue
+        if isinstance(r, raw.types.upload.File):
+            if len(r.bytes) >= max_bytes:
+                return None      # not a one-chunk file after all
+            return r.bytes
+        return None              # upload.FileCdnRedirect etc.
+    return None
+
+
+def _pick_thumb_media(msg):
+    """The small embedded thumbnail of a message's media (never the original)."""
+    if msg.photo:
+        pthumbs = getattr(msg.photo, "thumbs", None) or []
+        return pthumbs[-1] if pthumbs else msg.photo
+    for kind in ("video", "document", "animation", "audio"):
+        m = getattr(msg, kind, None)
+        if m is not None and getattr(m, "thumbs", None):
+            return m.thumbs[-1]
+    return None
+
+
+def _thumb_target(row) -> tuple:
     safe_uid = SAFE_NAME.sub("_", row["file_unique_id"] or str(row["id"]))[:80]
     fname = f"{safe_uid}.jpg"
-    target = os.path.join(THUMBS_ROOT, fname)
-    try:
-        # ── Path 1: HTTPS scrape via t.me embed (public channels only). ──
-        # Avoids MTProto + cross-DC auth.ExportAuthorization FloodWait.
-        https_bytes = None
-        if row["channel_username"]:
-            async with _THUMB_HTTPS_SEM:
-                https_bytes = await _fetch_thumb_https(
-                    row["channel_username"], row["tg_message_id"])
-        if https_bytes:
-            with open(target, "wb") as f:
-                f.write(https_bytes)
+    return fname, os.path.join(THUMBS_ROOT, fname)
+
+
+async def _thumb_store(row, fname: str, target: str) -> None:
+    """md5-dedup the downloaded thumb across channels and record it."""
+    with open(target, "rb") as f:
+        md5 = hashlib.md5(f.read()).hexdigest()
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchval(
+            """SELECT thumb_path FROM messages
+               WHERE thumb_md5 = $1
+                 AND thumb_path IS NOT NULL
+                 AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
+                 AND id <> $2
+               LIMIT 1""", md5, row["id"])
+        if existing and existing != fname:
+            try:
+                os.remove(target)
+            except Exception:
+                pass
+            await conn.execute(
+                "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
+                "thumb_accessed_at=NOW() WHERE id=$3",
+                existing, md5, row["id"])
         else:
-            # THUMB-ONLY emergency mode: skip MTProto fallback entirely — these
-            # rows just stay '__failed__' until the cross-DC FloodWait clears
-            # and the mode flag is flipped off.
-            if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
-                raise RuntimeError("THUMB_ONLY mode: HTTPS scrape miss + MTProto disabled")
-            # ── Path 2: MTProto fallback through global rate limiter. ──
-            # NEVER auto-join for a thumbnail: join_chat is capped ~20/day +
-            # FloodWait-prone, and this queue is dominated by left/private
-            # channels whose peer won't resolve. Plain get_messages works for
-            # cached/joined peers and fails FAST for the rest (→ __failed__),
-            # instead of grinding the 3/60s join limiter (the slow-thumbnail
-            # cause). Re-acquiring a left channel happens on user grab, not here.
-            async with _THUMB_MTPROTO_SEM:
-                msg = await _mtproto("get_messages",
-                    lambda: app.get_messages(row["tg_chat_id"], row["tg_message_id"]))
-                if not msg:
-                    raise RuntimeError("message gone")
-                thumb_media = None
-                if msg.photo:
-                    pthumbs = getattr(msg.photo, "thumbs", None) or []
-                    thumb_media = pthumbs[-1] if pthumbs else msg.photo
-                elif msg.video and getattr(msg.video, "thumbs", None):
-                    thumb_media = msg.video.thumbs[-1]
-                elif msg.document and getattr(msg.document, "thumbs", None):
-                    thumb_media = msg.document.thumbs[-1]
-                if not thumb_media:
-                    raise RuntimeError("no thumbnail available on message")
-                await _mtproto("download_media",
-                    lambda: app.download_media(thumb_media, file_name=target))
-        # MD5 of the downloaded bytes → dedup across channels
-        with open(target, "rb") as f:
-            md5 = hashlib.md5(f.read()).hexdigest()
-        async with db_pool.acquire() as conn:
-            existing = await conn.fetchval(
-                """SELECT thumb_path FROM messages
-                   WHERE thumb_md5 = $1
-                     AND thumb_path IS NOT NULL
-                     AND thumb_path NOT LIKE '\\_\\_%' ESCAPE '\\'
-                     AND id <> $2
-                   LIMIT 1""", md5, row["id"])
-            if existing and existing != fname:
-                try:
-                    os.remove(target)
-                except Exception:
-                    pass
-                await conn.execute(
-                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
-                    "thumb_accessed_at=NOW() WHERE id=$3",
-                    existing, md5, row["id"])
-                log.info("[thumbs] dedup id=%s → %s", row["id"], existing)
-            else:
-                await conn.execute(
-                    "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
-                    "thumb_accessed_at=NOW() WHERE id=$3",
-                    fname, md5, row["id"])
-    except FloodWait as fw:
-        wait = getattr(fw, "value", 60) + 5
-        log.warning("[thumbs] flood-wait %ds (id=%s) — leaving in queue", wait, row["id"])
-        await asyncio.sleep(min(wait, 3600))
-        # Row stays as __user_queued__; will be retried on next batch.
+            await conn.execute(
+                "UPDATE messages SET thumb_path=$1, thumb_md5=$2, "
+                "thumb_accessed_at=NOW() WHERE id=$3",
+                fname, md5, row["id"])
+
+
+_PEER_ERR_MARKS = ("CHANNEL_INVALID", "PEER_ID_INVALID", "Peer id invalid",
+                   "ID not found", "CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED",
+                   "USERNAME_INVALID")
+
+
+async def _thumb_fail(row, e, whole_channel: bool = False) -> None:
+    es = str(e)
+    channel_dead = whole_channel or any(m in es for m in _PEER_ERR_MARKS)
+    async with db_pool.acquire() as conn:
+        if channel_dead and row["tg_chat_id"]:
+            # Fail every queued thumb of an unreachable channel in one shot
+            # instead of grinding them one by one.
+            res = await conn.execute(
+                "UPDATE messages SET thumb_path='__failed__' "
+                "WHERE tg_chat_id=$1 AND thumb_path='__user_queued__'",
+                row["tg_chat_id"])
+            log.info("[thumbs] channel %s unreachable (%s) — failed queued batch %s",
+                     row["tg_chat_id"], es[:60], res)
+        else:
+            log.info("[thumbs] failed id=%s: %s", row["id"], es[:100])
+            await conn.execute(
+                "UPDATE messages SET thumb_path='__failed__' WHERE id=$1", row["id"])
+
+
+# Public channels we have already tried to re-resolve by username in this
+# process, so an unreachable one costs at most one lookup.
+_thumb_resolve_tried: set = set()
+
+
+async def _thumb_get_messages(chat_id: int, username, ids: list) -> dict:
+    """ONE get_messages round-trip for all queued thumbs of a channel.
+
+    If the session has no usable peer for the channel (fresh login, or a
+    public channel the account is not a member of), resolve it once by
+    username — reading a public channel needs no membership, and it never
+    joins anything — then retry.
+    """
+    async def _call():
+        return await _mtproto("get_messages",
+                              lambda: app.get_messages(chat_id, ids))
+    try:
+        msgs = await _call()
+    except FloodWait:
+        raise
     except Exception as e:
-        es = str(e)
-        log.warning("[thumbs] failed id=%s: %s", row["id"], es[:120])
-        # If the whole CHANNEL is unreachable (no username → no HTTPS, peer not
-        # resolvable), fail ALL its queued thumbs in one shot instead of
-        # grinding them one-by-one (~1s each on the single MTProto lane) — the
-        # main cause of a sluggish gallery full of un-fetchable channels.
-        channel_dead = any(s in es for s in (
-            "CHANNEL_INVALID", "PEER_ID_INVALID", "Peer id invalid",
-            "CHANNEL_PRIVATE", "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID"))
-        async with db_pool.acquire() as conn:
-            if channel_dead and row["tg_chat_id"]:
-                res = await conn.execute(
-                    "UPDATE messages SET thumb_path='__failed__' "
-                    "WHERE tg_chat_id=$1 AND thumb_path='__user_queued__'",
-                    row["tg_chat_id"])
-                log.info("[thumbs] channel %s unreachable — failed queued batch %s",
-                         row["tg_chat_id"], res)
-            else:
-                await conn.execute(
-                    "UPDATE messages SET thumb_path='__failed__' WHERE id=$1",
-                    row["id"])
+        if not (username and any(m in str(e) for m in _PEER_ERR_MARKS)
+                and username not in _thumb_resolve_tried):
+            raise
+        _thumb_resolve_tried.add(username)
+        log.info("[thumbs] no peer for %s — resolving @%s once", chat_id, username)
+        await _mtproto("resolveUsername", lambda: app.resolve_peer(username))
+        msgs = await _call()
+    if not isinstance(msgs, list):
+        msgs = [msgs]
+    return {m.id: m for m in msgs if m is not None and not getattr(m, "empty", False)}
+
+
+async def _thumb_process_batch(rows) -> None:
+    """Materialize a batch of user-requested thumbnails.
+
+    1. HTTPS scrape of the public t.me embed, in parallel — works for photo
+       posts and small native videos, costs no MTProto.
+    2. Everything else per channel: one get_messages for the whole group, then
+       the tiny embedded thumbs. (Large video *files* have no web preview at
+       all, so for a movie channel this is the only path — it used to be one
+       rate-limited get_messages per thumbnail.)
+    """
+    async def https_one(r) -> bool:
+        if not r["channel_username"]:
+            return False
+        fname, target = _thumb_target(r)
+        try:
+            async with _THUMB_HTTPS_SEM:
+                data = await _fetch_thumb_https(r["channel_username"], r["tg_message_id"])
+            if not data:
+                return False
+            with open(target, "wb") as f:
+                f.write(data)
+            await _thumb_store(r, fname, target)
+            return True
+        except Exception as e:
+            log.debug("[thumbs] https id=%s: %s", r["id"], e)
+            return False
+
+    got = await asyncio.gather(*[https_one(r) for r in rows])
+    rest = [r for r, ok in zip(rows, got) if not ok]
+    if not rest:
+        return
+    if os.environ.get("TGARR_THUMB_ONLY", "false").lower() == "true":
+        for r in rest:
+            await _thumb_fail(r, RuntimeError("THUMB_ONLY mode: HTTPS miss + MTProto disabled"))
+        return
+
+    by_chat: dict = {}
+    for r in rest:
+        by_chat.setdefault(r["tg_chat_id"], []).append(r)
+
+    for chat_id, grp in by_chat.items():
+        try:
+            async with _THUMB_MTPROTO_SEM:
+                msgs = await _thumb_get_messages(
+                    chat_id, grp[0]["channel_username"],
+                    [r["tg_message_id"] for r in grp])
+        except FloodWait as fw:
+            wait = int(getattr(fw, "value", 60) or 60) + 5
+            log.warning("[thumbs] flood-wait %ds — leaving %d queued", wait, len(grp))
+            await asyncio.sleep(min(wait, 3600))
+            return          # rows stay __user_queued__ for the next pass
+        except DailyBudgetExhausted as e:
+            log.warning("[thumbs] %s — leaving channel %s queued", e, chat_id)
+            continue
+        except Exception as e:
+            await _thumb_fail(grp[0], e, whole_channel=True)
+            continue
+
+        async def dl(r, msgs=msgs):
+            fname, target = _thumb_target(r)
+            try:
+                msg = msgs.get(r["tg_message_id"])
+                if msg is None:
+                    raise RuntimeError("message gone")
+                media = _pick_thumb_media(msg)
+                if media is None:
+                    raise RuntimeError("no thumbnail available on message")
+                async with _THUMB_DL_SEM:
+                    data = await _mtproto("download_thumb",
+                        lambda: _fetch_small_file(media))
+                    if data:
+                        with open(target, "wb") as f:
+                            f.write(data)
+                    else:
+                        # fast path not applicable → Pyrogram's own downloader
+                        await _mtproto("download_thumb",
+                            lambda: app.download_media(media, file_name=target))
+                if not os.path.exists(target) or os.path.getsize(target) == 0:
+                    raise RuntimeError("thumbnail download returned nothing")
+                await _thumb_store(r, fname, target)
+            except FloodWait as fw:
+                log.warning("[thumbs] flood-wait %ss on download (id=%s) — left queued",
+                            getattr(fw, "value", "?"), r["id"])
+            except Exception as e:
+                await _thumb_fail(r, e)
+
+        await asyncio.gather(*[dl(r) for r in grp])
 
 
 THUMB_TTL_HOURS = int(os.environ.get("TGARR_THUMB_TTL_HOURS", "5"))
@@ -2376,7 +2572,7 @@ async def preview_downloader() -> None:
 async def thumb_downloader() -> None:
     """Concurrent thumb-fetch dispatcher.
 
-    Pulls a batch of queued rows, fans out to _thumb_process_one in parallel,
+    Pulls a batch of queued rows, hands them to _thumb_process_batch,
     waits for the batch, repeats. HTTPS path is sem-capped at 10 concurrent;
     MTProto fallback at 1 (shared Pyrogram session).
 
@@ -2402,8 +2598,7 @@ async def thumb_downloader() -> None:
                        ORDER BY m.id DESC
                        LIMIT $1""", _THUMB_BATCH)
             if rows:
-                tasks = [asyncio.create_task(_thumb_process_one(r)) for r in rows]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await _thumb_process_batch(rows)
                 continue  # drain immediately, no nap
             # queue empty → wake instantly on the next thumb_queued NOTIFY
             # (fallback re-check guards against a missed wakeup).

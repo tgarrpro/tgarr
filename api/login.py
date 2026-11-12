@@ -18,6 +18,15 @@ from typing import Optional
 
 import qrcode
 from pyrogram import Client
+
+# Pyrogram 2.0.106 hard-codes the pre-2024 channel-id range
+# (MIN_CHANNEL_ID = -1002147483647). Telegram now hands out channel ids above
+# 2^31, and for those every call that addresses the chat by id — get_messages,
+# thumbnails, previews, downloads, backfill — died with "Peer id invalid".
+# Widen the range to the current MTProto limit.
+from pyrogram import utils as _pyro_utils
+if _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
+    _pyro_utils.MIN_CHANNEL_ID = -1007852516352
 from pyrogram.errors import (
     AuthTokenExpired,
     PhoneCodeInvalid,

@@ -807,7 +807,7 @@ async def _touch_preview(msg_id: int) -> None:
 async def lazy_thumb(msg_id: int):
     """On-demand thumb materialization. Cached -> serve. Uncached -> mark
     thumb_path='__user_queued__' so crawler thumb_downloader picks it up,
-    poll up to ~12s for the file to land, fallback to 202 + 1x1 GIF.
+    wait briefly (~2.5s) for the file to land, fallback to 202 + 1x1 GIF.
     """
     import asyncio
     async with db_pool.acquire() as conn:
@@ -833,7 +833,10 @@ async def lazy_thumb(msg_id: int):
             msg_id)
         # Wake the crawler's thumb dispatcher instantly (event-driven, no poll).
         await conn.execute("NOTIFY thumb_queued")
-    for _ in range(24):
+    # Short wait only: a browser has ~6 connections per host, and holding
+    # each for 12s made a page of uncached thumbnails feel frozen. The page
+    # script retries placeholders on its own.
+    for _ in range(5):
         await asyncio.sleep(0.5)
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -2605,6 +2608,26 @@ async function tgGrab(btn) {{
     setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
   }}
 }}
+</script>
+<script>
+// Thumbnails are fetched on demand. /api/thumb answers a not-ready image with
+// a 1x1 placeholder; keep asking (with backoff) until the real one arrives.
+// A failed thumbnail answers 410, which fires 'error' and shows the fallback.
+(() => {{
+  const MAX = 8;
+  document.addEventListener('load', ev => {{
+    const img = ev.target;
+    if (!(img instanceof HTMLImageElement)) return;
+    if (img.classList.contains('lazy-thumb')) return;   // gallery has its own hook
+    const base = (img.getAttribute('src') || '').split('?')[0];
+    if (!base.startsWith('/api/thumb/')) return;
+    if (img.naturalWidth > 1) {{ img.style.opacity = ''; return; }}
+    img._tgTry = (img._tgTry || 0) + 1;
+    img.style.opacity = '0';
+    if (img._tgTry > MAX) {{ img.dispatchEvent(new Event('error')); return; }}
+    setTimeout(() => {{ img.src = base + '?r=' + Date.now(); }}, 1500 + img._tgTry * 1000);
+  }}, true);
+}})();
 </script>
 </body></html>"""
 
