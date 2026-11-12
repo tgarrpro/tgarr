@@ -1143,6 +1143,20 @@ async def serve_media(msg_id: int, request: Request):
         # Without TG size, just serve whatever\'s in the file now
         end = os.path.getsize(path) - 1
 
+    def _tail_read(pos: int, n: int) -> bytes:
+        """Bytes at `pos` from the "<file>.tail" sidecar: the end of a file
+        that is still arriving, fetched first because the MP4 index lives
+        there (see the crawler). b"" when not available."""
+        try:
+            with open(path + ".tail", "rb") as tf:
+                t0 = int.from_bytes(tf.read(8), "big")
+                if pos < t0:
+                    return b""
+                tf.seek(8 + pos - t0)
+                return tf.read(n)
+        except OSError:
+            return b""
+
     async def stream_range():
         with open(path, "rb") as f:
             f.seek(start)
@@ -1152,6 +1166,13 @@ async def serve_media(msg_id: int, request: Request):
                 current = os.path.getsize(path)
                 target_pos = f.tell()
                 if current <= target_pos:
+                    chunk = _tail_read(target_pos, min(65536, remaining))
+                    if chunk:
+                        f.seek(target_pos + len(chunk))
+                        yield chunk
+                        remaining -= len(chunk)
+                        stuck_iters = 0
+                        continue
                     # Partial file caught up — wait for crawler to write more.
                     # Abort if download appears stalled.
                     stuck_iters += 1

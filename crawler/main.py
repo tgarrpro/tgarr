@@ -2384,9 +2384,9 @@ class _FastPathUnavailable(Exception):
     downloader instead."""
 
 
-async def _stream_file_cached(media):
+async def _stream_file_cached(media, start: int = 0):
     """Yield a file's bytes in 1 MB chunks over the cached media session of
-    its DC.
+    its DC, from byte `start` (a multiple of 1 MB).
 
     Compared with Pyrogram's stream/download (a new media session per file,
     plus a new auth key and auth.ExportAuthorization for every cross-DC file):
@@ -2410,7 +2410,7 @@ async def _stream_file_cached(media):
             id=fid.media_id, access_hash=fid.access_hash,
             file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
     chunk = 1024 * 1024
-    offset = 0
+    offset = start
     reopened = 0
     while True:
         sess = await _media_session(fid.dc_id)
@@ -2424,14 +2424,14 @@ async def _stream_file_cached(media):
             reopened += 1
             await _drop_media_session(fid.dc_id)
             if reopened > 3:
-                if offset == 0:
+                if offset == start:
                     raise _FastPathUnavailable(f"media session: {type(e).__name__}")
                 raise RuntimeError(f"media session kept dropping at offset {offset}: {e}")
             log.info("[media-session] DC%s dropped at offset %d (%s) — resuming",
                      fid.dc_id, offset, type(e).__name__)
             continue
         if not isinstance(r, raw.types.upload.File):
-            if offset == 0:
+            if offset == start:
                 raise _FastPathUnavailable(type(r).__name__)
             raise RuntimeError(f"unexpected {type(r).__name__} at offset {offset}")
         if r.bytes:
@@ -2440,6 +2440,72 @@ async def _stream_file_cached(media):
             return
         offset += chunk
         reopened = 0
+
+
+# An MP4 cannot start playing without its index (the "moov" box). Encoders
+# that do not "fast-start" a file put it at the very end, after all the
+# picture data - so a browser playing a file that is still arriving had to
+# wait for the last byte of a 2 GB film before showing the first frame.
+# When the head of a file shows that layout, fetch the tail first and park it
+# next to the file as "<file>.tail" (8 bytes: its offset, then the bytes);
+# the API serves requests for that region from there until the file is whole.
+_TAIL_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _mp4_tail_offset(head: bytes, total: int):
+    """Offset of what follows the picture data when the index is not in front
+    of it; None when the index comes first or this is not such a file."""
+    off = 0
+    while off + 8 <= len(head):
+        n, kind = struct.unpack(">I4s", head[off:off + 8])
+        if n == 1:
+            if off + 16 > len(head):
+                return None
+            n = struct.unpack(">Q", head[off + 8:off + 16])[0]
+        if n < 8 or kind == b"moov":
+            return None
+        if kind == b"mdat":
+            nxt = off + n
+            return nxt if 0 < nxt < total else None
+        off += n
+    return None
+
+
+async def _fetch_tail_sidecar(media, target: str, head: bytes, total: int) -> None:
+    """Best effort. FloodWait propagates; anything else just means the file
+    plays once it has fully arrived, as before."""
+    moov_at = _mp4_tail_offset(head, total)
+    if moov_at is None:
+        return
+    mb = 1024 * 1024
+    start = (moov_at // mb) * mb
+    if total - start > _TAIL_MAX_BYTES:
+        return
+    tmp = target + ".tail.tmp"
+    try:
+        with open(tmp, "wb") as tf:
+            tf.write(struct.pack(">Q", start))
+            async for part in _stream_file_cached(media, start=start):
+                tf.write(part)
+        os.replace(tmp, target + ".tail")
+        log.info("[on-demand-media] index at the end of the file: fetched the last %.1f MB first",
+                 (total - start) / mb)
+    except FloodWait:
+        raise
+    except Exception as e:
+        log.info("[on-demand-media] tail-first not possible (%s)", e)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _drop_tail_sidecar(target: str) -> None:
+    try:
+        os.remove(target + ".tail")
+    except OSError:
+        pass
 
 
 async def _stream_media_fast(msg, media):
@@ -4504,10 +4570,16 @@ async def _ondemand_fetch_one(row) -> None:
 
         expected = row["file_size"] or 0
         written = 0
+        _drop_tail_sidecar(target)
         with open(target, "wb") as f:
             async for chunk in _stream_media_fast(msg, media):
                 f.write(chunk)
+                f.flush()
+                if not written and expected > 8 * 1024 * 1024 and mt != "audio":
+                    await _fetch_tail_sidecar(media, target, chunk, expected)
                 written += len(chunk)
+        if not expected or written >= expected:
+            _drop_tail_sidecar(target)       # the file is whole: no longer needed
 
         if expected and written < expected * 0.95:
             log.warning("[on-demand-media] short download id=%s wrote=%s expected=%s",
