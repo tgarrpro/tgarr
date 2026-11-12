@@ -6671,6 +6671,36 @@ async def _session_change_watcher(boot_user_id: int):
         await asyncio.sleep(30)
 
 
+async def _session_saver() -> None:
+    """Write what the session has learned to disk as we go.
+
+    Pyrogram keeps the channels it knows (their access hashes, their
+    @usernames) in memory and writes them to the session file only when it is
+    stopped cleanly. A container is not stopped cleanly - it is killed - so
+    the file held the login and nothing else: after every restart, and so
+    after every update, the session knew no channel at all and each one had
+    to be looked up by @username again. That is the scarcest allowance an
+    account has, spent on every upgrade by every install.
+    """
+    import signal
+
+    def _commit():
+        try:
+            app.storage.conn.commit()
+        except Exception:
+            pass
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, lambda: (_commit(), os._exit(0)))
+    except (NotImplementedError, RuntimeError, ValueError):
+        pass
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await app.storage.save()
+        except Exception as e:
+            log.debug("[session] save: %s", e)
+
+
 async def main() -> None:
     global CURRENT_USER_ID, CURRENT_DC
     await init_db()
@@ -6778,6 +6808,7 @@ async def main() -> None:
     asyncio.create_task(stale_index_sweeper())
     asyncio.create_task(release_judge_worker())
     asyncio.create_task(membership_sync_worker())
+    asyncio.create_task(_session_saver())
     # seed_validator disabled on client: leftover from pre-federation split.
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)
