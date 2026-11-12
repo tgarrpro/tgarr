@@ -4172,6 +4172,40 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-card .pills { padding:0 12px 8px; display:flex; gap:4px; flex-wrap:wrap; min-height:24px; }
 .poster-card .grab-row { padding:8px 14px 12px; border-top:1px solid var(--border); margin-top:auto; background:var(--surface2); }
 .poster-card .grab-row .btn { width:100%; text-align:center; padding:8px; font-size:13px; }
+/* the media card: one shape for films, episodes and plain videos */
+.mc { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; transition:transform .12s, box-shadow .12s, border-color .12s; min-width:0; }
+.mc:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,.12); border-color:var(--accent); }
+.mc-img { position:relative; display:block; aspect-ratio:2/3; background:#e9eef4; overflow:hidden; }
+.mc.wide .mc-img { aspect-ratio:16/10; }
+.mc-img img { position:relative; z-index:1; width:100%; height:100%; object-fit:cover; display:block; }
+.mc-img .bq, .mc-img .bs, .mc-img .bp, .mc-img .pl { z-index:2; }
+.mc-img .fb { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:46px; color:#b8c4d2; }
+.mc-img .bq { position:absolute; top:8px; right:8px; padding:3px 8px; border-radius:6px; background:rgba(15,23,42,.8); color:#fff; font-size:10.5px; font-weight:700; letter-spacing:.4px; text-transform:uppercase; }
+.mc-img .bs { position:absolute; top:8px; left:8px; padding:3px 8px; border-radius:6px; background:rgba(5,150,105,.92); color:#fff; font-size:10.5px; font-weight:700; }
+.mc-img .bv { position:absolute; bottom:8px; right:8px; padding:3px 8px; border-radius:6px; background:rgba(37,99,235,.92); color:#fff; font-size:10.5px; font-weight:700; text-decoration:none; }
+.mc-img .bp { position:absolute; bottom:8px; left:8px; padding:3px 8px; border-radius:6px; background:rgba(15,23,42,.8); color:#fff; font-size:10.5px; font-weight:700; }
+.mc-img .pl { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(15,23,42,.28); opacity:0; transition:opacity .15s; }
+.mc-img .pl span { width:54px; height:54px; border-radius:50%; background:rgba(255,255,255,.94); color:#0f172a; display:flex; align-items:center; justify-content:center; font-size:22px; padding-left:4px; }
+.mc:hover .mc-img .pl { opacity:1; }
+.mc-over { position:relative; height:0; }
+.mc-over .bv { position:absolute; z-index:3; right:8px; bottom:8px; padding:3px 8px; border-radius:6px; background:rgba(37,99,235,.94); color:#fff; font-size:10.5px; font-weight:700; text-decoration:none; }
+.mc-over .bv:hover { background:#1d4ed8; }
+.mc-body { padding:10px 12px 8px; flex:1; min-width:0; }
+.mc-title { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; font-weight:700; font-size:14.5px; line-height:1.3; min-height:38px; color:var(--fg); text-decoration:none; word-break:break-word; }
+.mc-title:hover { color:var(--accent); }
+.mc-sub { font-size:12.5px; color:var(--muted); margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-height:17px; }
+.mc-meta { font-size:12px; color:var(--muted); margin-top:4px; display:flex; gap:8px; align-items:center; min-height:20px; white-space:nowrap; overflow:hidden; }
+.mc-meta .dc { font-weight:600; font-size:11px; padding:1px 6px; border-radius:8px; background:rgba(245,158,11,.16); color:#b45309; }
+.mc-meta .dc.same { background:rgba(16,185,129,.16); color:#047857; }
+.mc-act { display:flex; gap:6px; padding:8px 10px 10px; border-top:1px solid var(--border); background:var(--surface2); }
+.mc-act .b { flex:1 1 0; height:34px; display:inline-flex; align-items:center; justify-content:center; gap:5px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--fg); font:inherit; font-size:13px; font-weight:600; cursor:pointer; text-decoration:none; white-space:nowrap; padding:0 8px; min-width:0; }
+.mc-act .b:hover { border-color:var(--accent); color:var(--accent); }
+.mc-act .b.pri { background:var(--accent); border-color:var(--accent); color:#fff; }
+.mc-act .b.pri:hover { filter:brightness(1.08); color:#fff; }
+.mc-act .b.sq { flex:0 0 34px; padding:0; }
+.mc-act .b.on { color:#e11d48; }
+.mc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(176px,1fr)); gap:16px; }
+.mc-grid.wide { grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); }
 .view-toggle { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
 .view-toggle a { padding:6px 14px; color:var(--muted); text-decoration:none; font-size:13px; font-weight:600; }
 .view-toggle a.active { background:var(--accent); color:#fff; }
@@ -6834,7 +6868,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
 @app.get("/videos", response_class=HTMLResponse)
 async def page_videos(q: Optional[str] = None, limit: int = 120,
                       offset: int = 0, aud: str = "sfw",
-                      min_mb: int = 50, local: int = 0, fav: int = 0):
+                      min_mb: int = 50, local: int = 0, fav: int = 0, sort: str = "new"):
     if not login.session_exists():
         async with db_pool.acquire() as conn:
             n = await conn.fetchval("SELECT count(*) FROM channels")
@@ -6873,12 +6907,13 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
             f"m.thumb_path, m.local_path, m.file_dc, "
             f"EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav, "
             f"c.title AS ch_title, c.username AS ch_user, c.audience, "
-            f"r.id AS release_id, r.canonical_title, r.quality "
+            f"r.id AS release_id, r.canonical_title, r.quality, r.movie_title, r.series_title, "
+            f"r.part AS rel_part, r.movie_year, m.duration_sec "
             f"FROM messages m "
             f"JOIN channels c ON c.id = m.channel_id "
             f"LEFT JOIN releases r ON r.primary_msg_id = m.id "
             f"WHERE {where_sql} "
-            f"ORDER BY m.posted_at DESC NULLS LAST "
+            f"ORDER BY {'m.file_size DESC NULLS LAST, m.id DESC' if sort == 'size' else 'm.posted_at DESC NULLS LAST, m.id DESC'} "
             f"LIMIT {page_size} OFFSET {page_offset}",
             *params)
 
@@ -6887,107 +6922,69 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
                     "aud": aud if aud != "sfw" else None,
                     "min_mb": min_mb if min_mb != 50 else None,
                     "local": 1 if local else None, "fav": 1 if fav else None,
+                    "sort": sort if sort != "new" else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
-            if v not in (None, "", 0, "sfw"):
+            if v not in (None, "", "sfw") and not (v == 0 and k != "min_mb"):
                 bits.append(f"{k}={html.escape(str(v))}")
         return "?" + "&".join(bits) if bits else ""
 
-    def _aud_chip(val, label):
-        active = aud == val or (val == "sfw" and not aud)
-        href = f"/videos{_qs(aud=val if val != 'sfw' else None)}"
-        bg = "rgba(245,158,11,0.18)" if val == "nsfw" and active else "rgba(94,182,229,0.15)"
-        fg = "var(--warn)" if val == "nsfw" else "var(--accent-hi)"
-        style = (f'background:{bg};color:{fg};border-color:{fg};') if active else ''
-        return (f'<a class="btn ghost" href="{href}" '
-                f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
+    _nsfw_on = await _is_nsfw_enabled()
 
+    def _vc(label, href, on, tip=""):
+        return _chip_link(label, "/videos" + href, on, tip)
     toolbar = (
-        '<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
-        + _aud_chip("sfw", "SFW")
-        + _aud_chip("nsfw", "NSFW")
-        + _aud_chip("any", "all")
-        + '<span style="margin-left:6px"></span>' + _saved_chip("/videos", _qs, local)
-        + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1)}" '
+        '<div class="bar-tools" style="margin-bottom:18px">'
+        + ((_vc("SFW", _qs(aud=None, offset=None), aud == "sfw")
+            + _vc("18+", _qs(aud="nsfw", offset=None), aud == "nsfw")
+            + _vc("both", _qs(aud="any", offset=None), aud == "any")
+            + '<span class="sep"></span>') if _nsfw_on else '')
+        + '<span class="lbl">Size:</span>'
+        + _vc("any", _qs(min_mb=0, offset=None), min_mb <= 0)
+        + _vc("50 MB+", _qs(min_mb=None, offset=None), min_mb == 50, "leaves out clips")
+        + _vc("300 MB+", _qs(min_mb=300, offset=None), min_mb == 300, "film-sized")
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _vc("newest", _qs(sort=None, offset=None), sort != "size")
+        + _vc("largest", _qs(sort="size", offset=None), sort == "size")
+        + '<span class="sep"></span>'
+        + _saved_chip("/videos", _qs, local)
+        + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1, offset=None)}" '
           f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
           f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>'
-        + '</div>'
-        + '<script>function tgFavCard(b,id){fetch("/api/fav/"+id,{method:"POST"}).then(r=>r.json())'
-          '.then(j=>{if(j.fav===undefined)return;b.style.color=j.fav?"#e11d48":"";b.title=j.fav?"in your favourites":"add to favourites"})}</script>'
-    )
+        + '</div>' + _FAV_CARD_JS)
 
     def _card(r):
-        title = (r["canonical_title"] or r["file_name"]
-                 or (r["caption"] or "")[:80] or f"video-{r['id']}")
-        size = _fmt_size(r["file_size"]) if r["file_size"] else ""
-        date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
+        title = (r["canonical_title"] or r["movie_title"] or r["series_title"]
+                 or r["file_name"] or (r["caption"] or "")[:80] or f"video {r['id']}")
+        if r["rel_part"]:
+            title += f" — part {r['rel_part']}"
         ch = r["ch_title"] or r["ch_user"] or ""
-        parsed_pill = ('<span class="pill ok" style="font-size:11px" title="parsed">P</span>'
-                       if r["release_id"] else
-                       '<span class="pill muted" style="font-size:11px" title="unparsed">U</span>')
-        return (
-            f'<div class="poster-card">'
-            f'<div class="poster">'
-            f'<img class="poster-img" src="/api/thumb/{r["id"]}" loading="lazy" alt="" '
-            f'onerror="this.outerHTML=\'<div class=&quot;fallback&quot;>🎬</div>\'" />'
-            f'</div>'
-            f'<div class="info">'
-            f'<div class="title">{html.escape(title)}</div>'
-            f'<div class="sub">{html.escape(ch)} · {date}</div>'
-            f'</div>'
-            f'<div class="pills">'
-            f'{_dc_badge(r.get("file_dc"), _vid_my_dc)}'
-            f'{_local_pill(r["local_path"])}'
-            f'{parsed_pill}'
-            + (f'<span class="pill accent" style="font-size:11px">{html.escape(r["quality"])}</span>'
-               if r.get("quality") else '')
-            + f'<span class="pill muted" style="font-size:11px">{size}</span>'
-            f'</div>'
-            f'<div class="grab-row" style="margin-top:8px;display:flex;gap:6px">'
-            f'<a class="btn" href="/watch/{r["id"]}">▶ watch</a>'
-            f'<a class="btn ghost" href="/media/{r["id"]}" download>⬇</a>'
-            f'<button class="ghost" style="padding:6px 10px;{"color:#e11d48;" if r["fav"] else ""}" '
-            f'title="{"in your favourites" if r["fav"] else "add to favourites"}" '
-            f'onclick="tgFavCard(this,{r["id"]})">♥</button>'
-            f'</div>'
-            f'</div>'
-        )
+        date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
+        return _media_card(
+            msg_id=r["id"], title=title, sub=" · ".join(x for x in (ch, date) if x),
+            img=f'/api/thumb/{r["id"]}', size=r["file_size"], file_dc=r.get("file_dc"),
+            my_dc=_vid_my_dc, quality=r.get("quality"), saved=_is_local(r["local_path"]),
+            fav=r["fav"], wide=True, duration=r["duration_sec"])
 
-    grid_html = ('<div class="poster-grid">'
-                 + ''.join(_card(r) for r in rows)
-                 + '</div>')
     start_idx = page_offset + 1 if rows else 0
     end_idx = page_offset + len(rows)
-    filter_parts = [f"aud={aud}"]
-    if min_mb > 0:
-        filter_parts.append(f"≥{min_mb}MB")
+    if rows:
+        grid_html = '<div class="mc-grid wide">' + ''.join(_card(r) for r in rows) + '</div>'
+    else:
+        grid_html = ('<div class="empty-state"><div class="icon">🎬</div>'
+                     '<div>No video matches.</div></div>')
+    _note = []
     if q:
-        filter_parts.append(f'q="{html.escape(q)}"')
-    filter_desc = " · ".join(filter_parts)
-    prev_offset = max(0, page_offset - page_size)
-    next_offset = page_offset + page_size
-    nav_links = []
-    if page_offset > 0:
-        nav_links.append(
-            f'<a class="btn ghost" href="/videos{_qs(offset=prev_offset if prev_offset else None)}">← prev</a>')
-    if next_offset < (total or 0):
-        nav_links.append(
-            f'<a class="btn ghost" href="/videos{_qs(offset=next_offset)}">next →</a>')
-    pagination = (
-        f'<div style="display:flex;justify-content:space-between;align-items:center;'
-        f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
-        f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {start_idx}–{end_idx} of {total:,} '
-        f'<span style="opacity:0.7">({filter_desc})</span></span>'
-        f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div></div>')
+        _note.append(f'matching “{html.escape(q)}”')
     body = (
-        f'<h2 class="section">Videos '
-        f'<span class="count">{len(rows)} of {total:,}</span>'
-        f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;'
-        f'margin-left:10px">{filter_desc}</span></h2>'
-        f'{toolbar}{grid_html}{pagination}')
+        f'{_LIST_CSS}'
+        f'<h2 class="section">Videos <span class="count">{total:,}</span>'
+        f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
+        f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
+        f'{toolbar}{grid_html}'
+        + _page_nav("/videos", _qs, page_offset, page_size, len(rows), total or 0))
     return HTMLResponse(_layout("Videos", "/videos", body))
 
 
@@ -7034,64 +7031,93 @@ def _versions_pill(r) -> str:
             f'title="all versions of this title" style="text-decoration:none">{n} versions</a>')
 
 
-def _release_card(r, my_dc=None) -> str:
-    """Sonarr/Radarr-style poster card with 3-tier fallback +
-    DC badge (so users can pick same-DC items without clicking)."""
-    title_disp = r["canonical_title"] or r["name"].replace(".", " ")
-    poster = r["poster_url"]
-    pmid = r["primary_msg_id"]
-    se = ""
-    if r["season"] and r["episode"]:
-        se = f"S{r['season']:02}E{r['episode']:02}"
-    elif r["season"]:
-        se = f"Season {r['season']}"
-    posted = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
-    sub_bits = [b for b in (se, posted) if b]
-    cat_pill = ("accent" if r["category"] == "movie"
-                else "ok" if r["category"] == "tv" else "muted")
-    cat_label = {"movie": "MV", "tv": "TV"}.get(r["category"], "NA")  # 2-letter, fits card
-    # Always render the emoji fallback in the DOM and let the <img> overlay
-    # cover it. If the img 404s/410s the browser onerror hides the img and
-    # the emoji shows through. CSS .poster .fallback is absolute-positioned;
-    # .poster-img is z-index:2 stacked on top.
-    if poster:
-        img_src = html.escape(poster)
-    elif pmid:
-        img_src = f"/api/thumb/{pmid}"
+def _rk(r, k, default=None):
+    """Field of a row that may or may not carry it (pages select different columns)."""
+    try:
+        return r[k] if k in r.keys() else default
+    except Exception:
+        return default
+
+
+def _dc_mark(file_dc, my_dc) -> str:
+    if not file_dc:
+        return ""
+    same = bool(my_dc and file_dc == my_dc)
+    tip = ("on your Telegram data center: the fast path" if same else
+           "on another Telegram data center: it works, a little slower to start")
+    return f'<span class="dc{" same" if same else ""}" title="{tip}">DC{file_dc}</span>'
+
+
+def _fmt_dur_short(sec) -> str:
+    if not sec:
+        return ""
+    sec = int(sec)
+    return f"{sec // 3600}h {sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60} min"
+
+
+def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=None,
+                quality=None, saved=False, versions=0, work=None, part=None,
+                guid=None, fav=None, wide=False, duration=None, fallback="🎬") -> str:
+    """One card for a film, an episode or a plain video."""
+    watch = f"/watch/{msg_id}"
+    img_html = (f'<img src="{html.escape(img, quote=True)}" loading="lazy" alt="" '
+                f'onerror="this.remove()"/>' if img else "")
+    badges = ""
+    if quality:
+        badges += f'<span class="bq">{html.escape(quality)}</span>'
+    if saved:
+        badges += '<span class="bs" title="already downloaded: opens instantly">● saved</span>'
+    if part:
+        badges += f'<span class="bp" title="this film was posted in several parts">part {int(part)}</span>'
+    more = ""
+    if work and versions and versions > 1:
+        more = (f'<a class="bv" href="/releases?work={_q(work)}" '
+                f'title="other copies of this title: other resolutions or uploads">{versions} versions</a>')
+    meta = [x for x in (_fmt_size(size), _fmt_dur_short(duration)) if x]
+    acts = f'<a class="b pri" href="{watch}">▶ Play</a>'
+    if guid:
+        acts += (f'<button class="b grab-btn" data-guid="{guid}" onclick="tgGrab(this)" '
+                 f'title="save it to the download folder (the one Sonarr/Radarr read)">⬇ Grab</button>')
     else:
-        img_src = ""
-    poster_style = ""
-    if img_src:
-        # onerror swaps the <img> for a fallback emoji div (no CSS :has() needed)
-        poster_img = (f'<img class="poster-img" src="{img_src}" loading="lazy" alt="" '
-                      f'onerror="this.outerHTML=\'&lt;div class=&quot;fallback&quot;&gt;\🎬&lt;/div&gt;\'" />')
-        fallback = ""
-    else:
-        poster_img = ""
-        fallback = '<div class="fallback">\U0001F3AC</div>'
-    quality_badge = (f'<div class="badge">{html.escape(r["quality"])}</div>'
-                     if r["quality"] else "")
+        acts += (f'<a class="b sq" href="/media/{msg_id}" download title="download to this device">⬇</a>')
+    if fav is not None:
+        acts += (f'<button class="b sq{" on" if fav else ""}" onclick="tgFavCard(this,{msg_id})" '
+                 f'title="{"in your favourites" if fav else "add to favourites"}">♥</button>')
     return (
-        f'<div class="poster-card">'
-        f'<div class="poster" {poster_style}>{fallback}{poster_img}{quality_badge}</div>'
-        f'<div class="info">'
-        f'<div class="title">{html.escape(title_disp)}</div>'
-        f'<div class="sub">{" · ".join(html.escape(x) for x in sub_bits)}</div>'
-        f'</div>'
-        f'<div class="pills">'
-        f'{_dc_badge(r.get("file_dc") if hasattr(r,"get") else r["file_dc"], my_dc)}'
-        f'<span class="pill {cat_pill}">{cat_label}</span>'
-        f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
-        f'{_part_pill(r)}'
-        f'{_local_pill(r["local_path"] if "local_path" in r.keys() else None)}'
-        f'{_versions_pill(r)}'
-        f'</div>'
-        f'<div class="grab-row" style="display:flex;gap:6px">'
-        f'<button class="btn play-btn" onclick="location.href=\'/watch/{r["primary_msg_id"]}\'">▶ Play</button>'
-        f'<button class="btn grab-btn" data-guid="{r["guid"]}" onclick="tgGrab(this)">⬇ Grab</button>'
-        f'</div>'
-        f'</div>'
-    )
+        f'<div class="mc{" wide" if wide else ""}">'
+        f'<a class="mc-img" href="{watch}"><span class="fb">{fallback}</span>{img_html}'
+        f'<span class="pl"><span>▶</span></span>{badges}</a>'
+        f'{("<div class=mc-over>" + more + "</div>") if more else ""}'
+        f'<div class="mc-body"><a class="mc-title" href="{watch}" title="{html.escape(title, quote=True)}">'
+        f'{html.escape(title)}</a>'
+        f'<div class="mc-sub">{html.escape(sub)}</div>'
+        f'<div class="mc-meta">{" · ".join(meta)}{_dc_mark(file_dc, my_dc)}</div></div>'
+        f'<div class="mc-act">{acts}</div></div>')
+
+
+_FAV_CARD_JS = ('<script>function tgFavCard(b,id){fetch("/api/fav/"+id,{method:"POST"}).then(r=>r.json())'
+                '.then(j=>{if(j.fav===undefined)return;b.classList.toggle("on",j.fav);'
+                'b.title=j.fav?"in your favourites":"add to favourites"})}</script>')
+
+
+def _release_card(r, my_dc=None) -> str:
+    """A film or an episode."""
+    title = _rk(r, "canonical_title") or (r["name"] or "").replace(".", " ")
+    bits = []
+    if r["category"] == "tv" and r["season"] is not None:
+        bits.append(f'S{r["season"]:02}' + (f'E{r["episode"]:02}' if r["episode"] is not None else ""))
+    if _rk(r, "movie_year"):
+        bits.append(str(r["movie_year"]))
+    if not bits and r["posted_at"]:
+        bits.append("posted " + _fmt_time(r["posted_at"])[:10])
+    pmid = r["primary_msg_id"]
+    return _media_card(
+        msg_id=pmid, title=title, sub=" · ".join(bits),
+        img=r["poster_url"] or (f"/api/thumb/{pmid}" if pmid else ""),
+        size=r["size_bytes"], file_dc=_rk(r, "file_dc"), my_dc=my_dc,
+        quality=r["quality"], saved=_is_local(_rk(r, "local_path")),
+        versions=_rk(r, "versions") or 0, work=_rk(r, "wk"), part=_rk(r, "part"),
+        guid=r["guid"], wide=not r["poster_url"])
 
 
 @app.get("/releases", response_class=HTMLResponse)
@@ -7099,9 +7125,15 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         view: str = "grid", limit: int = 120,
                         offset: int = 0,
                         min_mb: int = 100, aud: str = "sfw",
-                        work: Optional[str] = None):
+                        work: Optional[str] = None, sort: str = "best"):
     if not login.session_exists():
         return RedirectResponse("/login")
+    _sorts = {"best": "composite_score DESC NULLS LAST, posted_at DESC NULLS LAST",
+              "new": "posted_at DESC NULLS LAST, id DESC",
+              "size": "size_bytes DESC NULLS LAST, id DESC",
+              "name": "lower(COALESCE(NULLIF(canonical_title, ''), name)), id"}
+    if sort not in _sorts:
+        sort = "best"
     where = ["1=1"]
     params = []
     if q:
@@ -7150,6 +7182,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     sql = (f"WITH base AS (SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
           f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, r.part, m.local_path, "
+          f"r.movie_year, "
           f"{_WORK_KEY_SQL} AS wk, {_QUALITY_RANK_SQL} AS qr, {_same_dc} AS same_dc, "
           f"  (r.parse_score "
           f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikidata' THEN 1.2 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
@@ -7167,7 +7200,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
           + (f"SELECT * FROM ranked ORDER BY {_order} "
              if work else
              f"SELECT * FROM ranked WHERE rn = 1 "
-             f"ORDER BY composite_score DESC NULLS LAST, posted_at DESC NULLS LAST ")
+             f"ORDER BY {_sorts[sort]} ")
           + f"LIMIT {page_size} OFFSET {page_offset}")
     count_sql = (f"WITH base AS (SELECT r.id, {_WORK_KEY_SQL} AS wk FROM releases r "
                  f"LEFT JOIN messages m ON m.id = r.primary_msg_id "
@@ -7182,14 +7215,15 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         total_matched = await conn.fetchval(count_sql, *_count_params)
 
     def _qs(**overrides) -> str:
-        defaults = {"q": q, "cat": cat, "view": view,
+        defaults = {"q": q, "cat": cat, "view": view if view != "grid" else None,
                     "aud": aud if aud != "sfw" else None,
+                    "sort": sort if sort != "best" else None,
                     "min_mb": min_mb if min_mb != 100 else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
-            if v not in (None, "", 0, "sfw"):
+            if v not in (None, "", "sfw") and not (v == 0 and k != "min_mb"):
                 bits.append(f"{k}={html.escape(str(v))}")
         return "?" + "&".join(bits) if bits else ""
 
@@ -7210,14 +7244,22 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         return (f'<a class="btn ghost" href="{href}" '
                f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
 
+    _nsfw_on = await _is_nsfw_enabled()
     grid_active = "active" if view != "list" else ""
     list_active = "active" if view == "list" else ""
     toolbar = (
         f'<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
-        f'{_chip("","all")}{_chip("movie","movies")}{_chip("tv","tv")}'
-        f'<span style="color:var(--muted);font-size:12px;margin:0 4px">·</span>'
-        f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","NSFW")}{_aud_chip("any","all")}'
-        f'<div style="margin-left:auto" class="view-toggle">'
+        f'{_chip("","all")}{_chip("movie","🎬 films")}{_chip("tv","📺 episodes")}'
+        + (f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
+           f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","18+")}{_aud_chip("any","both")}'
+           if _nsfw_on else '')
+        + f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
+        f'<span style="font-size:12px;color:var(--muted)">Sort:</span>'
+        + "".join(_chip_link(lbl, "/releases" + _qs(sort=None if k == "best" else k, offset=None), sort == k, tip)
+                  for k, lbl, tip in (("best", "best", "known titles and good copies first"),
+                                      ("new", "newest", "most recently posted"),
+                                      ("size", "largest", ""), ("name", "name", "")))
+        + f'<div style="margin-left:auto" class="view-toggle">'
         f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ Grid</a>'
         f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ List</a>'
         f'</div></div>'
@@ -7261,6 +7303,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         body_html = (f'<div class="poster-grid">'
                     f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
                     f'</div>')
+        body_html = body_html.replace('<div class="poster-grid">', '<div class="mc-grid">', 1)
 
     # Build pagination nav
     start_idx = page_offset + 1 if rows else 0
@@ -7284,14 +7327,22 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         f'<div style="display:flex;justify-content:space-between;align-items:center;'
         f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
         f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {start_idx}–{end_idx} of {total_matched:,} '
-        f'<span style="opacity:0.7">({filter_desc})</span></span>'
+        f'showing {start_idx}–{end_idx} of {total_matched:,}</span>'
         f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div>'
         f'</div>')
-    body = (f'<h2 class="section">Parsed releases '
-           f'<span class="count">{len(rows)} of {total_matched:,}</span>'
-           f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;'
-           f'margin-left:10px">{filter_desc}</span></h2>'
+    _what = ("Versions of this title" if work else
+             {"movie": "Films", "tv": "Episodes"}.get(cat or "", "Films and episodes"))
+    _note = []
+    if q:
+        _note.append(f'matching “{html.escape(q)}”')
+    if min_mb > 0 and not work:
+        _note.append(f'{min_mb} MB and larger · <a href="/releases{_qs(min_mb=0, offset=None)}">show smaller too</a>')
+    if work:
+        _note.append('<a href="/releases">← all releases</a>')
+    body = (f'<h2 class="section">{_what} '
+           f'<span class="count">{total_matched:,}</span>'
+           f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
+           f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
            f'{toolbar}{body_html}{pagination_html}')
     actions = (f'<form action="/releases" method="GET" style="margin-left:auto">'
               f'<input type="text" name="q" class="search" placeholder="filter…" '
@@ -7654,105 +7705,133 @@ async def page_search(q: Optional[str] = None,
                       scope: Optional[str] = None):
     if not login.session_exists():
         return RedirectResponse("/login")
-
-    scope = scope or "releases"  # releases | messages | channels
-    results_html = ""
-    elapsed_ms = 0
+    scope = scope if scope in ("releases", "messages", "channels") else "releases"
+    nsfw_on = await _is_nsfw_enabled()
+    # what may be shown: never the hard-blocked, adult only when switched on
+    gate = ("COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
+            + ("" if nsfw_on else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"))
+    results_html, elapsed_ms, found = "", 0, 0
     if q:
         t0 = time.time()
+        my_dc = await _get_my_dc()
         if scope == "messages":
-            res = await meili_search("messages", q, limit=120)
+            res = await meili_search("messages", q, limit=150)
             ids = [h["id"] for h in res.get("hits", [])]
+            rows = []
             if ids:
                 async with db_pool.acquire() as conn:
                     rows = await conn.fetch(f"""
-                        SELECT m.id, m.file_name, m.media_type, m.file_size,
-                               m.posted_at, m.local_path, m.thumb_path,
-                               c.username AS channel_username, c.title AS channel_title
-                        FROM messages m JOIN channels c ON c.id=m.channel_id
-                        WHERE m.id = ANY($1::bigint[])
-                        ORDER BY array_position($1::bigint[], m.id)
-                    """, ids)
-                cards = []
-                for r in rows:
-                    fname = html.escape((r["file_name"] or "(no name)")[:120])
-                    sz = (r["file_size"] or 0) // 1024 // 1024
-                    ch = html.escape(r["channel_username"] or r["channel_title"] or "")
-                    cards.append(
-                        f'<div class="card" style="padding:12px"><div style="font-weight:600;font-size:13px">{fname}</div>'
-                        f'<div style="font-size:11px;color:#888;margin-top:4px">'
-                        f'{html.escape(r["media_type"] or "")} · {sz}MB · @{ch}</div></div>')
-                results_html = (
-                    f'<h2 class="section">Messages <span class="count">{res.get("estimatedTotalHits", len(ids))}</span></h2>'
-                    f'<div class="poster-grid">{"".join(cards)}</div>')
+                        SELECT m.id, m.file_name, m.media_type, m.file_size, m.caption,
+                               m.posted_at, m.local_path, m.file_dc,
+                               c.username AS ch_user, c.title AS ch_title
+                        FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE m.id = ANY($1::bigint[]) AND {gate}
+                        ORDER BY array_position($1::bigint[], m.id)""", ids)
+            found = len(rows)
+            ico = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
+            items = []
+            for r in rows:
+                name = r["file_name"] or (r["caption"] or "")[:90] or f'{r["media_type"] or "file"} {r["id"]}'
+                href = (f'/gallery?q={_q(q)}' if r["media_type"] == "photo" else f'/watch/{r["id"]}')
+                items.append(
+                    f'<div class="ls-row"><div style="width:30px;text-align:center;font-size:20px">'
+                    f'{ico.get(r["media_type"], "📄")}</div>'
+                    f'<div class="ls-main"><div class="ls-title"><a href="{href}">{html.escape(name)}</a> '
+                    + ('<span class="tag ok">saved</span>' if _is_local(r["local_path"]) else '')
+                    + f'</div><div class="ls-sub"><span>{html.escape(r["ch_title"] or r["ch_user"] or "")}</span>'
+                    f'<span>{_fmt_size(r["file_size"])}</span>'
+                    f'<span>{_fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""}</span></div></div>'
+                    f'<div class="ls-act"><a class="abtn" href="{href}">Open</a></div></div>')
+            results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         elif scope == "channels":
-            res = await meili_search("channels", q, limit=60)
-            hits = res.get("hits", [])
-            cards = []
-            for h in hits:
-                title = html.escape((h.get("title") or "")[:80])
-                un = html.escape(h.get("username") or "")
-                members = h.get("members_count", 0)
-                sub = "★" if h.get("subscribed") else ""
-                cards.append(
-                    f'<div class="card" style="padding:14px"><div style="font-weight:600">{title} {sub}</div>'
-                    f'<div style="font-size:12px;color:#888;margin-top:4px">@{un} · {members:,} members · {html.escape(h.get("content_category") or "")}</div></div>')
-            results_html = (
-                f'<h2 class="section">Channels <span class="count">{res.get("estimatedTotalHits", len(hits))}</span></h2>'
-                f'<div class="poster-grid">{"".join(cards)}</div>')
+            res = await meili_search("channels", q, limit=80)
+            unames = [h.get("username") for h in res.get("hits", []) if h.get("username")]
+            rows = []
+            if unames:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(f"""
+                        SELECT c.username, c.title, c.members_count, c.subscribed, c.is_joined,
+                               c.audience, c.dead_at
+                        FROM channels c WHERE c.username = ANY($1::text[]) AND {gate}
+                        ORDER BY array_position($1::text[], c.username)""", unames)
+            found = len(rows)
+            items = []
+            for r in rows:
+                title = r["title"] or ("@" + r["username"])
+                tag = ('<span class="tag bad">gone</span>' if r["dead_at"] else
+                       '<span class="tag ok">joined</span>' if r["is_joined"] else
+                       '<span class="tag acc">followed</span>' if r["subscribed"] else '')
+                items.append(
+                    f'<div class="ls-row">{_avatar(title)}'
+                    f'<div class="ls-main"><div class="ls-title">{html.escape(title)} {tag}</div>'
+                    f'<div class="ls-sub"><a href="https://t.me/{html.escape(r["username"])}" target="_blank" '
+                    f'rel="noopener">@{html.escape(r["username"])}</a></div></div>'
+                    f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
+                    f'<div class="ls-act"><a class="abtn" href="/channels?q={_q(r["username"])}">Details</a></div></div>')
+            results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         else:
-            res = await meili_search("releases", q, limit=120)
+            res = await meili_search("releases", q, limit=150)
             ids = [h["id"] for h in res.get("hits", [])]
             rows = []
-            _release_my_dc = await _get_my_dc()
             if ids:
                 async with db_pool.acquire() as conn:
-                    rows = await conn.fetch("""
+                    rows = await conn.fetch(f"""
                         SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality,
-                               r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title,
-                               r.primary_msg_id, m.file_dc
-                        FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id
-                        WHERE r.id = ANY($1::bigint[])
-                        ORDER BY array_position($1::bigint[], r.id)
-                    """, ids)
-            if not rows:
-                results_html = ('<div class="empty-state">'
-                              '<div class="icon">🔍</div>'
-                              f'<div>No matches for <strong>{html.escape(q)}</strong></div>'
-                              '<div style="margin-top:8px;font-size:12px">Try fewer words or different spelling.</div>'
-                              '</div>')
-            else:
-                results_html = (
-                    f'<h2 class="section">Releases <span class="count">{res.get("estimatedTotalHits", len(rows))}</span></h2>'
-                    f'<div class="poster-grid">'
-                    f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
-                    f'</div>')
+                               r.size_bytes, r.posted_at, r.poster_url, r.canonical_title,
+                               r.primary_msg_id, r.movie_year, r.part, m.file_dc, m.local_path,
+                               {_WORK_KEY_SQL} AS wk
+                        FROM releases r
+                        JOIN messages m ON m.id = r.primary_msg_id
+                        JOIN channels c ON c.id = m.channel_id
+                        WHERE r.id = ANY($1::bigint[]) AND {gate}
+                        ORDER BY array_position($1::bigint[], r.id)""", ids)
+            # one card per title: the best-ranked copy leads, the rest are one click away
+            groups, order = {}, []
+            for r in rows:
+                k = r["wk"] or f"id:{r['id']}"
+                if k not in groups:
+                    groups[k] = []
+                    order.append(k)
+                groups[k].append(r)
+            found = len(order)
+            cards = []
+            for k in order:
+                lead = dict(groups[k][0])
+                lead["versions"] = len(groups[k])
+                cards.append(_release_card(lead, my_dc))
+            results_html = f'<div class="mc-grid">{"".join(cards)}</div>' if cards else ""
         elapsed_ms = int((time.time() - t0) * 1000)
+        if not results_html:
+            results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
+                            f'<div>Nothing found for <strong>{html.escape(q)}</strong></div>'
+                            '<div style="margin-top:8px;font-size:13px">Try fewer words, another spelling, '
+                            'or one of the other tabs.</div></div>')
+    else:
+        results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
+                        '<div>Search everything tgarr has indexed.</div>'
+                        '<div style="margin-top:8px;font-size:13px">Films and episodes by title · '
+                        'any file by its name · channels by name or @username.</div></div>')
 
     def tab(name, label):
-        active = (scope == name)
-        style = ("background:var(--accent);color:#fff;" if active
-                 else "background:var(--card);color:var(--fg);")
-        return (f'<a href="/search?q={html.escape(q or "")}&scope={name}" '
-                f'style="{style}padding:6px 14px;border-radius:6px;text-decoration:none;font-size:13px">{label}</a>')
-
-    timing = f'<span style="font-size:11px;color:#888;margin-left:10px">({elapsed_ms}ms · Meili)</span>' if q else ""
-
-    body = f"""
-<form action="/search" method="GET" style="margin-bottom:14px;display:flex;gap:10px">
-  <input type="text" name="q" value="{html.escape(q) if q else ''}"
-         placeholder="Search across releases, messages, channels…"
-         style="flex:1;font-size:15px;padding:11px 16px" autofocus />
-  <input type="hidden" name="scope" value="{scope}">
-  <button type="submit">Search</button>
-</form>
-<div style="display:flex;gap:8px;margin-bottom:18px;align-items:center">
-  {tab("releases","Releases")}
-  {tab("messages","Messages")}
-  {tab("channels","Channels")}
-  {timing}
-</div>
-{results_html}"""
+        on = scope == name
+        style = ("border-bottom:2px solid var(--accent);color:var(--accent-hi);font-weight:600;"
+                 if on else "border-bottom:2px solid transparent;color:var(--muted);")
+        return (f'<a href="/search?q={_q(q or "")}&scope={name}" style="{style}padding:8px 4px;'
+                f'margin-right:22px;text-decoration:none;font-size:15px">{label}'
+                + (f' <span style="font-size:12px;opacity:.7">{found:,}</span>' if on and q else '') + '</a>')
+    body = (
+        f'{_LIST_CSS}'
+        '<form action="/search" method="GET" style="margin-bottom:16px;display:flex;gap:10px">'
+        f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+        'placeholder="a film, a file name, a channel…" '
+        'style="flex:1;font-size:16px;padding:12px 16px" autofocus />'
+        f'<input type="hidden" name="scope" value="{scope}">'
+        '<button type="submit" style="padding:0 22px">Search</button></form>'
+        '<div style="display:flex;align-items:flex-end;border-bottom:1px solid var(--border);margin-bottom:20px">'
+        + tab("releases", "Films &amp; episodes") + tab("messages", "All files") + tab("channels", "Channels")
+        + (f'<span style="margin-left:auto;font-size:11px;color:var(--muted);padding-bottom:10px">'
+           f'{elapsed_ms} ms</span>' if q else '')
+        + f'</div>{results_html}')
     return HTMLResponse(_layout("Search", "/search", body, top_actions_html=""))
 
 
@@ -7799,6 +7878,16 @@ async def page_settings(request: Request):
     )
 
     body = f"""
+<style>
+.settings .dl-item .meta {{ display:block; line-height:1.65; }}
+.settings .dl-item .meta .pill {{ vertical-align:middle; }}
+.settings input[type=number] {{ font:inherit; font-size:14px; padding:6px 8px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--fg); text-align:center; }}
+.settings details.adv {{ margin-top:26px; }}
+.settings details.adv summary {{ cursor:pointer; font-size:13px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.07em; }}
+.settings details.adv summary:hover {{ color:var(--accent); }}
+</style>
+<script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
+<div class="settings">
 <h2 class="section">Telegram account</h2>
 <div class="dl-list">
   <div class="dl-item">
@@ -7810,45 +7899,7 @@ async def page_settings(request: Request):
   </div>
 </div>
 
-<h2 class="section">Crawler</h2>
-<div class="dl-list">
-  <div class="dl-item">
-    <div class="icon">⚙</div>
-    <div class="info"><div class="name">Parser score threshold</div>
-      <div class="meta">Messages below this score don't become releases</div></div>
-    <div class="right"><code>{os.environ.get("TG_PARSE_SCORE_MIN","0.30")}</code></div>
-  </div>
-  <div class="dl-item">
-    <div class="icon">📁</div>
-    <div class="info"><div class="name">Download root</div>
-      <div class="meta">Where MTProto-fetched files land</div></div>
-    <div class="right"><code>{os.environ.get("TG_DOWNLOAD_ROOT","/downloads/tgarr")}</code></div>
-  </div>
-  <div class="dl-item">
-    <div class="icon">🔢</div>
-    <div class="info"><div class="name">Backfill limit per channel</div>
-      <div class="meta">Max historical messages scanned on first run</div></div>
-    <div class="right"><code>{os.environ.get("TG_BACKFILL_LIMIT","5000")}</code></div>
-  </div>
-</div>
-
-<h2 class="section">External endpoints</h2>
-<div class="dl-list">
-  <div class="dl-item">
-    <div class="icon">🔌</div>
-    <div class="info"><div class="name">Newznab indexer URL</div>
-      <div class="meta">Paste into Sonarr / Radarr → Settings → Indexers → ➕ Newznab</div></div>
-    <div class="right"><code>{html.escape(_base_url(request))}/newznab/</code></div>
-  </div>
-  <div class="dl-item">
-    <div class="icon">⬇</div>
-    <div class="info"><div class="name">SABnzbd URL base</div>
-      <div class="meta">Paste into Sonarr / Radarr → Download Clients → ➕ SABnzbd → URL Base</div></div>
-    <div class="right"><code>/sabnzbd</code></div>
-  </div>
-</div>
-
-<h2 class="section">Content policy</h2>
+<h2 class="section">Library</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🎯</div>
@@ -7948,8 +7999,8 @@ async def page_settings(request: Request):
   <div class="dl-item">
     <div class="icon">🔑</div>
     <div class="info">
-      <div class="name">TMDB API key <span class="pill {('ok' if tmdb_raw else 'muted')}">{('configured' if tmdb_raw else 'not set — using Wikipedia fallback')}</span></div>
-      <div class="meta">Posters &amp; canonical titles from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a> (free, personal use). If empty, tgarr falls back to free Wikipedia REST — lower coverage but no key needed.</div>
+      <div class="name">TMDB API key <span class="pill {('ok' if tmdb_raw else 'muted')}">{('configured' if tmdb_raw else 'not set — using Wikidata only')}</span></div>
+      <div class="meta">Posters &amp; canonical titles from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a> (free, personal use). Without a key, titles are still recognised through Wikidata (free, no key), with fewer posters.</div>
       <form method="POST" action="/api/settings/tmdb_key" style="margin-top:12px;display:flex;gap:10px;max-width:600px">
         <input type="text" name="value" placeholder="paste your TMDB API key (or leave blank to clear)" value="{html.escape(tmdb_masked)}" style="flex:1" />
         <button type="submit">Save</button>
@@ -7971,6 +8022,48 @@ async def page_settings(request: Request):
   </div>
 </div>
 
+<h2 class="section">Connect Sonarr / Radarr</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🔌</div>
+    <div class="info"><div class="name">Newznab indexer</div>
+      <div class="meta">Settings → Indexers → + → Newznab → URL</div></div>
+    <div class="right" style="display:flex;gap:8px;align-items:center"><code>{html.escape(_base_url(request))}/newznab/</code>
+      <button class="ghost" onclick="tgCopy(this)" data-v="{html.escape(_base_url(request))}/newznab/">Copy</button></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">⬇</div>
+    <div class="info"><div class="name">SABnzbd download client</div>
+      <div class="meta">Settings → Download Clients → + → SABnzbd → same host and port, URL Base</div></div>
+    <div class="right" style="display:flex;gap:8px;align-items:center"><code>/sabnzbd</code>
+      <button class="ghost" onclick="tgCopy(this)" data-v="/sabnzbd">Copy</button></div>
+  </div>
+</div>
+
+<details class="adv"><summary>Advanced — values set when the containers were started</summary>
+<div class="dl-list" style="margin-top:12px">
+  <div class="dl-item">
+    <div class="icon">⚙</div>
+    <div class="info"><div class="name">Parser score threshold</div>
+      <div class="meta">A file whose name scores below this is not treated as a film or an episode · TG_PARSE_SCORE_MIN</div></div>
+    <div class="right"><code>{os.environ.get("TG_PARSE_SCORE_MIN","0.30")}</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">📁</div>
+    <div class="info"><div class="name">Download root</div>
+      <div class="meta">Where grabbed files are written · TG_DOWNLOAD_ROOT</div></div>
+    <div class="right"><code>{os.environ.get("TG_DOWNLOAD_ROOT","/downloads/tgarr")}</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">🔢</div>
+    <div class="info"><div class="name">Backfill limit per channel</div>
+      <div class="meta">How far back a channel is read the first time · TG_BACKFILL_LIMIT</div></div>
+    <div class="right"><code>{os.environ.get("TG_BACKFILL_LIMIT","5000")}</code></div>
+  </div>
+</div>
+<div style="font-size:12.5px;color:var(--muted);margin:10px 4px">Change them in <code>docker-compose.yml</code> / <code>.env</code> and restart. Background jobs and their state: <a href="/system">System</a>.</div>
+</details>
+
 <h2 class="section">About</h2>
 <div class="dl-list">
   <div class="dl-item">
@@ -7979,6 +8072,7 @@ async def page_settings(request: Request):
       <div class="meta">Self-hosted Telegram-as-source bridge · MIT license</div></div>
     <div class="right"><a class="btn ghost" href="https://tgarr.me" target="_blank">tgarr.me ↗</a></div>
   </div>
+</div>
 </div>
 """
     return HTMLResponse(_layout("Settings", "/settings", body))
