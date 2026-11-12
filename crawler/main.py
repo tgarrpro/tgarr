@@ -1026,6 +1026,37 @@ async def init_db() -> None:
         await conn.execute(
             "UPDATE messages SET rel_ver = NULL WHERE rel_ver IS NOT NULL AND rel_ver <> $1",
             RELEASE_JUDGE_VER)
+        # Thumbnails and previews that were really the channel avatar (see
+        # _tme_media_url): one stored picture standing in for several
+        # different files. Forget them; they are fetched again, correctly,
+        # the next time they are looked at.
+        if not await conn.fetchval(
+                "SELECT 1 FROM config WHERE key = 'thumb_avatar_fix_0_5_6'"):
+            for col, folder in (("thumb_path", THUMBS_ROOT), ("preview_path", PREVIEWS_ROOT)):
+                try:
+                    bad = [r[0] for r in await conn.fetch(
+                        f"""SELECT {col} FROM messages
+                            WHERE {col} IS NOT NULL AND left({col}, 2) <> '__'
+                              AND file_unique_id IS NOT NULL
+                            GROUP BY {col} HAVING count(DISTINCT file_unique_id) >= 3""")]
+                    if not bad:
+                        continue
+                    res = await conn.execute(
+                        f"UPDATE messages SET {col} = NULL"
+                        + (", thumb_md5 = NULL" if col == "thumb_path" else "")
+                        + f" WHERE {col} = ANY($1::text[])", bad)
+                    for name in bad:
+                        try:
+                            os.remove(os.path.join(folder, name))
+                        except OSError:
+                            pass
+                    log.info("[thumbs] %d wrong %s picture(s) forgotten (%s): they will be "
+                             "fetched again", len(bad), col.split("_")[0], res)
+                except Exception as e:
+                    log.warning("[thumbs] repair of %s failed: %s", col, e)
+            await conn.execute(
+                "INSERT INTO config (key, value) VALUES ('thumb_avatar_fix_0_5_6', 'done') "
+                "ON CONFLICT (key) DO NOTHING")
         # What Telegram reports for a video message: running time + frame size.
         for _col in ("duration_sec", "width", "height"):
             await conn.execute(
@@ -2450,6 +2481,47 @@ _TME_PREVIEW_RX = re.compile(
     r"https://cdn[0-9]+\.telesco\.pe/file/[A-Za-z0-9_\-]+\.jpg")
 
 
+# Which picture on a t.me embed page belongs to the message that was asked for.
+#
+# The page used to be searched for "the first CDN image" (thumbnails) or "the
+# last one" (previews). The first image on the page is the channel's AVATAR,
+# and a post that is part of an album renders the whole album - so every
+# photo of a channel got the same thumbnail (the avatar), and album photos
+# got each other's. On one install 2,330 of 3,352 stored thumbnails were
+# wrong this way.
+#
+# Each picture on the page is an <a class="…photo_wrap…" href="…/<message
+# id>?single" style="background-image:url('…')">; a video is an
+# <a class="…video_player…" href="…/<id>…"> holding an <i class="…video_thumb"
+# style="background-image:url('…')">. Take the one whose link is this
+# message. If the page shows exactly one picture and it carries no link, it
+# is the message itself. Anything else: no answer - the caller falls back to
+# MTProto, which cannot be wrong about which file it is.
+_TME_PHOTO_TAG_RX = re.compile(r'<a\b[^>]*\btgme_widget_message_photo_wrap\b[^>]*>')
+_TME_VIDEO_TAG_RX = re.compile(
+    r'<a\b[^>]*\btgme_widget_message_video_player\b[^>]*>.{0,600}?'
+    r'<i\b[^>]*\btgme_widget_message_video_thumb\b[^>]*>', re.DOTALL)
+_TME_BG_RX = re.compile(r"background-image:url\('([^']+)'\)")
+_TME_HREF_ID_RX = re.compile(r'href="[^"]*/(\d+)(?:\?[^"]*)?"')
+_TME_CDN_OK_RX = re.compile(r"^https://cdn[0-9]*\.[a-z0-9.\-]*(telesco\.pe|cdn-telegram\.org|telegram-cdn\.org)/")
+
+
+def _tme_media_url(page: str, tg_message_id: int):
+    cands = []
+    for tag in _TME_PHOTO_TAG_RX.findall(page) + _TME_VIDEO_TAG_RX.findall(page):
+        u = _TME_BG_RX.search(tag)
+        if not u or not _TME_CDN_OK_RX.match(u.group(1)):
+            continue
+        h = _TME_HREF_ID_RX.search(tag)
+        cands.append((int(h.group(1)) if h else None, u.group(1)))
+    for mid, url in cands:
+        if mid == tg_message_id:
+            return url
+    if len(cands) == 1 and cands[0][0] is None:
+        return cands[0][1]
+    return None
+
+
 async def _fetch_preview_https(username: str, tg_message_id: int) -> bytes | None:
     """Gallery slideshow preview (~76KB 450px JPEG). Same t.me embed scrape
     as thumb but takes the LAST cdn URL (background-image, bigger) instead
@@ -2467,14 +2539,9 @@ async def _fetch_preview_https(username: str, tg_message_id: int) -> bytes | Non
                 html = r.read().decode("utf-8", errors="replace")
         except Exception:
             return None
-        if ("tgme_widget_message_photo_wrap" not in html
-                and "tgme_widget_message_video_wrap" not in html):
+        target = _tme_media_url(html, tg_message_id)
+        if not target:
             return None
-        # ALL cdn jpg URLs in order; pick last = biggest available preview.
-        urls = _TME_PREVIEW_RX.findall(html)
-        if not urls:
-            return None
-        target = urls[-1] if len(urls) > 1 else urls[0]
         try:
             req2 = urllib.request.Request(
                 target, headers={"User-Agent": "Mozilla/5.0"})
@@ -2505,19 +2572,12 @@ async def _fetch_thumb_https(username: str, tg_message_id: int) -> bytes | None:
                 html = r.read().decode("utf-8", errors="replace")
         except Exception:
             return None
-        # Skip if post has no photo/video media (deleted / text-only post →
-        # embed only renders channel avatar, regex would falsely match it).
-        if ("tgme_widget_message_photo_wrap" not in html
-                and "tgme_widget_message_video_wrap" not in html):
-            return None
-        # First cdn URL in HTML = small thumb (<i src=>). background-image
-        # is the larger 450px preview — skip it.
-        m = _TME_THUMB_RX.search(html)
-        if not m:
+        target = _tme_media_url(html, tg_message_id)
+        if not target:
             return None
         try:
             req2 = urllib.request.Request(
-                m.group(0), headers={"User-Agent": "Mozilla/5.0"})
+                target, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req2, timeout=10) as r2:
                 return r2.read()
         except Exception:
@@ -3321,6 +3381,19 @@ async def _thumb_process_batch(rows) -> None:
                 data = await _fetch_thumb_https(r["channel_username"], r["tg_message_id"])
             if not data:
                 return False
+            # A scraped picture that is byte-for-byte the thumbnail of a
+            # DIFFERENT file in the same channel is not this message's picture
+            # (it is the avatar, or the page changed shape): ask Telegram.
+            if r["file_unique_id"]:
+                async with db_pool.acquire() as conn:
+                    clash = await conn.fetchval(
+                        """SELECT 1 FROM messages
+                           WHERE thumb_md5 = $1 AND channel_id = $2
+                             AND file_unique_id IS NOT NULL AND file_unique_id <> $3
+                           LIMIT 1""",
+                        hashlib.md5(data).hexdigest(), r["channel_id"], r["file_unique_id"])
+                if clash:
+                    return False
             with open(target, "wb") as f:
                 f.write(data)
             await _thumb_store(r, fname, target)

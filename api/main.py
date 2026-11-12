@@ -4215,6 +4215,17 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .gallery .item { break-inside:avoid; margin-bottom:14px; position:relative; border-radius:8px; overflow:hidden; cursor:zoom-in; box-shadow:var(--shadow); }
 .gallery .item img { width:100%; display:block; background:#f1f5f9; transition:transform 0.15s; }
 .gallery .item:hover img { transform:scale(1.02); }
+/* a tile whose picture has not arrived: visibly loading, not blank */
+.gallery .item { min-height:170px; background:linear-gradient(100deg,#e3e9f0 30%,#f4f7fa 50%,#e3e9f0 70%); background-size:200% 100%; animation:tgShim 1.3s linear infinite; }
+.gallery .item::before { content:'🖼'; position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:36px; opacity:.4; }
+.gallery .item img { opacity:0; }
+.gallery .item.loaded { min-height:0; background:none; animation:none; }
+.gallery .item.loaded::before { display:none; }
+.gallery .item.loaded img { opacity:1; transition:opacity .25s, transform .15s; }
+.gallery .item.nopic { animation:none; background:#eef1f5; cursor:default; }
+.gallery .item.nopic::before { content:'picture not available'; font-size:12.5px; opacity:.8; color:#64748b; }
+.gallery .item.nopic img { display:none; }
+@keyframes tgShim { to { background-position:-200% 0; } }
 .gallery .item .meta { position:absolute; left:0; right:0; bottom:0; padding:18px 12px 8px; background:linear-gradient(transparent, rgba(0,0,0,0.78)); color:#fff; font-size:12px; opacity:0; transition:opacity 0.15s; }
 .gallery .item:hover .meta { opacity:1; }
 .gallery .item .meta .ch { font-weight:700; }
@@ -6087,16 +6098,23 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '</div>'
         '<script>'
         '(() => {'
+        '  /* A thumbnail that has not arrived yet is a 1x1 placeholder from the server.'
+        '     Until the real picture is there the tile shows a moving shimmer; it is'
+        '     asked for again a few times, then the tile says there is no picture. */'
         '  function hookLazy(img) {'
         '    if (img._tgHook) return; img._tgHook = true; img._tgTry = 0;'
-        '    img.addEventListener("load", () => {'
-        '      if (img.naturalWidth <= 1 && img._tgTry < 4) {'
+        '    const fig = img.closest(".item");'
+        '    const check = () => {'
+        '      if (img.naturalWidth > 1) { fig.classList.remove("nopic"); fig.classList.add("loaded"); return; }'
+        '      if (img._tgTry < 6) {'
         '        img._tgTry++;'
         '        const base = img.src.split("?")[0];'
-        '        const delay = 3000 + img._tgTry * 2000;'
-        '        setTimeout(() => { img.src = base + "?r=" + Date.now(); }, delay);'
-        '      }'
-        '    });'
+        '        setTimeout(() => { img.src = base + "?r=" + Date.now(); }, 2500 + img._tgTry * 1500);'
+        '      } else { fig.classList.add("nopic"); }'
+        '    };'
+        '    img.addEventListener("load", check);'
+        '    img.addEventListener("error", () => fig.classList.add("nopic"));'
+        '    if (img.complete && img.naturalWidth) check();'
         '  }'
         '  document.querySelectorAll("img.lazy-thumb").forEach(hookLazy);'
         '  const items = [...document.querySelectorAll(".gallery .item")];'
@@ -7016,7 +7034,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1, offset=None)}" '
           f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
           f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>'
-        + '</div>' + _FAV_CARD_JS)
+        + '</div>' + _FAV_CARD_JS + _THUMB_RETRY_JS)
 
     def _card(r):
         title = (r["canonical_title"] or r["movie_title"] or r["series_title"]
@@ -7157,6 +7175,22 @@ def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=No
         f'<div class="mc-meta">{" · ".join(meta)}{_dc_mark(file_dc, my_dc)}</div></div>'
         f'<div class="mc-act">{acts}</div></div>')
 
+
+# Cards whose picture is a thumbnail still being fetched: the server answers
+# with a 1x1 placeholder at first. Shimmer until the real one is there, ask
+# again a few times, then leave the plain icon.
+_THUMB_RETRY_JS = (
+    '<style>.mc-img{background:linear-gradient(100deg,#e3e9f0 30%,#f4f7fa 50%,#e3e9f0 70%);'
+    'background-size:200% 100%;animation:tgShim 1.3s linear infinite}'
+    '.mc-img.done{animation:none;background:#e9eef4}'
+    '@keyframes tgShim{to{background-position:-200% 0}}</style>'
+    '<script>document.addEventListener("DOMContentLoaded",function(){'
+    'document.querySelectorAll(".mc-img img").forEach(function(img){var box=img.closest(".mc-img"),n=0;'
+    'function chk(){if(img.naturalWidth>1){box.classList.add("done");return}'
+    'if(img.src.indexOf("/api/thumb/")<0||n>=6){img.style.display="none";box.classList.add("done");return}'
+    'n++;var b=img.src.split("?")[0];setTimeout(function(){img.src=b+"?r="+Date.now()},2500+n*1500)}'
+    'img.addEventListener("load",chk);img.addEventListener("error",function(){box.classList.add("done")});'
+    'if(img.complete&&img.naturalWidth)chk()})})</script>')
 
 _FAV_CARD_JS = ('<script>function tgFavCard(b,id){fetch("/api/fav/"+id,{method:"POST"}).then(r=>r.json())'
                 '.then(j=>{if(j.fav===undefined)return;b.classList.toggle("on",j.fav);'
@@ -7402,7 +7436,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         _note.append(f'{min_mb} MB and larger · <a href="/releases{_qs(min_mb=0, offset=None)}">show smaller too</a>')
     if work:
         _note.append('<a href="/releases">← all releases</a>')
-    body = (f'<h2 class="section">{_what} '
+    body = (f'{_THUMB_RETRY_JS}<h2 class="section">{_what} '
            f'<span class="count">{total_matched:,}</span>'
            f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
            f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
@@ -7883,7 +7917,7 @@ async def page_search(q: Optional[str] = None,
                 f'margin-right:22px;text-decoration:none;font-size:15px">{label}'
                 + (f' <span style="font-size:12px;opacity:.7">{found:,}</span>' if on and q else '') + '</a>')
     body = (
-        f'{_LIST_CSS}'
+        f'{_LIST_CSS}{_THUMB_RETRY_JS}'
         '<form action="/search" method="GET" style="margin-bottom:16px;display:flex;gap:10px">'
         f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
         'placeholder="a film, a file name, a channel…" '
