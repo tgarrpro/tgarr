@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("tgarr-registry")
 
 DB_DSN = os.environ["DB_DSN"]
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
 # PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,

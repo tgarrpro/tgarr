@@ -19,6 +19,7 @@ from typing import Optional
 import qrcode
 from pyrogram import Client
 from pyrogram.errors import (
+    AuthTokenExpired,
     PhoneCodeInvalid,
     PhoneCodeExpired,
     SessionPasswordNeeded,
@@ -96,6 +97,7 @@ class LoginState:
         self.sms_phone: Optional[str] = None
         self.sms_phone_code_hash: Optional[str] = None
         self.user_info: Optional[dict] = None
+        self.qr_png: Optional[str] = None   # base64 PNG of the CURRENT token
 
     def reset(self):
         self.qr_token = None
@@ -106,6 +108,7 @@ class LoginState:
         self.sms_phone = None
         self.sms_phone_code_hash = None
         self.user_info = None
+        self.qr_png = None
 
 
 state = LoginState()
@@ -259,6 +262,20 @@ async def _save_user_and_disconnect(user_obj):
 
 
 # ─────── QR LOGIN ───────────────────────────────────────────────────
+def _set_qr(token: bytes, expires: int) -> str:
+    """Record the current login token and render its QR. Tokens live ~30s;
+    the poll loop calls this again whenever Telegram hands out a new one so
+    the page can swap the image instead of showing a dead code."""
+    state.qr_token = token
+    state.qr_expires = expires
+    token_b64 = base64.urlsafe_b64encode(token).decode().rstrip("=")
+    img = qrcode.make(f"tg://login?token={token_b64}", box_size=8, border=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    state.qr_png = base64.b64encode(buf.getvalue()).decode()
+    return state.qr_png
+
+
 async def qr_start() -> dict:
     """Start a QR login. Returns base64 PNG of QR + status."""
     if session_exists():
@@ -275,14 +292,8 @@ async def qr_start() -> dict:
         return {"status": "error", "message": state.message}
 
     if isinstance(r, LoginToken):
-        state.qr_token = r.token
-        state.qr_expires = r.expires
-        token_b64 = base64.urlsafe_b64encode(r.token).decode().rstrip("=")
-        qr_url = f"tg://login?token={token_b64}"
-        img = qrcode.make(qr_url, box_size=8, border=2)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        png_b64 = base64.b64encode(buf.getvalue()).decode()
+        png_b64 = _set_qr(r.token, r.expires)
+        qr_url = "tg://login?token=" + base64.urlsafe_b64encode(r.token).decode().rstrip("=")
         state.status = "qr_pending"
         state.message = "scan with Telegram app → Settings → Devices → Link Desktop Device"
         if not state.polling:
@@ -302,6 +313,7 @@ async def qr_start() -> dict:
 async def _qr_poll_loop():
     """Poll ExportLoginToken until success/migrate/timeout. Runs in background."""
     client = state.client
+    restarts = 0
     try:
         for _ in range(120):  # ~4 min
             await asyncio.sleep(2)
@@ -310,6 +322,13 @@ async def _qr_poll_loop():
                     api_id=API_ID, api_hash=API_HASH, except_ids=[]))
             except Exception as e:
                 log.warning("[login] qr poll: %s", e)
+                continue
+            if isinstance(r, LoginToken):
+                # Still waiting. Tokens expire after ~30s and Telegram then
+                # issues a new one — publish it, or the page keeps showing a
+                # code that can no longer be accepted.
+                if r.token != state.qr_token:
+                    _set_qr(r.token, r.expires)
                 continue
             if isinstance(r, LoginTokenSuccess):
                 await _save_user_and_disconnect(r.authorization.user)
@@ -339,6 +358,35 @@ async def _qr_poll_loop():
                     if isinstance(r2, LoginTokenSuccess):
                         await _save_user_and_disconnect(r2.authorization.user)
                         return
+                except AuthTokenExpired:
+                    # The code that was scanned had already run out (typically
+                    # scanned in its last seconds). Don't dead-end the user:
+                    # start over on a clean handshake and show a fresh code.
+                    restarts += 1
+                    if restarts > 3:
+                        state.status = "error"
+                        state.message = "QR code expired — reload the page and scan again"
+                        return
+                    log.info("[login] scanned token had expired — issuing a new QR (%d/3)",
+                             restarts)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    state.client = None
+                    try:
+                        client = await _ensure_client()
+                        r0 = await client.invoke(ExportLoginToken(
+                            api_id=API_ID, api_hash=API_HASH, except_ids=[]))
+                        if isinstance(r0, LoginToken):
+                            _set_qr(r0.token, r0.expires)
+                            state.message = "that code had expired — scan the new one"
+                    except Exception as e:
+                        log.exception("[login] restart after expired token: %s", e)
+                        state.status = "error"
+                        state.message = f"could not issue a new QR: {e}"
+                        return
+                    continue
                 except Exception as e:
                     log.exception("[login] DC migration: %s", e)
                     state.status = "error"
@@ -364,9 +412,12 @@ async def _qr_poll_loop():
 
 
 def qr_status() -> dict:
-    return {"status": state.status, "message": state.message,
-            "user": state.user_info, "polling": state.polling,
-            "expires_at": state.qr_expires}
+    out = {"status": state.status, "message": state.message,
+           "user": state.user_info, "polling": state.polling,
+           "expires_at": state.qr_expires}
+    if state.status == "qr_pending" and state.qr_png:
+        out["qr_png_base64"] = state.qr_png   # current code; page swaps it in
+    return out
 
 
 # ─────── SMS LOGIN (fallback) ───────────────────────────────────────

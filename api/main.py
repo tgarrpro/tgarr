@@ -175,7 +175,20 @@ async def _ebook_queue_restore() -> None:
 async def _startup():
     global db_pool
     db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
-    await _migrate_schema()
+    # The migration takes brief exclusive locks; against a busy crawler it can
+    # lose a deadlock. Retry rather than failing startup.
+    for _attempt in range(1, 7):
+        try:
+            await _migrate_schema()
+            break
+        except (asyncpg.exceptions.DeadlockDetectedError,
+                asyncpg.exceptions.LockNotAvailableError) as e:
+            if _attempt == 6:
+                raise
+            logging.getLogger("tgarr").warning(
+                "schema migration lock conflict (%s) — retry %d/5",
+                type(e).__name__, _attempt)
+            await asyncio.sleep(2 * _attempt)
     # Restore self-user from the session volume so the sidebar shows the real
     # username (not @anonymous) immediately after a restart, before any get_me.
     login.ensure_user_info()
@@ -1876,6 +1889,7 @@ async function qrStart() {
   window._qrStarted = true;
   const r = await fetch('/api/login/qr/start', {method: 'POST'}).then(r => r.json());
   if (r.qr_png_base64) {
+    window._qrPng = r.qr_png_base64;
     document.getElementById('qrimg').src = 'data:image/png;base64,' + r.qr_png_base64;
     setStatus('qr', r.message, '');
     qrPoll();
@@ -1889,7 +1903,16 @@ async function qrStart() {
 async function qrPoll() {
   while (true) {
     await new Promise(r => setTimeout(r, 2000));
-    const s = await fetch('/api/login/qr/status').then(r => r.json());
+    let s;
+    try {
+      s = await fetch('/api/login/qr/status').then(r => r.json());
+    } catch (e) { continue; }
+    // Login codes expire after ~30s; show whichever one is current.
+    if (s.qr_png_base64 && s.qr_png_base64 !== window._qrPng) {
+      window._qrPng = s.qr_png_base64;
+      document.getElementById('qrimg').src = 'data:image/png;base64,' + s.qr_png_base64;
+      if (s.message) setStatus('qr', s.message, '');
+    }
     if (s.status === 'success') {
       setStatus('qr', s.message + ' — redirecting…', 'ok');
       setTimeout(() => location.href = '/', 1500);
