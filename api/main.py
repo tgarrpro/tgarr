@@ -896,6 +896,9 @@ async def lazy_preview(msg_id: int):
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT preview_path FROM messages WHERE id=$1", msg_id)
+        if not row:      # removed while we waited (stale pointer cleaned up)
+            return Response(_TINY_TRANSPARENT_GIF, status_code=410,
+                            media_type="image/gif")
         pp = row["preview_path"]
         if pp and not pp.startswith("__"):
             fpath = os.path.join(PREVIEWS_DIR, pp)

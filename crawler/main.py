@@ -224,6 +224,7 @@ _MTPROTO_BUDGETS = {
     "get_messages":      (30, 60),
     "download_media":    (60, 60),
     "download_thumb":    (120, 60),  # <=320px embedded thumbs, ~10 KB each
+    "download_preview":  (60, 60),   # full-size photos for the lightbox
     "join_chat":         (3, 60),    # rare; TG hard-caps ~20/day
     "leave_chat":        (3, 60),
     "search_messages_count": (10, 60),
@@ -2122,11 +2123,12 @@ async def _drop_media_session(dc_id: int) -> None:
             pass
 
 
-async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
-    """Bytes of a small file (a thumbnail) via the cached media session of its
-    DC. Returns None when this fast path does not apply (CDN redirect, file
-    larger than one chunk, session trouble) — the caller then falls back to
-    app.download_media. FloodWait propagates."""
+async def _fetch_file_bytes(media, max_total: int = 24 * 1024 * 1024):
+    """Bytes of a file via the cached media session of its DC, in 1 MB chunks.
+
+    Returns None when this fast path does not apply (CDN redirect, larger
+    than `max_total`, session trouble after one rebuild) — the caller then
+    falls back to another source. FloodWait propagates."""
     from pyrogram import raw
     from pyrogram.file_id import FileType
     fid = FileId.decode(media.file_id)
@@ -2140,12 +2142,24 @@ async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
         location = raw.types.InputDocumentFileLocation(
             id=fid.media_id, access_hash=fid.access_hash,
             file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    chunk = 1024 * 1024
     for attempt in (1, 2):
         sess = await _media_session(fid.dc_id)
+        out = bytearray()
+        offset = 0
         try:
-            r = await sess.invoke(
-                raw.functions.upload.GetFile(location=location, offset=0, limit=max_bytes),
-                sleep_threshold=30)
+            while True:
+                r = await sess.invoke(
+                    raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk),
+                    sleep_threshold=30)
+                if not isinstance(r, raw.types.upload.File):
+                    return None          # upload.FileCdnRedirect etc.
+                out += r.bytes
+                if len(r.bytes) < chunk:
+                    return bytes(out)
+                if len(out) >= max_total:
+                    return None
+                offset += chunk
         except FloodWait:
             raise
         except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
@@ -2153,15 +2167,12 @@ async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
             log.info("[media-session] DC%s dropped (%s) — reopening", fid.dc_id,
                      type(e).__name__)
             await _drop_media_session(fid.dc_id)
-            if attempt == 2:
-                return None
-            continue
-        if isinstance(r, raw.types.upload.File):
-            if len(r.bytes) >= max_bytes:
-                return None      # not a one-chunk file after all
-            return r.bytes
-        return None              # upload.FileCdnRedirect etc.
     return None
+
+
+async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
+    """A one-chunk file (a thumbnail). None if it is not that small."""
+    return await _fetch_file_bytes(media, max_total=max_bytes)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2705,85 +2716,119 @@ async def thumb_cache_gc_worker() -> None:
 _PREVIEW_SEM = asyncio.Semaphore(5)  # concurrent HTTPS fetches
 
 
-async def _fetch_preview_mtproto(chat_id: int, msg_id: int) -> bytes | None:
-    """MTProto fallback for private-channel previews (NULL username can't
-    use t.me HTTPS scrape). Fetches the message, then downloads the photo
-    in-memory. download_media quota is generous (60/min) — safe for gallery
-    interaction rates.
+_PREVIEW_DL_SEM = asyncio.Semaphore(3)
+
+
+def _pick_preview_media(msg):
+    """What to show full-screen: the photo itself (largest size), or for a
+    non-photo message its best embedded thumbnail."""
+    if msg.photo:
+        return msg.photo
+    for kind in ("video", "animation", "document"):
+        m = getattr(msg, kind, None)
+        if m is not None and getattr(m, "thumbs", None):
+            return m.thumbs[-1]
+    return None
+
+
+async def _preview_store(row, blob: bytes) -> None:
+    safe_uid = SAFE_NAME.sub("_", row["file_unique_id"] or str(row["id"]))[:80]
+    fname = f"{safe_uid}.jpg"
+    with open(os.path.join(PREVIEWS_ROOT, fname), "wb") as f:
+        f.write(blob)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET preview_path=$1, preview_accessed_at=NOW() "
+            "WHERE id=$2", fname, row["id"])
+
+
+async def _preview_fail(row) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET preview_path='__failed__' WHERE id=$1", row["id"])
+
+
+async def _preview_process_batch(rows) -> None:
+    """Materialize the large images a user just opened.
+
+    Full resolution straight from Telegram, for every DC: one get_messages per
+    channel for the whole batch, then each photo over the cached media session
+    of its DC (one cross-DC authorization per DC for the life of the process).
+    This used to be one get_messages plus a brand-new media session per image,
+    and cross-DC images were limited to the ~450px t.me embed to avoid
+    re-authorizing each time. The embed stays as the fallback when MTProto
+    cannot answer (no usable peer, flood wait).
     """
-    try:
-        msg = await _mtproto("get_messages",
-            lambda: app.get_messages(chat_id, msg_id))
-    except Exception as e:
-        log.debug("[preview] mtproto get_messages chat=%s msg=%s: %s",
-                  chat_id, msg_id, e)
-        return None
-    if not msg or not msg.photo:
-        return None
-    try:
-        buf = await _mtproto("download_media",
-            lambda: app.download_media(msg.photo, in_memory=True))
-    except Exception as e:
-        log.debug("[preview] mtproto download chat=%s msg=%s: %s",
-                  chat_id, msg_id, e)
-        return None
-    if buf is None:
-        return None
-    data = buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
-    return data if data else None
+    by_chat: dict = {}
+    for r in rows:
+        by_chat.setdefault(r["tg_chat_id"], []).append(r)
 
+    for chat_id, grp in by_chat.items():
+        msgs = None
+        try:
+            async with _THUMB_MTPROTO_SEM:
+                msgs = await _thumb_get_messages(
+                    chat_id, grp[0]["channel_username"],
+                    [r["tg_message_id"] for r in grp])
+        except (FloodWait, DailyBudgetExhausted) as e:
+            log.info("[preview] channel %s: MTProto unavailable (%s) — embed fallback",
+                     chat_id, type(e).__name__)
+        except Exception as e:
+            log.debug("[preview] channel %s get_messages: %s", chat_id, str(e)[:100])
 
-async def _preview_process_one(row):
-    blob = None
-    # Same-DC → MTProto full-res FIRST. The t.me embed serves tiny ~240px
-    # grid-thumbs for ALBUMS (grouped media), which look blurry fullscreen;
-    # download_media gives the original. Gallery is same-DC by default so this
-    # is the common path. Cross-DC → HTTPS only (no cross-DC auth FloodWait).
-    same_dc = bool(row["file_dc"] and CURRENT_DC and row["file_dc"] == CURRENT_DC)
-    if same_dc:
-        blob = await _fetch_preview_mtproto(
-            row["tg_chat_id"], row["tg_message_id"])
-        if not blob and row["channel_username"]:
+        if msgs is not None:
             try:
-                async with _PREVIEW_SEM:
-                    blob = await _fetch_preview_https(
-                        row["channel_username"], row["tg_message_id"])
+                removed, is_dead = await _reconcile_missing(
+                    grp[0]["channel_id"], chat_id, grp[0]["channel_username"], grp, msgs)
+                if removed or is_dead:
+                    log.info("[preview] channel %s: %d stale pointer(s) removed%s", chat_id,
+                             removed, " — channel marked dead" if is_dead else "")
             except Exception as e:
-                log.debug("[preview] https err id=%s: %s", row["id"], e)
-    else:
-        if row["channel_username"]:
+                log.warning("[preview] stale reconcile for %s failed: %s", chat_id, e)
+
+        async def one(r, msgs=msgs):
+            blob = None
             try:
-                async with _PREVIEW_SEM:
-                    blob = await _fetch_preview_https(
-                        row["channel_username"], row["tg_message_id"])
+                msg = msgs.get(r["tg_message_id"]) if msgs is not None else None
+                if msgs is not None and msg is None:
+                    await _preview_fail(r)      # gone at the source
+                    return
+                media = _pick_preview_media(msg) if msg is not None else None
+                if media is not None:
+                    try:
+                        async with _PREVIEW_DL_SEM:
+                            blob = await _mtproto("download_preview",
+                                lambda: _fetch_file_bytes(media))
+                            if not blob:
+                                buf = await _mtproto("download_media",
+                                    lambda: app.download_media(media, in_memory=True))
+                                if buf is not None:
+                                    blob = (buf.getvalue() if hasattr(buf, "getvalue")
+                                            else bytes(buf))
+                    except FloodWait as fw:
+                        log.info("[preview] flood-wait %ss id=%s — embed fallback",
+                                 getattr(fw, "value", "?"), r["id"])
+                    except Exception as e:
+                        log.debug("[preview] mtproto id=%s: %s", r["id"], str(e)[:100])
+                if not blob and r["channel_username"]:
+                    try:
+                        async with _PREVIEW_SEM:
+                            blob = await _fetch_preview_https(
+                                r["channel_username"], r["tg_message_id"])
+                    except Exception as e:
+                        log.debug("[preview] https err id=%s: %s", r["id"], e)
+                if blob:
+                    await _preview_store(r, blob)
+                else:
+                    await _preview_fail(r)
             except Exception as e:
-                log.debug("[preview] https err id=%s: %s", row["id"], e)
-        if not blob:
-            blob = await _fetch_preview_mtproto(
-                row["tg_chat_id"], row["tg_message_id"])
-    if not blob:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
-                row["id"])
-        return
-    try:
-        safe_uid = SAFE_NAME.sub(
-            "_", row["file_unique_id"] or str(row["id"]))[:80]
-        fname = f"{safe_uid}.jpg"
-        target = os.path.join(PREVIEWS_ROOT, fname)
-        with open(target, "wb") as f:
-            f.write(blob)
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE messages SET preview_path=$1, preview_accessed_at=NOW() "
-                "WHERE id=$2", fname, row["id"])
-    except Exception as e:
-        log.warning("[preview] write failed id=%s: %s", row["id"], e)
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE messages SET preview_path='__failed__' WHERE id=$1",
-                row["id"])
+                log.warning("[preview] failed id=%s: %s", r["id"], str(e)[:120])
+                try:
+                    await _preview_fail(r)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[one(r) for r in grp])
 
 
 # On-demand wake signals. The API NOTIFYs the moment it queues a thumb/preview;
@@ -2819,10 +2864,10 @@ async def _ondemand_notify_listener() -> None:
 
 
 async def preview_downloader() -> None:
-    """450px+ JPEG preview fetcher — sem-capped 5 concurrent HTTPS scrapes.
-    LIFO batch (newest queued first) so user's just-opened slideshow is
-    prioritized over backlog. Same t.me embed source as thumb, takes the
-    larger CDN URL. Wakes instantly on preview_queued NOTIFY (no idle nap).
+    """Large-image fetcher for the lightbox / slideshow. LIFO batch (newest
+    queued first) so the image the user just opened beats any backlog. Wakes
+    instantly on preview_queued NOTIFY (no idle nap). See
+    _preview_process_batch for the fetch strategy.
     """
     log.info("[preview] dispatcher started; root=%s conc=5", PREVIEWS_ROOT)
     os.makedirs(PREVIEWS_ROOT, exist_ok=True)
@@ -2831,16 +2876,14 @@ async def preview_downloader() -> None:
             _preview_wake.clear()
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch(
-                    """SELECT m.id, m.tg_chat_id, m.tg_message_id,
+                    """SELECT m.id, m.channel_id, m.tg_chat_id, m.tg_message_id,
                               m.file_unique_id, m.file_dc,
                               c.username AS channel_username
                        FROM messages m JOIN channels c ON c.id = m.channel_id
                        WHERE m.preview_path = '__user_queued__'
                        ORDER BY m.id DESC LIMIT 20""")
             if rows:
-                await asyncio.gather(
-                    *[_preview_process_one(r) for r in rows],
-                    return_exceptions=True)
+                await _preview_process_batch(rows)
                 continue  # drain immediately, no nap
             try:
                 await asyncio.wait_for(_preview_wake.wait(),
