@@ -1116,6 +1116,8 @@ async def init_db() -> None:
     async with db_pool.acquire() as conn:
         await conn.execute(
             "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0")
+        await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS unfollowed_at TIMESTAMPTZ")
         # Every job waits a while after a start before its first round (up to
         # ~15 min, on purpose, so installs do not all act at once). Until then
         # its last report is from before the restart; the System page showed
@@ -3191,6 +3193,40 @@ async def _mark_channel_dead(channel_id: int, reason: str) -> None:
                WHERE id = $1""", channel_id, reason[:120])
 
 
+async def _dead_channel_housekeeping() -> list:
+    """Channels nobody can read any more. Returns the rows removed from the list.
+
+    A private channel (no public name) the account is no longer a member of
+    cannot be read, followed or re-joined from here: it is dead like one whose
+    name Telegram no longer knows, and gets the same grace period. Rejoining
+    within it takes the mark off again. After the grace period a dead channel
+    with nothing left in it leaves the list; one that still holds saved files
+    or favourites keeps its row."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE channels SET dead_at = NULL, dead_reason = NULL
+               WHERE dead_reason = 'left-private' AND COALESCE(is_joined, FALSE) = TRUE""")
+        await conn.execute(
+            """UPDATE channels SET dead_at = NOW(), dead_reason = 'left-private'
+               WHERE dead_at IS NULL AND username IS NULL
+                 AND COALESCE(is_joined, FALSE) = FALSE
+                 AND COALESCE(subscribed, FALSE) = FALSE
+                 AND COALESCE(title, '') NOT ILIKE 'KwickPOS%'
+                 AND COALESCE(category, '') <> 'personal'""")
+        gone = await conn.fetch(
+            """DELETE FROM channels c
+               WHERE c.dead_at < NOW() - make_interval(days => $1)
+                 AND COALESCE(c.is_joined, FALSE) = FALSE
+                 AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+                 AND COALESCE(c.category, '') <> 'personal'
+                 AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id)
+               RETURNING c.username, c.dead_reason""", DEAD_CHANNEL_GRACE_DAYS)
+    for g in gone:
+        log.info("[stale] dead channel @%s (%s): removed from the list",
+                 g["username"] or "(private)", g["dead_reason"])
+    return list(gone)
+
+
 async def _channel_gone(chat_id: int, username) -> "bool | None":
     """Is the channel itself gone/unreachable for good?
     True = Telegram said so explicitly. False = it answered normally.
@@ -3267,6 +3303,8 @@ async def stale_index_sweeper():
     while True:
         nap = STALE_SWEEP_INTERVAL_SEC
         try:
+            # ── 0a/0b. mark unreachable private channels; drop empty dead ones ──
+            await _dead_channel_housekeeping()
             # ── 0. retire channels that stayed dead through the grace period ──
             async with db_pool.acquire() as conn:
                 dead = await conn.fetchrow(
@@ -4310,6 +4348,11 @@ async def subscription_poller() -> None:
                         """UPDATE channels SET subscribed=FALSE,
                            subscribe_error=$1, last_polled_at=NOW()
                            WHERE id=$2""", type(e).__name__, row["id"])
+                # Telegram said the name is gone / the channel is closed to us:
+                # that is a dead channel. Marked like the ones the sweeper
+                # finds, so it is cleared and removed after the grace period
+                # instead of sitting in the list for ever with an error.
+                await _mark_channel_dead(row["id"], type(e).__name__)
                 continue
             except Exception as e:
                 # Transient — PeerIdInvalid (Pyrogram session cache miss, may
@@ -6199,6 +6242,91 @@ async def contribute_resources_worker() -> None:
             await asyncio.sleep(600)
 
 
+# ═════════════════════════════════════════════════
+# "Unfollow" means: I do not want this channel here.
+#
+# It used to mean "stop reading it" and nothing else - or, with
+# TGARR_INDEX_PURGE on, "clear it once the channel has been read to the end,
+# every file has been reported to tgarr.me AND tgarr.me confirms each one".
+# A channel that was unfollowed is no longer read, so it never reaches the
+# end; and tgarr.me does not confirm every file. In practice an unfollowed
+# channel stayed in the list, with its films and files, for good.
+#
+# Those rails ("never delete what tgarr.me lacks") are right for what the
+# PROGRAM lets go of by itself, and they still apply there. A channel the
+# USER unfollowed is their decision: its files get a few hours to be
+# reported (so the federation keeps the record), then the channel's index is
+# cleared and the channel leaves the list. It can be followed again from
+# Discover. Kept: files saved to this machine, favourites, and anything with
+# a download in progress - a channel that still holds such rows stays in the
+# list, marked cleared. Private chats and KwickPOS* are never touched.
+# Nothing is sent to tgarr.me about the unfollow, and nothing is removed there.
+# ═════════════════════════════════════════════════
+UNFOLLOW_REPORT_GRACE_HOURS = int(os.environ.get("TGARR_UNFOLLOW_REPORT_GRACE_HOURS", "6"))
+
+_UNFOLLOW_PICK_SQL = """
+    SELECT c.id, c.username, c.title FROM channels c
+    WHERE c.unfollowed_at IS NOT NULL
+      AND COALESCE(c.is_joined, FALSE) = FALSE
+      AND COALESCE(c.subscribed, FALSE) = FALSE
+      AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
+      AND COALESCE(c.category, '') <> 'personal'
+      AND (c.unfollowed_at < NOW() - make_interval(hours => $1)
+           OR NOT EXISTS (SELECT 1 FROM messages m
+                          WHERE m.channel_id = c.id AND m.file_unique_id IS NOT NULL
+                            AND m.contributed_at IS NULL))
+    ORDER BY c.unfollowed_at LIMIT 1"""
+
+# rows the user has a stake in: a file saved here, or a favourite
+_UNFOLLOW_CLEARABLE_SQL = """
+    SELECT m.id FROM messages m
+    WHERE m.channel_id = $1
+      AND (m.local_path IS NULL OR m.local_path LIKE '\\_\\_%' ESCAPE '\\')
+      AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)
+    LIMIT 5000"""
+
+
+async def _unfollow_clear_once() -> "str | None":
+    """Clear one batch of one unfollowed channel. Returns what was done, or None."""
+    async with db_pool.acquire() as conn:
+        ch = await conn.fetchrow(_UNFOLLOW_PICK_SQL, UNFOLLOW_REPORT_GRACE_HOURS)
+        if not ch:
+            return None
+        ids = [r["id"] for r in await conn.fetch(_UNFOLLOW_CLEARABLE_SQL, ch["id"])]
+    uname = ch["username"] or f"chat-{ch['id']}"
+    n = await _drop_gone_messages(ch["id"], ids) if ids else 0
+    if n:
+        log.info("[unfollow] @%s: cleared %d index rows", uname, n)
+        return f"@{uname}: cleared {n}"
+    # nothing (more) could be cleared: the channel is done
+    async with db_pool.acquire() as conn:
+        left = await conn.fetchval("SELECT count(*) FROM messages WHERE channel_id = $1", ch["id"])
+        if left == 0:
+            await conn.execute("DELETE FROM channels WHERE id = $1", ch["id"])
+            log.info("[unfollow] @%s: cleared, removed from the list", uname)
+            return f"@{uname}: removed"
+        await conn.execute(
+            "UPDATE channels SET unfollowed_at = NULL, purged_at = NOW() WHERE id = $1", ch["id"])
+        log.info("[unfollow] @%s: cleared; %d saved / favourite / downloading row(s) kept", uname, left)
+        return f"@{uname}: cleared, kept {left}"
+
+
+async def unfollow_clear_worker() -> None:
+    await asyncio.sleep(90)
+    while True:
+        try:
+            did = await _unfollow_clear_once()
+            if did:
+                await _heartbeat("unfollow_clear_worker", did)
+                await asyncio.sleep(3)
+                continue
+            await _heartbeat("unfollow_clear_worker", "nothing to clear", quiet_for=300)
+        except Exception as e:
+            log.exception("[unfollow] %s", e)
+            await _heartbeat("unfollow_clear_worker", error=str(e)[:200])
+        await asyncio.sleep(300)
+
+
 # ── Crawl-and-release: once a channel is contributed + released, drop its
 # local index. Central is the source of truth; grab rehydrates on demand. ──
 INDEX_PURGE_ENABLED = os.environ.get("TGARR_INDEX_PURGE", "false").lower() == "true"
@@ -6850,6 +6978,7 @@ async def main() -> None:
     asyncio.create_task(dialog_leave_worker())
     asyncio.create_task(dialog_reconcile_worker())
     asyncio.create_task(index_purge_worker())
+    asyncio.create_task(unfollow_clear_worker())
     asyncio.create_task(thumb_cache_gc_worker())
     # thumb_hash_backfill is proactive (scans all thumbs for md5 dedup), so it's
     # disabled to match the no-pre-download rule.

@@ -400,6 +400,7 @@ async def _migrate_schema():
               last_error_at TIMESTAMPTZ
             );
             ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS unfollowed_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_oldest_tg_id BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
@@ -5656,7 +5657,7 @@ async def api_channel_subscribe(username: str = Form(...)):
             "SELECT id FROM channels WHERE username ILIKE $1", u)
         if existing:
             await conn.execute(
-                """UPDATE channels SET subscribed=TRUE,
+                """UPDATE channels SET subscribed=TRUE, unfollowed_at=NULL, purged_at=NULL,
                    last_polled_at=NULL, subscribe_error=NULL
                    WHERE id=$1""", existing)
             return {"status": "ok", "message": f"already known — re-queued @{u}",
@@ -5679,8 +5680,8 @@ async def api_channel_subscribe(username: str = Form(...)):
 async def api_channel_unsubscribe(tg_chat_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """UPDATE channels SET subscribed=FALSE WHERE tg_chat_id=$1
-               AND subscribed=TRUE""", tg_chat_id)
+            """UPDATE channels SET subscribed=FALSE, unfollowed_at=NOW()
+               WHERE tg_chat_id=$1 AND subscribed=TRUE""", tg_chat_id)
     return {"status": "ok"}
 
 
@@ -5734,7 +5735,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                  WHERE r.category IN ('movie', 'tv') GROUP BY 1)
                SELECT c.tg_chat_id, c.username, c.title, c.backfilled, c.members_count,
                       c.audience, c.subscribed, c.is_joined, c.dead_at, c.subscribe_error,
-                      c.purged_at,
+                      c.purged_at, c.unfollowed_at,
                       COALESCE(a.msgs, 0) AS msgs, COALESCE(a.media, 0) AS media,
                       COALESCE(a.videos, 0) AS videos, COALESCE(a.songs, 0) AS songs,
                       COALESCE(a.photos, 0) AS photos, COALESCE(a.docs, 0) AS docs,
@@ -5844,6 +5845,13 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
             tags.append('<span class="tag ok" title="your account is a member">joined</span>')
         elif r["subscribed"]:
             tags.append('<span class="tag acc" title="read without joining">followed</span>')
+        elif r["unfollowed_at"]:
+            tags.append('<span class="tag warn" title="you unfollowed it: its films and files are being '
+                        'cleared from this index and it will leave this list. Follow it again to keep it.">'
+                        'unfollowed · being cleared</span>')
+        elif r["purged_at"] and not purge_on:
+            tags.append('<span class="tag" title="unfollowed and cleared; only files you saved or marked '
+                        'as favourite are still here">not followed · cleared</span>')
         elif purge_on and r["purged_at"]:
             tags.append('<span class="tag" title="not followed any more; its files have been cleared '
                         'from this index. tgarr.me still lists it: follow it again to get them back.">'
@@ -5912,10 +5920,9 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         # The button changes where it is. Reloading the page for one click
         # threw the reader back to the top of a long list every time.
         '<script>var tgUnfollowAsk=' + _js_str(
-            "Stop reading this channel?\n\nIts films and files will be CLEARED from this index once tgarr.me "
-            "holds a record of them. You can follow it again later, from here or from Discover, to get them back."
-            if purge_on else
-            "Stop reading this channel?\n\nNothing new will be indexed from it. What is already indexed stays.")
+            "Stop reading this channel and take it off this list?\n\n"
+            "Its films and files are cleared from this index within a few hours. Files you saved to "
+            "this machine and your favourites are kept. You can find the channel again on Discover.")
         + r""";
 function tgChSet(b, following) {
   b.disabled = false;
