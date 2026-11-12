@@ -4710,6 +4710,24 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
   <div class="content">{body_html}</div>
 </main>
 <script>
+// On a wide screen the list scrolls inside .content, not the window, so the
+// browser does not put it back after a reload: any button that reloads the
+// page (pause, remove, refresh…) sent the reader to the top. Remember the
+// place per page and restore it - on a reload only, never on a fresh visit.
+(function () {{
+  var box = document.querySelector('.content');
+  if (!box) return;
+  var key = 'tgScroll:' + location.pathname + location.search;
+  try {{
+    var nav = (performance.getEntriesByType('navigation')[0] || {{}}).type;
+    var saved = sessionStorage.getItem(key);
+    if (nav === 'reload' && saved) box.scrollTop = parseInt(saved, 10) || 0;
+    sessionStorage.removeItem(key);
+    window.addEventListener('pagehide', function () {{
+      if (box.scrollTop > 0) sessionStorage.setItem(key, String(box.scrollTop));
+    }});
+  }} catch (e) {{}}
+}})();
 async function tgGrab(btn) {{
   const guid = btn.dataset.guid;
   const orig = btn.textContent;
@@ -5858,13 +5876,14 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                 txt = f'{ico} {_n_things(n, word)}'
                 has.append(f'<a href="{href}">{txt}</a>' if href else f'<span>{txt}</span>')
         act = ""
+        _ids = (f'data-id="{r["tg_chat_id"]}" '
+                f'data-uname="{html.escape(r["username"] or "", quote=True)}"')
         if r["subscribed"] and not r["is_joined"]:
-            act = (f'<button class="abtn" onclick="tgUnfollow(this,{r["tg_chat_id"]})" '
+            act = (f'<button class="abtn" {_ids} onclick="tgUnfollow(this)" '
                    f'title="stop reading this channel">Unfollow</button>')
         elif not r["is_joined"] and not r["dead_at"] and r["username"]:
-            act = (f'<button class="abtn pri" data-uname="{html.escape(r["username"], quote=True)}" '
-                   f'onclick="tgFollow(this)" title="read this public channel again, without joining it">'
-                   f'+ Follow</button>')
+            act = (f'<button class="abtn pri" {_ids} onclick="tgFollow(this)" '
+                   f'title="read this public channel again, without joining it">+ Follow</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
@@ -5890,16 +5909,47 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
         'letter-spacing:0;margin-left:10px"><a href="/discover">find more on Discover →</a></span></h2>'
         f'{search}<div class="bar-tools">{chips}</div>{listing}'
-        '<script>function tgUnfollow(b,id){if(!confirm(' + _js_str(
+        # The button changes where it is. Reloading the page for one click
+        # threw the reader back to the top of a long list every time.
+        '<script>var tgUnfollowAsk=' + _js_str(
             "Stop reading this channel?\n\nIts films and files will be CLEARED from this index once tgarr.me "
             "holds a record of them. You can follow it again later, from here or from Discover, to get them back."
             if purge_on else
             "Stop reading this channel?\n\nNothing new will be indexed from it. What is already indexed stays.")
-        + '))return;'
-        'b.disabled=true;b.textContent="…";fetch("/api/channel/unsubscribe/"+id,{method:"POST"}).then(()=>location.reload())}'
-        'function tgFollow(b){b.disabled=true;b.textContent="…";fetch("/api/channel/subscribe",{method:"POST",'
-        'headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"username="+encodeURIComponent(b.dataset.uname)})'
-        '.then(()=>location.reload())}</script>')
+        + r""";
+function tgChSet(b, following) {
+  b.disabled = false;
+  if (following) {
+    b.className = "abtn"; b.textContent = "Unfollow"; b.title = "stop reading this channel";
+    b.onclick = function () { tgUnfollow(b); };
+  } else if (b.dataset.uname) {
+    b.className = "abtn pri"; b.textContent = "+ Follow";
+    b.title = "read this public channel again, without joining it";
+    b.onclick = function () { tgFollow(b); };
+  } else { b.remove(); }
+}
+function tgChFail(b, label, why) {
+  b.disabled = false; b.textContent = "Failed - retry"; b.title = why || "the request did not go through";
+  setTimeout(function () { if (b.textContent === "Failed - retry") b.textContent = label; }, 4000);
+}
+function tgUnfollow(b) {
+  if (!confirm(tgUnfollowAsk)) return;
+  b.disabled = true; b.textContent = "…";
+  fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChSet(b, false); })
+    .catch(function (e) { tgChFail(b, "Unfollow", e.message); });
+}
+function tgFollow(b) {
+  b.disabled = true; b.textContent = "…";
+  fetch("/api/channel/subscribe", {method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: "username=" + encodeURIComponent(b.dataset.uname)})
+    .then(function (r) { return r.json().then(function (j) {
+      if (!r.ok || j.status === "error") throw new Error(j.message || ("HTTP " + r.status));
+      tgChSet(b, true); }); })
+    .catch(function (e) { tgChFail(b, "+ Follow", e.message); });
+}
+</script>""")
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 
