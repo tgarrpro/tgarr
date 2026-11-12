@@ -136,6 +136,11 @@ async def _startup():
     await _seed_honeypots()
     asyncio.create_task(_build_central_sketch())
     asyncio.create_task(_audience_classifier())
+    try:
+        import webcrawl
+        webcrawl.start()        # slow reader of t.me's public preview, own thread
+    except Exception as e:
+        log.warning("web reader not started: %s: %s", type(e).__name__, e)
     log.info("registry up — schema applied + honeypots seeded + bloom builder scheduled")
 
 
@@ -357,7 +362,8 @@ async def _audience_classifier():
                          UPDATE registry_channels rc
                             SET release_files = st.rel, video_files = st.v,
                                 book_files = st.b, audio_files = st.a,
-                                last_file_at = st.last_file,
+                                -- the web reader may have seen a newer file post
+                                last_file_at = GREATEST(rc.last_file_at, st.last_file),
                                 files_stats_at = NOW()
                            FROM st WHERE rc.username = st.u
                          RETURNING 1)
