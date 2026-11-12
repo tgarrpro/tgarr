@@ -1808,134 +1808,478 @@ async def ebook_cover_unified(msg_id: int):
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
-@app.get("/epub/{msg_id}", response_class=HTMLResponse)
-async def epub_render(msg_id: int):
-    """Server-side epub renderer. Concatenates spine chapters into one
-    long HTML page, rewrites image refs, applies CJK-friendly typography.
-    """
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
-    epub_path = _epub_locate(msg_id, row)
-    if not epub_path:
-        return HTMLResponse("<h1>not cached</h1>", status_code=404)
-    title = row["file_name"] or f"book-{msg_id}"
-    try:
-        with _zipfile.ZipFile(epub_path) as zf:
-            # Find OPF via META-INF/container.xml
-            container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
-            from xml.etree import ElementTree as _ET
-            ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
-            opf_node = _ET.fromstring(container).find(".//c:rootfile", ns_c)
-            if opf_node is None:
-                raise RuntimeError("OPF not declared in container.xml")
-            opf_path = opf_node.attrib["full-path"]
-            opf_dir = os.path.dirname(opf_path).replace("\\", "/")
-            opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
-            ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
-            manifest = {item.attrib["id"]: item.attrib["href"]
-                        for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf)}
-            spine_ids = [item.attrib["idref"]
-                         for item in opf_root.findall(".//opf:spine/opf:itemref", ns_opf)]
+# ════════════════════════════════════════════════════════════════════
+# E-book reader
+#
+# /epub/{id}          the reader: our page, our script. Pages you turn with
+#                     buttons, arrow keys, the wheel or a swipe; contents;
+#                     font size; light / sepia / dark; it remembers where you
+#                     stopped.
+# /epub/{id}/toc      the book's reading order and chapter titles (JSON)
+# /epub/{id}/ch/{n}   one chapter, as a bare document
+#
+# The book itself is somebody else's HTML. It is shown one chapter at a time
+# (a 2,000-chapter web novel must not become one 40 MB page) inside a
+# sandboxed frame, and served with a Content-Security-Policy that allows no
+# script at all - so nothing inside a book can run, whatever the tag
+# stripping below misses. The reader lays the chapter out in columns from the
+# outside.
+# ════════════════════════════════════════════════════════════════════
+_EPUB_CSP = ("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; "
+             "font-src 'self' data:")
+_EPUB_INDEX_CACHE: dict = {}      # path -> (mtime, index)
 
-            chapters_html = []
-            for idref in spine_ids:
-                href = manifest.get(idref)
-                if not href:
+
+def _epub_index(epub_path: str) -> dict:
+    """Reading order + chapter titles of a book. Cached per file."""
+    mtime = os.path.getmtime(epub_path)
+    hit = _EPUB_INDEX_CACHE.get(epub_path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    from xml.etree import ElementTree as _ET
+    with _zipfile.ZipFile(epub_path) as zf:
+        container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+        ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+        opf_node = _ET.fromstring(container).find(".//c:rootfile", ns_c)
+        if opf_node is None:
+            raise RuntimeError("OPF not declared in container.xml")
+        opf_path = opf_node.attrib["full-path"]
+        opf_dir = os.path.dirname(opf_path).replace("\\", "/")
+        opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+        ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
+
+        def _in_zip(base_dir, href):
+            href = _uq(href.split("#", 1)[0])
+            path = (base_dir + "/" + href) if base_dir else href
+            return os.path.normpath(path).replace("\\", "/").lstrip("/")
+
+        items = {}
+        for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf):
+            items[item.attrib.get("id")] = item.attrib
+        chapters = []
+        for ref in opf_root.findall(".//opf:spine/opf:itemref", ns_opf):
+            it = items.get(ref.attrib.get("idref"))
+            if it and it.get("href"):
+                chapters.append(_in_zip(opf_dir, it["href"]))
+        names = set(zf.namelist())
+        chapters = [c for c in chapters if c in names]
+
+        # titles: EPUB 3 nav document, then the EPUB 2 NCX
+        titles = {}
+
+        def _clean(t):
+            return html.unescape(_re.sub(r"<[^>]+>", "", t or "")).strip()[:200]
+        for it in items.values():
+            href = it.get("href") or ""
+            try:
+                if "nav" in (it.get("properties") or "").split():
+                    nav_path = _in_zip(opf_dir, href)
+                    nav = zf.read(nav_path).decode("utf-8", "replace")
+                    nav_dir = os.path.dirname(nav_path)
+                    for m in _re.finditer(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+                                          nav, _re.DOTALL | _re.IGNORECASE):
+                        titles.setdefault(_in_zip(nav_dir, m.group(1)), _clean(m.group(2)))
+                elif it.get("media-type") == "application/x-dtbncx+xml":
+                    ncx_path = _in_zip(opf_dir, href)
+                    ncx = zf.read(ncx_path).decode("utf-8", "replace")
+                    ncx_dir = os.path.dirname(ncx_path)
+                    for m in _re.finditer(
+                            r"<navLabel>\s*<text>(.*?)</text>\s*</navLabel>\s*"
+                            r"<content\b[^>]*\bsrc=[\"']([^\"']+)[\"']",
+                            ncx, _re.DOTALL | _re.IGNORECASE):
+                        titles.setdefault(_in_zip(ncx_dir, m.group(2)), _clean(m.group(1)))
+            except (KeyError, ValueError):
+                continue
+        # a book without a usable table of contents: the first heading of each chapter
+        if chapters and sum(1 for c in chapters if titles.get(c)) * 2 < len(chapters) \
+                and len(chapters) <= 3000:
+            for c in chapters:
+                if titles.get(c):
                     continue
-                href = _uq(href)
-                chapter_path = (opf_dir + "/" + href).lstrip("/") if opf_dir else href
-                chapter_path = _re.sub(r"/+", "/", chapter_path)
                 try:
-                    raw = zf.read(chapter_path)
+                    head = zf.read(c)[:6000].decode("utf-8", "replace")
                 except KeyError:
                     continue
-                raw_html = raw.decode("utf-8", errors="replace")
-                # Extract <body>
-                m = _re.search(r"<body[^>]*>(.*?)</body>", raw_html,
-                              _re.DOTALL | _re.IGNORECASE)
-                body_html = m.group(1) if m else raw_html
+                m = (_re.search(r"<h[1-3][^>]*>(.*?)</h[1-3]>", head, _re.DOTALL | _re.IGNORECASE)
+                     or _re.search(r"<title[^>]*>(.*?)</title>", head, _re.DOTALL | _re.IGNORECASE))
+                if m and _clean(m.group(1)):
+                    titles[c] = _clean(m.group(1))
+        book_title = None
+        t = opf_root.find(".//{http://purl.org/dc/elements/1.1/}title")
+        if t is not None and (t.text or "").strip():
+            book_title = t.text.strip()[:200]
+    index = {"title": book_title, "chapters": chapters,
+             "titles": [titles.get(c) or "" for c in chapters]}
+    if len(_EPUB_INDEX_CACHE) > 32:
+        _EPUB_INDEX_CACHE.clear()
+    _EPUB_INDEX_CACHE[epub_path] = (mtime, index)
+    return index
 
-                # Rewrite img/css refs to /epub/{id}/asset/<absolute-in-zip>
-                chapter_dir = os.path.dirname(chapter_path).replace("\\", "/")
-                def fix_ref(match, attr):
-                    src = _uq(match.group(1))
-                    if src.startswith(("http://", "https://", "data:", "/")):
-                        return match.group(0)
-                    abs_in_zip = os.path.normpath(
-                        os.path.join(chapter_dir, src)).replace("\\", "/")
-                    new_url = f"/epub/{msg_id}/asset/{_q(abs_in_zip)}"
-                    return match.group(0).replace(match.group(1), new_url)
 
-                body_html = _re.sub(r"<img[^>]*\bsrc=[\"\']([^\"\']+)[\"\']",
-                                   lambda mm: fix_ref(mm, "src"), body_html)
-                # SVG covers use <image xlink:href="..."> or <image href="...">
-                body_html = _re.sub(r"<image[^>]*\b(?:xlink:)?href=[\"\']([^\"\']+)[\"\']",
-                                   lambda mm: fix_ref(mm, "href"), body_html)
-                # Strip <link rel=stylesheet> — chapter CSS would leak into reader
-                body_html = _re.sub(r"<link[^>]*\brel=[\"\']stylesheet[\"\'][^>]*/?>", "",
-                                   body_html, flags=_re.IGNORECASE)
-                # Strip <script> blocks (no JS in our reader)
-                body_html = _re.sub(r"<script[^>]*>.*?</script>", "",
-                                   body_html, flags=_re.DOTALL | _re.IGNORECASE)
-                # Strip inline event handlers (onclick="...")
-                body_html = _re.sub(r"\son[a-z]+\s*=\s*[\"\'][^\"\']*[\"\']", "",
-                                   body_html, flags=_re.IGNORECASE)
-                # Clamp SVG: epubs embed cover as <svg width="100%" height="100%">
-                # which expands to whole viewport. Strip width/height so our CSS wins.
-                body_html = _re.sub(r"(<svg[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
-                                   r"\1", body_html, count=2, flags=_re.IGNORECASE)
-                body_html = _re.sub(r"(<image[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
-                                   r"\1", body_html, count=2, flags=_re.IGNORECASE)
+def _epub_chapter_body(zf, msg_id: int, chapter_path: str) -> str:
+    """The <body> of one chapter, made safe to show: references rewritten to
+    /epub/{id}/asset/..., style sheets, scripts and event handlers removed."""
+    raw_html = zf.read(chapter_path).decode("utf-8", errors="replace")
+    m = _re.search(r"<body[^>]*>(.*?)</body>", raw_html, _re.DOTALL | _re.IGNORECASE)
+    body_html = m.group(1) if m else raw_html
+    chapter_dir = os.path.dirname(chapter_path).replace("\\", "/")
 
-                chapters_html.append(body_html)
+    def fix_ref(match):
+        src = _uq(match.group(1))
+        if src.startswith(("http://", "https://", "data:", "/")):
+            return match.group(0)
+        abs_in_zip = os.path.normpath(os.path.join(chapter_dir, src)).replace("\\", "/")
+        return match.group(0).replace(match.group(1), f"/epub/{msg_id}/asset/{_q(abs_in_zip)}")
 
-        body = "<hr class='chap-sep'/>".join(chapters_html)
-        css = (
-            "html,body{margin:0;padding:0}"
-            "body{background:#f5f7fa;font-family:'PingFang SC','Microsoft YaHei',"
-            "'Noto Sans CJK SC','Hiragino Sans GB',system-ui,sans-serif}"
-            ".bar{position:sticky;top:0;background:#fff;padding:12px 20px;"
-            "border-bottom:1px solid #e2e8f0;z-index:10;display:flex;gap:14px;"
-            "align-items:center;box-shadow:0 1px 4px rgba(0,0,0,0.04)}"
-            ".bar a{color:#64748b;text-decoration:none;font-size:14px}"
-            ".bar a:hover{color:#0f172a}"
-            ".bar .title{font-weight:600;color:#0f172a;flex:1;overflow:hidden;"
-            "text-overflow:ellipsis;white-space:nowrap}"
-            ".book{max-width:760px;margin:30px auto;padding:50px 56px;"
-            "background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,0.08);"
-            "font-size:17px;line-height:1.9;color:#1f2937}"
-            ".book h1,.book h2,.book h3,.book h4{color:#0f172a;font-weight:600;"
-            "margin:1.8em 0 0.6em;line-height:1.4}"
-            ".book h1{font-size:1.6em;border-bottom:2px solid #e2e8f0;padding-bottom:0.4em}"
-            ".book h2{font-size:1.35em}"
-            ".book h3{font-size:1.15em}"
-            ".book p{margin:1em 0;text-indent:2em}"
-            ".book img{max-width:100%;height:auto;display:block;margin:1.8em auto;"
-            "border-radius:4px}"
-            ".book svg{max-width:420px;width:100%;height:auto;display:block;margin:0 auto 2em}"
-            ".book svg image{width:100%;height:auto}"
-            ".book a{color:#3b82f6;text-decoration:none}"
-            ".book a:hover{text-decoration:underline}"
-            ".book blockquote{margin:1.4em 0;padding:0.4em 1.4em;border-left:4px solid #93c5fd;"
-            "color:#475569;background:#f1f5f9;border-radius:0 6px 6px 0}"
-            "hr.chap-sep{border:none;border-top:1px dashed #cbd5e1;margin:3em 0}"
-            "@media (max-width:768px){.book{margin:14px;padding:24px}}"
-        )
-        return HTMLResponse(
-            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            f"<title>{html.escape(title)}</title>"
-            f"<style>{css}</style></head><body>"
-            f"<div class='bar'><a href='javascript:history.back()'>\u2190 back</a>"
-            f"<div class='title'>{html.escape(title)}</div>"
-            f"<a href='/media/{msg_id}' download>\u2b07 raw</a></div>"
-            f"<div class='book'>{body}</div></body></html>"
-        )
+    body_html = _re.sub(r"<img[^>]*\bsrc=[\"\']([^\"\']+)[\"\']", fix_ref, body_html)
+    body_html = _re.sub(r"<image[^>]*\b(?:xlink:)?href=[\"\']([^\"\']+)[\"\']", fix_ref, body_html)
+    body_html = _re.sub(r"<link[^>]*\brel=[\"\']stylesheet[\"\'][^>]*/?>", "",
+                        body_html, flags=_re.IGNORECASE)
+    body_html = _re.sub(r"<(script|style|iframe|object|embed)\b[^>]*>.*?</\1>", "",
+                        body_html, flags=_re.DOTALL | _re.IGNORECASE)
+    body_html = _re.sub(r"<(script|iframe|object|embed|base|meta)\b[^>]*/?>", "",
+                        body_html, flags=_re.IGNORECASE)
+    body_html = _re.sub(r"\son[a-z]+\s*=\s*(\"[^\"]*\"|\'[^\']*\'|[^\s>]+)", "",
+                        body_html, flags=_re.IGNORECASE)
+    # links inside a book point at other files of the book: they would leave
+    # the reader. Keep the text, drop the jump.
+    body_html = _re.sub(r"(<a\b[^>]*?)\shref=(\"[^\"]*\"|\'[^\']*\')", r"\1", body_html,
+                        flags=_re.IGNORECASE)
+    # an EPUB cover is often <svg width="100%" height="100%">: let the reader size it
+    body_html = _re.sub(r"(<svg[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
+                        r"\1", body_html, count=2, flags=_re.IGNORECASE)
+    body_html = _re.sub(r"(<image[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
+                        r"\1", body_html, count=2, flags=_re.IGNORECASE)
+    return body_html
+
+
+_EPUB_CHAPTER_CSS = (
+    "html,body{margin:0;padding:0}"
+    "body{font-family:'PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Hiragino Sans GB',"
+    "Georgia,system-ui,sans-serif;line-height:1.9;word-break:break-word}"
+    "h1,h2,h3,h4{font-weight:600;margin:1.2em 0 .6em;line-height:1.4}"
+    "h1{font-size:1.5em}h2{font-size:1.3em}h3{font-size:1.12em}"
+    "p{margin:.9em 0;text-indent:2em}"
+    "img{max-width:100%;height:auto;display:block;margin:1.2em auto;border-radius:4px}"
+    "svg{max-width:100%;height:auto;display:block;margin:0 auto 1.5em}"
+    "svg image{width:100%;height:auto}"
+    "blockquote{margin:1.2em 0;padding:.3em 1.2em;border-left:4px solid rgba(120,140,170,.5);"
+    "opacity:.85}"
+    "table{max-width:100%}pre{white-space:pre-wrap}"
+    "sup,sub{font-size:.65em;line-height:0}"
+)
+
+
+def _epub_row_sql():
+    return "SELECT local_path, file_name FROM messages WHERE id=$1"
+
+
+@app.get("/epub/{msg_id}/toc")
+async def epub_toc(msg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    epub_path = _epub_locate(msg_id, row)
+    if not epub_path:
+        return JSONResponse({"error": "not cached"}, status_code=404)
+    try:
+        idx = await asyncio.to_thread(_epub_index, epub_path)
     except Exception as e:
+        return JSONResponse({"error": f"cannot read this book: {e}"}, status_code=422)
+    return JSONResponse({"title": idx["title"] or row["file_name"] or f"book-{msg_id}",
+                         "chapters": idx["titles"]})
+
+
+@app.get("/epub/{msg_id}/ch/{n}", response_class=HTMLResponse)
+async def epub_chapter(msg_id: int, n: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    epub_path = _epub_locate(msg_id, row)
+    if not epub_path:
+        return HTMLResponse("not cached", status_code=404)
+    try:
+        idx = await asyncio.to_thread(_epub_index, epub_path)
+        if not 0 <= n < len(idx["chapters"]):
+            return HTMLResponse("no such chapter", status_code=404)
+
+        def _read():
+            with _zipfile.ZipFile(epub_path) as zf:
+                return _epub_chapter_body(zf, msg_id, idx["chapters"][n])
+        body = await asyncio.to_thread(_read)
+    except Exception as e:
+        return HTMLResponse(f"<p>cannot show this chapter: {html.escape(str(e))}</p>",
+                            status_code=500, headers={"Content-Security-Policy": _EPUB_CSP})
+    await _touch_local(msg_id)
+    return HTMLResponse(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<style>{_EPUB_CHAPTER_CSS}</style></head><body>{body}</body></html>",
+        headers={"Content-Security-Policy": _EPUB_CSP,
+                 "X-Content-Type-Options": "nosniff",
+                 "Cache-Control": "private, max-age=3600"})
+
+
+_EPUB_READER_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>__TITLE__</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--fg);
+  --bg:#ffffff;--fg:#1f2937;--bar:#f8fafc;--line:#e2e8f0;--mut:#64748b;--acc:#2563eb}
+body[data-theme=sepia]{--bg:#f6efdc;--fg:#433422;--bar:#efe6cf;--line:#dccfae;--mut:#8a7a5c;--acc:#a0522d}
+body[data-theme=dark]{--bg:#15181d;--fg:#c9d1d9;--bar:#1c2128;--line:#30363d;--mut:#8b949e;--acc:#58a6ff}
+.bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bar);
+  border-bottom:1px solid var(--line);flex:none;min-height:50px}
+.bar.bottom{border-bottom:none;border-top:1px solid var(--line)}
+.ttl{flex:1;min-width:0;font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+button,.btn{font:inherit;font-size:14px;color:var(--fg);background:transparent;border:1px solid var(--line);
+  border-radius:8px;padding:7px 12px;cursor:pointer;text-decoration:none;white-space:nowrap;line-height:1.2}
+button:hover,.btn:hover{border-color:var(--acc);color:var(--acc)}
+button:disabled{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg)}
+button.big{font-size:15px;font-weight:600;padding:9px 18px;background:var(--acc);color:#fff;border-color:var(--acc)}
+button.big:hover{color:#fff;filter:brightness(1.1)}
+button.big:disabled{background:transparent;color:var(--fg);border-color:var(--line)}
+.stage{flex:1;position:relative;min-height:0}
+iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--bg)}
+.zone{position:absolute;top:0;bottom:0;width:16%;z-index:2;cursor:pointer;display:flex;align-items:center;
+  font-size:44px;color:var(--mut);opacity:0;transition:opacity .15s;user-select:none}
+.zone:hover{opacity:.55}
+.zone.l{left:0;justify-content:flex-start;padding-left:10px}
+.zone.r{right:0;justify-content:flex-end;padding-right:10px}
+body[data-mode=scroll] .zone{display:none}
+.pos{flex:1;min-width:0;text-align:center;font-size:13px;color:var(--mut)}
+.pos b{color:var(--fg);font-weight:600}
+.pos .chn{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+input[type=range]{width:100%;accent-color:var(--acc);margin:2px 0 0}
+.drawer{position:absolute;top:0;bottom:0;left:0;width:min(360px,86vw);background:var(--bar);
+  border-right:1px solid var(--line);z-index:5;transform:translateX(-102%);transition:transform .18s;
+  display:flex;flex-direction:column;box-shadow:4px 0 18px rgba(0,0,0,.12)}
+.drawer.open{transform:none}
+.drawer h3{margin:0;padding:14px 16px;font-size:15px;border-bottom:1px solid var(--line);display:flex;
+  justify-content:space-between;align-items:center}
+.drawer .list{overflow:auto;flex:1;padding:6px 0}
+.drawer a{display:block;padding:9px 16px;font-size:14px;color:var(--fg);text-decoration:none;cursor:pointer;
+  border-left:3px solid transparent}
+.drawer a:hover{background:rgba(127,127,127,.12)}
+.drawer a.cur{border-left-color:var(--acc);color:var(--acc);font-weight:600}
+.shade{position:absolute;inset:0;z-index:4;background:rgba(0,0,0,.25);display:none}
+.shade.open{display:block}
+.msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--mut);
+  z-index:1;pointer-events:none;font-size:15px}
+.tip{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:rgba(15,23,42,.88);color:#fff;
+  padding:9px 16px;border-radius:20px;font-size:13px;z-index:6;pointer-events:none;transition:opacity .6s}
+@media (max-width:640px){.hide-s{display:none}.bar{gap:5px;padding:6px 8px}button,.btn{padding:7px 9px}}
+</style></head>
+<body data-theme="light" data-mode="paged">
+<div class="bar">
+  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
+  <button id="tocBtn" title="table of contents">&#9776;<span class="hide-s"> Contents</span></button>
+  <div class="ttl" id="ttl">__TITLE__</div>
+  <button id="fsDown" title="smaller text">A&minus;</button>
+  <button id="fsUp" title="larger text">A+</button>
+  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
+  <button id="modeBtn" title="turn pages or scroll"><span id="modeLbl">Scroll</span></button>
+  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+</div>
+<div class="stage" id="stage">
+  <div class="msg" id="msg">opening the book…</div>
+  <iframe id="bk" sandbox="allow-same-origin" title="book"></iframe>
+  <div class="zone l" id="zl" title="previous page">&lsaquo;</div>
+  <div class="zone r" id="zr" title="next page">&rsaquo;</div>
+  <div class="shade" id="shade"></div>
+  <div class="drawer" id="drawer">
+    <h3><span>Contents</span><button id="tocClose">&times;</button></h3>
+    <div class="list" id="tocList"></div>
+  </div>
+  <div class="tip" id="tip">&larr; &rarr; or Space to turn pages &middot; click the edges &middot; swipe on a phone</div>
+</div>
+<div class="bar bottom">
+  <button class="big" id="prev">&lsaquo; Prev</button>
+  <div class="pos">
+    <span class="chn" id="chn"></span>
+    <span id="pg"></span>
+    <input type="range" id="slider" min="0" max="0" value="0" title="jump to a chapter">
+  </div>
+  <button class="big" id="next">Next &rsaquo;</button>
+</div>
+<script>
+(function(){
+const ID = __ID__, KEY = "tgarr.read." + ID;
+const $ = id => document.getElementById(id);
+const fr = $("bk");
+let titles = [], ch = 0, page = 0, pages = 1, W = 0, doc = null, pendingFrac = 0, busy = false;
+let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.reader") || "{}"); } catch (e) {}
+let fs = st.fs || 18, theme = st.theme || "light", mode = st.mode || "paged";
+const THEMES = {light: ["#ffffff", "#1f2937"], sepia: ["#f6efdc", "#433422"], dark: ["#15181d", "#c9d1d9"]};
+function saveSt(){ try { localStorage.setItem("tgarr.reader", JSON.stringify({fs, theme, mode})); } catch (e) {} }
+function frac(){
+  if (mode === "paged") return pages > 1 ? page / (pages - 1) : 0;
+  const se = doc && doc.scrollingElement; if (!se) return 0;
+  const max = se.scrollHeight - se.clientHeight; return max > 0 ? se.scrollTop / max : 0;
+}
+function savePos(){ try { localStorage.setItem(KEY, JSON.stringify({ch, frac: frac()})); } catch (e) {} }
+function css(){
+  const c = THEMES[theme];
+  let s = "html{background:" + c[0] + "}body{background:" + c[0] + ";color:" + c[1] + ";font-size:" + fs + "px}";
+  if (mode === "paged") {
+    const col = Math.min(W - 44, 860), P = Math.max(22, Math.round((W - col) / 2));
+    s += "html{height:100%;overflow:hidden}" +
+         "body{margin:0;height:100vh;box-sizing:border-box;padding:26px " + P + "px;column-width:" + (W - 2 * P) +
+         "px;column-gap:" + (2 * P) + "px;column-fill:auto;overflow:hidden}" +
+         "img,svg{max-height:calc(100vh - 90px);width:auto;max-width:100%;break-inside:avoid}" +
+         "h1,h2,h3,h4{break-after:avoid}";
+  } else {
+    s += "body{max-width:820px;margin:0 auto;padding:26px 22px 80px}";
+  }
+  return s;
+}
+function layout(keep){
+  if (!doc || !doc.body) return;
+  W = fr.clientWidth;
+  let el = doc.getElementById("tg-reader");
+  if (!el) { el = doc.createElement("style"); el.id = "tg-reader"; doc.head.appendChild(el); }
+  el.textContent = css();
+  document.body.dataset.theme = theme; document.body.dataset.mode = mode;
+  $("modeLbl").textContent = mode === "paged" ? "Scroll" : "Pages";
+  if (mode === "paged") {
+    pages = Math.max(1, Math.round(doc.body.scrollWidth / W));
+    page = Math.min(pages - 1, Math.max(0, Math.round(keep * (pages - 1))));
+    doc.body.scrollLeft = page * W;
+  } else {
+    const se = doc.scrollingElement, max = se.scrollHeight - se.clientHeight;
+    se.scrollTop = keep * Math.max(0, max);
+  }
+  ui();
+}
+function ui(){
+  const n = titles.length || 1;
+  $("chn").textContent = titles[ch] || ("Section " + (ch + 1));
+  let within = frac();
+  if (mode === "paged") $("pg").innerHTML = "page <b>" + (page + 1) + "</b> of " + pages + " &middot; chapter " + (ch + 1) + " of " + n +
+      " &middot; <b>" + Math.round((ch + (pages > 1 ? page / pages : 0)) / n * 100) + "%</b>";
+  else $("pg").innerHTML = "chapter " + (ch + 1) + " of " + n + " &middot; <b>" + Math.round((ch + within) / n * 100) + "%</b>";
+  $("slider").max = n - 1; $("slider").value = ch;
+  const first = ch === 0 && (mode === "paged" ? page === 0 : within <= 0.001);
+  const last = ch >= n - 1 && (mode === "paged" ? page >= pages - 1 : within >= 0.999);
+  $("prev").disabled = first; $("next").disabled = last;
+  document.querySelectorAll("#tocList a").forEach(a => a.classList.toggle("cur", +a.dataset.i === ch));
+  savePos();
+}
+function load(n, f){
+  n = Math.max(0, Math.min((titles.length || 1) - 1, n));
+  ch = n; pendingFrac = f || 0; busy = true;
+  $("msg").style.display = "flex"; $("msg").textContent = "loading…";
+  fr.src = "/epub/" + ID + "/ch/" + n;
+}
+function go(d){
+  if (busy || !doc) return;
+  hideTip();
+  if (mode === "paged") {
+    if (page + d >= 0 && page + d < pages) { page += d; doc.body.scrollLeft = page * W; ui(); return; }
+  } else {
+    const se = doc.scrollingElement, max = se.scrollHeight - se.clientHeight, step = se.clientHeight * 0.9;
+    if ((d > 0 && se.scrollTop < max - 2) || (d < 0 && se.scrollTop > 2)) { se.scrollTop += d * step; setTimeout(ui, 60); return; }
+  }
+  if (d > 0 && ch < titles.length - 1) load(ch + 1, 0);
+  else if (d < 0 && ch > 0) load(ch - 1, 1);
+}
+function onKey(e){
+  if (e.target && /INPUT|TEXTAREA/.test(e.target.tagName) && e.target.type !== "range") return;
+  const k = e.key;
+  if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey) || k === "ArrowDown" && mode === "paged") { e.preventDefault(); go(1); }
+  else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey) || k === "ArrowUp" && mode === "paged") { e.preventDefault(); go(-1); }
+  else if (k === "Home") { e.preventDefault(); load(0, 0); }
+  else if (k === "End") { e.preventDefault(); load(titles.length - 1, 1); }
+  else if (k === "Escape") toc(false);
+}
+let wheelAt = 0;
+function onWheel(e){
+  if (mode !== "paged") { setTimeout(ui, 80); return; }
+  e.preventDefault();
+  const now = Date.now(); if (now - wheelAt < 260) return;
+  if (Math.abs(e.deltaY) < 8 && Math.abs(e.deltaX) < 8) return;
+  wheelAt = now; go((Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX) > 0 ? 1 : -1);
+}
+let tx = null, ty = null;
+function onTouchStart(e){ const t = e.changedTouches[0]; tx = t.clientX; ty = t.clientY; }
+function onTouchEnd(e){
+  if (tx === null) return; const t = e.changedTouches[0], dx = t.clientX - tx, dy = t.clientY - ty; tx = null;
+  if (mode === "paged" && Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+  else if (mode !== "paged") setTimeout(ui, 120);
+}
+function wire(target){
+  try {
+    target.addEventListener("keydown", onKey);
+    target.addEventListener("wheel", onWheel, {passive: false});
+    target.addEventListener("touchstart", onTouchStart, {passive: true});
+    target.addEventListener("touchend", onTouchEnd, {passive: true});
+  } catch (e) {}
+}
+fr.addEventListener("load", function(){
+  try { doc = fr.contentDocument; } catch (e) { doc = null; }
+  if (!doc || !doc.body) return;
+  busy = false; $("msg").style.display = "none";
+  wire(doc);
+  doc.addEventListener("scroll", () => { if (mode !== "paged") ui(); }, {passive: true});
+  layout(pendingFrac);
+  // pictures arriving change the page count: lay out again, stay where we are
+  let t = null;
+  Array.from(doc.images || []).forEach(im => { if (!im.complete) im.addEventListener("load", () => {
+    clearTimeout(t); t = setTimeout(() => layout(frac()), 120); }); });
+});
+wire(window);
+window.addEventListener("resize", () => { if (doc) layout(frac()); });
+$("prev").onclick = () => go(-1); $("next").onclick = () => go(1);
+$("zl").onclick = () => go(-1); $("zr").onclick = () => go(1);
+$("fsUp").onclick = () => { fs = Math.min(30, fs + 2); saveSt(); layout(frac()); };
+$("fsDown").onclick = () => { fs = Math.max(12, fs - 2); saveSt(); layout(frac()); };
+$("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); layout(frac()); };
+$("modeBtn").onclick = () => { const f = frac(); mode = mode === "paged" ? "scroll" : "paged"; saveSt(); layout(f); };
+$("slider").addEventListener("change", e => load(+e.target.value, 0));
+function toc(open){ $("drawer").classList.toggle("open", open); $("shade").classList.toggle("open", open);
+  if (open) { const c = document.querySelector("#tocList a.cur"); if (c) c.scrollIntoView({block: "center"}); } }
+$("tocBtn").onclick = () => toc(!$("drawer").classList.contains("open"));
+$("tocClose").onclick = () => toc(false); $("shade").onclick = () => toc(false);
+function hideTip(){ const t = $("tip"); if (t) { t.style.opacity = 0; setTimeout(() => t.remove(), 700); } }
+setTimeout(hideTip, 7000);
+if (document.referrer && document.referrer.indexOf(location.host) > 0 && history.length > 1)
+  $("back").onclick = e => { e.preventDefault(); history.back(); };
+document.body.dataset.theme = theme;
+fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
+  if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
+  titles = j.chapters || [];
+  if (j.title) { $("ttl").textContent = j.title; document.title = j.title; }
+  const list = $("tocList"), fragm = document.createDocumentFragment();
+  let listed = 0;
+  titles.forEach((t, i) => { if (!t) return; listed++;
+    const a = document.createElement("a"); a.textContent = t; a.dataset.i = i;
+    a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
+  if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "Section " + (i + 1);
+    a.dataset.i = i; a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
+  list.appendChild(fragm);
+  let pos = {}; try { pos = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
+  // /epub/123#40 opens chapter 40
+  const h = parseInt((location.hash || "").slice(1), 10);
+  if (h >= 1 && h <= titles.length) pos = {ch: h - 1, frac: 0};
+  load(pos.ch || 0, pos.frac || 0);
+}).catch(() => { $("msg").textContent = "✗ could not open this book"; });
+})();
+</script>
+</body></html>"""
+
+
+@app.get("/epub/{msg_id}", response_class=HTMLResponse)
+async def epub_render(msg_id: int):
+    """The e-book reader (see the block comment above)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    if not _epub_locate(msg_id, row):
         return HTMLResponse(
-            f"<h1>EPUB render failed</h1><pre>{html.escape(str(e))}</pre>"
-            f"<p><a href='/media/{msg_id}' download>Download raw .epub</a></p>",
-            status_code=500)
+            f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            status_code=404)
+    title = _re.sub(r"\.epub$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
+    return HTMLResponse(_EPUB_READER_HTML.replace("__ID__", str(int(msg_id)))
+                        .replace("__TITLE__", html.escape(title)))
 
 
 @app.get("/epub/{msg_id}/cover")
@@ -2051,7 +2395,9 @@ async def epub_asset(msg_id: int, asset_path: str):
     return Response(
         content=data,
         media_type=_EPUB_MIME.get(ext, "application/octet-stream"),
-        headers={"Cache-Control": "public, max-age=3600"})
+        headers={"Cache-Control": "public, max-age=3600",
+                 "Content-Security-Policy": "sandbox; " + _EPUB_CSP,
+                 "X-Content-Type-Options": "nosniff"})
 
 
 async def _tg_flood() -> Optional[dict]:
@@ -2212,7 +2558,7 @@ function renderPlayer() {{
   }}
   if (ext === "epub") {{
     // Read in the built-in reader: instant, and no conversion to run.
-    main.innerHTML = `<iframe sandbox="allow-same-origin" src="/epub/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+    location.replace("/epub/" + MSG_ID);
     return;
   }}
   if (["mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
