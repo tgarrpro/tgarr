@@ -12,6 +12,7 @@ import asyncio
 import base64
 import io
 import json
+import re
 import logging
 import os
 from typing import Optional
@@ -43,9 +44,58 @@ from pyrogram.raw.types.auth import (
 
 log = logging.getLogger("tgarr.login")
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
 SESSION_DIR = "/app/session"
+# The Telegram app id and hash: from .env when given there, otherwise from
+# this file, written by the first-run page. An install that has neither
+# starts anyway and asks for them in the browser.
+APP_FILE = os.path.join(SESSION_DIR, "telegram_app.json")
+_APP_HASH_RX = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _valid_app(api_id, api_hash) -> bool:
+    return (str(api_id).isdigit() and 0 < int(api_id) < 10 ** 12
+            and bool(_APP_HASH_RX.match(str(api_hash))))
+
+
+def _load_app():
+    api_id, api_hash = (os.environ.get("TG_API_ID") or "").strip(), (os.environ.get("TG_API_HASH") or "").strip()
+    if _valid_app(api_id, api_hash):
+        return int(api_id), api_hash, "env"
+    try:
+        with open(APP_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if _valid_app(d.get("api_id"), d.get("api_hash")):
+            return int(d["api_id"]), d["api_hash"], "file"
+    except (OSError, ValueError):
+        pass
+    return 0, "", ""
+
+
+API_ID, API_HASH, APP_SOURCE = _load_app()
+
+
+def app_configured() -> bool:
+    return bool(API_ID)
+
+
+def save_app(api_id: str, api_hash: str) -> dict:
+    """Keep the id and hash typed into the first-run page. Only while none is
+    set: a working install's values are never replaced from the browser."""
+    global API_ID, API_HASH, APP_SOURCE
+    if app_configured():
+        return {"status": "error", "message": "the Telegram app is already set"}
+    api_id, api_hash = (api_id or "").strip(), (api_hash or "").strip().lower()
+    if not _valid_app(api_id, api_hash):
+        return {"status": "error",
+                "message": "The App api_id is a number and the App api_hash is 32 letters and digits (0-9, a-f)."}
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    tmp = APP_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"api_id": int(api_id), "api_hash": api_hash}, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, APP_FILE)
+    API_ID, API_HASH, APP_SOURCE = int(api_id), api_hash, "file"
+    return {"status": "ok"}
 REVOKED_MARKER = os.path.join(SESSION_DIR, ".revoked")
 # user_info lives in-memory (lost on container restart) but the session file
 # persists on the mounted volume. Persist the self-user beside it so the

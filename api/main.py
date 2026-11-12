@@ -4004,13 +4004,76 @@ qrStart();
 </body></html>"""
 
 
+APP_SETUP_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>tgarr - first-time setup</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
+  display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;max-width:560px;width:100%;padding:30px 32px;
+  box-shadow:0 10px 30px rgba(15,23,42,.08)}
+h1{margin:0 0 6px;font-size:24px}h1 span{color:#0ea5e9}
+p{color:#475569;line-height:1.55;margin:8px 0}
+ol{color:#334155;line-height:1.7;padding-left:20px;margin:14px 0 18px}
+label{display:block;font-size:13px;font-weight:600;color:#334155;margin:14px 0 5px}
+input{width:100%;box-sizing:border-box;padding:11px 12px;font:inherit;font-size:15px;border:1px solid #cbd5e1;
+  border-radius:8px;font-family:ui-monospace,Consolas,monospace}
+input:focus{outline:2px solid #0ea5e9;border-color:#0ea5e9}
+button{margin-top:20px;width:100%;padding:12px;font:inherit;font-size:15px;font-weight:600;color:#fff;
+  background:#0ea5e9;border:0;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.6;cursor:default}
+#err{color:#b91c1c;font-size:14px;margin-top:12px;min-height:20px}
+small{color:#64748b;font-size:12.5px;line-height:1.5;display:block;margin-top:16px}
+a{color:#0284c7}
+</style></head><body><div class="card">
+<h1>tg<span>arr</span> - one step before signing in</h1>
+<p>Telegram asks every program that connects to it for an <b>app id</b> and <b>app hash</b>.
+They are free, belong to your own account, and take a minute to get:</p>
+<ol>
+<li>Open <a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>
+and sign in with your phone number (the code arrives in Telegram itself).</li>
+<li>Fill in "Create new application" - any title and short name will do - and press Create.</li>
+<li>Copy <b>App api_id</b> and <b>App api_hash</b> into the two boxes below.</li>
+</ol>
+<form id="f" autocomplete="off">
+<label for="i">App api_id</label><input id="i" name="api_id" inputmode="numeric" placeholder="1234567" required/>
+<label for="h">App api_hash</label><input id="h" name="api_hash" placeholder="32 letters and digits" required/>
+<button id="b" type="submit">Save and continue to sign-in</button>
+<div id="err"></div>
+</form>
+<small>The two values stay on this machine, beside the Telegram session. Setting TG_API_ID and
+TG_API_HASH in the .env file does the same thing and takes precedence.</small>
+</div>
+<script>
+document.getElementById("f").addEventListener("submit", async function (e) {
+  e.preventDefault();
+  const b = document.getElementById("b"), err = document.getElementById("err");
+  b.disabled = true; err.textContent = "";
+  try {
+    const r = await fetch("/api/login/app", {method: "POST", body: new FormData(e.target)}).then(r => r.json());
+    if (r.status === "ok") { location.href = "/login"; return; }
+    err.textContent = r.message || "That did not work.";
+  } catch (x) { err.textContent = "Could not reach tgarr: " + x; }
+  b.disabled = false;
+});
+</script></body></html>"""
+
+
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(preview: Optional[int] = None):
     # .revoked marker overrides "already signed in" — session file is stale,
     # account was logged out upstream, must re-auth before doing anything.
     if login.session_exists() and not preview and not _is_revoked():
         return RedirectResponse("/")
+    if not login.app_configured():
+        return HTMLResponse(APP_SETUP_HTML)
     return HTMLResponse(LOGIN_HTML)
+
+
+@app.post("/api/login/app")
+async def api_login_app(api_id: str = Form(""), api_hash: str = Form("")):
+    return login.save_app(api_id, api_hash)
 
 
 @app.post("/api/login/qr/start")
@@ -8734,7 +8797,7 @@ async def page_settings(request: Request):
         f'<div class="acct-sub">'
         + (f'@{html.escape(_uname)} · ' if _uname and _full else '')
         + f'Telegram data center {my_dc_disp} <span class="pill ok">signed in</span></div>'
-        f'<div class="acct-meta">API ID <code>{html.escape(os.environ.get("TG_API_ID", "-"))}</code> · '
+        f'<div class="acct-meta">API ID <code>{html.escape(str(login.API_ID or "-"))}</code> · '
         f'session at <code>_data/session/tgarr.session</code></div></div>'
         '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'Sign out of Telegram on this tgarr?'
         '\\n\\nPrivate chats are removed from the index. Public channels and files already saved stay.\'))'

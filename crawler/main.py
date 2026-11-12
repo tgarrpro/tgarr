@@ -54,8 +54,33 @@ logging.basicConfig(
 log = logging.getLogger("tgarr")
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
+def _telegram_app():
+    """The Telegram app id and hash: from .env, or from the file the first-run
+    page writes beside the session. With neither there is nothing to connect
+    with yet - wait for the page to be filled in rather than crash and restart."""
+    import json as _json
+    import re as _re
+    waited = 0
+    while True:
+        api_id = (os.environ.get("TG_API_ID") or "").strip()
+        api_hash = (os.environ.get("TG_API_HASH") or "").strip()
+        if not (api_id.isdigit() and _re.match(r"^[0-9a-f]{32}$", api_hash)):
+            try:
+                with open("/app/session/telegram_app.json", encoding="utf-8") as f:
+                    d = _json.load(f)
+                api_id, api_hash = str(d.get("api_id") or ""), str(d.get("api_hash") or "")
+            except (OSError, ValueError):
+                api_id = api_hash = ""
+        if api_id.isdigit() and int(api_id) > 0 and _re.match(r"^[0-9a-f]{32}$", api_hash):
+            return int(api_id), api_hash
+        if waited % 300 == 0:
+            log.warning("no Telegram app id/hash yet - open tgarr in a browser to enter them "
+                        "(or set TG_API_ID and TG_API_HASH in .env)")
+        time.sleep(10)
+        waited += 10
+
+
+API_ID, API_HASH = _telegram_app()
 DB_DSN = os.environ["DB_DSN"]
 BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
