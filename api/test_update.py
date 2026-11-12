@@ -95,4 +95,17 @@ for tag in ("latest", "edge", ""):
 main.UPDATE_CHECK_ENABLED = False
 ok(S(stalled, NOW)["kind"] == "current", "switched off")
 
+# disk warning levels: an absolute floor and a share, whichever is worse
+GB = 1024 ** 3
+L = main._disk_level
+ok(L(159 * GB, 232 * GB) == "ok", "plenty free")
+ok(L(19 * GB, 232 * GB) == "warn", "under 20 GB free is a warning even on a big disk")
+ok(L(4 * GB, 232 * GB) == "bad", "under 5 GB free is red")
+ok(L(60 * GB, 1000 * GB) == "warn", "under 10% free is a warning even with 60 GB left")
+ok(L(25 * GB, 1000 * GB) == "bad", "under 3% free is red")
+ok(L(30 * GB, 64 * GB) == "ok", "a small disk half empty is fine")
+ok(L(0, 0) == "off", "unknown disk")
+ok(main._fmt_uptime(12 * 86400 + 21 * 3600) == "12 d 21 h" and main._fmt_uptime(3 * 3600 + 120) == "3 h 2 min",
+   "uptime wording")
+
 print(f"ok - {n} checks")
