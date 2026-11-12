@@ -34,7 +34,8 @@ from pyrogram.errors import (
 )
 from pyrogram.types import Message
 
-from parser import parse_filename, to_release_name, decide_release
+from parser import (parse_filename, to_release_name, decide_release, is_video_file,
+                    is_generic_name, part_number, title_from_caption, with_context)
 
 # Pyrogram 2.0.106 hard-codes the pre-2024 channel-id range
 # (MIN_CHANNEL_ID = -1002147483647). Telegram now hands out channel ids above
@@ -1012,6 +1013,17 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verify_cursor BIGINT")
+        # Release re-judgement bookkeeping (see release_judge_worker).
+        await conn.execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS rel_ver SMALLINT")
+        await conn.execute(
+            "ALTER TABLE releases ADD COLUMN IF NOT EXISTS part SMALLINT")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_rejudge ON messages (id) "
+            "WHERE rel_ver IS NULL AND media_type IN ('video', 'document')")
+        await conn.execute(
+            "UPDATE messages SET rel_ver = NULL WHERE rel_ver IS NOT NULL AND rel_ver <> $1",
+            RELEASE_JUDGE_VER)
         # What Telegram reports for a video message: running time + frame size.
         for _col in ("duration_sec", "width", "height"):
             await conn.execute(
@@ -1062,6 +1074,251 @@ async def _heartbeat(worker: str, action: str = "", error: str | None = None) ->
                     worker, action[:200])
     except Exception:
         pass  # never let heartbeat failures cascade
+
+
+# ════════════════════════════════════════════════════════
+# Release re-judgement
+#
+# A release is a verdict about a file, made once, when the file was indexed:
+# with the parser of that day, without the running time (filled in later by
+# the sweeper), and without the poster that carries the title when the file
+# itself is called 01_0.mp4 (during a backfill the poster is indexed AFTER
+# the file). Verdicts therefore go stale: "2026" and "迅雷影音" as film titles,
+# five-minute clips as movies, real films with no release at all.
+#
+# This worker goes through every indexed video/document once per rule version
+# (and again whenever something a verdict depends on changes: the running
+# time arrives, a titled poster appears right before the file) and makes the
+# release agree with the current rules: create, correct, or remove.
+# Pure database work: no Telegram calls, nothing is downloaded, nothing is
+# auto-grabbed. A release someone has downloaded or grabbed is never removed.
+# ════════════════════════════════════════════════════════
+RELEASE_JUDGE_VER = 1            # bump when the rules change: everything is re-judged
+RELEASE_JUDGE_BATCH = 300
+CONTEXT_WINDOW = 12              # messages back from a file to look for its poster
+
+
+async def _context_title(conn, m):
+    """(ctx, part, parts_total) for a file whose own name says nothing, from
+    the caption that states the title: its own, or the poster's right before
+    it. Strict on purpose - a wrong title is worse than none:
+      - every message between the poster and the file must be there (a gap
+        is a message we do not have: possibly the next title) and must be a
+        nameless file or an uncaptioned photo;
+      - file counters must rise (01, 02, 03): a restart is another work.
+    """
+    own = title_from_caption(m["caption"])
+    my_part = part_number(m["file_name"])
+    mid = m["tg_message_id"]
+    around = {r["tg_message_id"]: r for r in await conn.fetch(
+        """SELECT tg_message_id, media_type, file_name, caption FROM messages
+           WHERE channel_id = $1 AND tg_message_id BETWEEN $2 AND $3""",
+        m["channel_id"], mid - CONTEXT_WINDOW, mid + CONTEXT_WINDOW)}
+    ctx, anchor = own, mid
+    if not own:
+        if m["caption"]:
+            return None                    # it has a caption, and it states no title
+        last = my_part
+        i = mid - 1
+        ctx = None
+        while i >= mid - CONTEXT_WINDOW:
+            r = around.get(i)
+            if r is None:
+                return None
+            if r["caption"]:
+                ctx = title_from_caption(r["caption"])
+                anchor = i
+                break
+            if r["media_type"] != "photo":
+                if not is_generic_name(r["file_name"]):
+                    return None
+                pn = part_number(r["file_name"])
+                if pn is not None:
+                    if last is not None and pn >= last:
+                        return None
+                    last = pn
+            i -= 1
+        if not ctx:
+            return None
+    # how many numbered files does this title have?
+    total, lastp, j = 0, 0, anchor + (0 if own else 1)
+    while j in around and j <= mid + CONTEXT_WINDOW:
+        r = around[j]
+        if j != anchor and (r["caption"] or (r["media_type"] != "photo"
+                                             and not is_generic_name(r["file_name"]))):
+            break
+        pn = part_number(r["file_name"]) if r["media_type"] != "photo" else None
+        if pn is not None:
+            if pn <= lastp:
+                break
+            lastp = pn
+            total += 1
+        j += 1
+    return ctx, my_part, total
+
+
+def _release_row(parsed: dict, verdict: dict, file_name) -> dict | None:
+    """The releases columns a verdict implies; None if it yields no name."""
+    type_ = verdict["type"]
+    p = dict(parsed)
+    if verdict["quality"] and not p.get("quality"):
+        p["quality"] = verdict["quality"]
+    p["type"] = type_
+    name = to_release_name(p, fallback=file_name or "")
+    if not name:
+        return None
+    return {
+        "name": name, "category": type_,
+        "series_title": p.get("title") if type_ == "tv" else None,
+        "season": p.get("season") if type_ == "tv" else None,
+        "episode": p.get("episode") if type_ == "tv" else None,
+        "movie_title": p.get("title") if type_ == "movie" else None,
+        "movie_year": p.get("year") if type_ == "movie" else None,
+        "quality": p.get("quality"), "source": p.get("source"), "codec": p.get("codec"),
+        "parse_score": verdict["score"], "part": p.get("part"),
+    }
+
+
+_REL_IDENTITY = ("category", "series_title", "season", "episode", "movie_title",
+                 "movie_year", "part")
+_REL_COLS = ("name", "category", "series_title", "season", "episode", "movie_title",
+             "movie_year", "quality", "source", "codec", "parse_score", "part")
+
+
+def _meili_release_doc(rel_id, row, m):
+    return {
+        "id": rel_id, "name": row["name"], "canonical_title": row["name"],
+        "series_title": row["series_title"], "movie_title": row["movie_title"],
+        "category": row["category"], "quality": row["quality"] or "",
+        "movie_year": row["movie_year"] or 0, "season": row["season"] or 0,
+        "episode": row["episode"] or 0, "parse_score": float(row["parse_score"] or 0),
+        "grab_count": 0, "size_bytes": m["file_size"] or 0,
+        "posted_at_ts": int(m["posted_at"].timestamp()) if m["posted_at"] else 0,
+        "audience": "sfw",
+    }
+
+
+async def _judge_message(conn, m, gone: list) -> str:
+    """Make the release for one indexed file agree with the current rules.
+    Returns what happened: created / updated / removed / same / none / kept."""
+    fn = m["file_name"]
+    row = None
+    if is_video_file(fn, m["mime_type"], m["media_type"]):
+        parsed = parse_filename(fn or "")
+        if is_generic_name(fn) or not parsed.get("has_title"):
+            c = await _context_title(conn, m)
+            if c:
+                parsed = with_context(parsed, c[0], c[1], c[2])
+        verdict = decide_release(parsed, file_size=m["file_size"], duration=m["duration_sec"],
+                                 width=m["width"], height=m["height"],
+                                 min_score=PARSE_SCORE_MIN,
+                                 min_movie_bytes=MIN_MOVIE_BYTES,
+                                 min_tv_bytes=MIN_TV_BYTES)
+        if verdict["create"]:
+            row = _release_row(parsed, verdict, fn)
+    rel_id = m["rel_id"]
+    if row is None:
+        if not rel_id:
+            return "none"
+        if m["protected"]:
+            return "kept"
+        await conn.execute("DELETE FROM releases WHERE id = $1", rel_id)
+        gone.append(rel_id)
+        return "removed"
+    if rel_id:
+        def _same(k):
+            a, b = m["r_" + k], row[k]
+            if k == "parse_score":
+                return abs(float(a or 0) - float(b or 0)) < 0.005
+            return a == b
+        if all(_same(k) for k in _REL_COLS):
+            return "same"
+        reset = any(not _same(k) for k in _REL_IDENTITY)
+        await conn.execute(
+            """UPDATE releases SET name=$2, category=$3, series_title=$4, season=$5,
+                      episode=$6, movie_title=$7, movie_year=$8, quality=$9, source=$10,
+                      codec=$11, parse_score=$12, part=$13"""
+            + (""", canonical_title=NULL, poster_url=NULL, overview=NULL,
+                      metadata_source=NULL, metadata_lookup_at=NULL""" if reset else "")
+            + " WHERE id=$1", rel_id, *[row[k] for k in _REL_COLS])
+        _meili_enqueue("releases", _meili_release_doc(rel_id, row, m))
+        return "updated"
+    # no release yet: one per file
+    if m["file_unique_id"] and await conn.fetchval(
+            """SELECT 1 FROM releases r JOIN messages x ON x.id = r.primary_msg_id
+               WHERE x.file_unique_id = $1 AND x.id <> $2 LIMIT 1""",
+            m["file_unique_id"], m["id"]):
+        return "none"
+    new_id = await conn.fetchval(
+        """INSERT INTO releases
+             (name, category, series_title, season, episode, movie_title, movie_year,
+              quality, source, codec, parse_score, part, size_bytes, posted_at, primary_msg_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id""",
+        *[row[k] for k in _REL_COLS], m["file_size"], m["posted_at"], m["id"])
+    _meili_enqueue("releases", _meili_release_doc(new_id, row, m))
+    return "created"
+
+
+async def release_judge_worker():
+    await asyncio.sleep(90)
+    log.info("[judge] release re-judgement started (rules v%d)", RELEASE_JUDGE_VER)
+    totals: dict = {}
+    while True:
+        try:
+            gone: list = []
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """SELECT m.id, m.channel_id, m.tg_message_id, m.media_type, m.mime_type,
+                              m.file_name, m.caption, m.file_size, m.posted_at,
+                              m.file_unique_id, m.duration_sec, m.width, m.height,
+                              r.id AS rel_id, r.name AS r_name, r.category AS r_category,
+                              r.series_title AS r_series_title, r.season AS r_season,
+                              r.episode AS r_episode, r.movie_title AS r_movie_title,
+                              r.movie_year AS r_movie_year, r.quality AS r_quality,
+                              r.source AS r_source, r.codec AS r_codec,
+                              r.parse_score AS r_parse_score, r.part AS r_part,
+                              (r.id IS NOT NULL AND (
+                                   COALESCE(r.grab_count, 0) > 0
+                                OR EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = r.id)
+                                OR EXISTS (SELECT 1 FROM monitored_movies mm
+                                           WHERE mm.grabbed_release_id = r.id))) AS protected
+                       FROM (SELECT * FROM messages
+                             WHERE rel_ver IS NULL AND media_type IN ('video', 'document')
+                               AND indexed_at < NOW() - INTERVAL '2 minutes'
+                             ORDER BY id LIMIT $1) m
+                       LEFT JOIN releases r ON r.primary_msg_id = m.id
+                       ORDER BY m.id""", RELEASE_JUDGE_BATCH)
+                if not rows:
+                    if totals:
+                        log.info("[judge] caught up: %s", totals)
+                        totals = {}
+                    await _heartbeat("release_judge_worker", "idle")
+                    await asyncio.sleep(60)
+                    continue
+                counts: dict = {}
+                async with conn.transaction():
+                    for m in rows:
+                        try:
+                            async with conn.transaction():
+                                what = await _judge_message(conn, m, gone)
+                        except Exception as e:
+                            what = "error"
+                            log.warning("[judge] msg %s: %s", m["id"], e)
+                        counts[what] = counts.get(what, 0) + 1
+                    await conn.execute(
+                        "UPDATE messages SET rel_ver = $1 WHERE id = ANY($2::bigint[])",
+                        RELEASE_JUDGE_VER, list({m["id"] for m in rows}))
+            if gone:
+                await _meili_delete("releases", gone)
+            for k, v in counts.items():
+                totals[k] = totals.get(k, 0) + v
+            await _heartbeat("release_judge_worker",
+                             ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+            await asyncio.sleep(1 if len(rows) >= RELEASE_JUDGE_BATCH else 30)
+        except Exception as e:
+            log.exception("[judge] loop")
+            await _heartbeat("release_judge_worker", "error", error=str(e))
+            await asyncio.sleep(60)
 
 
 MIN_MOVIE_BYTES = 100 * 1024 * 1024   # 100 MB — anything smaller is sample/trailer/junk
@@ -1311,6 +1568,14 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
             audio_title, audio_performer, audio_duration_sec, msg.date,
             file_dc, detected_lang, duration_sec, width, height,
         )
+
+        if new_msg_id and caption and title_from_caption(caption):
+            # a titled poster: the nameless files right after it get judged again
+            await conn.execute(
+                """UPDATE messages SET rel_ver = NULL
+                   WHERE channel_id = $1 AND tg_message_id > $2
+                     AND tg_message_id <= $2 + $3 AND rel_ver IS NOT NULL""",
+                ch_id, msg_id, CONTEXT_WINDOW)
 
         if new_msg_id and file_name:
             try:
@@ -2899,7 +3164,8 @@ async def stale_index_sweeper():
                     async with db_pool.acquire() as conn:
                         await conn.execute(
                             """UPDATE messages m
-                                  SET duration_sec = v.d, width = v.w, height = v.h
+                                  SET duration_sec = v.d, width = v.w, height = v.h,
+                                      rel_ver = NULL
                                  FROM unnest($2::bigint[], $3::int[], $4::int[], $5::int[])
                                       AS v(mid, d, w, h)
                                 WHERE m.channel_id = $1 AND m.tg_message_id = v.mid
@@ -6190,6 +6456,7 @@ async def main() -> None:
     asyncio.create_task(registry_puller())
     asyncio.create_task(audience_classifier_worker())
     asyncio.create_task(stale_index_sweeper())
+    asyncio.create_task(release_judge_worker())
     asyncio.create_task(membership_sync_worker())
     # seed_validator disabled on client: leftover from pre-federation split.
 

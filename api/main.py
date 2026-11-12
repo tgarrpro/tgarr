@@ -449,6 +449,7 @@ async def _migrate_schema():
 
             -- grab_count for B (composite ranking) — derived from downloads table
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS grab_count INT NOT NULL DEFAULT 0;
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS part SMALLINT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS detected_lang TEXT;
             CREATE INDEX IF NOT EXISTS idx_messages_lang ON messages (detected_lang) WHERE detected_lang IS NOT NULL;
             -- Per-download live progress (populated by Pyrogram callback in
@@ -2476,6 +2477,7 @@ _WORK_KEY_SQL = (
     "(CASE WHEN r.category = 'movie' AND COALESCE(NULLIF(r.canonical_title, ''), NULLIF(r.movie_title, '')) IS NOT NULL "
     "      THEN 'm:' || lower(regexp_replace(COALESCE(NULLIF(r.canonical_title, ''), r.movie_title), "
     "                         '[[:space:][:punct:]]+', '', 'g')) || ':' || COALESCE(r.movie_year::text, '') "
+    "           || COALESCE(':part' || r.part::text, '') "
     "      WHEN r.category = 'tv' AND r.season IS NOT NULL "
     "           AND COALESCE(NULLIF(r.canonical_title, ''), NULLIF(r.series_title, '')) IS NOT NULL "
     "      THEN 't:' || lower(regexp_replace(COALESCE(NULLIF(r.canonical_title, ''), r.series_title), "
@@ -2639,7 +2641,7 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-card .info { padding:10px 12px 4px; min-height:84px; flex:1; }
 .poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
 .poster-card .info .sub { font-size:13px; color:var(--muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.poster-card .pills { padding:0 12px 8px; display:flex; gap:4px; flex-wrap:nowrap; overflow:hidden; min-height:24px; }
+.poster-card .pills { padding:0 12px 8px; display:flex; gap:4px; flex-wrap:wrap; min-height:24px; }
 .poster-card .grab-row { padding:8px 14px 12px; border-top:1px solid var(--border); margin-top:auto; background:var(--surface2); }
 .poster-card .grab-row .btn { width:100%; text-align:center; padding:8px; font-size:13px; }
 .view-toggle { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
@@ -4923,6 +4925,15 @@ def _dc_badge(file_dc, my_dc) -> str:
     return f'<span class="pill warn" title="cross-DC ({file_dc} vs your {my_dc}) — may hit FloodWait" style="font-size:11px">🟡 DC{file_dc}</span>'
 
 
+def _part_pill(r) -> str:
+    """A film posted in pieces: say which piece this card is."""
+    try:
+        n = r["part"] if "part" in r.keys() else None
+    except Exception:
+        return ""
+    return f'<span class="pill muted" title="this film was posted in several parts">part {int(n)}</span>' if n else ""
+
+
 def _versions_pill(r) -> str:
     try:
         n = r["versions"] if "versions" in r.keys() else 1
@@ -4983,6 +4994,7 @@ def _release_card(r, my_dc=None) -> str:
         f'{_dc_badge(r.get("file_dc") if hasattr(r,"get") else r["file_dc"], my_dc)}'
         f'<span class="pill {cat_pill}">{cat_label}</span>'
         f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
+        f'{_part_pill(r)}'
         f'{_versions_pill(r)}'
         f'</div>'
         f'<div class="grab-row" style="display:flex;gap:6px">'
@@ -5048,7 +5060,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         _work_filter = f"WHERE wk = ${len(params)}"
     sql = (f"WITH base AS (SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
-          f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, "
+          f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, r.part, "
           f"{_WORK_KEY_SQL} AS wk, {_QUALITY_RANK_SQL} AS qr, {_same_dc} AS same_dc, "
           f"  (r.parse_score "
           f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikidata' THEN 1.2 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "

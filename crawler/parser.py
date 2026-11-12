@@ -19,7 +19,16 @@ RX_TV_VERBOSE = re.compile(
     r"Season[\s_.\-]*(\d{1,3})[\s_.\-]*Episode[\s_.\-]*(\d{1,3})", re.IGNORECASE
 )
 RX_TV_SEASON_PACK = re.compile(r"\bS(\d{1,2})(?!\s*E)\b|\bSeason[\s_.\-]+(\d{1,2})\b", re.IGNORECASE)
-RX_RES = re.compile(r"\b(2160p|1440p|1080p|720p|576p|480p|360p|240p|4K|UHD)\b", re.IGNORECASE)
+RX_RES = re.compile(
+    r"(?:(?<![0-9])(?=[0-9]{3,4}p)|\b)(2160p|1440p|1080p|720p|576p|480p|360p|240p|4K|UHD)\b",
+    re.IGNORECASE)
+# a source tag glued in front of the resolution ("HD1080P", "BD720p")
+RX_RES_PREFIX = re.compile(r"\b(?:F?HD|BD|WEB)(?=(?:2160|1440|1080|720|576|480)p\b)", re.IGNORECASE)
+# "阳光电影dygod.org.", "www.xxx.com-", "[电影天堂www.dytt8.net]" in front of the title
+RX_SITE_PREFIX = re.compile(
+    r"^(?:[\[【(][^\]】)]{0,40}\.(?:com|org|net|cc|tv|me|vip|top|xyz|info)[^\]】)]{0,10}[\]】)][\s._\-]*"
+    r"|(?:[一-鿿]{2,12})?www\.[A-Za-z0-9\-]{2,20}\.(?:com|org|net|cc|tv|me|vip|top|xyz|info)[\s._\-]+"
+    r"|[一-鿿]{2,12}[A-Za-z0-9\-]{2,20}\.(?:com|org|net|cc|tv|me|vip|top|xyz|info)[\s._\-]+)", re.IGNORECASE)
 RX_SOURCE = re.compile(
     r"\b(BluRay|Blu[-_. ]?Ray|BDRip|BDMux|BR[-_. ]?Rip|WEB[-_. ]?DL|WEB[-_. ]?Rip|WEBMux|HDTV|HDRip|HC[-_. ]?HDRip|DVDRip|DVDR|HDTS|TELESYNC|HDCAM|HD[-_. ]?CAM|CAMRip|PDVD|PreDVD|VHSRip|TVRip|SDTV)\b",
     re.IGNORECASE,
@@ -273,7 +282,7 @@ RX_CAP_TITLE_YEAR = re.compile(
     r"(?:\s*\u7b2c\s*(\d{1,3})\s*[\u96c6\u8bdd\u8a71\u671f])?")
 RX_CAP_SERIES = re.compile(
     r"(\u8fde\u7eed\u5267|\u96fb\u8996\u5287|\u7535\u89c6\u5267|\u5267\u96c6|\u56fd\u4ea7\u5267|\u97e9\u5267|\u7f8e\u5267|\u65e5\u5267|\u6e2f\u5267|\u53f0\u5267|\u6cf0\u5267"
-    r"|\u52a8\u6f2b|\u756a\u5267|\u7efc\u827a|\u5168\s*\d+\s*\u96c6|\u66f4\u65b0\u81f3|\u7b2c\s*\d+\s*\u96c6|TV Series|Season\s*\d)",
+    r"|\u756a\u5267|\u7efc\u827a|\u5168\s*\d+\s*\u96c6|\u66f4\u65b0\u81f3|\u7b2c\s*\d+\s*\u96c6|TV Series|Season\s*\d)",
     re.IGNORECASE)
 _RX_CAP_SEASON = re.compile(
     r"\u7b2c\s*([\d一\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]{1,3})\s*[\u5b63\u90e8]|\bSeason\s*(\d{1,2})\b",
@@ -357,9 +366,11 @@ def with_context(parsed: dict, ctx: dict, part=None, parts_total: int = 1) -> di
     if not out.get("quality") and ctx.get("quality"):
         out["quality"] = ctx["quality"]
     episode = ctx.get("episode")
-    if episode is None and ctx.get("series") and part is not None:
+    if episode is None and part is not None and (ctx.get("series") or parts_total >= 6):
         episode = part
-    if ctx.get("series"):
+    # a film is posted in two or three pieces, not in six: that many numbered
+    # files under one title are episodes
+    if ctx.get("series") or (part is not None and parts_total >= 6):
         out.update(type="tv", season=ctx.get("season") or 1)
         if episode is not None:
             out["episode"] = episode
@@ -383,8 +394,8 @@ def with_context(parsed: dict, ctx: dict, part=None, parts_total: int = 1) -> di
 #   隐秘的生活_高清_欧乐影院_欧乐影院面向海外华人的在线视频媒体平台…
 #   本心-免费在线观看-爱壹帆国际版
 RX_SITE_TAIL = re.compile(
-    r"[\s_\-.]*(?:(?:\u9ad8\u6e05|\u8d85\u6e05|\u84dd\u5149)[\s_\-.]*)?"
-    r"(?:\u514d\u8d39)?(?:\u5728\u7ebf\u89c2\u770b|\u6b27\u4e50\u5f71\u9662|\u7231\u58f9\u5e06).*$")
+    r"[\s_\-.]*(?:(?:高清|超清|蓝光|视频|免费)[\s_\-.]*)*"
+    r"(?:在线观看|立即播放|欧乐影院|爱壹帆).*$")
 
 
 def parse_filename(name: str) -> dict:
@@ -399,6 +410,8 @@ def parse_filename(name: str) -> dict:
 
     base = RX_EXT.sub("", name)
     base = RX_SITE_TAIL.sub("", base) or base
+    base = RX_SITE_PREFIX.sub("", base) or base
+    base = RX_RES_PREFIX.sub("", base)
     work = base
 
     out = {}
@@ -455,6 +468,11 @@ def parse_filename(name: str) -> dict:
             _year_m = None if _year_m.start() == 0 else _year_m
     if _year_m and is_generic_name(name):
         _year_m = None          # IMG_2024.jpg, VID_2019_0001.mp4: a counter
+    # A name that opens with a date is a dated post - a talk, a news clip, a
+    # stream recording - and a year mentioned later in it is part of a sentence.
+    _dated = bool(RX_DATE.match(base.lstrip(" _-.[(【")))
+    if _dated:
+        _year_m = None
     if _year_m:
         out["year"] = int(_year_m.group(1))
     _year_pos = _year_m.start() if _year_m else None
@@ -572,7 +590,7 @@ def parse_filename(name: str) -> dict:
     if (m := RX_GROUP.search(work)):
         # Heuristic: group must be at very end and not a common false-positive
         cand = m.group(1)
-        if cand.upper() not in {"MP3", "MP4", "MKV", "PART"}:
+        if cand.upper() not in {"MP3", "MP4", "MKV", "PART"} and re.search(r"[A-Za-z]", cand):
             out["group"] = cand
             work = work[: m.start()]
 
@@ -595,7 +613,10 @@ def parse_filename(name: str) -> dict:
     work = RX_DOTSPACE.sub(" ", work)
     work = RX_WS.sub(" ", work).strip(" -_.(" + "（")
     # an uploader's counter in front of a CJK title: "1-战狼"
-    work = re.sub(r"^\d{1,2}\s*[-_.]\s*(?=[一-鿿])", "", work)
+    work = re.sub(r"^(?:\d{1,2}\s*[-_.]|0\d{1,2}\s)\s*(?=[《一-鿿])", "", work)
+    # 《片名》 -> 片名
+    work = work.replace("《", " ").replace("》", " ")
+    work = RX_WS.sub(" ", work).strip(" -_.")
 
     title = work
     if not title:
@@ -632,7 +653,12 @@ def parse_filename(name: str) -> dict:
         # they'd false-match news headlines ("Москвач Новости") and real
         # latin releases usually carry year/quality metadata that already scores.
         _cjk = len(re.findall(r"[一-鿿぀-ヿ가-힯]", _t))
-        if _cjk >= 3:
+        # ...unless it reads as a sentence: commentary and news videos are
+        # titled with whole sentences ("…是震慑美国和全世界亲美派的好时机"), films
+        # are not.
+        _sentence = (len(re.findall(r"[，。？！、；…—“”?!]", _t)) >= 2
+                     or len(_t) > 30)
+        if _cjk >= 3 and not _dated and not _sentence:
             s += 0.15
     if out.get("year"):
         s += 0.20
