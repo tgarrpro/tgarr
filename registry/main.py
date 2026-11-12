@@ -696,6 +696,21 @@ async def contribute(request: Request):
             await _bump_suspicion(f"inst:{inst_hash}", 30 * seeds_csam_flagged,
                                 f"csam-seed-x{seeds_csam_flagged}")
 
+    # === What the install found for the candidates it was given ===
+    # Without this a dead or private candidate stayed "not looked at" and was
+    # handed out again and again. Only a candidate still waiting is changed.
+    seed_results = _seed_results_clean(body.get("seed_results"))
+    if seed_results:
+        async with db_pool.acquire() as conn:
+            await conn.executemany(
+                """UPDATE seed_candidates
+                      SET validation_status = $2, validated_at = NOW(),
+                          validation_attempts = COALESCE(validation_attempts, 0) + 1,
+                          validation_error = 'reported by an install'
+                    WHERE username = $1
+                      AND (validation_status IS NULL OR validation_status = 'pending')""",
+                seed_results)
+
     # Honest deception: return the SAME shape regardless. Bad actor can't
     # tell their submission was caught — they just see normal-looking counts.
     return {"status": "ok", "accepted": accepted, "rejected": rejected,
@@ -1128,6 +1143,49 @@ async def channel_resources_get(request: Request, channel: str = Query(""), limi
 # because /contribute is idempotent + distinct_contributors aggregation
 # naturally dedupes consensus.
 # ====================================================================
+# An install asks about once an hour. This used to be counted against the
+# channel-list allowance (24 a day), which it used up entirely by itself.
+SEEDS_PULLS_PER_IP_DAY = int(os.environ.get("SEEDS_PULLS_PER_IP_DAY", "48"))
+_seeds_day: list = ["", {}]
+
+
+def _seeds_allow(ip_hash: str) -> bool:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    if _seeds_day[0] != day:
+        _seeds_day[0], _seeds_day[1] = day, {}
+    seen = _seeds_day[1]
+    seen[ip_hash] = seen.get(ip_hash, 0) + 1
+    return seen[ip_hash] <= SEEDS_PULLS_PER_IP_DAY
+
+
+def _seed_kind_sql(kind: str) -> str:
+    """Which candidates an install is given. Names are read from t.me's public
+    preview by the registry itself (webcrawl.py) - an install would spend one
+    of its ~200 daily name lookups on each. Invite links cannot be read from
+    the web, so they are the work that needs an account. 'any' therefore
+    means invite links; only an explicit kind=username returns names."""
+    return "invite_link IS NULL" if kind == "username" else "invite_link IS NOT NULL"
+
+
+_SEED_RESULT = {"alive": "alive", "dead": "dead", "private": "forbidden"}
+
+
+def _seed_results_clean(items) -> list:
+    """(candidate key, status) pairs from an install's report: what it found
+    for the candidates it was given. At most 100, known statuses only."""
+    out = []
+    if not isinstance(items, list):
+        return out
+    for it in items[:100]:
+        if not isinstance(it, dict):
+            continue
+        key = it.get("username")
+        st = _SEED_RESULT.get(it.get("status"))
+        if isinstance(key, str) and 5 <= len(key) <= 80 and st:
+            out.append((key.strip(), st))
+    return out
+
+
 @app.get("/api/v1/seeds")
 async def get_seeds(
     request: Request,
@@ -1146,27 +1204,21 @@ async def get_seeds(
     _test_ips = [s.strip() for s in (os.getenv("TGARR_TEST_SHOWCASE_IPS") or "").split(",") if s.strip()]
     _bypass_rate_limit = ip_hash in _test_ips
 
+    if not _bypass_rate_limit and not _seeds_allow(ip_hash):
+        raise HTTPException(
+            429, f"daily seeds-pull limit exceeded ({SEEDS_PULLS_PER_IP_DAY}/day)",
+            headers={"Retry-After": "3600"})
     async with db_pool.acquire() as conn:
-        if not _bypass_rate_limit:
-            # Rate limit: same registry_pulls counter as /api/v1/registry
-            today_pulls = await conn.fetchval(
-                """SELECT count(*) FROM registry_pulls
-                   WHERE ip_hash = $1
-                     AND pulled_at > NOW() - INTERVAL '24 hours'""", ip_hash)
-            if today_pulls and today_pulls >= PULL_LIMIT_FREE_PER_DAY:
-                raise HTTPException(
-                    429, f"daily seeds-pull limit exceeded ({PULL_LIMIT_FREE_PER_DAY}/day free)")
 
         # Apply suspicion gate (same as /registry)
         susp = await _suspicion_score(ip_hash)
         if susp >= 60:
             raise HTTPException(403, "suspicion-blocked")
 
-        where_clauses = ["validation_status = 'pending'"]
-        if kind == "username":
-            where_clauses.append("invite_link IS NULL")
-        elif kind == "invite":
-            where_clauses.append("invite_link IS NOT NULL")
+        # not looked at yet: 'pending', or never given a status at all
+        # (invite links reported by installs arrive that way)
+        where_clauses = ["(validation_status = 'pending' OR validation_status IS NULL)",
+                         _seed_kind_sql(kind)]
 
         sql = f"""SELECT username, invite_link, source, category,
                          audience_hint, language, region
@@ -1175,11 +1227,6 @@ async def get_seeds(
                   ORDER BY RANDOM()
                   LIMIT $1"""
         rows = await conn.fetch(sql, batch)
-
-        # Log the pull (same registry_pulls table used for /registry)
-        await conn.execute(
-            "INSERT INTO registry_pulls (ip_hash, api_key_set) VALUES ($1, FALSE)",
-            ip_hash)
 
     return {
         "version": VERSION,

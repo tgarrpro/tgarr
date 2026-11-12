@@ -2906,11 +2906,10 @@ INSTANCE_UUID_ROTATE_DAYS = 7
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
 FEDERATION_VALIDATOR_ENABLED = os.environ.get("TGARR_FEDERATION_VALIDATOR", "true").lower() == "true"
-# 3 seeds an hour ≈ 70 username lookups a day, and never more than the
-# background share of the day's allowance (_MTPROTO_BG_SHARE): this is work
-# done for the federation, on the user's account, and it comes after the
-# user's own. (6 an hour was ~144/day - 70% of the allowance; the first
-# default, 20, was ~360.)
+# 3 candidates an hour, about 70 a day. Since 0.5.7 these are invite links
+# only: the registry reads channel names from Telegram's public web preview
+# itself, so an install no longer spends its name lookups (about 200 a day)
+# on the federation. Looking at an invite link does not join anything.
 SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "3"))
 SEEDS_INTERVAL_SEC = int(os.environ.get("TGARR_SEEDS_INTERVAL_SEC", "3600"))  # 1h
 PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/seed -> 1/min resolveUsername
@@ -5510,7 +5509,7 @@ async def federation_validator() -> None:
                 pass
             # ─── 1. Fetch a batch from central ──────────────────────────
             try:
-                url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
+                url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}&kind=invite"
                 req = urllib.request.Request(url, headers={
                     "User-Agent": TGARR_UA})
                 resp = await asyncio.to_thread(
@@ -5530,6 +5529,7 @@ async def federation_validator() -> None:
 
             log.info("[fed-validator] received %d seeds to validate", len(seeds))
             verified_alive = []
+            seed_results = []       # what became of every candidate, alive or not
             flood_aborted = False
 
             # ─── 2. Validate each via TG ────────────────────────────────
@@ -5560,10 +5560,16 @@ async def federation_validator() -> None:
                     # noise, federation value 0. The subscribe path already
                     # rejects these; the validator must too, or it just feeds
                     # central garbage seeds that every client re-validates.
+                    seed_results.append({"username": uname, "status": "alive"})
                     noise_hit, noise_kw = _is_noise_title(title, real_username)
                     if noise_hit:
                         log.info("[fed-validator] NOISE-TITLE @%s kw=%r title=%s — skip",
                                  real_username, noise_kw, (title or "")[:40])
+                        await asyncio.sleep(PER_SEED_DELAY_SEC)
+                        continue
+                    if invite and not _cu:
+                        # a private channel behind an invite link: it has no
+                        # public name to list, the candidate is simply done
                         await asyncio.sleep(PER_SEED_DELAY_SEC)
                         continue
                     verified_alive.append({
@@ -5584,14 +5590,22 @@ async def federation_validator() -> None:
                     break
                 except (UsernameNotOccupied, UsernameInvalid):
                     log.info("[fed-validator] dead @%s", uname)
+                    seed_results.append({"username": uname, "status": "dead"})
                 except (ChannelInvalid, ChannelPrivate):
                     log.info("[fed-validator] private/forbidden @%s", uname)
+                    seed_results.append({"username": uname, "status": "private"})
                 except Exception as e:
-                    log.warning("[fed-validator] err @%s: %s", uname, str(e)[:80])
+                    # an invite link that expired or never existed (matched by
+                    # name: the class lives in different places across libraries)
+                    if type(e).__name__ in ("InviteHashExpired", "InviteHashInvalid", "InviteHashEmpty"):
+                        log.info("[fed-validator] dead invite %s", uname)
+                        seed_results.append({"username": uname, "status": "dead"})
+                    else:
+                        log.warning("[fed-validator] err @%s: %s", uname, str(e)[:80])
                 await asyncio.sleep(PER_SEED_DELAY_SEC)
 
             # ─── 3. Push verified-alive back to central ─────────────────
-            if verified_alive:
+            if verified_alive or seed_results:
                 try:
                     async with db_pool.acquire() as conn:
                         row = await conn.fetchrow(
@@ -5614,6 +5628,9 @@ async def federation_validator() -> None:
                         "instance_uuid": uuid_val,
                         "tgarr_version": TGARR_VERSION,
                         "channels": verified_alive,
+                        # every candidate's outcome, so that a dead one is
+                        # not handed to the next install again
+                        "seed_results": seed_results,
                     }
                     req = urllib.request.Request(
                         REGISTRY_URL + "/api/v1/contribute",
@@ -5624,8 +5641,8 @@ async def federation_validator() -> None:
                     resp = await asyncio.to_thread(
                         lambda: urllib.request.urlopen(req, timeout=30).read())
                     result = json.loads(resp.decode())
-                    log.info("[fed-validator] pushed %d alive: %s",
-                             len(verified_alive), result)
+                    log.info("[fed-validator] pushed %d alive, %d outcomes: %s",
+                             len(verified_alive), len(seed_results), result)
                 except Exception as e:
                     log.warning("[fed-validator] contribute-back failed: %s", e)
 
