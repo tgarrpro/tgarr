@@ -440,6 +440,23 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
                                    lambda: app.get_messages(chat_id, msg_id))
         except ChannelInvalid:
             pass
+        # A PUBLIC channel can be read without being a member. If we know its
+        # username, resolve it (one lookup, then cached in the session) and
+        # retry before spending a join — joins are capped at a handful per
+        # day and clutter the user's own Telegram.
+        try:
+            async with db_pool.acquire() as conn:
+                _uname = await conn.fetchval(
+                    "SELECT username FROM channels WHERE tg_chat_id=$1", chat_id)
+            if _uname:
+                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname))
+                return await _mtproto("get_messages",
+                                      lambda: app.get_messages(chat_id, msg_id))
+        except FloodWait:
+            raise
+        except Exception as e:
+            log.info("[mtproto] read-without-join failed for %s (%s) — will try join",
+                     chat_id, str(e)[:80])
         # Last resort: join the channel. join_chat(chat_id) only works if we
         # have access_hash. For a new account that never resolved this peer,
         # we need username lookup. Try chat_id first (cheap), fallback to
@@ -1561,10 +1578,37 @@ async def _process_one_download(row_payload: dict) -> None:
             _safe = os.path.basename(
                 (getattr(_media, "file_name", None) or "").replace("\\", "/")
             ).strip().lstrip(".")
-            _dest = f"{target_dir}/{_safe}" if _safe else f"{target_dir}/"
-            local_path = await _mtproto("download_media",
-                lambda: app.download_media(msg, file_name=_dest,
-                                           progress=_progress))
+            if _safe:
+                os.makedirs(target_dir, exist_ok=True)
+                _final = os.path.join(target_dir, _safe)
+                _part = _final + ".part"
+                _total = int(getattr(_media, "file_size", 0) or 0)
+
+                async def _download():
+                    done = 0
+                    try:
+                        with open(_part, "wb") as f:
+                            async for part in _stream_media_fast(msg, _media):
+                                f.write(part)
+                                done += len(part)
+                                await _progress(done, _total or done)
+                        if _total and done < _total:
+                            raise RuntimeError(f"short download: {done} of {_total} bytes")
+                        os.replace(_part, _final)
+                        return _final
+                    except BaseException:
+                        try:
+                            os.remove(_part)
+                        except OSError:
+                            pass
+                        raise
+
+                local_path = await _mtproto("download_media", _download)
+            else:
+                # no usable file name on the message: let Pyrogram name it
+                local_path = await _mtproto("download_media",
+                    lambda: app.download_media(msg, file_name=f"{target_dir}/",
+                                               progress=_progress))
         local_path = await _rename_for_arr(str(local_path), row)
         try:
             os.chmod(local_path, 0o666)
@@ -2168,6 +2212,83 @@ async def _fetch_file_bytes(media, max_total: int = 24 * 1024 * 1024):
                      type(e).__name__)
             await _drop_media_session(fid.dc_id)
     return None
+
+
+class _FastPathUnavailable(Exception):
+    """The cached-media-session path cannot serve this file (e.g. Telegram
+    redirected it to a CDN). Nothing has been yielded; use Pyrogram's own
+    downloader instead."""
+
+
+async def _stream_file_cached(media):
+    """Yield a file's bytes in 1 MB chunks over the cached media session of
+    its DC.
+
+    Compared with Pyrogram's stream/download (a new media session per file,
+    plus a new auth key and auth.ExportAuthorization for every cross-DC file):
+    no per-file session setup, no per-file cross-DC authorization — which is
+    the call a multi-file grab used to hit FloodWait on — and a dropped
+    connection resumes at the current offset instead of failing the file.
+    Raises _FastPathUnavailable before the first byte if this path does not
+    apply. FloodWait propagates.
+    """
+    from pyrogram import raw
+    from pyrogram.file_id import FileType
+    fid = FileId.decode(media.file_id)
+    if fid.file_type == FileType.CHAT_PHOTO:
+        raise _FastPathUnavailable("chat photo")
+    if fid.file_type == FileType.PHOTO:
+        location = raw.types.InputPhotoFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    else:
+        location = raw.types.InputDocumentFileLocation(
+            id=fid.media_id, access_hash=fid.access_hash,
+            file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
+    chunk = 1024 * 1024
+    offset = 0
+    reopened = 0
+    while True:
+        sess = await _media_session(fid.dc_id)
+        try:
+            r = await sess.invoke(
+                raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk),
+                sleep_threshold=30)
+        except FloodWait:
+            raise
+        except (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            reopened += 1
+            await _drop_media_session(fid.dc_id)
+            if reopened > 3:
+                if offset == 0:
+                    raise _FastPathUnavailable(f"media session: {type(e).__name__}")
+                raise RuntimeError(f"media session kept dropping at offset {offset}: {e}")
+            log.info("[media-session] DC%s dropped at offset %d (%s) — resuming",
+                     fid.dc_id, offset, type(e).__name__)
+            continue
+        if not isinstance(r, raw.types.upload.File):
+            if offset == 0:
+                raise _FastPathUnavailable(type(r).__name__)
+            raise RuntimeError(f"unexpected {type(r).__name__} at offset {offset}")
+        if r.bytes:
+            yield r.bytes
+        if len(r.bytes) < chunk:
+            return
+        offset += chunk
+        reopened = 0
+
+
+async def _stream_media_fast(msg, media):
+    """Stream a message's file: cached media session first, Pyrogram's own
+    streamer when that path does not apply."""
+    try:
+        async for part in _stream_file_cached(media):
+            yield part
+        return
+    except _FastPathUnavailable as e:
+        log.info("[media-session] fast path n/a (%s) — using Pyrogram streamer", e)
+    async for part in app.stream_media(msg):
+        yield part
 
 
 async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
@@ -4129,7 +4250,7 @@ async def on_demand_media_downloader() -> None:
                 expected = row["file_size"] or 0
                 written = 0
                 with open(target, "wb") as f:
-                    async for chunk in app.stream_media(msg):
+                    async for chunk in _stream_media_fast(msg, media):
                         f.write(chunk)
                         written += len(chunk)
 
