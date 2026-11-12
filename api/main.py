@@ -8617,9 +8617,18 @@ async def page_settings(request: Request):
     cache_detail = " · ".join(
         f'{r["n"]:,} {_kind.get(r["kind"], r["kind"])} ({_fmt_size(r["bytes"]) or "0"})'
         for r in _usage) or "nothing downloaded yet"
+    _full = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
+    _uname = user.get("username")
+    try:                                   # the account's own picture, when it has one
+        user_icon = (f'<img src="/api/me/avatar?v={int(os.path.getmtime(login.AVATAR_FILE))}" alt="" '
+                     f'style="width:46px;height:46px;border-radius:50%;object-fit:cover;display:block">')
+    except OSError:
+        user_icon = "👤"
     user_html = (
-        f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
-        f'<span class="pill ok">signed in</span></div>'
+        f'<div class="name">{html.escape(_full or (("@" + _uname) if _uname else "-"))} '
+        + (f'<span style="color:var(--muted);font-weight:400">@{html.escape(_uname)}</span> '
+           if _uname and _full else '')
+        + '<span class="pill ok">signed in</span></div>'
         if authed else
         '<div class="name">not signed in <span class="pill bad">no session</span></div>'
     )
@@ -8642,7 +8651,7 @@ async def page_settings(request: Request):
 <h2 class="section">Telegram account</h2>
 <div class="dl-list">
   <div class="dl-item">
-    <div class="icon">👤</div>
+    <div class="icon">{user_icon}</div>
     <div class="info">{user_html}
       <div class="meta">API ID <code>{os.environ.get("TG_API_ID","-")}</code> · session at <code>_data/session/tgarr.session</code></div>
     </div>
