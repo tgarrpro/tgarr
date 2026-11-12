@@ -2504,7 +2504,14 @@ def _pdf_clean(im):
     return grey.point([255 if v >= 205 else int(255 * (v / 205) ** 1.5) for v in range(256)])
 
 
-def _pdf_render(path: str, n: int, width: int, clean: bool) -> bytes:
+def _pdf_render(path: str, n: int, width: int, clean: bool):
+    """One page as a picture: (bytes, media type).
+
+    As it is: JPEG. Cleaned: the page is drawn without any lossy step
+    (PNG from poppler), filtered, sharpened a little so that strokes the
+    filter thinned get their edge back, and sent as a grey PNG - text on
+    white compresses well losslessly and keeps crisp edges, where JPEG
+    leaves a haze around every stroke."""
     import subprocess
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -2515,23 +2522,25 @@ def _pdf_render(path: str, n: int, width: int, clean: bool) -> bytes:
                 os.nice(10)
             except OSError:
                 pass
+        fmt = ["-png"] if clean else ["-jpeg", "-jpegopt", "quality=93"]
         r = subprocess.run(
             ["pdftoppm", "-f", str(n), "-l", str(n), "-singlefile",
-             "-scale-to-x", str(width), "-scale-to-y", "-1",
-             "-jpeg", "-jpegopt", "quality=93", path, base],
+             "-scale-to-x", str(width), "-scale-to-y", "-1", *fmt, path, base],
             capture_output=True, timeout=60, preexec_fn=_nice)
-        out = base + ".jpg"
+        out = base + (".png" if clean else ".jpg")
         if r.returncode != 0 or not os.path.exists(out):
             raise RuntimeError("could not draw this page")
         if not clean:
             with open(out, "rb") as f:
-                return f.read()
+                return f.read(), "image/jpeg"
         import io as _io
-        from PIL import Image
+        from PIL import Image, ImageFilter
         buf = _io.BytesIO()
         with Image.open(out) as im:
-            _pdf_clean(im.convert("RGB")).save(buf, "JPEG", quality=93)
-        return buf.getvalue()
+            page = _pdf_clean(im.convert("RGB"))
+            page = page.filter(ImageFilter.UnsharpMask(radius=1.2, percent=90, threshold=2))
+            page.save(buf, "PNG", optimize=False, compress_level=6)
+        return buf.getvalue(), "image/png"
 
 
 @app.get("/pdf/{msg_id}/info")
@@ -2584,7 +2593,7 @@ async def pdf_page(msg_id: int, n: int, w: int = 1200, clean: int = 0):
         return Response(f"cannot draw this page: {e}", status_code=500)
     if n == 1:
         await _touch_local(msg_id)
-    return Response(content=data, media_type="image/jpeg",
+    return Response(content=data[0], media_type=data[1],
                     headers={"Cache-Control": "private, max-age=86400"})
 
 
