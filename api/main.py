@@ -397,6 +397,22 @@ async def _migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_releases_primary_msg ON releases (primary_msg_id);
             CREATE INDEX IF NOT EXISTS idx_downloads_release ON downloads (release_id);
             CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads (status);
+            -- One-time: metadata used to be taken from the first search result,
+            -- so releases carry posters/titles of unrelated things ("1080p",
+            -- a university, an actress). Clear every attached match and let
+            -- the worker look them up again under the stricter rules. The
+            -- +0.3 score boost a "hit" earned is taken back too.
+            DO $recheck$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM config WHERE key = 'meta_recheck_0_5_5') THEN
+                UPDATE releases
+                   SET metadata_source = NULL, metadata_lookup_at = NULL,
+                       poster_url = NULL, canonical_title = NULL, overview = NULL,
+                       parse_score = GREATEST(COALESCE(parse_score, 0) - 0.3, 0.30)
+                 WHERE metadata_source IN ('tmdb', 'wikipedia');
+                INSERT INTO config (key, value) VALUES ('meta_recheck_0_5_5', 'done')
+                  ON CONFLICT (key) DO NOTHING;
+              END IF;
+            END $recheck$;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -652,7 +668,16 @@ async def _metadata_worker():
                 continue
             current_score = float(row["parse_score"] or 0)
             async with db_pool.acquire() as conn:
-                if result:
+                if result is md.UNMATCHED:
+                    # The sources answered, but not with this title (or the
+                    # "title" is just "1080p"). Attach nothing and judge
+                    # nothing: no poster, no score change, no delete.
+                    await conn.execute("""
+                        UPDATE releases SET metadata_source='unmatched',
+                          metadata_lookup_at=NOW()
+                        WHERE id=$1
+                    """, row["id"])
+                elif result:
                     # TMDB hit — boost parse_score (this IS a real movie/show)
                     new_score = min(1.0, current_score + 0.3)
                     await conn.execute("""
