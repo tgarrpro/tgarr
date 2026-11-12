@@ -154,7 +154,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.6"
+TGARR_VERSION = "0.5.7"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -321,6 +321,7 @@ async def _startup():
     asyncio.create_task(_ebook_queue_restore())
     asyncio.create_task(_arr_alias_sync_worker())
     asyncio.create_task(_cache_gc_worker())
+    asyncio.create_task(_update_check_worker())
 
 
 async def _migrate_schema():
@@ -1467,6 +1468,149 @@ async def _cache_usage() -> list:
                      GROUP BY local_path) x
                WHERE split_part(local_path, '/', 1) IN ('video', 'audio', 'library')
                GROUP BY 1 ORDER BY 3 DESC""")
+
+
+# ═════════════════════════════════════════════════
+# Is there a newer tgarr, and is this install updating itself?
+#
+# Until 0.5.7 nothing in tgarr said that a newer version existed. Installs
+# whose updater was missing or broken (most installs made before 0.5.6, and
+# 0.5.6 itself on a current Docker engine) simply stayed where they were, and
+# their owners had no way to know.
+#
+# Every ~6 hours the registry is asked which version is current (one small
+# GET that sends nothing about this install; the answer is cached by the CDN).
+# A newer version alone is not news - the updater installs it within the
+# hour. It becomes a notice on the Dashboard when this install is STILL
+# behind several hours after it first learned of the version: then the
+# updater is not doing its job, and the notice says what to run.
+# Off with TGARR_UPDATE_CHECK=false.
+# ═════════════════════════════════════════════════
+UPDATE_CHECK_ENABLED = os.environ.get("TGARR_UPDATE_CHECK", "true").lower() != "false"
+UPDATE_REGISTRY_URL = os.environ.get("TGARR_REGISTRY_URL", "https://tgarr.me").rstrip("/")
+UPDATE_STALLED_AFTER_S = 4 * 3600
+UPDATE_HELP_URL = "https://github.com/tgarrpro/tgarr/blob/main/docs/install/upgrade.md"
+_PINNED_TAG = os.environ.get("TGARR_PINNED_TAG", "").strip()
+_VERSION_RX = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,4}$")
+
+
+def _ver_tuple(v: str) -> tuple:
+    return tuple(int(x) for x in v.split(".")) if v and _VERSION_RX.match(v) else ()
+
+
+def _update_fetch() -> str:
+    req = urllib.request.Request(UPDATE_REGISTRY_URL + "/api/v1/version",
+                                 headers={"User-Agent": f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        v = str(_json.loads(r.read(65536)).get("current_version", ""))
+    return v if _VERSION_RX.match(v) else ""
+
+
+async def _update_note(latest: str, now: float) -> None:
+    """Record what the registry said. `update_seen` remembers WHEN this install
+    first learned of a version newer than itself; it is what 'still behind
+    after N hours' is measured from, and it is kept across restarts."""
+    async with db_pool.acquire() as conn:
+        async def put(k, v):
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+        await put("update_latest", latest)
+        await put("update_checked_at", str(int(now)))
+        if _ver_tuple(latest) > _ver_tuple(TGARR_VERSION):
+            seen = await conn.fetchval("SELECT value FROM config WHERE key = 'update_seen'") or ""
+            if seen.split("|")[0] != latest:
+                await put("update_seen", f"{latest}|{int(now)}")
+        else:
+            await conn.execute("DELETE FROM config WHERE key IN ('update_seen', 'update_dismissed')")
+
+
+async def _update_check_worker():
+    import random
+    if not UPDATE_CHECK_ENABLED:
+        return
+    await asyncio.sleep(random.uniform(45, 300))
+    while True:
+        try:
+            latest = await asyncio.to_thread(_update_fetch)
+            if latest:
+                await _update_note(latest, time.time())
+        except Exception as e:
+            log.info("[update] could not ask %s which version is current: %s", UPDATE_REGISTRY_URL, e)
+        # 6 h, spread out so installs do not all ask at once
+        await asyncio.sleep(21600 + random.uniform(0, 3600))
+
+
+def _update_state(rows: dict, now: float) -> dict:
+    """Pure: what to tell the user, from the stored config values."""
+    latest = rows.get("update_latest") or ""
+    if not UPDATE_CHECK_ENABLED or _ver_tuple(latest) <= _ver_tuple(TGARR_VERSION):
+        return {"kind": "current"}
+    seen_v, _, seen_at = (rows.get("update_seen") or "").partition("|")
+    try:
+        behind_s = max(0, now - float(seen_at)) if seen_v == latest else 0
+    except ValueError:
+        behind_s = 0
+    st = {"latest": latest, "hours": int(behind_s // 3600)}
+    if rows.get("update_dismissed") == latest:
+        st["kind"] = "dismissed"
+    elif _PINNED_TAG and _PINNED_TAG not in ("latest", "edge"):
+        st.update(kind="pinned", tag=_PINNED_TAG)
+    elif behind_s >= UPDATE_STALLED_AFTER_S:
+        st["kind"] = "stalled"
+    else:
+        st["kind"] = "pending"
+    return st
+
+
+async def _update_banner() -> str:
+    async with db_pool.acquire() as conn:
+        rows = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key IN "
+            "('update_latest', 'update_seen', 'update_dismissed')")}
+    st = _update_state(rows, time.time())
+    if st["kind"] in ("current", "dismissed", "pending"):
+        return ""
+    latest = html.escape(st["latest"])
+    hide = ('<form method="POST" action="/api/update/dismiss" style="margin:0">'
+            '<button class="abtn" type="submit" title="hide until the next version">Hide</button></form>')
+    box = ('<div style="background:{bg};border:1px solid {bd};border-radius:12px;padding:14px 18px;'
+           'margin-bottom:16px;line-height:1.6;display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">'
+           '<div style="flex:1;min-width:240px">{body}</div>{hide}</div>')
+    if st["kind"] == "pinned":
+        body = (f'<b>tgarr {latest} is available.</b> This install stays on {html.escape(TGARR_VERSION)} '
+                f'because <code>TGARR_TAG={html.escape(st["tag"])}</code> is set in <code>.env</code>. '
+                f'Remove that line and run <code>docker compose up -d</code> to follow new versions.')
+        return box.format(bg="#eff6ff", bd="#bfdbfe", body=body, hide=hide)
+    body = (f'<b>tgarr {latest} is available, and this install is still on {html.escape(TGARR_VERSION)}.</b> '
+            f'It has not updated itself in {st["hours"]} hours, so its updater is probably missing or not running. '
+            f'To update now, in the folder that holds <code>docker-compose.yml</code>:'
+            f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
+            f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">How to make updates automatic again</a>')
+    return box.format(bg="#fffbeb", bd="#fde68a", body=body, hide=hide)
+
+
+@app.post("/api/update/dismiss")
+async def update_dismiss():
+    async with db_pool.acquire() as conn:
+        latest = await conn.fetchval("SELECT value FROM config WHERE key = 'update_latest'")
+        if latest:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('update_dismissed', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", latest)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/api/update")
+async def update_status():
+    async with db_pool.acquire() as conn:
+        rows = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key IN "
+            "('update_latest', 'update_seen', 'update_dismissed', 'update_checked_at')")}
+    st = _update_state(rows, time.time())
+    st.update(running=TGARR_VERSION, enabled=UPDATE_CHECK_ENABLED,
+              checked_at=int(rows["update_checked_at"]) if rows.get("update_checked_at", "").isdigit() else None)
+    return st
 
 
 def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> str:
@@ -5228,6 +5372,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
     sto = _status("warn" if free_gb < 10 else "ok", "Storage",
                   f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
     status_html = f'<div class="st-row">{tg}{cr}{sh}{sto}</div>'
+    status_html = await _update_banner() + status_html
     if not browsable:
         status_html = (
             '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;'

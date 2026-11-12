@@ -106,6 +106,9 @@ services:
       TGARR_BASE_URL: ${TGARR_BASE_URL:-}
       TMDB_API_KEY: ${TMDB_API_KEY:-}
       TGARR_API_KEY: ${TGARR_API_KEY:-}
+      # lets the Dashboard say "you pinned this version" instead of "your updater is broken"
+      TGARR_PINNED_TAG: ${TGARR_TAG:-}
+      TGARR_UPDATE_CHECK: ${TGARR_UPDATE_CHECK:-true}
       TGARR_UI_PASSWORD: ${TGARR_UI_PASSWORD:-}
     volumes:
       - ./_data/session:/app/session
