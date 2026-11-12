@@ -8795,7 +8795,7 @@ async def page_settings(request: Request):
 .acct-sub {{ margin-top:4px; font-size:14px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
 .acct-meta {{ margin-top:10px; font-size:13px; color:var(--muted); }}
 .acct-act {{ flex:none; }}
-.sys {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(165px, 1fr)); gap:12px; }}
+.sys {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(165px, 1fr)); gap:12px; }}
 .sys-t {{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px;
   box-shadow:var(--shadow); }}
 .sys-t.warn {{ border-color:#fcd34d; background:#fffbeb; }}
