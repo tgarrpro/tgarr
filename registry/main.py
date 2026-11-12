@@ -1503,3 +1503,8 @@ Each instance POSTs eligible channels here; clients pull a deduped, contributor-
 <table><thead><tr><th>username</th><th>title</th><th>members</th><th>distinct contributors</th></tr></thead>
 <tbody>{rows or '<tr><td colspan="4" style="text-align:center;color:#94a3b8">no contributions yet</td></tr>'}</tbody></table>
 </body></html>"""
+
+
+# Operator panel at /admin/ - off unless registry/admin.json exists.
+import admin as _admin  # noqa: E402
+_admin.setup(app, lambda: db_pool, VERSION, _ip_hash)
