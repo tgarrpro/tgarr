@@ -510,6 +510,46 @@ async def _migrate_schema():
                   ON CONFLICT (key) DO NOTHING;
               END IF;
             END $recheck2$;
+            -- One release per file. file_unique_id is Telegram's identity for
+            -- the bytes: the same file reposted in a channel, or forwarded to
+            -- five others, is still one file. Every copy used to become its
+            -- own release (a quarter of all releases on a long-running
+            -- install; one file had 228).
+            CREATE INDEX IF NOT EXISTS idx_messages_fuid ON messages (file_unique_id)
+              WHERE file_unique_id IS NOT NULL;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS dead_at TIMESTAMPTZ;
+            DO $dedup$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM config WHERE key = 'dedup_releases_0_5_6') THEN
+                -- Keep the copy whose source is the most useful: one that has
+                -- download history, then verified metadata, then a channel the
+                -- account is still in / follows / that is still alive, then
+                -- the better parse, then the newer post.
+                CREATE TEMP TABLE _dup_rel ON COMMIT DROP AS
+                  SELECT id FROM (
+                    SELECT r.id,
+                           row_number() OVER (
+                             PARTITION BY m.file_unique_id
+                             ORDER BY (EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = r.id)) DESC,
+                                      (r.metadata_source IN ('tmdb', 'wikidata')) DESC NULLS LAST,
+                                      COALESCE(c.is_joined, FALSE) DESC,
+                                      COALESCE(c.subscribed, FALSE) DESC,
+                                      (c.dead_at IS NULL) DESC,
+                                      r.parse_score DESC NULLS LAST,
+                                      r.posted_at DESC NULLS LAST,
+                                      r.id) AS rn
+                    FROM releases r
+                    JOIN messages m ON m.id = r.primary_msg_id
+                    JOIN channels c ON c.id = m.channel_id
+                    WHERE m.file_unique_id IS NOT NULL) x
+                  WHERE rn > 1
+                    AND NOT EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = x.id);
+                UPDATE monitored_movies SET grabbed_release_id = NULL
+                 WHERE grabbed_release_id IN (SELECT id FROM _dup_rel);
+                DELETE FROM releases WHERE id IN (SELECT id FROM _dup_rel);
+                INSERT INTO config (key, value) VALUES ('dedup_releases_0_5_6', 'done')
+                  ON CONFLICT (key) DO NOTHING;
+              END IF;
+            END $dedup$;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,

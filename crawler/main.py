@@ -1081,6 +1081,14 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
                              min_tv_bytes=MIN_TV_BYTES)
     if not verdict["create"]:
         return None
+    # One release per file: if this exact file (file_unique_id) already has a
+    # release through another post, this post is just another source for it.
+    if await conn.fetchval(
+            """SELECT 1 FROM releases r JOIN messages m ON m.id = r.primary_msg_id
+               WHERE m.file_unique_id = (SELECT file_unique_id FROM messages WHERE id = $1)
+                 AND m.file_unique_id IS NOT NULL AND m.id <> $1
+               LIMIT 1""", msg_row_id):
+        return None
     score = verdict["score"]
     type_ = verdict["type"]
     if verdict["quality"] and not parsed.get("quality"):
@@ -2518,6 +2526,27 @@ async def _drop_gone_messages(channel_id: int, msg_ids: list) -> int:
         ids = [i for i in msg_ids if i not in keep]
         if not ids:
             return 0
+        # A release whose source post is gone is not lost if the same file is
+        # still posted somewhere else: move the release to that copy.
+        moved = await conn.fetch(
+            """UPDATE releases r
+                  SET primary_msg_id = alt.id
+                 FROM messages gone
+                 JOIN LATERAL (
+                        SELECT m2.id FROM messages m2
+                        JOIN channels c2 ON c2.id = m2.channel_id
+                        WHERE m2.file_unique_id = gone.file_unique_id
+                          AND m2.id <> ALL($1::bigint[])
+                          AND c2.dead_at IS NULL
+                        ORDER BY COALESCE(c2.is_joined, FALSE) DESC,
+                                 COALESCE(c2.subscribed, FALSE) DESC, m2.id DESC
+                        LIMIT 1) alt ON TRUE
+                WHERE gone.id = ANY($1::bigint[])
+                  AND gone.file_unique_id IS NOT NULL
+                  AND r.primary_msg_id = gone.id
+                RETURNING r.id""", ids)
+        if moved:
+            log.info("[stale] %d release(s) moved to another copy of the same file", len(moved))
         rel_ids = [r["id"] for r in await conn.fetch(
             "SELECT id FROM releases WHERE primary_msg_id = ANY($1::bigint[])", ids)]
     n = await _purge_messages(channel_id, ids)
