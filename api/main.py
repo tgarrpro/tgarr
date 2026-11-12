@@ -3597,7 +3597,7 @@ poll();
 # ════════════════════════════════════════════════════════════════════
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
-<meta charset="utf-8"><title>tgarr — sign in to Telegram</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>tgarr — sign in to Telegram</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <style>
 :root { --bg:#f5f7fa; --bg2:#ffffff; --fg:#1e293b; --muted:#64748b; --accent:#229ED9; --tg-blue:#229ED9; --border:#e2e8f0; --ok:#15803d; --bad:#b91c1c; }

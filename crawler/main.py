@@ -2420,7 +2420,7 @@ async def wait_for_session() -> None:
     """Block until the api container's login flow finishes signing in."""
     if _session_authed():
         return
-    log.info("[startup] no Telegram session yet — open http://<host>:8765/login + scan QR")
+    log.info("[startup] no Telegram session yet — open tgarr in a browser (http://<this-host>:8765 unless you changed TGARR_PORT) and sign in")
     log.info("[startup] waiting for signed-in session at %s …", SESSION_PATH)
     while not _session_authed():
         await asyncio.sleep(5)
