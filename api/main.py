@@ -7123,10 +7123,11 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'{"<span style=color:#e11d48>♥</span>" if r["fav"] else ""} {state}</td>'
                 f'<td class="num">{_fmt_size(total)}</td>'
                 f'<td class="num">{_fmt_time(r["used"]) if r["used"] else ""}</td>'
-                f'<td class="ac"><a class="dl-btn" href="/media/{r["id"]}" download '
-                f'title="download to this device">⬇</a> '
-                f'<button class="dl-btn bad" onclick="fetchRemove({r["id"]})" '
-                f'title="remove from the server">✗</button></td></tr>')
+                f'<td class="ac"><div class="dl-ctrls">'
+                f'<a class="dl-btn sq" href="/media/{r["id"]}" download '
+                f'title="download to this device">⬇</a>'
+                f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
+                f'title="remove from the server">✗</button></div></td></tr>')
         table = (
             '<style>.sv-list{width:100%;border-collapse:collapse;background:var(--surface);'
             'border:1px solid var(--border);border-radius:10px;overflow:hidden}'
@@ -7140,7 +7141,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             '.sv-list .nm a:hover{color:var(--accent)}</style>'
             '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
             '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
-            '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()">✗ Remove selected</button>'
+            '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
             '<span id="svN" style="color:var(--muted)"></span></div>'
             '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
             '<th>last opened</th><th></th></tr></thead>'
@@ -7311,16 +7312,27 @@ function dlAct(id, action){
     .catch(e=>alert('failed: '+e));
 }
 </script>
-<style>
-.dl-ctrls{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;margin-bottom:4px}
-.dl-btn{font-size:11px;padding:4px 10px;border:1px solid #d1d5db;background:#f9fafb;border-radius:4px;cursor:pointer;color:#374151}
-.dl-btn:hover{background:#e5e7eb}
-.dl-btn.ok{color:#065f46;border-color:#a7f3d0;background:#ecfdf5}
-.dl-btn.ok:hover{background:#d1fae5}
-.dl-btn.bad{color:#991b1b;border-color:#fecaca;background:#fef2f2}
-.dl-btn.bad:hover{background:#fee2e2}
-.dl-time{font-size:11px;color:#888;text-align:right;margin-top:2px}
-</style>'''
+'''
+    # one look for every action button on this page: same height, same width
+    # for the worded ones, square for the icon-only ones in the table
+    dl_css = """<style>
+.dl-item .right{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:4px}
+.dl-ctrls{display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:nowrap}
+.dl-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;box-sizing:border-box;
+  min-width:104px;height:34px;padding:0 14px;font:inherit;font-size:13px;font-weight:500;line-height:1;
+  border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;
+  cursor:pointer;text-decoration:none;white-space:nowrap;transition:background .12s,border-color .12s,color .12s}
+.dl-btn:hover{border-color:var(--accent);color:var(--accent)}
+.dl-btn:disabled{opacity:.4;cursor:default;border-color:var(--border);color:var(--fg)}
+.dl-btn.ok{color:#047857;border-color:#a7f3d0;background:#ecfdf5}
+.dl-btn.ok:hover{background:#d1fae5;border-color:#34d399;color:#047857}
+.dl-btn.bad{color:#b91c1c;border-color:#fecaca;background:#fef2f2}
+.dl-btn.bad:hover{background:#fee2e2;border-color:#f87171;color:#b91c1c}
+.dl-btn.sq{min-width:34px;width:34px;padding:0}
+.dl-time{font-size:11px;color:#888;text-align:right}
+@media (max-width:640px){.dl-btn{min-width:0;padding:0 10px}.dl-ctrls{flex-wrap:wrap}}
+</style>"""
+
     def _tab(key, label, n):
         on = tab == key
         style = ("border-bottom:2px solid var(--accent);color:var(--accent-hi);font-weight:600;"
@@ -7333,9 +7345,9 @@ function dlAct(id, action){
             + _tab("players", "Opened in players", len(fetches))
             + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active)) + '</div>')
     if tab == "players":
-        body = f'{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
+        body = f'{dl_css}{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
     else:
-        body = (f'{tabs}'
+        body = (f'{dl_css}{tabs}'
                 f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
                 f'{_render(active, show_finished=False)}'
                 f'<h2 class="section">History <span class="count">last 100</span></h2>'
