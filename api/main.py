@@ -1272,18 +1272,24 @@ async def _touch_local(msg_id: int) -> None:
         pass
 
 
-async def _want_fetch(msg_id: int) -> None:
+async def _want_fetch(msg_id: int, opened: bool = False) -> None:
     """Say "someone is asking for this file right now". The crawler keeps
     fetching a big file only while this keeps being said (see its
     _ondemand_fetch_one); a player, a reader or a browser download says it
-    every few seconds for as long as it is open."""
+    every few seconds for as long as it is open.
+
+    fetch_wanted_at also carries the two things a person can decide on the
+    Downloads page: 'epoch' = paused by hand (a player that is merely still
+    open does not undo that; opening the item again does), and a time in the
+    future = "finish this one whether or not anyone is watching"."""
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """UPDATE messages SET fetch_wanted_at = NOW()
                    WHERE id = $1 AND (fetch_wanted_at IS NULL
-                                      OR fetch_wanted_at < NOW() - INTERVAL '15 seconds')""",
-                msg_id)
+                          OR (fetch_wanted_at < NOW() - INTERVAL '15 seconds'
+                              AND ($2 OR fetch_wanted_at <> 'epoch')))""",
+                msg_id, opened)
     except Exception:
         pass
 
@@ -1295,8 +1301,10 @@ async def _revive_fetch(msg_id: int, lp: str) -> None:
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "UPDATE messages SET local_path = $$__user_queued__$$, fetch_wanted_at = NOW() "
-                "WHERE id = $1 AND local_path = $2", msg_id, lp)
+                "UPDATE messages SET local_path = $$__user_queued__$$, "
+                "fetch_wanted_at = GREATEST(fetch_wanted_at, NOW()) "
+                "WHERE id = $1 AND local_path = $2 "
+                "AND (fetch_wanted_at IS NULL OR fetch_wanted_at <> 'epoch')", msg_id, lp)
     except Exception:
         pass
 
@@ -1606,14 +1614,16 @@ async def _player_fetches() -> list:
                       m.fetch_wanted_at
                FROM messages m
                WHERE m.local_path = '__user_queued__'
-                  OR (m.fetch_wanted_at > NOW() - INTERVAL '1 day'
+                  OR ((m.fetch_wanted_at > NOW() - INTERVAL '1 day' OR m.fetch_wanted_at = 'epoch')
                       AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')
                ORDER BY m.fetch_wanted_at DESC NULLS LAST LIMIT 60""")
     out, now = [], _time.time()
     for r in rows:
         lp, total = r["local_path"], r["file_size"] or 0
+        paused = bool(r["fetch_wanted_at"] and r["fetch_wanted_at"].year < 2000)
+        pinned = bool(r["fetch_wanted_at"] and r["fetch_wanted_at"].timestamp() > now + 600)
         if lp == "__user_queued__":
-            out.append({"r": r, "state": "queued", "have": 0})
+            out.append({"r": r, "state": "queued", "have": 0, "pinned": pinned})
             continue
         if not lp.startswith(_CACHE_PREFIXES):
             continue
@@ -1623,8 +1633,9 @@ async def _player_fetches() -> list:
             continue
         if total and st.st_size >= total:
             continue                            # complete: not a fetch any more
-        out.append({"r": r, "have": st.st_size,
-                    "state": "fetching" if now - st.st_mtime < 30 else "stopped"})
+        out.append({"r": r, "have": st.st_size, "pinned": pinned,
+                    "state": ("paused" if paused else
+                              "fetching" if now - st.st_mtime < 30 else "stopped")})
     return out
 
 
@@ -1710,6 +1721,32 @@ async def fetch_remove_many(request: Request):
             await asyncio.to_thread(_cache_unlink, lp)
             n += 1
     return {"removed": n}
+
+
+@app.post("/api/fetch/{msg_id}/pause")
+async def fetch_pause(msg_id: int):
+    """Stop fetching, keep what has arrived. The crawler notices within
+    seconds; a player that is still open does not restart it."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET fetch_wanted_at = 'epoch' WHERE id = $1", msg_id)
+        # not started yet: take it out of the queue (nothing has arrived)
+        await conn.execute(
+            "UPDATE messages SET local_path = NULL "
+            "WHERE id = $1 AND local_path = '__user_queued__'", msg_id)
+    return {"ok": True}
+
+
+@app.post("/api/fetch/{msg_id}/resume")
+async def fetch_resume(msg_id: int):
+    """Fetch the rest, and finish it whether or not anyone is watching."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE messages SET fetch_wanted_at = NOW() + INTERVAL '1 day',
+                      local_path = '__user_queued__'
+               WHERE id = $1 AND (local_path IS NULL OR left(local_path, 2) <> '__'
+                                  OR local_path = '__user_queued__')""", msg_id)
+    return {"ok": True}
 
 
 @app.post("/api/fetch/{msg_id}/cancel")
@@ -3117,7 +3154,10 @@ async def media_status(msg_id: int):
             idle = _time.time() - os.path.getmtime(path)
         except OSError:
             idle = 1e9
-        if idle > 45:
+        async with db_pool.acquire() as conn:
+            _by_hand = await conn.fetchval(
+                "SELECT fetch_wanted_at = 'epoch' FROM messages WHERE id = $1", msg_id)
+        if idle > 45 and not _by_hand:      # paused by hand stays paused
             await _revive_fetch(msg_id, lp)
             return JSONResponse({"status": "queued", "bytes": bytes_, "total": total,
                                  "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc,
@@ -3127,7 +3167,11 @@ async def media_status(msg_id: int):
                             "mime": row["mime_type"], "media_type": row["media_type"],
                             "file_name": row["file_name"],
                             "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
+    async with db_pool.acquire() as conn:
+        _paused = await conn.fetchval(
+            "SELECT fetch_wanted_at = 'epoch' FROM messages WHERE id = $1", msg_id)
     return JSONResponse({"status": "downloading", "bytes": bytes_, "total": total,
+                        "paused": bool(_paused),
                         "mime": row["mime_type"], "media_type": row["media_type"],
                         "file_name": row["file_name"],
                         "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
@@ -3276,7 +3320,9 @@ function tgVideo(main){
       if (j.status === "downloading" && j.total) {
         const pct = Math.min(100, j.bytes / j.total * 100);
         $("vArr").style.display = "flex"; $("vArrBar").style.width = pct + "%";
-        $("vArrTxt").textContent = "still arriving: " + pct.toFixed(0) + "% here — skipping further ahead will wait";
+        $("vArrTxt").textContent = j.paused
+          ? "paused at " + pct.toFixed(0) + "% — resume it on the Downloads page, or reopen this film"
+          : "still arriving: " + pct.toFixed(0) + "% here — skipping further ahead will wait";
       } else if (j.status === "ready") { $("vArr").style.display = "none"; return; }
     } catch (e) {}
     setTimeout(arrival, 3000);
@@ -3300,7 +3346,7 @@ async def watch_page(msg_id: int):
         return HTMLResponse("<h1>404 — message not indexed</h1>", status_code=404)
     title = row["file_name"] or f"msg-{msg_id}"
     mt = row["media_type"] or "document"
-    await _want_fetch(msg_id)
+    await _want_fetch(msg_id, opened=True)
 
     # Trigger queueing immediately so the user doesn\'t wait for first poll.
     if not row["local_path"]:
@@ -7114,6 +7160,8 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
 
     _fetch_js = ('<script>function fetchCancel(id){fetch("/api/fetch/"+id+"/cancel",{method:"POST"})'
                  '.then(()=>location.reload())}'
+                 'function fetchAct(id,a){fetch("/api/fetch/"+id+"/"+a,{method:"POST"})'
+                 '.then(()=>setTimeout(()=>location.reload(),600))}'
                  'function fetchRemove(id){if(confirm("Remove this file from the server? '
                  'It stays in the index and can be fetched again."))fetchCancel(id)}</script>')
 
@@ -7128,7 +7176,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 "queued": ("queued", "warn", "⏳"),
                 "fetching": ("arriving", "accent", "⬇"),
                 "stopped": ("stopped — nobody is watching", "muted", "⏸"),
+                "paused": ("paused", "muted", "⏸"),
             }[it["state"]]
+            if it.get("pinned") and it["state"] in ("queued", "fetching"):
+                label += " · will finish on its own"
+            if it["state"] in ("queued", "fetching"):
+                act = (f'<button class="dl-btn" onclick="fetchAct({r["id"]},\'pause\')" '
+                       f'title="stop for now and keep what has arrived">⏸ Pause</button>')
+            else:
+                act = (f'<button class="dl-btn ok" onclick="fetchAct({r["id"]},\'resume\')" '
+                       f'title="fetch the rest, even with no player open">▶ Resume</button>')
             dc = _dc_badge(r["file_dc"], _my_dc) if r["file_dc"] else ""
             items.append(
                 f'<div class="dl-item"><div class="icon">{icon}</div><div class="info">'
@@ -7139,14 +7196,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<div class="dl-progress"><div class="dl-progress-bar"><div class="dl-progress-fill" '
                 f'style="width:{pct}%"></div></div>'
                 f'<div class="dl-progress-meta">{pct:.1f}% · {_fmt_size(have) or "0"} / {_fmt_size(total)}</div></div>'
-                f'</div><div class="right"><div class="dl-ctrls">'
+                f'</div><div class="right"><div class="dl-ctrls">{act}'
                 f'<button class="dl-btn bad" onclick="fetchCancel({r["id"]})" '
                 f'title="stop, and remove what has arrived">✗ Cancel</button></div></div></div>')
         return (
             f'<h2 class="section">Opened in a player <span class="count">{len(fetches)}</span></h2>'
             '<div style="color:var(--muted);font-size:13px;margin:-6px 0 12px">'
             'Opening a film fetches it from Telegram. It keeps arriving while its player is open, '
-            'stops when it is closed, and continues from the same point when it is opened again.</div>'
+            'stops when it is closed, and continues from the same point when it is opened again. '
+            '<b>Resume</b> here fetches the rest with no player open; <b>Pause</b> stops it and keeps '
+            'what has arrived.</div>'
             f'<div class="dl-list">{"".join(items)}</div>')
 
     def _render(rows, show_finished):
