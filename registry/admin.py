@@ -47,6 +47,9 @@ _locks: dict = {}
 def setup(app, get_pool, version: str, ip_hash) -> None:
     _ctx.update(pool=get_pool, version=version, ip_hash=ip_hash)
     app.include_router(router)
+    # monitoring runs whether or not the panel is switched on: when it is
+    # switched on later, the history is already there
+    app.middleware("http")(_metrics_mw)
 
 
 # ── config ────────────────────────────────────────────────────────────
@@ -502,6 +505,185 @@ async def api_suspicion(request: Request):
     return _json(await _cached("suspicion", 120, _suspicion))
 
 
+# ── server monitoring ─────────────────────────────────────────────────
+# Counted in the registry itself: every request it answers, the bytes of
+# every response, how many are in flight. Once a minute that, plus the
+# machine's CPU, memory and disk (read from /proc: the host's figures, also
+# from inside a container), becomes one row of registry_metrics.
+# Bandwidth here is what the registry hands to the web server, i.e. before
+# compression: exact for the binary dedup filter (the bulk of it), an upper
+# bound for JSON.
+_mx = {"req": 0, "out": 0, "in": 0, "inflight": 0, "peak": 0, "err": 0, "paths": {}}
+_cpu_prev = [None]
+
+
+def _path_key(method: str, path: str) -> str:
+    if path.startswith("/api/v1/"):
+        return method + " " + "/".join(path.split("/")[:4])[:60]
+    if path.startswith("/admin"):
+        return "admin"
+    return "other"
+
+
+async def _metrics_mw(request: Request, call_next):
+    if not _mx.get("sampler"):
+        # started with the first request: no start-up hook to depend on
+        _mx["sampler"] = asyncio.create_task(_metrics_sampler())
+    _mx["inflight"] += 1
+    if _mx["inflight"] > _mx["peak"]:
+        _mx["peak"] = _mx["inflight"]
+    try:
+        resp = await call_next(request)
+    except Exception:
+        _mx["err"] += 1
+        raise
+    finally:
+        _mx["inflight"] -= 1
+    try:
+        n_out = int(resp.headers.get("content-length") or 0)
+    except ValueError:
+        n_out = 0
+    try:
+        n_in = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        n_in = 0
+    _mx["req"] += 1
+    _mx["out"] += n_out
+    _mx["in"] += n_in
+    if resp.status_code >= 500:
+        _mx["err"] += 1
+    k = _path_key(request.method, request.url.path)
+    if k != "admin":
+        cell = _mx["paths"].setdefault(k, [0, 0])
+        cell[0] += 1
+        cell[1] += n_out
+        if len(_mx["paths"]) > 60:                     # a scanner inventing paths
+            _mx["paths"] = dict(sorted(_mx["paths"].items(), key=lambda x: -x[1][1])[:30])
+    return resp
+
+
+def _machine() -> dict:
+    out = {"cores": os.cpu_count() or 1}
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:9]]
+        idle, total = v[3] + v[4], sum(v)
+        prev = _cpu_prev[0]
+        _cpu_prev[0] = (idle, total)
+        if prev and total > prev[1]:
+            out["cpu_busy"] = round(100.0 * (1 - (idle - prev[0]) / (total - prev[1])), 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out["load1"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        pass
+    try:
+        kv = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, val = line.partition(":")
+                kv[k] = int(val.split()[0]) * 1024
+        out["mem_total"], out["mem_avail"] = kv.get("MemTotal"), kv.get("MemAvailable")
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import shutil
+        du = shutil.disk_usage(os.path.dirname(os.path.abspath(__file__)))
+        out["disk_free"], out["disk_total"] = du.free, du.total
+    except OSError:
+        pass
+    return out
+
+
+async def _metrics_sampler():
+    await asyncio.sleep(5)
+    _machine()                                         # first CPU reading: a baseline only
+    while True:
+        await asyncio.sleep(60)
+        try:
+            snap = {k: _mx[k] for k in ("req", "out", "in", "peak", "err")}
+            paths = _mx["paths"]
+            _mx.update(req=0, out=0, err=0, peak=_mx["inflight"], paths={})
+            _mx["in"] = 0
+            m = await asyncio.to_thread(_machine)
+            pool = _ctx["pool"]()
+            if pool is None:
+                continue
+            async with pool.acquire() as conn:
+                db_conns = await conn.fetchval(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()")
+                await conn.execute(
+                    """INSERT INTO registry_metrics
+                         (ts, cpu_busy, load1, cores, mem_avail, mem_total, disk_free, disk_total,
+                          requests, bytes_out, bytes_in, inflight_peak, errors, db_conns, by_path)
+                       VALUES (date_trunc('minute', NOW()), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+                       ON CONFLICT (ts) DO NOTHING""",
+                    m.get("cpu_busy"), m.get("load1"), m.get("cores"), m.get("mem_avail"), m.get("mem_total"),
+                    m.get("disk_free"), m.get("disk_total"), snap["req"], snap["out"], snap["in"],
+                    snap["peak"], snap["err"], db_conns, json.dumps(paths))
+                if secrets.randbelow(1440) == 0:       # about once a day
+                    await conn.execute("DELETE FROM registry_metrics WHERE ts < NOW() - INTERVAL '400 days'")
+        except Exception:
+            pass                                       # monitoring must never hurt the registry
+
+
+def forecast(per_install_bytes_day: float, peak_factor: float, installs: int) -> dict:
+    """What `installs` installs would need, if each behaves like today's
+    average one. peak_factor = busiest hour / average hour, from history."""
+    day = per_install_bytes_day * installs
+    avg_mbps = day * 8 / 86400 / 1e6
+    return {"installs": installs, "gb_day": round(day / 1e9, 1), "tb_month": round(day * 30 / 1e12, 2),
+            "mbps_avg": round(avg_mbps, 1), "mbps_peak": round(avg_mbps * max(1.0, peak_factor), 1)}
+
+
+async def _server():
+    now = await _q("""SELECT * FROM registry_metrics ORDER BY ts DESC LIMIT 1""")
+    last5 = (await _q("""
+        SELECT COALESCE(sum(requests), 0) AS req, COALESCE(sum(bytes_out), 0) AS bytes_out,
+               COALESCE(max(inflight_peak), 0) AS inflight, COALESCE(avg(cpu_busy), 0) AS cpu,
+               count(*) AS minutes
+        FROM registry_metrics WHERE ts > NOW() - INTERVAL '5 minutes'"""))[0]
+    day = await _q("""
+        SELECT to_timestamp(floor(extract(epoch FROM ts) / 600) * 600) AS t,
+               avg(cpu_busy) AS cpu, max(cpu_busy) AS cpu_max, sum(requests) AS req,
+               sum(bytes_out) AS bytes_out, max(inflight_peak) AS inflight, sum(errors) AS errors,
+               max(db_conns) AS db_conns, min(mem_avail) AS mem_avail
+        FROM registry_metrics WHERE ts > NOW() - INTERVAL '24 hours' GROUP BY 1 ORDER BY 1""")
+    month = await _q("""
+        SELECT ts::date AS day, sum(bytes_out) AS bytes_out, sum(bytes_in) AS bytes_in, sum(requests) AS req,
+               max(cpu_busy) AS cpu_max, avg(cpu_busy) AS cpu, max(inflight_peak) AS inflight,
+               sum(errors) AS errors, count(*) AS minutes
+        FROM registry_metrics WHERE ts > NOW() - INTERVAL '30 days' GROUP BY 1 ORDER BY 1""")
+    hours = await _q("""
+        SELECT date_trunc('hour', ts) AS h, sum(bytes_out) AS b
+        FROM registry_metrics WHERE ts > NOW() - INTERVAL '7 days' GROUP BY 1""")
+    paths = await _q("""
+        SELECT k AS path, sum((v->>0)::bigint) AS req, sum((v->>1)::bigint) AS bytes_out
+        FROM registry_metrics, jsonb_each(by_path) AS e(k, v)
+        WHERE ts > NOW() - INTERVAL '24 hours' GROUP BY 1 ORDER BY 3 DESC LIMIT 12""")
+    installs = (await _q("""
+        SELECT count(DISTINCT instance_hash) AS n FROM registry_contributions
+        WHERE submitted_at > NOW() - INTERVAL '24 hours'"""))[0]["n"]
+    # per-install cost from the full days on record (a day with under 20 h of samples is not a day)
+    full = [d for d in month if d["minutes"] >= 1200]
+    per_install = None
+    if full and installs:
+        per_install = sum(d["bytes_out"] for d in full) / len(full) / installs
+    hb = [h["b"] for h in hours if h["b"]]
+    peak_factor = (max(hb) / (sum(hb) / len(hb))) if hb else 1.0
+    return {"now": now[0] if now else None, "last5": last5, "day": day, "month": month, "paths": paths,
+            "installs_24h": installs, "per_install_bytes_day": per_install,
+            "peak_factor": round(peak_factor, 2), "full_days": len(full),
+            "forecast": [forecast(per_install, peak_factor, n) for n in (100, 1000, 10000)] if per_install else []}
+
+
+@router.get("/admin/api/server")
+async def api_server(request: Request):
+    _auth(request)
+    return _json(await _cached("server", 55, _server))
+
+
 # ── the page ──────────────────────────────────────────────────────────
 _PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>tgarr.me · admin</title>
@@ -517,6 +699,7 @@ nav a.on{background:var(--card);color:var(--acc);border:1px solid var(--line);bo
 main{padding:16px 20px 60px;max-width:1400px}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:18px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.card.warn{border-color:#fcd34d;background:#fffbeb}.card.bad{border-color:#fca5a5;background:#fef2f2}
 .card .n{font-size:24px;font-weight:700;line-height:1.2}.card .l{color:var(--mut);font-size:12px}.card .s{font-size:12px;color:var(--mut);margin-top:2px}
 h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:22px 0 8px}
 .box{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:auto}
@@ -543,7 +726,7 @@ svg{display:block;width:100%;height:110px}svg rect{fill:var(--acc)}svg rect:hove
 <form method="post" action="/admin/logout" style="margin:0"><button>Sign out</button></form></header>
 <nav id="nav"></nav><main id="main"><div class="mut">loading…</div></main>
 <script>
-const TABS=[["overview","Overview"],["instances","Contributors"],["trends","Trends"],["channels","Channels"],["pulls","Pulls & limits"],["suspicion","Flagged"]];
+const TABS=[["overview","Overview"],["server","Server & capacity"],["instances","Contributors"],["trends","Trends"],["channels","Channels"],["pulls","Pulls & limits"],["suspicion","Flagged"]];
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const num=n=>n==null?"–":Number(n).toLocaleString("en-US");
@@ -565,6 +748,36 @@ function chart(title,days,key,noSum){const vals=days.map(d=>Number(d[key]||0));c
   return `<div class="chart"><div class="t">${esc(title)}</div><div class="v">${noSum?"peak "+short(max):short(total)+" in 30 days"} · today ${short(vals[vals.length-1])}</div>
   <svg viewBox="0 0 100 40" preserveAspectRatio="none">${vals.map((v,i)=>`<rect x="${(i*w+0.15*w).toFixed(2)}" width="${(0.7*w).toFixed(2)}" y="${(40-38*v/max).toFixed(2)}" height="${(38*v/max).toFixed(2)}"><title>${day(days[i].day)}: ${num(v)}</title></rect>`).join("")}</svg></div>`}
 const V={
+ async server(){const s=await get("server");const n=s.now;
+  if(!n){$("#main").innerHTML='<div class="mut">No samples yet. The registry writes one a minute; look again shortly.</div>';return}
+  const mbps=b=>(b*8/60/1e6);const pct=x=>x==null?"–":x.toFixed(1)+"%";
+  const lvl=(v,w,b)=>v>=b?"bad":v>=w?"warn":"";
+  const tile=(n_,l,s_,c)=>`<div class="card ${c||""}"><div class="n">${n_}</div><div class="l">${esc(l)}</div>${s_?`<div class="s">${s_}</div>`:""}</div>`;
+  const memUsed=n.mem_total?100*(1-n.mem_avail/n.mem_total):0, diskUsed=n.disk_total?100*(1-n.disk_free/n.disk_total):0;
+  const m5=s.last5.minutes||1;
+  let h=`<h2>Right now</h2><div class="cards">
+   ${tile(pct(100-(n.cpu_busy||0)),"processor idle",`${n.cores} cores · load ${n.load1}`,lvl(n.cpu_busy||0,70,90))}
+   ${tile(bytes(n.mem_avail),"memory available","of "+bytes(n.mem_total),lvl(memUsed,88,95))}
+   ${tile(bytes(n.disk_free),"disk free","of "+bytes(n.disk_total),lvl(diskUsed,85,95))}
+   ${tile((s.last5.bytes_out*8/(m5*60)/1e6).toFixed(2)+" Mbps","sent, last 5 minutes","before compression")}
+   ${tile(num(Math.round(s.last5.req/m5)),"requests a minute","last 5 minutes")}
+   ${tile(num(s.last5.inflight),"most at one moment","requests in flight, last 5 min")}
+   ${tile(num(n.db_conns),"database connections")}
+   ${tile(num(s.installs_24h),"installs sending data","last 24 hours")}</div>`;
+  const d=s.day.map(r=>({day:r.t,mbps:mbps(r.bytes_out)/10,cpu:r.cpu||0,cpu_max:r.cpu_max||0,req:r.req||0,inflight:r.inflight||0}));
+  const line=(title,rows,key,unit,digits)=>{const vals=rows.map(r=>Number(r[key]||0));const max=Math.max(1e-9,...vals);const w=100/Math.max(1,vals.length);
+   return `<div class="chart"><div class="t">${esc(title)}</div><div class="v">peak ${max.toFixed(digits)}${unit} · now ${vals.length?vals[vals.length-1].toFixed(digits):0}${unit}</div>
+   <svg viewBox="0 0 100 40" preserveAspectRatio="none">${vals.map((v,i)=>`<rect x="${(i*w).toFixed(2)}" width="${Math.max(0.2,w*0.85).toFixed(2)}" y="${(40-38*v/max).toFixed(2)}" height="${(38*v/max).toFixed(2)}"><title>${String(rows[i].day).slice(0,16).replace("T"," ")}: ${v.toFixed(digits)}${unit}</title></rect>`).join("")}</svg></div>`};
+  h+=`<h2>Last 24 hours (10-minute steps)</h2><div class="grid2">${line("Bandwidth sent",d,"mbps"," Mbps",2)}${line("Processor busy (average)",d,"cpu","%",1)}${line("Requests",d,"req","",0)}${line("Most requests in flight",d,"inflight","",0)}</div>`;
+  const mo=s.month.map(r=>({day:r.day,gb:r.bytes_out/1e9,req:r.req,cpu_max:r.cpu_max||0,inflight:r.inflight||0}));
+  h+=`<h2>Last 30 days</h2><div class="grid2">${line("Sent per day",mo,"gb"," GB",2)}${line("Requests per day",mo,"req","",0)}${line("Processor busy (daily peak)",mo,"cpu_max","%",1)}${line("Most requests in flight (daily peak)",mo,"inflight","",0)}</div>`;
+  h+=`<h2>Where the bandwidth goes (24 hours)</h2>`+table([["endpoint",r=>`<code>${esc(r.path)}</code>`],["requests",r=>num(r.req),"r"],["sent",r=>bytes(r.bytes_out),"r"],["per request",r=>bytes(r.bytes_out/Math.max(1,r.req)),"r"],
+    ["share",r=>{const t=s.paths.reduce((a,b)=>a+Number(b.bytes_out),0)||1;return (100*r.bytes_out/t).toFixed(1)+"%"},"r"]],s.paths,"no traffic recorded yet");
+  h+=`<h2>Capacity forecast</h2>`;
+  if(s.forecast.length){h+=`<div class="bar"><span>Each install costs about <b>${bytes(s.per_install_bytes_day)}</b> a day (${s.installs_24h} installs, average of ${s.full_days} full day${s.full_days===1?"":"s"}). The busiest hour runs at ${s.peak_factor}× the average. If every install behaves like today's:</span></div>`+
+    table([["installs",r=>num(r.installs),"r"],["per day",r=>r.gb_day+" GB","r"],["per month",r=>r.tb_month+" TB","r"],["average",r=>r.mbps_avg+" Mbps","r"],["busiest hour",r=>r.mbps_peak+" Mbps","r"]],s.forecast)}
+  else h+=`<div class="mut">Needs one full day of samples and at least one install sending data. Samples so far cover ${s.month.reduce((a,b)=>a+Number(b.minutes),0)} minutes.</div>`;
+  $("#main").innerHTML=h},
  async overview(){const o=await get("overview");$("#ver").textContent="registry "+o.version+" · up "+ago(Date.now()-o.uptime_s*1000).replace(" ago","");
   const c=o.channels,i=o.instances,e=o.est;
   let h=`<h2>Contributors</h2><div class="cards">${card(num(i.d1),"active in 24 h")}${card(num(i.d7),"active in 7 days")}${card(num(i.d30),"active in 30 days")}${card(num(i.total),"ever")}
