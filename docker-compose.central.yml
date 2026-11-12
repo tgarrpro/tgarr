@@ -1,0 +1,91 @@
+# The tgarr.me registry server (the federation's central service). Not for
+# ordinary installs. It runs the database, the registry and the site's own api:
+# no crawler, no Telegram account.
+#
+#   docker compose -f docker-compose.central.yml up -d --build
+#   (or put COMPOSE_FILE=docker-compose.central.yml in .env on that host)
+
+name: tgarr
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tgarr-db
+    restart: unless-stopped
+    logging: &tgarr-logging
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      POSTGRES_USER: tgarr
+      POSTGRES_DB: tgarr
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./_data/postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    networks:
+      - tgarr-net
+
+  # tgarr.me also serves the web pages nginx proxies to (:8765) from this
+  # api, and its search index. Both were missing from the first draft of
+  # this file; leaving them out would orphan two containers the site needs.
+  meili:
+    image: getmeili/meilisearch:v1.11
+    container_name: tgarr-meili
+    restart: unless-stopped
+    logging: *tgarr-logging
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_ENV: production
+    volumes:
+      - ./_data/meili:/meili_data
+    ports:
+      - "127.0.0.1:7700:7700"
+    networks:
+      - tgarr-net
+
+  api:
+    build: ./api
+    container_name: tgarr-api
+    restart: unless-stopped
+    logging: *tgarr-logging
+    depends_on: [db]
+    environment:
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      TGARR_BASE_URL: ${TGARR_BASE_URL:-}
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+    volumes:
+      - ./api:/app
+      - ./_data/session:/app/session
+      - ./_data/downloads:/downloads
+    ports:
+      - "${TGARR_PORT:-8765}:8088"
+    networks:
+      - tgarr-net
+
+  registry:
+    build: ./registry
+    container_name: tgarr-registry
+    restart: unless-stopped
+    logging: *tgarr-logging
+    depends_on: [db]
+    environment:
+      REGISTRY_MIN_CONSENSUS: "1"
+      BLOOM_DC_THRESHOLD: "1"
+      TGARR_TEST_SHOWCASE_IPS: ${TGARR_TEST_SHOWCASE_IPS:-}
+      SUSPICION_BATCH_THRESHOLD: "10000"
+      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+    volumes:
+      - ./registry:/app
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks:
+      - tgarr-net
+
+networks:
+  tgarr-net:
+    driver: bridge

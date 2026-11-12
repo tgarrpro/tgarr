@@ -11,6 +11,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import sys
 import logging
 import random
 import struct
@@ -34,7 +35,8 @@ from pyrogram.errors import (
 )
 from pyrogram.types import Message
 
-from parser import parse_filename, to_release_name
+from parser import (parse_filename, to_release_name, decide_release, is_video_file,
+                    is_generic_name, part_number, title_from_caption, with_context)
 
 # Pyrogram 2.0.106 hard-codes the pre-2024 channel-id range
 # (MIN_CHANNEL_ID = -1002147483647). Telegram now hands out channel ids above
@@ -59,7 +61,7 @@ BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 # Single source for the version this crawler reports to the registry.
-TGARR_VERSION = "0.5.5"
+TGARR_VERSION = "0.5.6"
 TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
@@ -246,6 +248,22 @@ _MTPROTO_DAILY_MAX = {
     "exportAuthorization": int(os.environ.get("TGARR_EXPORT_AUTH_DAILY_MAX", "40")),
 }
 _MTPROTO_DAILY: dict = {}   # method → [utc_day:str, count:int]
+# Who gets the allowance.
+#
+# Username lookups are the scarcest thing an account has (Telegram tolerates
+# roughly 150-300 a day). The federation validator - work done for tgarr.me,
+# not for the person running this install - was built to spend about 144 of
+# the 200 a day, around the clock. What was left for the person's own
+# thumbnails, films and follows ran out by the evening of an ordinary day,
+# and a restart (which sent the validator straight into another batch) made
+# it worse.
+#
+# So the allowance is split: BACKGROUND work may use at most this share of
+# the day's allowance; work a person is waiting on may use all of it. And it
+# is recorded who used how much, so that "where did it go" has an answer.
+_MTPROTO_BG_SHARE = float(os.environ.get("TGARR_BACKGROUND_SHARE", "0.4"))
+_MTPROTO_BG_HALT_UNTIL: dict = {}     # method → epoch: background callers only
+_MTPROTO_DAILY_BY: dict = {}          # method → [utc_day, {caller: count}]
 
 
 class DailyBudgetExhausted(RuntimeError):
@@ -261,8 +279,11 @@ def _secs_to_utc_midnight() -> float:
     return 86400 - (now % 86400)
 
 
-async def _daily_budget_take(method_name: str) -> bool:
-    """Consume one unit of today's budget. False = exhausted. Persisted."""
+async def _daily_budget_take(method_name: str, user: bool = True, who: str = "") -> bool:
+    """Consume one unit of today's allowance. False = none left FOR THIS
+    CALLER: a background caller is refused once background work has used its
+    share, while work a person is waiting on can still go ahead. Persisted,
+    with a per-caller tally."""
     cap = _MTPROTO_DAILY_MAX.get(method_name)
     if not cap or cap <= 0:
         return True   # uncapped (0 or negative disables the ceiling)
@@ -271,45 +292,102 @@ async def _daily_budget_take(method_name: str) -> bool:
     ent = _MTPROTO_DAILY.get(method_name)
     if ent is None:
         ent = [today, 0]
+        by = [today, {}]
         try:
             if db_pool is not None:
                 async with db_pool.acquire() as conn:
                     v = await conn.fetchval(
                         "SELECT value FROM config WHERE key=$1", key)
+                    vb = await conn.fetchval(
+                        "SELECT value FROM config WHERE key=$1", f"mtproto_daily_by:{method_name}")
                 if v and ":" in v:
                     d, _, c = v.partition(":")
                     ent = [d, int(c or 0)]
+                if vb and "|" in vb:
+                    d, _, j = vb.partition("|")
+                    by = [d, json.loads(j)]
         except Exception as e:
             log.debug("[mtproto-rl] daily budget load %s: %s", method_name, e)
         _MTPROTO_DAILY[method_name] = ent
+        _MTPROTO_DAILY_BY[method_name] = by
+    by = _MTPROTO_DAILY_BY.setdefault(method_name, [today, {}])
     if ent[0] != today:
         ent[0], ent[1] = today, 0
+    if by[0] != today:
+        by[0], by[1] = today, {}
     if ent[1] >= cap:
         return False
+    if not user:
+        bg_used = sum(n for k, n in by[1].items() if k.startswith("bg:"))
+        if bg_used >= int(cap * _MTPROTO_BG_SHARE):
+            return False
     ent[1] += 1
+    tag = ("" if user else "bg:") + (who or "?")
+    by[1][tag] = by[1].get(tag, 0) + 1
     try:
         if db_pool is not None:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     """INSERT INTO config (key, value) VALUES ($1, $2)
-                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value""",
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
                     key, f"{ent[0]}:{ent[1]}")
+                await conn.execute(
+                    """INSERT INTO config (key, value) VALUES ($1, $2)
+                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                    f"mtproto_daily_by:{method_name}", f"{by[0]}|{json.dumps(by[1])}")
     except Exception as e:
         log.debug("[mtproto-rl] daily budget save %s: %s", method_name, e)
     return True
 
 
-async def _mtproto(method_name: str, coro_factory):
+async def _username_cached(username) -> bool:
+    """Does the session already know this @username? Then looking it up costs
+    Telegram nothing, and must not be charged to the day's allowance (Pyrogram
+    keeps a username for eight hours)."""
+    if not username or not isinstance(username, str):
+        return False
+    try:
+        await app.storage.get_peer_by_username(username.lstrip("@").lower())
+        return True
+    except Exception:
+        return False
+
+
+async def _mtproto(method_name: str, coro_factory, wait: bool = True,
+                   user: "bool | None" = None, username=None):
     """Gate Pyrogram calls: per-method rate limit + per-method halt + FloodWait observation.
     Halt is per-method: TG flood-waits specific endpoints (e.g. resolveUsername)
     rather than the whole session, so other methods stay unblocked.
+
+    wait=False is for work a person is waiting on (a thumbnail, a preview, a
+    film they opened): a method that is parked - by a flood wait or because
+    its daily allowance is spent - raises DailyBudgetExhausted at once instead
+    of sleeping. A background job can sit out twelve hours; the thumbnail
+    dispatcher sleeping twelve hours inside one channel's lookup meant no
+    thumbnail at all, for anything, until midnight.
+
+    user: is a person waiting on this? Defaults to "yes if we may not wait".
+    Background work only gets its share of a daily allowance (see
+    _MTPROTO_BG_SHARE). username: for resolveUsername, the name being looked
+    up - if the session still knows it the call is free and is not charged.
     """
+    if user is None:
+        # joining only ever happens because someone opened a file
+        user = (not wait) or method_name == "join_chat"
+    who = sys._getframe(1).f_code.co_name
+    if method_name == "resolveUsername" and username and await _username_cached(username):
+        method_name = "get_chat"          # answered from the session: no lookup happens
     while True:
         # 1. Honor THIS method's halt (set by prior FloodWait on same method).
         now = time.time()
         halt_until = _MTPROTO_HALT_UNTIL.get(method_name, 0)
+        if not user:
+            halt_until = max(halt_until, _MTPROTO_BG_HALT_UNTIL.get(method_name, 0))
         if halt_until > now:
             remaining = halt_until - now
+            if not wait and remaining > 3:
+                raise DailyBudgetExhausted(
+                    f"{method_name} is paused for another {int(remaining)}s")
             log.info("[mtproto-rl] halt %s: %ds remaining → sleeping",
                      method_name, int(remaining))
             await asyncio.sleep(min(remaining + 1, 60))
@@ -318,19 +396,32 @@ async def _mtproto(method_name: str, coro_factory):
         # user-click download path, so say so instead of hanging until
         # midnight. Username resolution is background-only: park the method
         # until the UTC day rolls over, exactly like a FloodWait halt.
-        if method_name in _MTPROTO_DAILY_MAX and not await _daily_budget_take(method_name):
+        if method_name in _MTPROTO_DAILY_MAX and not await _daily_budget_take(
+                method_name, user=user, who=who):
             cap = _MTPROTO_DAILY_MAX[method_name]
+            _spent = (_MTPROTO_DAILY.get(method_name) or ["", 0])[1] >= cap
+            if not _spent:
+                # only the background share is used up: park background
+                # callers, leave the rest for the person
+                _park = _secs_to_utc_midnight() + 5
+                async with _MTPROTO_LOCK:
+                    _MTPROTO_BG_HALT_UNTIL[method_name] = time.time() + _park
+                log.info("[mtproto-rl] %s: background work has used its share of today's "
+                         "allowance (%d of %d) — background paused %dh%02dm, the rest is kept "
+                         "for you", method_name, int(cap * _MTPROTO_BG_SHARE), cap,
+                         int(_park // 3600), int(_park % 3600 // 60))
+                continue
             if method_name == "join_chat":
                 log.warning("[mtproto-rl] join_chat daily budget (%d) spent — refusing", cap)
                 raise DailyBudgetExhausted(
                     f"daily join budget ({cap}) reached — protecting the Telegram "
                     f"account; try again after 00:00 UTC")
-            wait = _secs_to_utc_midnight() + 5
+            _park = _secs_to_utc_midnight() + 5
             async with _MTPROTO_LOCK:
                 _MTPROTO_HALT_UNTIL[method_name] = max(
-                    _MTPROTO_HALT_UNTIL.get(method_name, 0), time.time() + wait)
+                    _MTPROTO_HALT_UNTIL.get(method_name, 0), time.time() + _park)
             log.warning("[mtproto-rl] %s daily budget (%d) spent — parked %dh%02dm",
-                        method_name, cap, int(wait // 3600), int(wait % 3600 // 60))
+                        method_name, cap, int(_park // 3600), int(_park % 3600 // 60))
             continue
         # 2. Per-method token bucket.
         limit, window = _MTPROTO_BUDGETS.get(method_name,
@@ -542,7 +633,8 @@ async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
                 _uname = await conn.fetchval(
                     "SELECT username FROM channels WHERE tg_chat_id=$1", chat_id)
             if _uname:
-                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname))
+                await _mtproto("resolveUsername", lambda: app.resolve_peer(_uname), wait=False,
+                               username=_uname)
                 return await _mtproto("get_messages",
                                       lambda: app.get_messages(chat_id, msg_id))
         except FloodWait:
@@ -991,7 +1083,34 @@ def _extract_invites(text: str) -> set[str]:
 
 async def init_db() -> None:
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=4)
+    # The database may still be starting, and on a first start the tables are
+    # created by the API container, which comes up at the same moment: wait
+    # for both instead of dying on "relation does not exist".
+    for _i in range(90):
+        try:
+            db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=4)
+            break
+        except (OSError, asyncpg.PostgresError) as e:
+            if _i == 89:
+                raise
+            if _i % 10 == 0:
+                log.info("[boot] waiting for the database (%s)", type(e).__name__)
+            await asyncio.sleep(2)
+    for _i in range(90):
+        try:
+            async with db_pool.acquire() as conn:
+                if await conn.fetchval(
+                        "SELECT to_regclass('public.messages') IS NOT NULL "
+                        "AND to_regclass('public.config') IS NOT NULL") and await conn.fetchval(
+                        "SELECT 1 FROM config WHERE key = 'schema_ready'"):
+                    break
+        except asyncpg.PostgresError:
+            pass
+        if _i % 10 == 0:
+            log.info("[boot] waiting for the API to prepare the database")
+        await asyncio.sleep(2)
+    else:
+        log.warning("[boot] the API has not reported the database ready after 3 min — going on")
     # Crawl-and-release columns (also created by api _migrate_schema; ensure
     # here so crawler workers can query them regardless of migration order).
     async with db_pool.acquire() as conn:
@@ -1012,6 +1131,64 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS verify_cursor BIGINT")
+        # Release re-judgement bookkeeping (see release_judge_worker).
+        await conn.execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS rel_ver SMALLINT")
+        await conn.execute(
+            "ALTER TABLE releases ADD COLUMN IF NOT EXISTS part SMALLINT")
+        await conn.execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS fetch_wanted_at TIMESTAMPTZ")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_rejudge ON messages (id) "
+            "WHERE rel_ver IS NULL AND media_type IN ('video', 'document')")
+        await conn.execute(
+            "UPDATE messages SET rel_ver = NULL WHERE rel_ver IS NOT NULL AND rel_ver <> $1",
+            RELEASE_JUDGE_VER)
+        # Thumbnails and previews that were really the channel avatar (see
+        # _tme_media_url): one stored picture standing in for several
+        # different files. Forget them; they are fetched again, correctly,
+        # the next time they are looked at.
+        if not await conn.fetchval(
+                "SELECT 1 FROM config WHERE key = 'thumb_avatar_fix_0_5_6'"):
+            for col, folder in (("thumb_path", THUMBS_ROOT), ("preview_path", PREVIEWS_ROOT)):
+                try:
+                    bad = [r[0] for r in await conn.fetch(
+                        f"""SELECT {col} FROM messages
+                            WHERE {col} IS NOT NULL AND left({col}, 2) <> '__'
+                              AND file_unique_id IS NOT NULL
+                            GROUP BY {col} HAVING count(DISTINCT file_unique_id) >= 3""")]
+                    if not bad:
+                        continue
+                    res = await conn.execute(
+                        f"UPDATE messages SET {col} = NULL"
+                        + (", thumb_md5 = NULL" if col == "thumb_path" else "")
+                        + f" WHERE {col} = ANY($1::text[])", bad)
+                    for name in bad:
+                        try:
+                            os.remove(os.path.join(folder, name))
+                        except OSError:
+                            pass
+                    log.info("[thumbs] %d wrong %s picture(s) forgotten (%s): they will be "
+                             "fetched again", len(bad), col.split("_")[0], res)
+                except Exception as e:
+                    log.warning("[thumbs] repair of %s failed: %s", col, e)
+            await conn.execute(
+                "INSERT INTO config (key, value) VALUES ('thumb_avatar_fix_0_5_6', 'done') "
+                "ON CONFLICT (key) DO NOTHING")
+        # What Telegram reports for a video message: running time + frame size.
+        for _col in ("duration_sec", "width", "height"):
+            await conn.execute(
+                f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {_col} INTEGER")
+        # Existing rows were indexed without them. The stale-index sweeper
+        # already re-reads every indexed message in batches; restart its walk
+        # once so it fills these in as it goes (no extra Telegram calls).
+        if not await conn.fetchval(
+                "SELECT 1 FROM config WHERE key='dims_backfill_0_5_6'"):
+            await conn.execute(
+                "UPDATE channels SET verified_at = NULL, verify_cursor = 0")
+            await conn.execute(
+                "INSERT INTO config (key, value) VALUES ('dims_backfill_0_5_6', 'started') "
+                "ON CONFLICT (key) DO NOTHING")
         # Content profile the registry sends for Discover ranking.
         for _col in ("release_files", "video_files", "book_files", "audio_files"):
             await conn.execute(
@@ -1050,27 +1227,284 @@ async def _heartbeat(worker: str, action: str = "", error: str | None = None) ->
         pass  # never let heartbeat failures cascade
 
 
+# ════════════════════════════════════════════════════════
+# Release re-judgement
+#
+# A release is a verdict about a file, made once, when the file was indexed:
+# with the parser of that day, without the running time (filled in later by
+# the sweeper), and without the poster that carries the title when the file
+# itself is called 01_0.mp4 (during a backfill the poster is indexed AFTER
+# the file). Verdicts therefore go stale: "2026" and "迅雷影音" as film titles,
+# five-minute clips as movies, real films with no release at all.
+#
+# This worker goes through every indexed video/document once per rule version
+# (and again whenever something a verdict depends on changes: the running
+# time arrives, a titled poster appears right before the file) and makes the
+# release agree with the current rules: create, correct, or remove.
+# Pure database work: no Telegram calls, nothing is downloaded, nothing is
+# auto-grabbed. A release someone has downloaded or grabbed is never removed.
+# ════════════════════════════════════════════════════════
+RELEASE_JUDGE_VER = 1            # bump when the rules change: everything is re-judged
+RELEASE_JUDGE_BATCH = 300
+CONTEXT_WINDOW = 12              # messages back from a file to look for its poster
+
+
+async def _context_title(conn, m):
+    """(ctx, part, parts_total) for a file whose own name says nothing, from
+    the caption that states the title: its own, or the poster's right before
+    it. Strict on purpose - a wrong title is worse than none:
+      - every message between the poster and the file must be there (a gap
+        is a message we do not have: possibly the next title) and must be a
+        nameless file or an uncaptioned photo;
+      - file counters must rise (01, 02, 03): a restart is another work.
+    """
+    own = title_from_caption(m["caption"])
+    my_part = part_number(m["file_name"])
+    mid = m["tg_message_id"]
+    around = {r["tg_message_id"]: r for r in await conn.fetch(
+        """SELECT tg_message_id, media_type, file_name, caption FROM messages
+           WHERE channel_id = $1 AND tg_message_id BETWEEN $2 AND $3""",
+        m["channel_id"], mid - CONTEXT_WINDOW, mid + CONTEXT_WINDOW)}
+    ctx, anchor = own, mid
+    if not own:
+        if m["caption"]:
+            return None                    # it has a caption, and it states no title
+        last = my_part
+        i = mid - 1
+        ctx = None
+        while i >= mid - CONTEXT_WINDOW:
+            r = around.get(i)
+            if r is None:
+                return None
+            if r["caption"]:
+                ctx = title_from_caption(r["caption"])
+                anchor = i
+                break
+            if r["media_type"] != "photo":
+                if not is_generic_name(r["file_name"]):
+                    return None
+                pn = part_number(r["file_name"])
+                if pn is not None:
+                    if last is not None and pn >= last:
+                        return None
+                    last = pn
+            i -= 1
+        if not ctx:
+            return None
+    # how many numbered files does this title have?
+    total, lastp, j = 0, 0, anchor + (0 if own else 1)
+    while j in around and j <= mid + CONTEXT_WINDOW:
+        r = around[j]
+        if j != anchor and (r["caption"] or (r["media_type"] != "photo"
+                                             and not is_generic_name(r["file_name"]))):
+            break
+        pn = part_number(r["file_name"]) if r["media_type"] != "photo" else None
+        if pn is not None:
+            if pn <= lastp:
+                break
+            lastp = pn
+            total += 1
+        j += 1
+    return ctx, my_part, total
+
+
+def _release_row(parsed: dict, verdict: dict, file_name) -> dict | None:
+    """The releases columns a verdict implies; None if it yields no name."""
+    type_ = verdict["type"]
+    p = dict(parsed)
+    if verdict["quality"] and not p.get("quality"):
+        p["quality"] = verdict["quality"]
+    p["type"] = type_
+    name = to_release_name(p, fallback=file_name or "")
+    if not name:
+        return None
+    return {
+        "name": name, "category": type_,
+        "series_title": p.get("title") if type_ == "tv" else None,
+        "season": p.get("season") if type_ == "tv" else None,
+        "episode": p.get("episode") if type_ == "tv" else None,
+        "movie_title": p.get("title") if type_ == "movie" else None,
+        "movie_year": p.get("year") if type_ == "movie" else None,
+        "quality": p.get("quality"), "source": p.get("source"), "codec": p.get("codec"),
+        "parse_score": verdict["score"], "part": p.get("part"),
+    }
+
+
+_REL_IDENTITY = ("category", "series_title", "season", "episode", "movie_title",
+                 "movie_year", "part")
+_REL_COLS = ("name", "category", "series_title", "season", "episode", "movie_title",
+             "movie_year", "quality", "source", "codec", "parse_score", "part")
+
+
+def _meili_release_doc(rel_id, row, m):
+    return {
+        "id": rel_id, "name": row["name"], "canonical_title": row["name"],
+        "series_title": row["series_title"], "movie_title": row["movie_title"],
+        "category": row["category"], "quality": row["quality"] or "",
+        "movie_year": row["movie_year"] or 0, "season": row["season"] or 0,
+        "episode": row["episode"] or 0, "parse_score": float(row["parse_score"] or 0),
+        "grab_count": 0, "size_bytes": m["file_size"] or 0,
+        "posted_at_ts": int(m["posted_at"].timestamp()) if m["posted_at"] else 0,
+        "audience": "sfw",
+    }
+
+
+async def _judge_message(conn, m, gone: list) -> str:
+    """Make the release for one indexed file agree with the current rules.
+    Returns what happened: created / updated / removed / same / none / kept."""
+    fn = m["file_name"]
+    row = None
+    if is_video_file(fn, m["mime_type"], m["media_type"]):
+        parsed = parse_filename(fn or "")
+        if is_generic_name(fn) or not parsed.get("has_title"):
+            c = await _context_title(conn, m)
+            if c:
+                parsed = with_context(parsed, c[0], c[1], c[2])
+        verdict = decide_release(parsed, file_size=m["file_size"], duration=m["duration_sec"],
+                                 width=m["width"], height=m["height"],
+                                 min_score=PARSE_SCORE_MIN,
+                                 min_movie_bytes=MIN_MOVIE_BYTES,
+                                 min_tv_bytes=MIN_TV_BYTES)
+        if verdict["create"]:
+            row = _release_row(parsed, verdict, fn)
+    rel_id = m["rel_id"]
+    if row is None:
+        if not rel_id:
+            return "none"
+        if m["protected"]:
+            return "kept"
+        await conn.execute("DELETE FROM releases WHERE id = $1", rel_id)
+        gone.append(rel_id)
+        return "removed"
+    if rel_id:
+        def _same(k):
+            a, b = m["r_" + k], row[k]
+            if k == "parse_score":
+                return abs(float(a or 0) - float(b or 0)) < 0.005
+            return a == b
+        if all(_same(k) for k in _REL_COLS):
+            return "same"
+        reset = any(not _same(k) for k in _REL_IDENTITY)
+        await conn.execute(
+            """UPDATE releases SET name=$2, category=$3, series_title=$4, season=$5,
+                      episode=$6, movie_title=$7, movie_year=$8, quality=$9, source=$10,
+                      codec=$11, parse_score=$12, part=$13"""
+            + (""", canonical_title=NULL, poster_url=NULL, overview=NULL,
+                      metadata_source=NULL, metadata_lookup_at=NULL""" if reset else "")
+            + " WHERE id=$1", rel_id, *[row[k] for k in _REL_COLS])
+        _meili_enqueue("releases", _meili_release_doc(rel_id, row, m))
+        return "updated"
+    # no release yet: one per file
+    if m["file_unique_id"] and await conn.fetchval(
+            """SELECT 1 FROM releases r JOIN messages x ON x.id = r.primary_msg_id
+               WHERE x.file_unique_id = $1 AND x.id <> $2 LIMIT 1""",
+            m["file_unique_id"], m["id"]):
+        return "none"
+    new_id = await conn.fetchval(
+        """INSERT INTO releases
+             (name, category, series_title, season, episode, movie_title, movie_year,
+              quality, source, codec, parse_score, part, size_bytes, posted_at, primary_msg_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id""",
+        *[row[k] for k in _REL_COLS], m["file_size"], m["posted_at"], m["id"])
+    _meili_enqueue("releases", _meili_release_doc(new_id, row, m))
+    return "created"
+
+
+async def release_judge_worker():
+    await asyncio.sleep(90)
+    log.info("[judge] release re-judgement started (rules v%d)", RELEASE_JUDGE_VER)
+    totals: dict = {}
+    while True:
+        try:
+            gone: list = []
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """SELECT m.id, m.channel_id, m.tg_message_id, m.media_type, m.mime_type,
+                              m.file_name, m.caption, m.file_size, m.posted_at,
+                              m.file_unique_id, m.duration_sec, m.width, m.height,
+                              r.id AS rel_id, r.name AS r_name, r.category AS r_category,
+                              r.series_title AS r_series_title, r.season AS r_season,
+                              r.episode AS r_episode, r.movie_title AS r_movie_title,
+                              r.movie_year AS r_movie_year, r.quality AS r_quality,
+                              r.source AS r_source, r.codec AS r_codec,
+                              r.parse_score AS r_parse_score, r.part AS r_part,
+                              (r.id IS NOT NULL AND (
+                                   COALESCE(r.grab_count, 0) > 0
+                                OR EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = r.id)
+                                OR EXISTS (SELECT 1 FROM monitored_movies mm
+                                           WHERE mm.grabbed_release_id = r.id))) AS protected
+                       FROM (SELECT * FROM messages
+                             WHERE rel_ver IS NULL AND media_type IN ('video', 'document')
+                               AND indexed_at < NOW() - INTERVAL '2 minutes'
+                             ORDER BY id LIMIT $1) m
+                       LEFT JOIN releases r ON r.primary_msg_id = m.id
+                       ORDER BY m.id""", RELEASE_JUDGE_BATCH)
+                if not rows:
+                    if totals:
+                        log.info("[judge] caught up: %s", totals)
+                        totals = {}
+                    await _heartbeat("release_judge_worker", "idle")
+                    await asyncio.sleep(60)
+                    continue
+                counts: dict = {}
+                async with conn.transaction():
+                    for m in rows:
+                        try:
+                            async with conn.transaction():
+                                what = await _judge_message(conn, m, gone)
+                        except Exception as e:
+                            what = "error"
+                            log.warning("[judge] msg %s: %s", m["id"], e)
+                        counts[what] = counts.get(what, 0) + 1
+                    await conn.execute(
+                        "UPDATE messages SET rel_ver = $1 WHERE id = ANY($2::bigint[])",
+                        RELEASE_JUDGE_VER, list({m["id"] for m in rows}))
+            if gone:
+                await _meili_delete("releases", gone)
+            for k, v in counts.items():
+                totals[k] = totals.get(k, 0) + v
+            await _heartbeat("release_judge_worker",
+                             ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+            await asyncio.sleep(1 if len(rows) >= RELEASE_JUDGE_BATCH else 30)
+        except Exception as e:
+            log.exception("[judge] loop")
+            await _heartbeat("release_judge_worker", "error", error=str(e))
+            await asyncio.sleep(60)
+
+
 MIN_MOVIE_BYTES = 100 * 1024 * 1024   # 100 MB — anything smaller is sample/trailer/junk
 MIN_TV_BYTES = 30 * 1024 * 1024       # 30 MB — short TV ep can be 50MB at 480p
 
 
-async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at):
-    """Parse filename + insert release row if score is high enough."""
+async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at,
+                               duration=None, width=None, height=None):
+    """Parse the file name and insert a release row if it qualifies. The
+    decision (see parser.decide_release) also weighs the running time and
+    frame size Telegram reported, when it did."""
     parsed = parse_filename(file_name or "")
-    score = parsed.get("score", 0.0)
-    if score < PARSE_SCORE_MIN:
+    verdict = decide_release(parsed, file_size=file_size, duration=duration,
+                             width=width, height=height,
+                             min_score=PARSE_SCORE_MIN,
+                             min_movie_bytes=MIN_MOVIE_BYTES,
+                             min_tv_bytes=MIN_TV_BYTES)
+    if not verdict["create"]:
         return None
+    # One release per file: if this exact file (file_unique_id) already has a
+    # release through another post, this post is just another source for it.
+    if await conn.fetchval(
+            """SELECT 1 FROM releases r JOIN messages m ON m.id = r.primary_msg_id
+               WHERE m.file_unique_id = (SELECT file_unique_id FROM messages WHERE id = $1)
+                 AND m.file_unique_id IS NOT NULL AND m.id <> $1
+               LIMIT 1""", msg_row_id):
+        return None
+    score = verdict["score"]
+    type_ = verdict["type"]
+    if verdict["quality"] and not parsed.get("quality"):
+        parsed["quality"] = verdict["quality"]
+    parsed["type"] = type_
     rname = to_release_name(parsed, fallback=file_name or "")
     if not rname:
         return None
-    type_ = parsed.get("type", "unknown")
-    # Size sanity: filename-only parse calls trailers/samples "movie".
-    # Real video files exceed these floors. Skip junk before it pollutes releases.
-    if file_size:
-        if type_ == "movie" and file_size < MIN_MOVIE_BYTES:
-            return None
-        if type_ == "tv" and file_size < MIN_TV_BYTES:
-            return None
     rel_id = await conn.fetchval(
         """INSERT INTO releases
              (name, category, series_title, season, episode,
@@ -1160,10 +1594,14 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
     audio_title = None
     audio_performer = None
     audio_duration_sec = None
+    duration_sec = width = height = None
 
     # Identify the media kind explicitly so /gallery can find photos cleanly.
     if msg.video:
         media, media_type = msg.video, "video"
+        duration_sec = getattr(msg.video, "duration", None) or None
+        width = getattr(msg.video, "width", None) or None
+        height = getattr(msg.video, "height", None) or None
     elif msg.document:
         media, media_type = msg.document, "document"
     elif msg.audio:
@@ -1179,6 +1617,8 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
     file_dc = None
     if media:
         file_name = getattr(media, "file_name", None)
+        if file_name:
+            file_name = file_name.replace("\x00", "")   # NUL breaks the INSERT
         file_size = getattr(media, "file_size", None)
         mime_type = getattr(media, "mime_type", None)
         file_unique_id = getattr(media, "file_unique_id", None)
@@ -1270,19 +1710,28 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
                  (channel_id, tg_message_id, tg_chat_id,
                   file_unique_id, file_name, caption, file_size, mime_type,
                   media_type, audio_title, audio_performer, audio_duration_sec,
-                  posted_at, file_dc, detected_lang)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                  posted_at, file_dc, detected_lang, duration_sec, width, height)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                ON CONFLICT (channel_id, tg_message_id) DO NOTHING
                RETURNING id""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
             (caption.replace("\x00", "")[:1024] or None), file_size, mime_type, media_type,
             audio_title, audio_performer, audio_duration_sec, msg.date,
-            file_dc, detected_lang,
+            file_dc, detected_lang, duration_sec, width, height,
         )
+
+        if new_msg_id and caption and title_from_caption(caption):
+            # a titled poster: the nameless files right after it get judged again
+            await conn.execute(
+                """UPDATE messages SET rel_ver = NULL
+                   WHERE channel_id = $1 AND tg_message_id > $2
+                     AND tg_message_id <= $2 + $3 AND rel_ver IS NOT NULL""",
+                ch_id, msg_id, CONTEXT_WINDOW)
 
         if new_msg_id and file_name:
             try:
-                await maybe_create_release(conn, new_msg_id, file_name, file_size, msg.date)
+                await maybe_create_release(conn, new_msg_id, file_name, file_size, msg.date,
+                                           duration=duration_sec, width=width, height=height)
             except Exception as e:
                 log.warning("[parse] failed msg_id=%s file=%s err=%s", new_msg_id, file_name, e)
 
@@ -1928,10 +2377,12 @@ INSTANCE_UUID_ROTATE_DAYS = 7
 # Each client validates a slice — quota scales linearly with # of clients.
 # See reference_tgarr_federation_swarm_design.md.
 FEDERATION_VALIDATOR_ENABLED = os.environ.get("TGARR_FEDERATION_VALIDATOR", "true").lower() == "true"
-# 6 seeds per ~66 min cycle ≈ 130 username lookups/day — inside Telegram's
-# daily tolerance with room left for the user's own subscriptions. (The old
-# default of 20 worked out to ~360/day.)
-SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "6"))
+# 3 seeds an hour ≈ 70 username lookups a day, and never more than the
+# background share of the day's allowance (_MTPROTO_BG_SHARE): this is work
+# done for the federation, on the user's account, and it comes after the
+# user's own. (6 an hour was ~144/day - 70% of the allowance; the first
+# default, 20, was ~360.)
+SEEDS_BATCH = int(os.environ.get("TGARR_SEEDS_BATCH", "3"))
 SEEDS_INTERVAL_SEC = int(os.environ.get("TGARR_SEEDS_INTERVAL_SEC", "3600"))  # 1h
 PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/seed -> 1/min resolveUsername
 AUDIO_ROOT = "/downloads/audio"
@@ -1969,7 +2420,7 @@ async def wait_for_session() -> None:
     """Block until the api container's login flow finishes signing in."""
     if _session_authed():
         return
-    log.info("[startup] no Telegram session yet — open http://<host>:8765/login + scan QR")
+    log.info("[startup] no Telegram session yet — open tgarr in a browser (http://<this-host>:8765 unless you changed TGARR_PORT) and sign in")
     log.info("[startup] waiting for signed-in session at %s …", SESSION_PATH)
     while not _session_authed():
         await asyncio.sleep(5)
@@ -2150,6 +2601,47 @@ _TME_PREVIEW_RX = re.compile(
     r"https://cdn[0-9]+\.telesco\.pe/file/[A-Za-z0-9_\-]+\.jpg")
 
 
+# Which picture on a t.me embed page belongs to the message that was asked for.
+#
+# The page used to be searched for "the first CDN image" (thumbnails) or "the
+# last one" (previews). The first image on the page is the channel's AVATAR,
+# and a post that is part of an album renders the whole album - so every
+# photo of a channel got the same thumbnail (the avatar), and album photos
+# got each other's. On one install 2,330 of 3,352 stored thumbnails were
+# wrong this way.
+#
+# Each picture on the page is an <a class="…photo_wrap…" href="…/<message
+# id>?single" style="background-image:url('…')">; a video is an
+# <a class="…video_player…" href="…/<id>…"> holding an <i class="…video_thumb"
+# style="background-image:url('…')">. Take the one whose link is this
+# message. If the page shows exactly one picture and it carries no link, it
+# is the message itself. Anything else: no answer - the caller falls back to
+# MTProto, which cannot be wrong about which file it is.
+_TME_PHOTO_TAG_RX = re.compile(r'<a\b[^>]*\btgme_widget_message_photo_wrap\b[^>]*>')
+_TME_VIDEO_TAG_RX = re.compile(
+    r'<a\b[^>]*\btgme_widget_message_video_player\b[^>]*>.{0,600}?'
+    r'<i\b[^>]*\btgme_widget_message_video_thumb\b[^>]*>', re.DOTALL)
+_TME_BG_RX = re.compile(r"background-image:url\('([^']+)'\)")
+_TME_HREF_ID_RX = re.compile(r'href="[^"]*/(\d+)(?:\?[^"]*)?"')
+_TME_CDN_OK_RX = re.compile(r"^https://cdn[0-9]*\.[a-z0-9.\-]*(telesco\.pe|cdn-telegram\.org|telegram-cdn\.org)/")
+
+
+def _tme_media_url(page: str, tg_message_id: int):
+    cands = []
+    for tag in _TME_PHOTO_TAG_RX.findall(page) + _TME_VIDEO_TAG_RX.findall(page):
+        u = _TME_BG_RX.search(tag)
+        if not u or not _TME_CDN_OK_RX.match(u.group(1)):
+            continue
+        h = _TME_HREF_ID_RX.search(tag)
+        cands.append((int(h.group(1)) if h else None, u.group(1)))
+    for mid, url in cands:
+        if mid == tg_message_id:
+            return url
+    if len(cands) == 1 and cands[0][0] is None:
+        return cands[0][1]
+    return None
+
+
 async def _fetch_preview_https(username: str, tg_message_id: int) -> bytes | None:
     """Gallery slideshow preview (~76KB 450px JPEG). Same t.me embed scrape
     as thumb but takes the LAST cdn URL (background-image, bigger) instead
@@ -2167,14 +2659,9 @@ async def _fetch_preview_https(username: str, tg_message_id: int) -> bytes | Non
                 html = r.read().decode("utf-8", errors="replace")
         except Exception:
             return None
-        if ("tgme_widget_message_photo_wrap" not in html
-                and "tgme_widget_message_video_wrap" not in html):
+        target = _tme_media_url(html, tg_message_id)
+        if not target:
             return None
-        # ALL cdn jpg URLs in order; pick last = biggest available preview.
-        urls = _TME_PREVIEW_RX.findall(html)
-        if not urls:
-            return None
-        target = urls[-1] if len(urls) > 1 else urls[0]
         try:
             req2 = urllib.request.Request(
                 target, headers={"User-Agent": "Mozilla/5.0"})
@@ -2205,19 +2692,12 @@ async def _fetch_thumb_https(username: str, tg_message_id: int) -> bytes | None:
                 html = r.read().decode("utf-8", errors="replace")
         except Exception:
             return None
-        # Skip if post has no photo/video media (deleted / text-only post →
-        # embed only renders channel avatar, regex would falsely match it).
-        if ("tgme_widget_message_photo_wrap" not in html
-                and "tgme_widget_message_video_wrap" not in html):
-            return None
-        # First cdn URL in HTML = small thumb (<i src=>). background-image
-        # is the larger 450px preview — skip it.
-        m = _TME_THUMB_RX.search(html)
-        if not m:
+        target = _tme_media_url(html, tg_message_id)
+        if not target:
             return None
         try:
             req2 = urllib.request.Request(
-                m.group(0), headers={"User-Agent": "Mozilla/5.0"})
+                target, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req2, timeout=10) as r2:
                 return r2.read()
         except Exception:
@@ -2351,9 +2831,9 @@ class _FastPathUnavailable(Exception):
     downloader instead."""
 
 
-async def _stream_file_cached(media):
+async def _stream_file_cached(media, start: int = 0):
     """Yield a file's bytes in 1 MB chunks over the cached media session of
-    its DC.
+    its DC, from byte `start` (a multiple of 1 MB).
 
     Compared with Pyrogram's stream/download (a new media session per file,
     plus a new auth key and auth.ExportAuthorization for every cross-DC file):
@@ -2377,7 +2857,7 @@ async def _stream_file_cached(media):
             id=fid.media_id, access_hash=fid.access_hash,
             file_reference=fid.file_reference, thumb_size=fid.thumbnail_size)
     chunk = 1024 * 1024
-    offset = 0
+    offset = start
     reopened = 0
     while True:
         sess = await _media_session(fid.dc_id)
@@ -2391,14 +2871,14 @@ async def _stream_file_cached(media):
             reopened += 1
             await _drop_media_session(fid.dc_id)
             if reopened > 3:
-                if offset == 0:
+                if offset == start:
                     raise _FastPathUnavailable(f"media session: {type(e).__name__}")
                 raise RuntimeError(f"media session kept dropping at offset {offset}: {e}")
             log.info("[media-session] DC%s dropped at offset %d (%s) — resuming",
                      fid.dc_id, offset, type(e).__name__)
             continue
         if not isinstance(r, raw.types.upload.File):
-            if offset == 0:
+            if offset == start:
                 raise _FastPathUnavailable(type(r).__name__)
             raise RuntimeError(f"unexpected {type(r).__name__} at offset {offset}")
         if r.bytes:
@@ -2407,6 +2887,168 @@ async def _stream_file_cached(media):
             return
         offset += chunk
         reopened = 0
+
+
+# An MP4 cannot start playing without its index (the "moov" box). Encoders
+# that do not "fast-start" a file put it at the very end, after all the
+# picture data - so a browser playing a file that is still arriving had to
+# wait for the last byte of a 2 GB film before showing the first frame.
+# When the head of a file shows that layout, fetch the tail first and park it
+# next to the file as "<file>.tail" (8 bytes: its offset, then the bytes);
+# the API serves requests for that region from there until the file is whole.
+_TAIL_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _mp4_tail_offset(head: bytes, total: int):
+    """Offset of what follows the picture data when the index is not in front
+    of it; None when the index comes first or this is not such a file."""
+    off = 0
+    while off + 8 <= len(head):
+        n, kind = struct.unpack(">I4s", head[off:off + 8])
+        if n == 1:
+            if off + 16 > len(head):
+                return None
+            n = struct.unpack(">Q", head[off + 8:off + 16])[0]
+        if n < 8 or kind == b"moov":
+            return None
+        if kind == b"mdat":
+            nxt = off + n
+            return nxt if 0 < nxt < total else None
+        off += n
+    return None
+
+
+async def _fetch_tail_sidecar(media, target: str, head: bytes, total: int) -> None:
+    """Best effort. FloodWait propagates; anything else just means the file
+    plays once it has fully arrived, as before."""
+    moov_at = _mp4_tail_offset(head, total)
+    if moov_at is None:
+        return
+    mb = 1024 * 1024
+    start = (moov_at // mb) * mb
+    if total - start > _TAIL_MAX_BYTES:
+        return
+    tmp = target + ".tail.tmp"
+    try:
+        with open(tmp, "wb") as tf:
+            tf.write(struct.pack(">Q", start))
+            async for part in _stream_file_cached(media, start=start):
+                tf.write(part)
+        os.replace(tmp, target + ".tail")
+        log.info("[on-demand-media] index at the end of the file: fetched the last %.1f MB first",
+                 (total - start) / mb)
+    except FloodWait:
+        raise
+    except Exception as e:
+        log.info("[on-demand-media] tail-first not possible (%s)", e)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+# Some taggers write a FLAC's embedded cover (the PICTURE block) without a
+# MIME type. Chrome's decoder then refuses the whole file - "format not
+# supported" - and the song never plays, although the audio is fine.
+# The type is filled in from the image's own signature and the same number of
+# bytes is taken out of a padding block, so the file keeps its exact size
+# (the API serves by the size Telegram reported). With no padding to take
+# from, the picture block is relabelled as padding: no cover, but it plays.
+_FLAC_META_MAX = 8 * 1024 * 1024
+
+
+def _flac_meta_len(buf) -> int | None:
+    """Length of "fLaC" + all metadata blocks if `buf` holds them whole;
+    None if more bytes are needed; 0 if this is not a FLAC stream."""
+    if len(buf) < 4:
+        return None
+    if bytes(buf[:4]) != b"fLaC":
+        return 0
+    off = 4
+    while True:
+        if off + 4 > len(buf):
+            return None
+        last = buf[off] & 0x80
+        off += 4 + int.from_bytes(buf[off + 1:off + 4], "big")
+        if off > len(buf):
+            return None
+        if last:
+            return off
+
+
+def _flac_fix_meta(meta: bytes) -> bytes:
+    """`meta` ("fLaC" + metadata blocks) with untyped covers repaired; the
+    same object if nothing needed doing. Never changes the length."""
+    blocks, off = [], 4
+    while off < len(meta):
+        ln = int.from_bytes(meta[off + 1:off + 4], "big")
+        blocks.append([meta[off] & 0x7F, meta[off + 4:off + 4 + ln]])
+        off += 4 + ln
+    changed = False
+    for b in blocks:
+        body = b[1]
+        if b[0] != 6 or len(body) < 12 or int.from_bytes(body[4:8], "big") != 0:
+            continue
+        data_at = 12 + int.from_bytes(body[8:12], "big") + 16 + 4
+        magic = body[data_at:data_at + 8]
+        mime = (b"image/jpeg" if magic[:3] == b"\xff\xd8\xff" else
+                b"image/png" if magic[:8] == b"\x89PNG\r\n\x1a\n" else
+                b"image/gif" if magic[:4] == b"GIF8" else
+                b"image/webp" if magic[:4] == b"RIFF" else b"")
+        pad = next((x for x in blocks if x[0] == 1 and len(x[1]) >= len(mime)), None)
+        if mime and pad is not None:
+            b[1] = body[:4] + len(mime).to_bytes(4, "big") + mime + body[8:]
+            pad[1] = pad[1][:len(pad[1]) - len(mime)]
+        else:
+            b[0] = 1
+        changed = True
+    if not changed:
+        return meta
+    out = bytearray(b"fLaC")
+    for i, (t, body) in enumerate(blocks):
+        out.append(t | (0x80 if i == len(blocks) - 1 else 0))
+        out += len(body).to_bytes(3, "big") + body
+    return bytes(out) if len(out) == len(meta) else meta
+
+
+def _flac_fix_file(path: str) -> bool:
+    """Repair a FLAC already on disk. True if it was changed."""
+    try:
+        with open(path, "r+b") as f:
+            buf = f.read(1024 * 1024)
+            n = _flac_meta_len(buf)
+            if n is None:
+                buf += f.read(_FLAC_META_MAX)
+                n = _flac_meta_len(buf)
+            if not n:
+                return False
+            fixed = _flac_fix_meta(buf[:n])
+            if fixed is buf[:n] or fixed == buf[:n]:
+                return False
+            f.seek(0)
+            f.write(fixed)
+            return True
+    except OSError:
+        return False
+
+
+def _flac_fix_existing() -> int:
+    n = 0
+    try:
+        for name in os.listdir(AUDIO_ROOT):
+            if name.lower().endswith(".flac") and _flac_fix_file(os.path.join(AUDIO_ROOT, name)):
+                n += 1
+    except OSError:
+        pass
+    return n
+
+
+def _drop_tail_sidecar(target: str) -> None:
+    try:
+        os.remove(target + ".tail")
+    except OSError:
+        pass
 
 
 async def _stream_media_fast(msg, media):
@@ -2493,6 +3135,27 @@ async def _drop_gone_messages(channel_id: int, msg_ids: list) -> int:
         ids = [i for i in msg_ids if i not in keep]
         if not ids:
             return 0
+        # A release whose source post is gone is not lost if the same file is
+        # still posted somewhere else: move the release to that copy.
+        moved = await conn.fetch(
+            """UPDATE releases r
+                  SET primary_msg_id = alt.id
+                 FROM messages gone
+                 JOIN LATERAL (
+                        SELECT m2.id FROM messages m2
+                        JOIN channels c2 ON c2.id = m2.channel_id
+                        WHERE m2.file_unique_id = gone.file_unique_id
+                          AND m2.id <> ALL($1::bigint[])
+                          AND c2.dead_at IS NULL
+                        ORDER BY COALESCE(c2.is_joined, FALSE) DESC,
+                                 COALESCE(c2.subscribed, FALSE) DESC, m2.id DESC
+                        LIMIT 1) alt ON TRUE
+                WHERE gone.id = ANY($1::bigint[])
+                  AND gone.file_unique_id IS NOT NULL
+                  AND r.primary_msg_id = gone.id
+                RETURNING r.id""", ids)
+        if moved:
+            log.info("[stale] %d release(s) moved to another copy of the same file", len(moved))
         rel_ids = [r["id"] for r in await conn.fetch(
             "SELECT id FROM releases WHERE primary_msg_id = ANY($1::bigint[])", ids)]
     n = await _purge_messages(channel_id, ids)
@@ -2513,11 +3176,29 @@ async def _channel_gone(chat_id: int, username) -> "bool | None":
     """Is the channel itself gone/unreachable for good?
     True = Telegram said so explicitly. False = it answered normally.
     None = could not tell (flood wait, missing peer, network)."""
+    hit = _GONE_CACHE.get(chat_id)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]          # asked recently: every empty batch must not cost a lookup
+    res = await _channel_gone_ask(chat_id, username)
+    if res is not None:
+        if len(_GONE_CACHE) > 2000:
+            _GONE_CACHE.clear()
+        _GONE_CACHE[chat_id] = (time.time(), res)
+    return res
+
+
+_GONE_CACHE: dict = {}        # chat_id → (asked at, answer)
+
+
+async def _channel_gone_ask(chat_id: int, username) -> "bool | None":
     try:
         if username:
-            await _mtproto("resolveUsername", lambda: app.get_chat(username))
+            # never wait here: this runs inside the thumbnail and preview
+            # dispatchers, and "cannot tell right now" is a valid answer
+            await _mtproto("resolveUsername", lambda: app.get_chat(username), wait=False,
+                           username=username)
         else:
-            await _mtproto("get_chat", lambda: app.get_chat(chat_id))
+            await _mtproto("get_chat", lambda: app.get_chat(chat_id), wait=False)
         return False
     except (FloodWait, DailyBudgetExhausted):
         return None
@@ -2672,6 +3353,28 @@ async def stale_index_sweeper():
                 await asyncio.sleep(nap)
                 continue
 
+            # Same round-trip, extra value: record the running time and frame
+            # size of every video we just looked at.
+            try:
+                _dims = [(mid, getattr(m.video, "duration", None) or None,
+                          getattr(m.video, "width", None) or None,
+                          getattr(m.video, "height", None) or None)
+                         for mid, m in found.items() if getattr(m, "video", None)]
+                if _dims:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE messages m
+                                  SET duration_sec = v.d, width = v.w, height = v.h,
+                                      rel_ver = NULL
+                                 FROM unnest($2::bigint[], $3::int[], $4::int[], $5::int[])
+                                      AS v(mid, d, w, h)
+                                WHERE m.channel_id = $1 AND m.tg_message_id = v.mid
+                                  AND m.duration_sec IS NULL""",
+                            ch["id"], [x[0] for x in _dims], [x[1] for x in _dims],
+                            [x[2] for x in _dims], [x[3] for x in _dims])
+            except Exception as e:
+                log.warning("[stale] could not record video attributes for @%s: %s", uname, e)
+
             removed, is_dead = await _reconcile_missing(
                 ch["id"], ch["tg_chat_id"], ch["username"], rows, found)
             async with db_pool.acquire() as conn:
@@ -2788,9 +3491,16 @@ async def _thumb_get_messages(chat_id: int, username, ids: list) -> dict:
         if not (username and any(m in str(e) for m in _PEER_ERR_MARKS)
                 and username not in _thumb_resolve_tried):
             raise
-        _thumb_resolve_tried.add(username)
         log.info("[thumbs] no peer for %s — resolving @%s once", chat_id, username)
-        await _mtproto("resolveUsername", lambda: app.resolve_peer(username))
+        try:
+            await _mtproto("resolveUsername", lambda: app.resolve_peer(username), wait=False,
+                           username=username)
+        except DailyBudgetExhausted:
+            raise                        # not this channel's fault: try again another day
+        except Exception:
+            _thumb_resolve_tried.add(username)
+            raise
+        _thumb_resolve_tried.add(username)
         msgs = await _call()
     if not isinstance(msgs, list):
         msgs = [msgs]
@@ -2816,6 +3526,19 @@ async def _thumb_process_batch(rows) -> None:
                 data = await _fetch_thumb_https(r["channel_username"], r["tg_message_id"])
             if not data:
                 return False
+            # A scraped picture that is byte-for-byte the thumbnail of a
+            # DIFFERENT file in the same channel is not this message's picture
+            # (it is the avatar, or the page changed shape): ask Telegram.
+            if r["file_unique_id"]:
+                async with db_pool.acquire() as conn:
+                    clash = await conn.fetchval(
+                        """SELECT 1 FROM messages
+                           WHERE thumb_md5 = $1 AND channel_id = $2
+                             AND file_unique_id IS NOT NULL AND file_unique_id <> $3
+                           LIMIT 1""",
+                        hashlib.md5(data).hexdigest(), r["channel_id"], r["file_unique_id"])
+                if clash:
+                    return False
             with open(target, "wb") as f:
                 f.write(data)
             await _thumb_store(r, fname, target)
@@ -2849,7 +3572,15 @@ async def _thumb_process_batch(rows) -> None:
             await asyncio.sleep(min(wait, 3600))
             return          # rows stay __user_queued__ for the next pass
         except DailyBudgetExhausted as e:
-            log.warning("[thumbs] %s — leaving channel %s queued", e, chat_id)
+            # Cannot reach this channel right now. Take its rows out of the
+            # queue (they are asked for again the next time someone looks) -
+            # left queued they would be picked up again at once, for ever.
+            log.info("[thumbs] %s — channel %s skipped for now (%d thumbnails)", e, chat_id, len(grp))
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET thumb_path = NULL "
+                    "WHERE id = ANY($1::bigint[]) AND thumb_path = '__user_queued__'",
+                    [r["id"] for r in grp])
             continue
         except Exception as e:
             await _thumb_fail(grp[0], e, whole_channel=True)
@@ -3516,8 +4247,10 @@ async def subscription_poller() -> None:
                         raise
                     log.info("[subscribe] @%s stale peer cache → force-resolve", uname)
                     from pyrogram.raw.functions.contacts import ResolveUsername
+                    # a channel is followed because someone chose to follow it
                     r = await _mtproto("resolveUsername",
-                        lambda: app.invoke(ResolveUsername(username=uname.lstrip("@"))))
+                        lambda: app.invoke(ResolveUsername(username=uname.lstrip("@"))),
+                        user=True)
                     await app.fetch_peers(r.chats + r.users)
                     chat = await _mtproto("get_chat",
                         lambda: app.get_chat(uname))
@@ -3892,27 +4625,31 @@ async def registry_puller() -> None:
                     await conn.execute(
                         "DELETE FROM config WHERE key='registry_pull_force'")
                     log.info("[pull] force-trigger received, pulling now")
-                last_pulled = await conn.fetchval(
-                    "SELECT max(last_pulled_at) FROM discovered")
-            params = {"audience": "sfw", "only_verified": "1", "limit": "5000"}
-            if last_pulled:
-                params["since"] = last_pulled.isoformat()
-            qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-            url = REGISTRY_URL + "/api/v1/registry?" + qs
-
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": TGARR_UA,
-                             "Accept": "application/json"},
-                )
-                resp = await asyncio.to_thread(
-                    lambda: urllib.request.urlopen(req, timeout=30).read())
-                data = json.loads(resp.decode())
-                channels = data.get("channels", [])
-            except Exception as e:
-                log.warning("[pull] registry GET failed: %s", e)
-                channels = []
+                # The list is asked for per audience. It used to be asked for
+                # "sfw" only, whatever the setting said: someone who had
+                # switched adult content on got an empty adult Discover.
+                _adult = (await conn.fetchval(
+                    "SELECT value FROM config WHERE key='nsfw_enabled'")) == "true"
+                _since = {r["audience"]: r["t"] for r in await conn.fetch(
+                    "SELECT audience, max(last_pulled_at) AS t FROM discovered GROUP BY 1")}
+            channels = []
+            for _aud in (["sfw", "nsfw"] if _adult else ["sfw"]):
+                params = {"audience": _aud, "only_verified": "1", "limit": "5000"}
+                if _since.get(_aud):
+                    params["since"] = _since[_aud].isoformat()
+                qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
+                url = REGISTRY_URL + "/api/v1/registry?" + qs
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": TGARR_UA,
+                                 "Accept": "application/json"},
+                    )
+                    resp = await asyncio.to_thread(
+                        lambda: urllib.request.urlopen(req, timeout=30).read())
+                    channels += json.loads(resp.decode()).get("channels", [])
+                except Exception as e:
+                    log.warning("[pull] registry GET (%s) failed: %s", _aud, e)
 
             inserted = updated = 0
             async with db_pool.acquire() as conn:
@@ -4133,10 +4870,31 @@ async def federation_validator() -> None:
     log.info("[fed-validator] enabled; batch=%d interval=%ds per_seed=%ds endpoint=%s",
              SEEDS_BATCH, SEEDS_INTERVAL_SEC, PER_SEED_DELAY_SEC, REGISTRY_URL)
     await asyncio.sleep(180)  # let backfill + metadata settle first
+    # A restart is not a reason to validate another batch: wait out what is
+    # left of the interval since the last one. (A day of updates used to mean
+    # a batch per restart.)
+    try:
+        async with db_pool.acquire() as conn:
+            _last = await conn.fetchval(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - updated_at)) FROM config "
+                "WHERE key = 'fed_validator_last'")
+        if _last is not None and _last < SEEDS_INTERVAL_SEC:
+            log.info("[fed-validator] last batch %d min ago — next in %d min",
+                     int(_last // 60), int((SEEDS_INTERVAL_SEC - _last) // 60))
+            await asyncio.sleep(SEEDS_INTERVAL_SEC - _last)
+    except Exception:
+        pass
 
     while True:
         try:
             await _heartbeat("federation_validator", f"fetching seed batch (size={SEEDS_BATCH})")
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO config (key, value) VALUES ('fed_validator_last', 'x')
+                           ON CONFLICT (key) DO UPDATE SET updated_at = NOW()""")
+            except Exception:
+                pass
             # ─── 1. Fetch a batch from central ──────────────────────────
             try:
                 url = f"{REGISTRY_URL}/api/v1/seeds?batch={SEEDS_BATCH}"
@@ -4180,7 +4938,7 @@ async def federation_validator() -> None:
                             lambda: app.get_chat(invite))
                     else:
                         chat = await _mtproto("resolveUsername",
-                            lambda: app.get_chat(uname))
+                            lambda: app.get_chat(uname), username=uname)
                     members = getattr(chat, "members_count", None)
                     _cu = getattr(chat, "username", None)
                     title = getattr(chat, "title", None) or (_cu or uname)
@@ -4343,92 +5101,228 @@ async def dc_backfill_worker() -> None:
             await asyncio.sleep(60)
 
 
+# Files a person asked for are fetched several at a time. One at a time meant
+# a 2 GB film opened earlier held every later click - a 5 MB song included -
+# until it had finished. A slot is always kept for small files.
+ONDEMAND_SLOTS = 3
+ONDEMAND_BIG_BYTES = 200 * 1024 * 1024
+ONDEMAND_BIG_SLOTS = 2
+_ondemand_active: dict = {}        # message row id -> is it a big file
+
+
 async def on_demand_media_downloader() -> None:
     """Process messages marked local_path='__user_queued__' by API.
 
     Strictly user-driven: scans only for the queue marker, no proactive
-    backlog work. Same stream_media() path as the disabled proactive
-    worker, with FloodWait + short-download detection.
+    backlog work. Up to ONDEMAND_SLOTS files at once, small ones first, at
+    most ONDEMAND_BIG_SLOTS of them big.
     """
     log.info("[on-demand-media] started — processes __user_queued__ marker")
     os.makedirs(AUDIO_ROOT, exist_ok=True)
     os.makedirs(LIBRARY_ROOT, exist_ok=True)
     os.makedirs(VIDEO_ROOT, exist_ok=True)
+    try:
+        _n = await asyncio.to_thread(_flac_fix_existing)
+        if _n:
+            log.info("[on-demand-media] repaired the cover type of %d FLAC file(s) "
+                     "already downloaded", _n)
+    except Exception as e:
+        log.warning("[on-demand-media] FLAC check: %s", e)
     while True:
         try:
+            if len(_ondemand_active) >= ONDEMAND_SLOTS:
+                await asyncio.sleep(1)
+                continue
+            big_ok = sum(1 for v in _ondemand_active.values() if v) < ONDEMAND_BIG_SLOTS
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow("""
                     SELECT m.id, m.tg_chat_id, m.tg_message_id, m.media_type,
                            m.file_name, m.file_size
                     FROM messages m
                     WHERE m.local_path = '__user_queued__'
-                    ORDER BY m.id DESC
+                      AND m.id <> ALL($1::bigint[])
+                      AND ($2 OR COALESCE(m.file_size, 0) < $3)
+                    ORDER BY (COALESCE(m.file_size, 0) >= $3), m.id DESC
                     LIMIT 1
-                """)
+                """, list(_ondemand_active), big_ok, ONDEMAND_BIG_BYTES)
             if not row:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1 if _ondemand_active else 2)
                 continue
-
-            mt = row["media_type"] or "document"
-            await _heartbeat("on_demand_media_downloader", f"streaming msg {row['id']} ({mt})")
-            root = (AUDIO_ROOT if mt == "audio"
-                    else VIDEO_ROOT if mt == "video"
-                    else LIBRARY_ROOT)
-            base = (row["file_name"] or f"item-{row['id']}")
-            safe = SAFE_NAME.sub("_", base)[:180]
-            target = os.path.join(root, safe)
-            rel = os.path.relpath(target, "/downloads")
-
-            try:
-                msg = await _mtproto_get_messages_with_auto_join(
-                    row["tg_chat_id"], row["tg_message_id"])
-                if not msg:
-                    raise RuntimeError("msg gone")
-                media = (msg.audio if mt == "audio"
-                         else msg.video if mt == "video"
-                         else msg.document)
-                if not media:
-                    raise RuntimeError("no media obj")
-
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET local_path=$1 WHERE id=$2",
-                        rel, row["id"])
-                log.info("[on-demand-media] %s id=%s → %s", mt, row["id"], rel)
-
-                expected = row["file_size"] or 0
-                written = 0
-                with open(target, "wb") as f:
-                    async for chunk in _stream_media_fast(msg, media):
-                        f.write(chunk)
-                        written += len(chunk)
-
-                if expected and written < expected * 0.95:
-                    log.warning("[on-demand-media] short download id=%s wrote=%s expected=%s",
-                                row["id"], written, expected)
-                    async with db_pool.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE messages SET local_path='__failed__' WHERE id=$1",
-                            row["id"])
-                else:
-                    log.info("[on-demand-media] complete id=%s wrote=%s", row["id"], written)
-            except FloodWait as e:
-                wait_s = getattr(e, "value", 30)
-                log.warning("[on-demand-media] FloodWait %ss id=%s", wait_s, row["id"])
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET local_path='__user_queued__' WHERE id=$1",
-                        row["id"])
-                await asyncio.sleep(wait_s + 5)
-            except Exception as e:
-                log.exception("[on-demand-media] id=%s error: %s", row["id"], e)
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE messages SET local_path='__failed__' WHERE id=$1",
-                        row["id"])
+            _ondemand_active[row["id"]] = (row["file_size"] or 0) >= ONDEMAND_BIG_BYTES
+            asyncio.create_task(_ondemand_run(row))
         except Exception:
             log.exception("[on-demand-media] outer loop")
             await asyncio.sleep(10)
+
+
+async def _ondemand_run(row) -> None:
+    try:
+        await _ondemand_fetch_one(row)
+    except Exception:
+        log.exception("[on-demand-media] id=%s", row["id"])
+    finally:
+        _ondemand_active.pop(row["id"], None)
+
+
+# Opening a film starts fetching the whole file. That is right while someone
+# is watching it and wrong the moment they are not: ten films opened and
+# closed were ten complete downloads - bandwidth, disk, and the account's
+# cross-DC allowance spent on nothing.
+#
+# The API stamps messages.fetch_wanted_at for as long as a player, a reader
+# or a browser download is asking for the file. A fetch of a big file checks
+# the stamp as it goes and stops once nobody has asked for a while; what has
+# arrived is kept, and the next request continues from there instead of
+# starting again. Songs and books are small: they simply finish.
+# (No stamp at all = an API that does not write them: behave as before.)
+ONDEMAND_WATCH_BYTES = 64 * 1024 * 1024
+ONDEMAND_IDLE_SEC = int(os.environ.get("TGARR_ONDEMAND_IDLE_SEC", "150"))
+
+
+async def _ondemand_wanted(msg_id: int) -> bool:
+    try:
+        async with db_pool.acquire() as conn:
+            v = await conn.fetchval(
+                """SELECT fetch_wanted_at IS NULL
+                          OR fetch_wanted_at > NOW() - make_interval(secs => $2)
+                   FROM messages WHERE id = $1""", msg_id, float(ONDEMAND_IDLE_SEC))
+        return v is not False
+    except Exception:
+        return True
+
+
+async def _ondemand_fetch_one(row) -> None:
+    mt = row["media_type"] or "document"
+    await _heartbeat("on_demand_media_downloader", f"streaming msg {row['id']} ({mt})")
+    root = (AUDIO_ROOT if mt == "audio"
+            else VIDEO_ROOT if mt == "video"
+            else LIBRARY_ROOT)
+    base = (row["file_name"] or f"item-{row['id']}")
+    safe = SAFE_NAME.sub("_", base)[:180]
+    target = os.path.join(root, safe)
+    rel = os.path.relpath(target, "/downloads")
+    expected = row["file_size"] or 0
+    watched = expected >= ONDEMAND_WATCH_BYTES
+    mb = 1024 * 1024
+
+    try:
+        if watched and not await _ondemand_wanted(row["id"]):
+            # asked for, then left before the fetch even began
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET local_path = NULL "
+                    "WHERE id = $1 AND local_path = '__user_queued__'", row["id"])
+            log.info("[on-demand-media] id=%s: nobody is waiting for it any more — not fetched",
+                     row["id"])
+            return
+        have = os.path.getsize(target) if os.path.exists(target) else 0
+        if expected and have >= expected:
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE messages SET local_path=$1 WHERE id=$2", rel, row["id"])
+            _drop_tail_sidecar(target)
+            return                               # already here in full
+
+        msg = await _mtproto_get_messages_with_auto_join(
+            row["tg_chat_id"], row["tg_message_id"])
+        if not msg:
+            raise RuntimeError("msg gone")
+        media = (msg.audio if mt == "audio"
+                 else msg.video if mt == "video"
+                 else msg.document)
+        if not media:
+            raise RuntimeError("no media obj")
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path=$1 WHERE id=$2",
+                rel, row["id"])
+        # continue a fetch that was stopped half-way (whole megabytes only:
+        # that is the unit Telegram serves)
+        start = (have // mb) * mb if (watched and mb <= have < expected) else 0
+        log.info("[on-demand-media] %s id=%s → %s%s", mt, row["id"], rel,
+                 f" (continuing at {start // mb} MB)" if start else "")
+
+        async def _fetch(start: int):
+            written, paused, checked = start, False, time.time()
+            if not start:
+                _drop_tail_sidecar(target)
+            # a FLAC's metadata is held back until it is whole, so that it can
+            # be repaired before a single byte is visible to the player
+            hold = bytearray() if (target.lower().endswith(".flac") and not start) else None
+            with open(target, "r+b" if start else "wb") as f:
+                if start:
+                    f.seek(start)
+                    f.truncate()
+                src = (_stream_file_cached(media, start=start) if start
+                       else _stream_media_fast(msg, media))
+                async for chunk in src:
+                    if hold is not None:
+                        hold += chunk
+                        n = _flac_meta_len(hold)
+                        if n is None and len(hold) < _FLAC_META_MAX:
+                            continue
+                        if n:
+                            fixed = _flac_fix_meta(bytes(hold[:n]))
+                            if fixed != bytes(hold[:n]):
+                                log.info("[on-demand-media] id=%s: FLAC cover had no type "
+                                         "(browsers refuse such a file) — repaired", row["id"])
+                            chunk = fixed + bytes(hold[n:])
+                        else:
+                            chunk = bytes(hold)
+                        hold = None
+                    f.write(chunk)
+                    f.flush()
+                    if written == 0 and expected > 8 * mb and mt != "audio":
+                        await _fetch_tail_sidecar(media, target, chunk, expected)
+                    written += len(chunk)
+                    if watched and time.time() - checked > 10:
+                        checked = time.time()
+                        if not await _ondemand_wanted(row["id"]):
+                            paused = True
+                            break
+                if hold:
+                    f.write(hold)
+                    written += len(hold)
+            return written, paused
+
+        try:
+            written, paused = await _fetch(start)
+        except _FastPathUnavailable:
+            if not start:
+                raise
+            written, paused = await _fetch(0)     # cannot continue this one: start over
+
+        if paused:
+            log.info("[on-demand-media] id=%s: nobody is watching — stopped at %d%% (%d of %d MB); "
+                     "it continues from here when someone opens it again",
+                     row["id"], written * 100 // max(expected, 1), written // mb, expected // mb)
+            return
+        if not expected or written >= expected:
+            _drop_tail_sidecar(target)       # the file is whole: no longer needed
+
+        if expected and written < expected * 0.95:
+            log.warning("[on-demand-media] short download id=%s wrote=%s expected=%s",
+                        row["id"], written, expected)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET local_path='__failed__' WHERE id=$1",
+                    row["id"])
+        else:
+            log.info("[on-demand-media] complete id=%s wrote=%s", row["id"], written)
+    except FloodWait as e:
+        wait_s = getattr(e, "value", 30)
+        log.warning("[on-demand-media] FloodWait %ss id=%s", wait_s, row["id"])
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path='__user_queued__' WHERE id=$1",
+                row["id"])
+        await asyncio.sleep(wait_s + 5)
+    except Exception as e:
+        log.exception("[on-demand-media] id=%s error: %s", row["id"], e)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path='__failed__' WHERE id=$1",
+                row["id"])
 
 
 DEEP_BACKFILL_ENABLED = os.environ.get("TGARR_DEEP_BACKFILL", "true").lower() == "true"
@@ -5451,6 +6345,23 @@ async def index_purge_worker() -> None:
       • messages with an active/queued download are kept
       • FK-safe order in a transaction (downloads → releases → messages)
     """
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('mtproto_caps', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
+                json.dumps({"caps": _MTPROTO_DAILY_MAX, "bg_share": _MTPROTO_BG_SHARE}))
+    except Exception:
+        pass
+    # The API tells people what "unfollow" will do: it has to know this.
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('index_purge', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
+                "on" if INDEX_PURGE_ENABLED else "off")
+    except Exception:
+        pass
     if not INDEX_PURGE_ENABLED:
         log.info("[index-purge] TGARR_INDEX_PURGE=false — disabled")
         return
@@ -5787,6 +6698,36 @@ async def _session_change_watcher(boot_user_id: int):
         await asyncio.sleep(30)
 
 
+async def _session_saver() -> None:
+    """Write what the session has learned to disk as we go.
+
+    Pyrogram keeps the channels it knows (their access hashes, their
+    @usernames) in memory and writes them to the session file only when it is
+    stopped cleanly. A container is not stopped cleanly - it is killed - so
+    the file held the login and nothing else: after every restart, and so
+    after every update, the session knew no channel at all and each one had
+    to be looked up by @username again. That is the scarcest allowance an
+    account has, spent on every upgrade by every install.
+    """
+    import signal
+
+    def _commit():
+        try:
+            app.storage.conn.commit()
+        except Exception:
+            pass
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, lambda: (_commit(), os._exit(0)))
+    except (NotImplementedError, RuntimeError, ValueError):
+        pass
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await app.storage.save()
+        except Exception as e:
+            log.debug("[session] save: %s", e)
+
+
 async def main() -> None:
     global CURRENT_USER_ID, CURRENT_DC
     await init_db()
@@ -5892,7 +6833,9 @@ async def main() -> None:
     asyncio.create_task(registry_puller())
     asyncio.create_task(audience_classifier_worker())
     asyncio.create_task(stale_index_sweeper())
+    asyncio.create_task(release_judge_worker())
     asyncio.create_task(membership_sync_worker())
+    asyncio.create_task(_session_saver())
     # seed_validator disabled on client: leftover from pre-federation split.
 
     log.info("starting backfill (limit %s/channel)...", BACKFILL_LIMIT)

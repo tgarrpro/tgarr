@@ -298,6 +298,11 @@ async def qr_start() -> dict:
     except Exception as e:
         state.status = "error"
         state.message = f"export token: {e}"
+        if "API_ID_INVALID" in str(e) or "API_ID_PUBLISHED_FLOOD" in str(e):
+            # the most likely mistake on a new install: say where to fix it
+            state.message = ("Telegram rejected the API credentials. Check TG_API_ID and "
+                             "TG_API_HASH in the .env file (from https://my.telegram.org/apps), "
+                             "then run: docker compose up -d")
         return {"status": "error", "message": state.message}
 
     if isinstance(r, LoginToken):

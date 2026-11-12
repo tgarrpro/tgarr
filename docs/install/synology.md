@@ -37,11 +37,9 @@
    MEILI_MASTER_KEY=<openssl rand -hex 32>
    ```
 
-4. One-time interactive Telegram login (SMS code stays in your terminal, never lands in any file):
+4. Start the stack (next step), then sign in:
 
-   ```bash
-   docker compose run --rm crawler python login.py
-   ```
+   After the stack is started, open `http://<your-host>:8765` in a browser and sign in — scan the QR code with the Telegram app, or enter your phone number and the code Telegram sends you. Nothing is typed in a terminal, and the code never touches a file.
 
 5. Start the stack:
 

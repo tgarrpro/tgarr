@@ -1,19 +1,43 @@
+# tgarr — the install most people want.
+#
+#   curl -fsSLO https://raw.githubusercontent.com/tgarrpro/tgarr/main/docker-compose.yml
+#   curl -fsSL  https://raw.githubusercontent.com/tgarrpro/tgarr/main/.env.example -o .env
+#   # fill in .env, then:
+#   docker compose up -d        # open http://<this-host>:8765 and sign in
+#
+# These two files are all you need: no checkout of the source. Images come
+# from ghcr.io and are kept up to date by the watchtower service below (it
+# only ever touches the two tgarr containers). To stay on one version instead,
+# set TGARR_TAG in .env (for example TGARR_TAG=0.5.6).
+#
+# Building from source instead:  docker-compose.dev.yml
+# The tgarr.me registry server:  docker-compose.central.yml
+
 name: tgarr
+
+x-logging: &tgarr-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
 
 services:
   db:
     image: postgres:16-alpine
     container_name: tgarr-db
     restart: unless-stopped
+    logging: *tgarr-logging
     environment:
       POSTGRES_USER: tgarr
       POSTGRES_DB: tgarr
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - ./_data/postgres:/var/lib/postgresql/data
-      - ./schema:/docker-entrypoint-initdb.d:ro
-    ports:
-      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tgarr -d tgarr"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
     networks:
       - tgarr-net
 
@@ -21,94 +45,90 @@ services:
     image: getmeili/meilisearch:v1.11
     container_name: tgarr-meili
     restart: unless-stopped
+    logging: *tgarr-logging
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
     volumes:
       - ./_data/meili:/meili_data
-    ports:
-      - "127.0.0.1:7700:7700"
     networks:
       - tgarr-net
 
   crawler:
-    build: ./crawler
+    image: ghcr.io/tgarrpro/tgarr-crawler:${TGARR_TAG:-latest}
     container_name: tgarr-crawler
-    # The crawler exits on purpose in a few situations (new login, account
-    # switch) and relies on being restarted.
     restart: unless-stopped
-    depends_on: [db, meili]
-    logging: &tgarr-logging
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
+    logging: *tgarr-logging
+    depends_on:
+      db:
+        condition: service_healthy
+      meili:
+        condition: service_started
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
     environment:
       TG_API_ID: ${TG_API_ID}
       TG_API_HASH: ${TG_API_HASH}
-      TG_PHONE: ${TG_PHONE}
+      TG_PHONE: ${TG_PHONE:-}
       DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
       MEILI_URL: http://meili:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
       TG_DOWNLOAD_ROOT: /downloads/tgarr
-      TGARR_SEED_VALIDATOR: ${TGARR_SEED_VALIDATOR:-false}
-      TGARR_SEED_VALIDATOR_INTERVAL: ${TGARR_SEED_VALIDATOR_INTERVAL:-30}
-      TG_PARSE_SCORE_MIN: "0.30"
     volumes:
       - ./_data/session:/app/session
-      - ./_data/downloads:/downloads
-      - ./tools:/app/tools:ro
+      - ${TGARR_DOWNLOADS:-./_data/downloads}:/downloads
     networks:
       - tgarr-net
-    # Sign in at http://<host>:8765/login once the stack is up; the crawler
-    # waits for that session and starts by itself.
 
   api:
-    build: ./api
+    image: ghcr.io/tgarrpro/tgarr-api:${TGARR_TAG:-latest}
     container_name: tgarr-api
     restart: unless-stopped
-    depends_on: [db]
     logging: *tgarr-logging
+    depends_on:
+      db:
+        condition: service_healthy
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    # an init process reaps what a stopped e-book conversion leaves behind
+    init: true
+    # Sonarr / Radarr published on this same host are reachable as
+    # host.docker.internal whatever the host's address is.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
-      TGARR_BASE_URL: ${TGARR_BASE_URL:-}
       TG_API_ID: ${TG_API_ID}
       TG_API_HASH: ${TG_API_HASH}
-      TMDB_API_KEY: ${TMDB_API_KEY:-}
-      # search page needs the same Meilisearch the crawler writes to
       MEILI_URL: http://meili:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
-      # optional access control — see README "Securing tgarr"
+      TGARR_BASE_URL: ${TGARR_BASE_URL:-}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
       TGARR_API_KEY: ${TGARR_API_KEY:-}
       TGARR_UI_PASSWORD: ${TGARR_UI_PASSWORD:-}
     volumes:
-      - ./api:/app
       - ./_data/session:/app/session
-      - ./_data/downloads:/downloads
+      - ${TGARR_DOWNLOADS:-./_data/downloads}:/downloads
     ports:
       - "${TGARR_PORT:-8765}:8088"
     networks:
       - tgarr-net
 
-  # Central federation registry. Runs ONLY on the tgarr.me host (1.37):
-  #   docker compose --profile server up -d
-  # End-user instances skip this service entirely.
-  registry:
-    profiles: ["server"]
-    build: ./registry
-    container_name: tgarr-registry
+  # Keeps the two tgarr containers on the newest released image. It looks
+  # only at containers carrying the label above - nothing else on this host.
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: tgarr-watchtower
     restart: unless-stopped
-    depends_on: [db]
+    logging: *tgarr-logging
     environment:
-      REGISTRY_MIN_CONSENSUS: "1"
-      BLOOM_DC_THRESHOLD: "1"
-      TGARR_TEST_SHOWCASE_IPS: ${TGARR_TEST_SHOWCASE_IPS:-}
-      SUSPICION_BATCH_THRESHOLD: "10000"
-      DB_DSN: postgresql://tgarr:${DB_PASSWORD}@db:5432/tgarr
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "${TGARR_AUTOUPDATE_INTERVAL:-1800}"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
     volumes:
-      - ./registry:/app
-    ports:
-      - "127.0.0.1:8090:8090"
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - tgarr-net
 

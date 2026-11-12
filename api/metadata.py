@@ -1,15 +1,21 @@
-"""Metadata lookup with two-tier fallback.
+"""Metadata lookup: TMDB search, then Wikidata.
 
-Tier 1 — TMDB (themoviedb.org), if user has set an API key in Settings.
-         Best quality: posters, canonical titles, overview, release date,
-         vote average. Requires user registration at themoviedb.org.
+TMDB (themoviedb.org) — used when the user has set an API key in Settings.
+    Posters, localized titles, overview, release date. The search runs in the
+    language of the title and a result is only accepted when it really is that
+    title (see pick_tmdb_hit).
 
-Tier 2 — Wikipedia REST API. Free, no key. Posters are en.wikipedia.org
-         thumbnails (Commons-licensed). Lower coverage and quality than
-         TMDB but acceptable as a zero-friction default.
+Wikidata — free, no key, every language. Resolves a title to a screen work
+    and its TMDB / IMDb ids. With a TMDB key the poster and details are then
+    fetched by id; without one the user still gets the verified title, year
+    and type.
 
-The caller (typically a background worker in main.py) reads the TMDB key
-from the `config` table and passes it in via `tmdb_key=`.
+lookup() returns a dict on a match, None when nothing was found, UNMATCHED
+when the sources answered but not with this title, and raises LookupFailed
+when a source could not be reached.
+
+The caller (a background worker in main.py) reads the TMDB key from the
+`config` table and passes it in via `tmdb_key=`.
 """
 import asyncio
 import json
@@ -23,9 +29,7 @@ log = logging.getLogger("tgarr.metadata")
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p"
-WIKI_API = "https://en.wikipedia.org/w/api.php"
-WIKI_REST = "https://en.wikipedia.org/api/rest_v1/page/summary"
-USER_AGENT = "tgarr/0.3 (+https://tgarr.me)"
+USER_AGENT = "tgarr/0.5 (+https://tgarr.me; metadata lookup)"
 
 
 # Returned by lookup() when a source DID answer but nothing it offered is the
@@ -38,10 +42,6 @@ _NOISE_TOKENS = re.compile(
     r"hdr10|dv|web[ ._-]?dl|webrip|web|bluray|blu[ ._-]?ray|bdrip|brrip|hdtv|hdrip|"
     r"dvdrip|dvd|remux|x264|x265|h264|h265|hevc|avc|av1|aac|ac3|dts|flac|mp4|mkv|avi|"
     r"mov|ts|rmvb|wmv)(?![a-z0-9])")
-_SCREEN_WORK = re.compile(
-    r"(?i)\b(film|movie|television|tv series|tv show|miniseries|mini-series|anime|"
-    r"documentary|sitcom|web series|drama series|drama|telenovela|animated series|"
-    r"animation|soap opera|ova|short film|serial)\b")
 
 
 def is_junk_title(title: str) -> bool:
@@ -77,6 +77,98 @@ def title_matches(query: str, *candidates) -> bool:
     return False
 
 
+# Script of the query -> TMDB language. Asking in the query's own language makes
+# TMDB return the localized title, which is the only thing a translated title
+# ("福尔摩斯小姐2" for Enola Holmes 2) can be compared against: such a film's
+# title and original_title are both English.
+_SCRIPT_LANG = (
+    ("[\u3040-\u30ff]", "ja-JP"),
+    ("[\uac00-\ud7af]", "ko-KR"),
+    ("[\u4e00-\u9fff]", "zh-CN"),
+    ("[\u0400-\u04ff]", "ru-RU"),
+    ("[\u0590-\u05ff]", "he-IL"),
+    ("[\u0600-\u06ff]", "ar-SA"),
+    ("[\u0900-\u097f]", "hi-IN"),
+)
+
+
+_AD_SUFFIX = re.compile(
+    r"\s*[-\u2013\u2014~\uff5e|\uff5c]+\s*\S*(TG|tg|\u7535\u62a5|\u9891\u9053|\u5f71\u9662|\u8d44\u6e90|@).*$")
+
+
+def clean_query_title(title: str) -> str:
+    """Strip posting decorations that are not part of the title before asking
+    a metadata source: a leading '#', a list index ("1 La La Land"), a channel
+    advert after a dash ("Title -TG cinema ~ hot movies"), and a dangling
+    opening bracket left by the parser."""
+    t = (title or "").strip()
+    t = re.sub(r"^[#\uff03\s]+", "", t)
+    t = _AD_SUFFIX.sub("", t)
+    t = re.sub(r"^\d{1,2}\s+(?=\D)", "", t)
+    t = re.sub(r"[\s(\[{<\uff08\u3010\u300a\u300c\u300e]+$", "", t)
+    return t.strip() or (title or "").strip()
+
+
+def query_language(title: str):
+    for rx, lang in _SCRIPT_LANG:
+        if re.search(rx, title or ""):
+            return lang
+    return None
+
+
+def _shared_prefix(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _hit_year(hit: dict):
+    d = (hit.get("release_date") or hit.get("first_air_date") or "")[:4]
+    return int(d) if d.isdigit() else None
+
+
+def pick_tmdb_hit(title: str, year, results: list, lang):
+    """Choose the search result that is really `title`, or None.
+
+    1. A result whose title / original title equals the query (any script).
+    2. Non-Latin query: a result whose LOCALIZED title starts the same way
+       (>= 2 characters and at least half of the shorter one) — sequels and
+       subtitles differ after the common stem.
+    3. Non-Latin query with a year: the top result, if its year is within one
+       of ours. TMDB search matches translated/alternative titles we cannot
+       see, and the year is independent confirmation.
+    Latin queries stay strict (rule 1 only): that is where the wrong posters
+    came from ("Kiki" -> "Kiki's Delivery Service").
+    """
+    top = results[:5]
+    for h in top:
+        if title_matches(title, h.get("title"), h.get("name"),
+                         h.get("original_title"), h.get("original_name")):
+            return h
+    if not lang:
+        return None
+    q = _norm(re.sub(r"[ ._(\[-]+(19|20)\d{2}[)\]]?$", "", (title or "").strip()))
+    for h in top:
+        for cand in (h.get("title"), h.get("name")):
+            c = _norm(cand)
+            if not c or not q:
+                continue
+            k = _shared_prefix(q, c)
+            short = min(len(q), len(c))
+            # a real common stem (>= 3 chars and at least half), or one title
+            # is entirely the beginning of the other
+            if (k >= 3 and k * 2 >= short) or (k >= 2 and k == short):
+                return h
+    if year and top:
+        hy = _hit_year(top[0])
+        if hy is not None and abs(hy - int(year)) <= 1 and len(q) >= 2:
+            return top[0]
+    return None
+
+
 class LookupFailed(Exception):
     """A metadata source errored (network, 5xx, bad key). NOT a miss."""
 
@@ -96,6 +188,9 @@ def _fetch(url: str, params: dict | None = None, timeout: int = 12) -> dict:
 async def _tmdb_search(category: str, title: str, year: int | None,
                        key: str) -> dict | None:
     params = {"query": title, "include_adult": "false", "api_key": key}
+    lang = query_language(title)
+    if lang:
+        params["language"] = lang
     if category == "tv" and year:
         params["first_air_date_year"] = year
         path = "/search/tv"
@@ -116,12 +211,8 @@ async def _tmdb_search(category: str, title: str, year: int | None,
     results = data.get("results") or []
     if not results:
         return None
-    # The first search result is not necessarily our title. Take the first of
-    # the top few whose (localized or original) title really matches.
-    hit = next((h for h in results[:5]
-                if title_matches(title, h.get("title"), h.get("name"),
-                                 h.get("original_title"), h.get("original_name"))),
-               None)
+    # The first search result is not necessarily our title.
+    hit = pick_tmdb_hit(title, year, results, lang)
     if hit is None:
         return UNMATCHED
     return {
@@ -138,86 +229,171 @@ async def _tmdb_search(category: str, title: str, year: int | None,
     }
 
 
-# ─────────────── Wikipedia tier ───────────────────────────────────────
-async def _wiki_search_title(query: str) -> str | None:
-    """Use the search API to find the best Wikipedia page title."""
+# ─────────────── Wikidata tier ────────────────────────────────────────
+# Free, keyless and multilingual: every entity carries its title in all
+# languages (plus aliases), a type, a date, and the TMDB / IMDb ids. Used
+#   * as the resolver when TMDB search did not find the title, and
+#   * as the only source when the user has no TMDB key.
+# It replaces the old English-Wikipedia fallback, which returned whatever page
+# a search happened to find (universities, actors, phones).
+WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+_WD_LANG = {"zh-CN": "zh", "ja-JP": "ja", "ko-KR": "ko", "ru-RU": "ru",
+            "he-IL": "he", "ar-SA": "ar", "hi-IN": "hi"}
+# Plain "zh" labels are often the Traditional / Taiwan title; a Chinese query
+# is most likely Simplified, so prefer those labels when they exist.
+_WD_LABEL_PREF = {"zh": ("zh-cn", "zh-hans", "zh", "zh-hant")}
+# instance-of values that are screen works. Not exhaustive on purpose: an
+# entity that carries a TMDB id or an IMDb title id is accepted as well.
+_WD_FILM_TYPES = {
+    "Q11424", "Q24869", "Q202866", "Q29168811", "Q20650540", "Q506240",
+    "Q93204", "Q24862", "Q229390", "Q130232", "Q17013749", "Q18011172",
+}
+_WD_TV_TYPES = {
+    "Q5398426", "Q63952888", "Q1259759", "Q581714", "Q15416", "Q526877",
+    "Q1261214", "Q117467246", "Q21191270", "Q7725310", "Q113671041",
+}
+
+
+def _wd_claim(claims: dict, prop: str):
+    for st in claims.get(prop, []):
+        snak = st.get("mainsnak") or {}
+        if "datavalue" in snak:
+            return snak["datavalue"]["value"]
+    return None
+
+
+def _wd_year(claims: dict):
+    for prop in ("P577", "P580"):          # publication date, start time
+        v = _wd_claim(claims, prop)
+        if isinstance(v, dict):
+            y = (v.get("time") or "")[1:5]
+            if y.isdigit():
+                return int(y)
+    return None
+
+
+async def _wikidata_resolve(category: str, title: str, year: int | None) -> dict | None:
+    """Find the screen work called `title` (in any language). Returns
+    {kind, tmdb_id, imdb_id, title, year, image} / UNMATCHED / None."""
+    lang = _WD_LANG.get(query_language(title) or "", "en")
     try:
-        data = await asyncio.to_thread(_fetch, WIKI_API, {
-            "action": "query", "list": "search", "format": "json",
-            "srsearch": query, "srlimit": 1, "srprop": "size",
-        })
+        found = await asyncio.to_thread(_fetch, WIKIDATA_API, {
+            "action": "wbsearchentities", "search": title, "language": lang,
+            "uselang": lang, "type": "item", "limit": 7, "format": "json"})
     except Exception as e:
-        log.warning("wiki search %r: %s", query, e)
-        raise LookupFailed(f"wiki search: {e}") from e
-    hits = (data.get("query") or {}).get("search") or []
-    return hits[0]["title"] if hits else None
-
-
-async def _wiki_summary(title: str) -> dict | None:
-    """REST summary endpoint — gives thumbnail + extract."""
-    url = WIKI_REST + "/" + urllib.parse.quote(title.replace(" ", "_"), safe="")
+        log.warning("wikidata search %r: %s", title, e)
+        raise LookupFailed(f"wikidata search: {e}") from e
+    cands = found.get("search") or []
+    if not cands:
+        return None
     try:
-        data = await asyncio.to_thread(_fetch, url, None)
+        ents = (await asyncio.to_thread(_fetch, WIKIDATA_API, {
+            "action": "wbgetentities", "ids": "|".join(c["id"] for c in cands),
+            "props": "claims|labels",
+            "languages": "|".join(_WD_LABEL_PREF.get(lang, (lang,)) + ("en",)),
+            "format": "json"})).get("entities") or {}
+    except Exception as e:
+        log.warning("wikidata entities %r: %s", title, e)
+        raise LookupFailed(f"wikidata entities: {e}") from e
+
+    for c in cands:
+        ent = ents.get(c["id"]) or {}
+        claims = ent.get("claims") or {}
+        types = {st["mainsnak"]["datavalue"]["value"]["id"]
+                 for st in claims.get("P31", [])
+                 if "datavalue" in (st.get("mainsnak") or {})}
+        tmdb_movie = _wd_claim(claims, "P4947")
+        tmdb_tv = _wd_claim(claims, "P4983")
+        imdb = _wd_claim(claims, "P345")
+        is_tv = bool(tmdb_tv) or bool(types & _WD_TV_TYPES)
+        is_film = bool(tmdb_movie) or bool(types & _WD_FILM_TYPES)
+        if not (is_tv or is_film or (isinstance(imdb, str) and imdb.startswith("tt"))):
+            continue                         # a person, a place, a company …
+        # The search matches labels and aliases, also loosely. Insist that the
+        # matched text really is our title.
+        matched = (c.get("match") or {}).get("text") or c.get("label") or ""
+        if not (title_matches(title, matched, c.get("label"))
+                or pick_tmdb_hit(title, None, [{"title": matched}], "x")):
+            continue
+        ey = _wd_year(claims)
+        if year and ey and abs(ey - int(year)) > 1:
+            continue                         # same name, different work
+        labels = ent.get("labels") or {}
+        kind = "tv" if (is_tv and not is_film) or (is_tv and category == "tv") else "movie"
+        image = _wd_claim(claims, "P18")
+        return {
+            "kind": kind,
+            "tmdb_id": (tmdb_tv if kind == "tv" else tmdb_movie) or tmdb_movie or tmdb_tv,
+            "imdb_id": imdb if isinstance(imdb, str) else None,
+            "title": (next(((labels.get(l) or {}).get("value")
+                            for l in _WD_LABEL_PREF.get(lang, (lang,))
+                            if (labels.get(l) or {}).get("value")), None)
+                      or (labels.get("en") or {}).get("value") or matched),
+            "year": ey,
+            "image": image if isinstance(image, str) else None,
+        }
+    return UNMATCHED
+
+
+async def _tmdb_by_id(kind: str, tmdb_id, key: str, lang) -> dict | None:
+    """Details of a known TMDB id (no searching, so no wrong match)."""
+    path = f"/{'tv' if kind == 'tv' else 'movie'}/{tmdb_id}"
+    params = {"api_key": key}
+    if lang:
+        params["language"] = lang
+    try:
+        hit = await asyncio.to_thread(_fetch, TMDB_BASE + path, params)
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return None  # page genuinely absent = a real miss
-        log.warning("wiki summary %r: %s", title, e)
-        raise LookupFailed(f"wiki summary: {e}") from e
+            return None
+        raise LookupFailed(f"tmdb id: {e}") from e
     except Exception as e:
-        log.warning("wiki summary %r: %s", title, e)
-        raise LookupFailed(f"wiki summary: {e}") from e
-    if data.get("type") != "standard":
-        return None
-    # Only pages about a screen work. Search happily returns universities,
-    # actors, phones and airports for arbitrary strings.
-    if not _SCREEN_WORK.search(data.get("description") or ""):
-        return UNMATCHED
-    thumb = data.get("thumbnail") or {}
-    orig = data.get("originalimage") or {}
+        raise LookupFailed(f"tmdb id: {e}") from e
     return {
-        "source": "wikipedia",
-        "tmdb_id": None,
-        "canonical_title": data.get("title"),
-        "poster_url": thumb.get("source"),
-        "backdrop_url": orig.get("source") if orig.get("width", 0) >= 800 else None,
-        "overview": (data.get("extract") or "")[:2000],
-        "release_date": None,
-        "vote_average": None,
+        "source": "tmdb",
+        "tmdb_id": hit.get("id"),
+        "canonical_title": hit.get("title") or hit.get("name"),
+        "poster_url": (f"{TMDB_IMG}/w342{hit['poster_path']}"
+                       if hit.get("poster_path") else None),
+        "backdrop_url": (f"{TMDB_IMG}/w780{hit['backdrop_path']}"
+                         if hit.get("backdrop_path") else None),
+        "overview": (hit.get("overview") or "")[:2000],
+        "release_date": hit.get("release_date") or hit.get("first_air_date"),
+        "vote_average": hit.get("vote_average"),
     }
 
 
-async def _wiki_lookup(category: str, title: str,
-                      year: int | None) -> dict | None:
-    # Search refinement: try "{title} ({year} film)" / "({year} TV series)" first,
-    # then "{title}" alone if no hit.
-    candidates = []
-    if year:
-        if category == "tv":
-            candidates.append(f"{title} ({year} TV series)")
-        else:
-            candidates.append(f"{title} ({year} film)")
-        candidates.append(f"{title} {year}")
-    candidates.append(title)
-
-    saw_page = False
-    for q in candidates:
-        wiki_title = await _wiki_search_title(q)
-        if not wiki_title:
-            continue
-        saw_page = True
-        # "Hibiscus Town (film)" → compare without the disambiguator
-        if not title_matches(title, re.sub(r"\s*\([^)]*\)\s*$", "", wiki_title)):
-            continue
-        result = await _wiki_summary(wiki_title)
-        if result and result is not UNMATCHED and result.get("poster_url"):
-            return result
-    return UNMATCHED if saw_page else None
+async def _wikidata_lookup(category: str, title: str, year: int | None,
+                           tmdb_key: str | None) -> dict | None:
+    wd = await _wikidata_resolve(category, title, year)
+    if wd is None or wd is UNMATCHED:
+        return wd
+    if tmdb_key and wd.get("tmdb_id"):
+        out = await _tmdb_by_id(wd["kind"], wd["tmdb_id"], tmdb_key,
+                                query_language(title))
+        if out:
+            return out
+    poster = None
+    if wd.get("image"):
+        poster = ("https://commons.wikimedia.org/wiki/Special:FilePath/"
+                  + urllib.parse.quote(wd["image"].replace(" ", "_")) + "?width=342")
+    return {
+        "source": "wikidata",
+        "tmdb_id": wd.get("tmdb_id"),
+        "canonical_title": wd["title"],
+        "poster_url": poster,
+        "backdrop_url": None,
+        "overview": "",
+        "release_date": f"{wd['year']}-01-01" if wd.get("year") else None,
+        "vote_average": None,
+    }
 
 
 # ─────────────── Unified entry point ──────────────────────────────────
 async def lookup(category: str, title: str, year: int | None,
                  tmdb_key: str | None = None) -> dict | None:
-    """Try TMDB first if key configured, then Wikipedia.
+    """Try TMDB search first if a key is configured, then Wikidata (which
+    resolves titles in any language and hands back a TMDB id when it has one).
 
     Returns None ONLY on a genuine miss (both sources answered and had nothing).
     Raises LookupFailed when a source could not be reached / errored, so callers
@@ -225,7 +401,7 @@ async def lookup(category: str, title: str, year: int | None,
     """
     if not title or len(title.strip()) < 2:
         return None
-    title = title.strip()
+    title = clean_query_title(title)
     if is_junk_title(title):
         return UNMATCHED
     tmdb_err = None
@@ -240,7 +416,7 @@ async def lookup(category: str, title: str, year: int | None,
             unmatched = True
         elif out:
             return out
-    out = await _wiki_lookup(category, title, year)
+    out = await _wikidata_lookup(category, title, year, tmdb_key)
     if out is UNMATCHED:
         unmatched, out = True, None
     if out:

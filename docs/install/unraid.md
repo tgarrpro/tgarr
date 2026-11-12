@@ -12,13 +12,10 @@
    - `TG_PHONE` — your Telegram phone number, international format `+1XXXXXXXXXX`
    - `DB_PASSWORD` — `openssl rand -hex 24`
    - `MEILI_MASTER_KEY` — `openssl rand -hex 32`
-5. First-time login (need a terminal session):
+5. First-time login, after Compose Up:
 
-   ```bash
-   docker compose --project-directory /boot/config/plugins/compose.manager/projects/tgarr run --rm crawler python login.py
-   ```
+   After the stack is started, open `http://<your-host>:8765` in a browser and sign in — scan the QR code with the Telegram app, or enter your phone number and the code Telegram sends you. Nothing is typed in a terminal, and the code never touches a file.
 
-   Telegram sends SMS code to your phone; type it at the prompt.
 6. In the Compose tab UI, click **Compose Up**.
 
 ## Community Apps template (coming soon)

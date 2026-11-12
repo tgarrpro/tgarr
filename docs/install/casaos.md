@@ -12,16 +12,16 @@ tgarr runs as a 3-container docker-compose stack (postgres + meilisearch + api/c
 - ~10 GB free disk space for postgres + meilisearch indexes
 - Enough free space for whatever media you plan to download
 
-## Step 1 — clone the repo
+## Step 1 — get the two files
 
 SSH into your CasaOS box:
 
 ```bash
-sudo mkdir -p /DATA/AppData/tgarr
-sudo chown $USER /DATA/AppData/tgarr
-cd /DATA/AppData/tgarr
-git clone https://github.com/tgarrpro/tgarr.git app
-cd app
+sudo mkdir -p /DATA/AppData/tgarr/app
+sudo chown -R $USER /DATA/AppData/tgarr
+cd /DATA/AppData/tgarr/app
+curl -fsSLO https://raw.githubusercontent.com/tgarrpro/tgarr/main/docker-compose.yml
+curl -fsSL  https://raw.githubusercontent.com/tgarrpro/tgarr/main/.env.example -o .env
 ```
 
 ## Step 2 — get Telegram API credentials
@@ -64,40 +64,17 @@ echo "DB_PASSWORD=$(openssl rand -hex 24)"        # paste into .env
 echo "MEILI_MASTER_KEY=$(openssl rand -hex 32)"   # paste into .env
 ```
 
-## Step 4 — first-time Telegram login (interactive)
-
-tgarr needs to authenticate your Telegram account once. The session file is cached after, runs unattended forever.
-
-```bash
-docker compose run --rm -it crawler python -c "
-import asyncio
-from pyrogram import Client
-import os
-app = Client(name='tgarr', api_id=int(os.environ['TG_API_ID']),
-             api_hash=os.environ['TG_API_HASH'], workdir='/app/session')
-async def go():
-    await app.start()
-    me = await app.get_me()
-    print(f'logged in as @{me.username or me.first_name} (id {me.id})')
-    await app.stop()
-asyncio.run(go())
-"
-```
-
-Pyrogram will prompt:
-
-- `Enter phone number or bot token` → paste your phone with country code, e.g. `+12815551234`
-- `Enter confirmation code` → check Telegram on your phone for the code, type it here
-- (If your account has 2FA) `Enter password` → your Telegram cloud password
-
-You should see `logged in as @yourhandle`. The session is now saved in `_data/session/`.
-
-## Step 5 — start the stack
+## Step 4 — start it
 
 ```bash
 docker compose up -d
-docker compose logs -f crawler
 ```
+
+## Step 5 — sign in
+
+In a browser, open `http://<your-host>:8765` in a browser and sign in — scan the QR code with the Telegram app, or enter your phone number and the code Telegram sends you. Nothing is typed in a terminal, and the code never touches a file.
+
+The session is saved in `_data/session/`; you sign in once.
 
 Expected logs:
 
@@ -153,10 +130,12 @@ A starter list of channels is at <https://tgarr.me/channels/>.
 
 ## Upgrade
 
+New releases are installed automatically. To update by hand:
+
 ```bash
 cd /DATA/AppData/tgarr/app
-git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 Sessions, database, and downloads persist across upgrades.

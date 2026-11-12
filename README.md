@@ -91,24 +91,25 @@ Public-tracker users have their IP logged by tens of thousands of peers. US ISPs
 > Requires Docker + docker compose v2. Runs on any platform that runs Docker — Synology, CasaOS, Unraid, TrueNAS, QNAP, Portainer, plain Linux, etc.
 
 ```bash
-git clone https://github.com/tgarrpro/tgarr.git
-cd tgarr
+mkdir tgarr && cd tgarr
+curl -fsSLO https://raw.githubusercontent.com/tgarrpro/tgarr/main/docker-compose.yml
+curl -fsSL  https://raw.githubusercontent.com/tgarrpro/tgarr/main/.env.example -o .env
 
 # 1. Get Telegram API credentials at https://my.telegram.org/apps
-# 2. Copy .env template and fill in TG_API_ID, TG_API_HASH, TG_PHONE
-cp .env.example .env
+# 2. Fill in .env: TG_API_ID, TG_API_HASH and two secrets of your own
 $EDITOR .env
 
-# 3. One-time interactive login — Telegram prompts for SMS code in the terminal,
-#    the code never appears in any config file.
-docker compose up -d   # then open http://<your-host>:8765/login and sign in (QR or SMS)
-
-# 4. Run the full stack
+# 3. Start it
 docker compose up -d
 
-# 5. Watch ingestion in real time
-docker compose logs -f crawler
+# 4. Open http://<your-host>:8765 and sign in (QR code, or phone number + code)
 ```
+
+Those two files are the whole install — no checkout of the source. New
+releases are picked up automatically (a `watchtower` container that only
+touches tgarr's own containers); set `TGARR_TAG` in `.env` to stay on one
+version. To build from source instead, clone the repository and use
+`docker-compose.dev.yml`.
 
 Once running:
 
@@ -139,7 +140,7 @@ Container images are multi-arch (`linux/amd64`, `linux/arm64`) — every modern 
 | `api/` | Newznab-compatible HTTP API — Sonarr/Radarr query target | Python · FastAPI |
 | `worker/` | Download executor — pulls files from Telegram, delivers to *arr | Python · Pyrogram |
 | `ui/` | Web admin — channel management, stats, manual search | React · Vite |
-| `schema/` | PostgreSQL DDL + migrations | SQL |
+| `api/schema.sql` | PostgreSQL base schema (applied by the api on start) | SQL |
 
 ## FAQ
 

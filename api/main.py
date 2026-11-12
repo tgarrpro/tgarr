@@ -154,7 +154,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.5"
+TGARR_VERSION = "0.5.6"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -208,6 +208,12 @@ ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
 app.middleware("http")(_request_guard)   # defined above, next to its helpers
+# The module-level logger. It was missing: the cache cleanup removed files and
+# then died on its own log line (NameError), once, for good - and the
+# "clear everything" button answered 500 after doing its work.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+log = logging.getLogger("tgarr")
+
 db_pool: Optional[asyncpg.Pool] = None
 
 
@@ -232,6 +238,9 @@ async def _ebook_queue_restore() -> None:
                 mid = int(f.read().strip())
             src = marker[:-len(".queue")]
             pdf = src + ".pdf"
+            if src.lower().endswith(".epub"):
+                os.unlink(marker)       # EPUB is read directly now: nothing to convert
+                continue
             # If PDF already exists + newer than src, cleanup stale marker
             if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
                 os.unlink(marker)
@@ -251,7 +260,28 @@ async def _ebook_queue_restore() -> None:
 @app.on_event("startup")
 async def _startup():
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
+    # The database may still be starting: wait for it instead of crash-looping.
+    for _i in range(60):
+        try:
+            db_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=8)
+            break
+        except (OSError, asyncpg.PostgresError) as e:
+            if _i == 59:
+                raise
+            await asyncio.sleep(2)
+    # The base tables. They used to come only from a file mounted into the
+    # database container (./schema) - which an install that fetched just the
+    # compose file does not have, and nothing else created them. They are
+    # part of the image now and (re)applied at every start; every statement
+    # is IF NOT EXISTS.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql"),
+                  encoding="utf-8") as _f:
+            _base = _f.read()
+        async with db_pool.acquire() as conn:
+            await conn.execute(_base)
+    except FileNotFoundError:
+        pass
     # The migration takes brief exclusive locks; against a busy crawler it can
     # lose a deadlock. Retry rather than failing startup.
     for _attempt in range(1, 7):
@@ -266,6 +296,12 @@ async def _startup():
                 "schema migration lock conflict (%s) — retry %d/5",
                 type(e).__name__, _attempt)
             await asyncio.sleep(2 * _attempt)
+    # Tell the crawler the schema is in place (it waits for this before it
+    # touches the tables - on a first start the two come up together).
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('schema_ready', $1)
+               ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", TGARR_VERSION)
     # Restore self-user from the session volume so the sidebar shows the real
     # username (not @anonymous) immediately after a restart, before any get_me.
     login.ensure_user_info()
@@ -284,6 +320,7 @@ async def _startup():
     asyncio.create_task(_stats_snapshot_worker())
     asyncio.create_task(_ebook_queue_restore())
     asyncio.create_task(_arr_alias_sync_worker())
+    asyncio.create_task(_cache_gc_worker())
 
 
 async def _migrate_schema():
@@ -449,6 +486,14 @@ async def _migrate_schema():
 
             -- grab_count for B (composite ranking) — derived from downloads table
             ALTER TABLE releases ADD COLUMN IF NOT EXISTS grab_count INT NOT NULL DEFAULT 0;
+            ALTER TABLE releases ADD COLUMN IF NOT EXISTS part SMALLINT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_accessed_at TIMESTAMPTZ;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_lyrics TEXT;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS fetch_wanted_at TIMESTAMPTZ;
+            CREATE TABLE IF NOT EXISTS favorites (
+              msg_id BIGINT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS detected_lang TEXT;
             CREATE INDEX IF NOT EXISTS idx_messages_lang ON messages (detected_lang) WHERE detected_lang IS NOT NULL;
             -- Per-download live progress (populated by Pyrogram callback in
@@ -460,6 +505,10 @@ async def _migrate_schema():
             -- category the *arr asked for on add (tv / movies / …); echoed back
             -- in queue + history so each app only sees its own jobs.
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS sab_cat TEXT;
+            -- running time + frame size as reported by Telegram for videos
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS duration_sec INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS width INTEGER;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS height INTEGER;
             -- 450px gallery preview (~76KB JPEG) — bigger than 12KB thumb for
             -- lightbox/slideshow. Same lazy-fetch model: '__user_queued__'
             -- marker triggers preview_downloader on next /api/photo-preview hit.
@@ -494,6 +543,58 @@ async def _migrate_schema():
                   ON CONFLICT (key) DO NOTHING;
               END IF;
             END $recheck$;
+            -- 0.5.5 judged translated titles too strictly (a foreign film under
+            -- its Chinese / Russian / ... title has only English titles in
+            -- TMDB, so nothing "matched"). Give every 'unmatched' release one
+            -- more look under the 0.5.6 rules. No score is touched.
+            DO $recheck2$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM config WHERE key = 'meta_recheck_0_5_6') THEN
+                UPDATE releases SET metadata_source = NULL, metadata_lookup_at = NULL
+                 WHERE metadata_source = 'unmatched';
+                INSERT INTO config (key, value) VALUES ('meta_recheck_0_5_6', 'done')
+                  ON CONFLICT (key) DO NOTHING;
+              END IF;
+            END $recheck2$;
+            -- One release per file. file_unique_id is Telegram's identity for
+            -- the bytes: the same file reposted in a channel, or forwarded to
+            -- five others, is still one file. Every copy used to become its
+            -- own release (a quarter of all releases on a long-running
+            -- install; one file had 228).
+            CREATE INDEX IF NOT EXISTS idx_messages_fuid ON messages (file_unique_id)
+              WHERE file_unique_id IS NOT NULL;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS dead_at TIMESTAMPTZ;
+            DO $dedup$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM config WHERE key = 'dedup_releases_0_5_6') THEN
+                -- Keep the copy whose source is the most useful: one that has
+                -- download history, then verified metadata, then a channel the
+                -- account is still in / follows / that is still alive, then
+                -- the better parse, then the newer post.
+                CREATE TEMP TABLE _dup_rel ON COMMIT DROP AS
+                  SELECT id FROM (
+                    SELECT r.id,
+                           row_number() OVER (
+                             PARTITION BY m.file_unique_id
+                             ORDER BY (EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = r.id)) DESC,
+                                      (r.metadata_source IN ('tmdb', 'wikidata')) DESC NULLS LAST,
+                                      COALESCE(c.is_joined, FALSE) DESC,
+                                      COALESCE(c.subscribed, FALSE) DESC,
+                                      (c.dead_at IS NULL) DESC,
+                                      r.parse_score DESC NULLS LAST,
+                                      r.posted_at DESC NULLS LAST,
+                                      r.id) AS rn
+                    FROM releases r
+                    JOIN messages m ON m.id = r.primary_msg_id
+                    JOIN channels c ON c.id = m.channel_id
+                    WHERE m.file_unique_id IS NOT NULL) x
+                  WHERE rn > 1
+                    AND NOT EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = x.id);
+                UPDATE monitored_movies SET grabbed_release_id = NULL
+                 WHERE grabbed_release_id IN (SELECT id FROM _dup_rel);
+                DELETE FROM releases WHERE id IN (SELECT id FROM _dup_rel);
+                INSERT INTO config (key, value) VALUES ('dedup_releases_0_5_6', 'done')
+                  ON CONFLICT (key) DO NOTHING;
+              END IF;
+            END $dedup$;
             CREATE TABLE IF NOT EXISTS seed_candidates (
               username TEXT PRIMARY KEY,
               title TEXT,
@@ -702,7 +803,7 @@ async def _stats_snapshot_worker():
 
 
 async def _metadata_worker():
-    """Continuously enrich releases with TMDB (if key) or Wikipedia metadata.
+    """Continuously enrich releases with TMDB (if key) and Wikidata metadata.
     Picks oldest-unfilled release, looks it up, persists. Sleeps 30s when no
     work. Short delay between lookups to respect rate limits.
     """
@@ -1021,6 +1122,7 @@ async def serve_media(msg_id: int, request: Request):
         return Response("no msg", status_code=404)
     if row["local_path"] == "__failed__":
         return Response("download failed", status_code=410)
+    await _want_fetch(msg_id)
 
     # Queue download if not already + wait for file to start appearing
     if not row["local_path"] or row["local_path"] == "__user_queued__":
@@ -1030,8 +1132,10 @@ async def serve_media(msg_id: int, request: Request):
                 "WHERE id = $1 AND (local_path IS NULL "
                 "OR local_path = $$__user_queued__$$)",
                 msg_id)
-        for _ in range(180):  # wait up to 90s for download to start writing
+        for _i in range(180):  # wait up to 90s for download to start writing
             await asyncio.sleep(0.5)
+            if _i % 20 == 19:
+                await _want_fetch(msg_id)
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """SELECT local_path, file_name, file_size, mime_type, media_type
@@ -1049,6 +1153,7 @@ async def serve_media(msg_id: int, request: Request):
     path = os.path.join("/downloads", row["local_path"])
     mime = _mime_for(row["media_type"], row["mime_type"])
     fn = row["file_name"]
+    await _touch_local(msg_id)
     total_size = row["file_size"] or 0  # TG-reported final size
 
     # Wait for the file to actually exist on disk
@@ -1087,18 +1192,50 @@ async def serve_media(msg_id: int, request: Request):
         # Without TG size, just serve whatever\'s in the file now
         end = os.path.getsize(path) - 1
 
+    def _tail_read(pos: int, n: int) -> bytes:
+        """Bytes at `pos` from the "<file>.tail" sidecar: the end of a file
+        that is still arriving, fetched first because the MP4 index lives
+        there (see the crawler). b"" when not available."""
+        try:
+            with open(path + ".tail", "rb") as tf:
+                t0 = int.from_bytes(tf.read(8), "big")
+                if pos < t0:
+                    return b""
+                tf.seek(8 + pos - t0)
+                return tf.read(n)
+        except OSError:
+            return b""
+
+    _lp = row["local_path"]
+
     async def stream_range():
+        import time as _time
+        said, revived = _time.time(), False
         with open(path, "rb") as f:
             f.seek(start)
             remaining = end - start + 1
             stuck_iters = 0
             while remaining > 0:
+                if _time.time() - said > 15:      # still being read: still wanted
+                    said = _time.time()
+                    await _want_fetch(msg_id)
                 current = os.path.getsize(path)
                 target_pos = f.tell()
                 if current <= target_pos:
+                    chunk = _tail_read(target_pos, min(65536, remaining))
+                    if chunk:
+                        f.seek(target_pos + len(chunk))
+                        yield chunk
+                        remaining -= len(chunk)
+                        stuck_iters = 0
+                        continue
                     # Partial file caught up — wait for crawler to write more.
                     # Abort if download appears stalled.
                     stuck_iters += 1
+                    if stuck_iters == 60 and not revived:
+                        # 30 s without a new byte: the fetch is not running
+                        revived = True
+                        await _revive_fetch(msg_id, _lp)
                     if stuck_iters > 600:  # 5 min no progress = give up
                         return
                     await asyncio.sleep(0.5)
@@ -1121,6 +1258,568 @@ async def serve_media(msg_id: int, request: Request):
         headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
     return StreamingResponse(stream_range(), status_code=206,
                            media_type=mime, headers=headers)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Downloaded files (the on-demand cache)
+#
+# Opening a film, a song or a book fetches the file from Telegram into
+# /downloads/{video,audio,library}. Nothing ever removed them: a first user
+# who clicks through twenty films has silently spent 40 GB, and nothing in the
+# lists said which items were already there (and so open instantly).
+#   - lists mark what is saved and can show only that;
+#   - a file not opened for `cache_ttl_days` (default 30) is removed, and when
+#     the cache is over `cache_max_gb` (default 50) the least recently opened
+#     go first. 0 turns either rule off. The index entry stays: opening the
+#     item again simply fetches it again.
+# Only these three folders are touched - never what Sonarr/Radarr grabbed.
+# ════════════════════════════════════════════════════════════════════
+_CACHE_PREFIXES = ("video/", "audio/", "library/")
+_CACHE_SIDECARS = ("", ".tail", ".pdf", ".cover.jpg", ".queue", ".pdf.inprogress.pdf")
+_LOCAL_SQL = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
+CACHE_TTL_DAYS_DEFAULT = 30
+CACHE_MAX_GB_DEFAULT = 50
+
+
+def _is_local(lp) -> bool:
+    return bool(lp) and not lp.startswith("__")
+
+
+def _local_pill(lp) -> str:
+    if not _is_local(lp):
+        return ""
+    return ('<span class="pill ok" style="font-size:11px" '
+            'title="already downloaded: opens instantly">● saved</span>')
+
+
+async def _touch_local(msg_id: int) -> None:
+    """Remember that a downloaded file was just used (cleanup goes by this)."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE messages SET local_accessed_at = NOW()
+                   WHERE id = $1 AND (local_accessed_at IS NULL
+                                      OR local_accessed_at < NOW() - INTERVAL '10 minutes')""",
+                msg_id)
+    except Exception:
+        pass
+
+
+async def _want_fetch(msg_id: int, opened: bool = False) -> None:
+    """Say "someone is asking for this file right now". The crawler keeps
+    fetching a big file only while this keeps being said (see its
+    _ondemand_fetch_one); a player, a reader or a browser download says it
+    every few seconds for as long as it is open.
+
+    fetch_wanted_at also carries the two things a person can decide on the
+    Downloads page: 'epoch' = paused by hand (a player that is merely still
+    open does not undo that; opening the item again does), and a time in the
+    future = "finish this one whether or not anyone is watching"."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE messages SET fetch_wanted_at = NOW()
+                   WHERE id = $1 AND (fetch_wanted_at IS NULL
+                          OR (fetch_wanted_at < NOW() - INTERVAL '15 seconds'
+                              AND ($2 OR fetch_wanted_at <> 'epoch')))""",
+                msg_id, opened)
+    except Exception:
+        pass
+
+
+async def _revive_fetch(msg_id: int, lp: str) -> None:
+    """A half-fetched file that has stopped growing (the fetch was stopped
+    because nobody was watching, or the crawler was restarted) and is being
+    asked for again: put it back in the queue. It continues where it stopped."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path = $$__user_queued__$$, "
+                "fetch_wanted_at = GREATEST(fetch_wanted_at, NOW()) "
+                "WHERE id = $1 AND local_path = $2 "
+                "AND (fetch_wanted_at IS NULL OR fetch_wanted_at <> 'epoch')", msg_id, lp)
+    except Exception:
+        pass
+
+
+async def _cache_settings() -> tuple:
+    async with db_pool.acquire() as conn:
+        rows = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key IN ('cache_ttl_days', 'cache_max_gb')")}
+
+    def _num(key, default):
+        try:
+            return max(0, int(float(rows.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+    return _num("cache_ttl_days", CACHE_TTL_DAYS_DEFAULT), _num("cache_max_gb", CACHE_MAX_GB_DEFAULT)
+
+
+def _cache_stat(lp: str):
+    """(bytes on disk incl. sidecars, newest mtime) of one cached item; None if gone."""
+    base = os.path.join("/downloads", lp)
+    size, mtime, found = 0, 0.0, False
+    for suf in _CACHE_SIDECARS:
+        try:
+            st = os.stat(base + suf)
+        except OSError:
+            continue
+        size += st.st_size
+        if suf == "":
+            found, mtime = True, st.st_mtime
+    return (size, mtime) if found else None
+
+
+def _cache_unlink(lp: str) -> None:
+    base = os.path.join("/downloads", lp)
+    for suf in _CACHE_SIDECARS:
+        try:
+            os.unlink(base + suf)
+        except OSError:
+            pass
+
+
+async def _cache_sweep(clear_all: bool = False) -> tuple:
+    """Apply the rules (or remove everything). Returns (files removed, bytes freed)."""
+    import time as _time
+    ttl_days, max_gb = await _cache_settings()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT local_path, max(local_accessed_at) AS used, max(file_size) AS want,
+                      bool_or(EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = messages.id)) AS fav
+               FROM messages
+               WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+               GROUP BY local_path""")
+    now = _time.time()
+    items, lost, partial = [], [], []
+    for r in rows:
+        lp = r["local_path"]
+        if not lp.startswith(_CACHE_PREFIXES) or ".." in lp:
+            continue
+        st = await asyncio.to_thread(_cache_stat, lp)
+        if st is None:
+            lost.append(lp)                 # the file is gone: forget the path
+            continue
+        size, mtime = st
+        if now - mtime < 180:
+            continue                        # still arriving, or just finished
+        used = max(mtime, r["used"].timestamp() if r["used"] else 0)
+        try:
+            have = os.path.getsize(os.path.join("/downloads", lp))
+        except OSError:
+            have = 0
+        if r["want"] and have < r["want"] * 0.95 and not clear_all:
+            # a fetch stopped half-way: kept a day in case it is continued
+            if now - used > 86400:
+                partial.append((used, size, lp))
+            continue
+        if r["fav"] and not clear_all:
+            continue                            # a favourite stays until un-favourited
+        items.append((used, size, lp))
+    doomed = []
+    if clear_all:
+        doomed = items
+    else:
+        keep = []
+        for it in items:
+            (doomed if ttl_days and now - it[0] > ttl_days * 86400 else keep).append(it)
+        if max_gb:
+            keep.sort()                     # least recently used first
+            total = sum(x[1] for x in keep)
+            while keep and total > max_gb * 1024 ** 3:
+                it = keep.pop(0)
+                total -= it[1]
+                doomed.append(it)
+    doomed += partial
+    freed = 0
+    for used, size, lp in doomed:
+        await asyncio.to_thread(_cache_unlink, lp)
+        freed += size
+    gone = [x[2] for x in doomed] + lost
+    if gone:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET local_path = NULL, local_accessed_at = NULL "
+                "WHERE local_path = ANY($1::text[])", gone)
+    return len(doomed), freed
+
+
+async def _cache_gc_worker():
+    await asyncio.sleep(600)
+    while True:
+        try:
+            n, freed = await _cache_sweep()
+            if n:
+                log.info("[cache] removed %d downloaded file(s) not opened lately, freed %s",
+                         n, _fmt_size(freed))
+        except Exception as e:
+            log.warning("[cache] sweep failed: %s", e)
+        await asyncio.sleep(3600)
+
+
+async def _cache_usage() -> list:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT split_part(local_path, '/', 1) AS kind, count(*) AS n,
+                      COALESCE(sum(sz), 0) AS bytes
+               FROM (SELECT local_path, max(file_size) AS sz FROM messages
+                     WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+                     GROUP BY local_path) x
+               WHERE split_part(local_path, '/', 1) IN ('video', 'audio', 'library')
+               GROUP BY 1 ORDER BY 3 DESC""")
+
+
+def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> str:
+    """'showing a-b of n' + prev / next. `qs(offset=...)` builds the query string."""
+    if not total or (offset == 0 and shown >= total):
+        return ""
+    links = []
+    if offset > 0:
+        prev = max(0, offset - size)
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=prev if prev else None)}">← prev</a>')
+    if offset + size < total:
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=offset + size)}">next →</a>')
+    return (
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'margin-top:18px;padding:12px 0 90px;border-top:1px solid var(--border, #e2e8f0)">'
+        f'<span style="color:var(--muted, #64748b);font-size:13px">'
+        f'showing {offset + 1 if shown else 0}–{offset + shown} of {total:,}</span>'
+        f'<div style="display:flex;gap:8px">{"".join(links)}</div></div>')
+
+
+def _saved_chip(path: str, qs, local: int) -> str:
+    style = ("background:rgba(16,185,129,0.15);color:#059669;border-color:#10b981;"
+             if local else "")
+    return (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
+            f'style="{style}padding:5px 12px;font-size:12px" '
+            f'title="only what is already downloaded">● saved</a>')
+
+
+@app.post("/api/fav/{msg_id}")
+async def fav_toggle(msg_id: int):
+    """Toggle a favourite. Favourites get their own filter, and their
+    downloaded file is never tidied away."""
+    async with db_pool.acquire() as conn:
+        gone = await conn.fetchval(
+            "DELETE FROM favorites WHERE msg_id = $1 RETURNING msg_id", msg_id)
+        if gone is None:
+            try:
+                await conn.execute(
+                    "INSERT INTO favorites (msg_id) VALUES ($1) ON CONFLICT DO NOTHING", msg_id)
+            except asyncpg.ForeignKeyViolationError:
+                return JSONResponse({"error": "no such item"}, status_code=404)
+    return {"fav": gone is None}
+
+
+_LRC_LINE = _re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+
+
+def _lyrics_payload(raw: str) -> dict:
+    """LRC text -> timed lines; anything else -> plain text."""
+    lines = []
+    for ln in (raw or "").splitlines():
+        stamps = list(_LRC_LINE.finditer(ln))
+        if not stamps:
+            continue
+        text = _LRC_LINE.sub("", ln).strip()
+        for m in stamps:
+            frac = m.group(3) or "0"
+            t = int(m.group(1)) * 60 + int(m.group(2)) + int(frac) / (10 ** len(frac))
+            lines.append([round(t, 2), text])
+    if len(lines) >= 3:
+        lines.sort(key=lambda x: x[0])
+        return {"found": True, "synced": True, "lines": lines}
+    text = _re.sub(r"\[[^\]\n]{0,24}\]", "", raw or "").strip()
+    if text:
+        return {"found": True, "synced": False, "text": text[:20000]}
+    return {"found": False}
+
+
+def _flac_embedded_lyrics(path: str):
+    """LYRICS / UNSYNCEDLYRICS from a FLAC's Vorbis comments, if any."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"fLaC":
+                return None
+            while True:
+                h = f.read(4)
+                if len(h) < 4:
+                    return None
+                ln = int.from_bytes(h[1:], "big")
+                if (h[0] & 0x7F) != 4:
+                    if h[0] & 0x80:
+                        return None
+                    f.seek(ln, 1)
+                    continue
+                b = f.read(min(ln, 2 * 1024 * 1024))
+                off = 4 + int.from_bytes(b[:4], "little")
+                n = int.from_bytes(b[off:off + 4], "little")
+                off += 4
+                for _ in range(min(n, 500)):
+                    cl = int.from_bytes(b[off:off + 4], "little")
+                    c = b[off + 4:off + 4 + cl].decode("utf-8", "replace")
+                    off += 4 + cl
+                    k, _, v = c.partition("=")
+                    if k.upper() in ("LYRICS", "UNSYNCEDLYRICS", "SYNCEDLYRICS") and v.strip():
+                        return v
+                return None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _lrclib_lookup(title: str, artist: str, duration) -> str:
+    """Lyrics from lrclib.net (free, no key). '' when it has none.
+    Sends the track title, artist and length - nothing about the user."""
+    import json
+    import urllib.parse
+    import urllib.request
+    ua = {"User-Agent": f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"}
+
+    def _get(url):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=ua), timeout=8) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except Exception:
+            return None
+    q = {"track_name": title}
+    if artist:
+        q["artist_name"] = artist
+    if artist and duration:
+        j = _get("https://lrclib.net/api/get?" + urllib.parse.urlencode({**q, "duration": int(duration)}))
+        if isinstance(j, dict) and (j.get("syncedLyrics") or j.get("plainLyrics")):
+            return j.get("syncedLyrics") or j.get("plainLyrics") or ""
+    j = _get("https://lrclib.net/api/search?" + urllib.parse.urlencode(q))
+    if isinstance(j, list):
+        best = None
+        for it in j[:20]:
+            if not isinstance(it, dict):
+                continue
+            if duration and it.get("duration") and abs(float(it["duration"]) - float(duration)) > 8:
+                continue
+            if it.get("syncedLyrics"):
+                return it["syncedLyrics"]
+            best = best or it.get("plainLyrics")
+        return best or ""
+    return ""
+
+
+@app.get("/api/lyrics/{msg_id}")
+async def lyrics(msg_id: int):
+    """Lyrics for a track: the file's own tag first, then lrclib.net. Looked
+    up once (when someone opens the lyrics) and kept."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow(
+            """SELECT audio_lyrics, audio_title, audio_canonical_title, audio_performer,
+                      audio_duration_sec, file_name, local_path
+               FROM messages WHERE id = $1 AND media_type = 'audio'""", msg_id)
+    if not r:
+        return JSONResponse({"found": False}, status_code=404)
+    raw = r["audio_lyrics"]
+    if raw is None:
+        raw = ""
+        if _is_local(r["local_path"]) and (r["local_path"] or "").lower().endswith(".flac"):
+            raw = await asyncio.to_thread(
+                _flac_embedded_lyrics, os.path.join("/downloads", r["local_path"])) or ""
+        if not raw:
+            title = (r["audio_canonical_title"] or r["audio_title"] or "").strip()
+            artist = (r["audio_performer"] or "").strip()
+            if not title and r["file_name"]:
+                stem = r["file_name"].rsplit(".", 1)[0]
+                if " - " in stem:
+                    artist, _, title = stem.partition(" - ")
+                else:
+                    title = stem
+            if title:
+                raw = await asyncio.to_thread(
+                    _lrclib_lookup, title.strip(), artist.strip(), r["audio_duration_sec"])
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE messages SET audio_lyrics = $2 WHERE id = $1", msg_id, raw)
+    return JSONResponse(_lyrics_payload(raw))
+
+
+async def _player_fetches() -> list:
+    """Files being fetched because someone opened them (not grabs): queued,
+    arriving, or stopped half-way."""
+    import time as _time
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT m.id, m.file_name, m.file_size, m.media_type, m.local_path, m.file_dc,
+                      m.fetch_wanted_at
+               FROM messages m
+               WHERE m.local_path = '__user_queued__'
+                  OR ((m.fetch_wanted_at > NOW() - INTERVAL '1 day' OR m.fetch_wanted_at = 'epoch')
+                      AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')
+               ORDER BY m.fetch_wanted_at DESC NULLS LAST LIMIT 60""")
+    out, now = [], _time.time()
+    for r in rows:
+        lp, total = r["local_path"], r["file_size"] or 0
+        paused = bool(r["fetch_wanted_at"] and r["fetch_wanted_at"].year < 2000)
+        pinned = bool(r["fetch_wanted_at"] and r["fetch_wanted_at"].timestamp() > now + 600)
+        if lp == "__user_queued__":
+            out.append({"r": r, "state": "queued", "have": 0, "pinned": pinned})
+            continue
+        if not lp.startswith(_CACHE_PREFIXES):
+            continue
+        try:
+            st = os.stat(os.path.join("/downloads", lp))
+        except OSError:
+            continue
+        if total and st.st_size >= total:
+            continue                            # complete: not a fetch any more
+        out.append({"r": r, "have": st.st_size, "pinned": pinned,
+                    "state": ("paused" if paused else
+                              "fetching" if now - st.st_mtime < 30 else "stopped")})
+    return out
+
+
+_SAVED_KINDS = {"video": "m.media_type = 'video'", "audio": "m.media_type = 'audio'",
+                "book": "m.media_type NOT IN ('video', 'audio')"}
+_SAVED_SORTS = {
+    "recent": "COALESCE(m.local_accessed_at, m.indexed_at) DESC NULLS LAST, m.id DESC",
+    "size": "m.file_size DESC NULLS LAST, m.id DESC",
+    "name": "m.file_name ASC NULLS LAST, m.id",
+    "oldest": "COALESCE(m.local_accessed_at, m.indexed_at) ASC NULLS FIRST, m.id",
+}
+
+
+async def _player_saved(q=None, kind=None, sort="recent", fav=0, limit=50, offset=0) -> dict:
+    """One page of the files that were opened in a player and kept.
+
+    Everything comes from the database (the partial index on local_path
+    makes "what is saved" cheap however large the index is); the disk is
+    looked at only for the rows on the page, to mark one that is not whole.
+    A library of tens of thousands of saved files costs the same as ten."""
+    where = ["m.local_path IS NOT NULL", "left(m.local_path, 2) <> '__'",
+             "split_part(m.local_path, '/', 1) IN ('video', 'audio', 'library')"]
+    params = []
+    if q:
+        for w in q.split()[:6]:
+            params.append(f"%{w}%")
+            where.append(f"m.file_name ILIKE ${len(params)}")
+    if kind in _SAVED_KINDS:
+        where.append(_SAVED_KINDS[kind])
+    if fav:
+        where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
+    wsql = " AND ".join(where)
+    order = _SAVED_SORTS.get(sort, _SAVED_SORTS["recent"])
+    async with db_pool.acquire() as conn:
+        tot = await conn.fetchrow(
+            f"SELECT count(*) AS n, COALESCE(sum(m.file_size), 0) AS bytes FROM messages m WHERE {wsql}",
+            *params)
+        kinds = await conn.fetch(
+            """SELECT split_part(local_path, '/', 1) AS k, count(*) AS n
+               FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+                 AND split_part(local_path, '/', 1) IN ('video', 'audio', 'library')
+               GROUP BY 1""")
+        rows = await conn.fetch(
+            f"""SELECT m.id, m.file_name, m.file_size, m.media_type, m.local_path,
+                       COALESCE(m.local_accessed_at, m.indexed_at) AS used,
+                       EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav
+                FROM messages m WHERE {wsql}
+                ORDER BY {order} LIMIT {int(limit)} OFFSET {int(offset)}""", *params)
+
+    def _stat(rows_):
+        out = []
+        for r in rows_:
+            try:
+                have = os.path.getsize(os.path.join("/downloads", r["local_path"]))
+            except OSError:
+                have = None
+            out.append(have)
+        return out
+    have = await asyncio.to_thread(_stat, rows)
+    return {"rows": rows, "have": have, "total": tot["n"], "bytes": tot["bytes"],
+            "kinds": {r["k"]: r["n"] for r in kinds}}
+
+
+@app.post("/api/fetch/remove")
+async def fetch_remove_many(request: Request):
+    """Remove several saved files at once (they stay in the index)."""
+    try:
+        ids = [int(x) for x in (await request.json()).get("ids", [])][:500]
+    except Exception:
+        return JSONResponse({"error": "bad request"}, status_code=400)
+    if not ids:
+        return {"removed": 0}
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """UPDATE messages m SET local_path = NULL, local_accessed_at = NULL,
+                      fetch_wanted_at = 'epoch'
+               FROM (SELECT id, local_path FROM messages WHERE id = ANY($1::bigint[])) o
+               WHERE m.id = o.id RETURNING o.local_path""", ids)
+    n = 0
+    for r in rows:
+        lp = r["local_path"]
+        if _is_local(lp) and lp.startswith(_CACHE_PREFIXES) and ".." not in lp:
+            await asyncio.to_thread(_cache_unlink, lp)
+            n += 1
+    return {"removed": n}
+
+
+@app.post("/api/fetch/{msg_id}/pause")
+async def fetch_pause(msg_id: int):
+    """Stop fetching, keep what has arrived. The crawler notices within
+    seconds; a player that is still open does not restart it."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET fetch_wanted_at = 'epoch' WHERE id = $1", msg_id)
+        # not started yet: take it out of the queue (nothing has arrived)
+        await conn.execute(
+            "UPDATE messages SET local_path = NULL "
+            "WHERE id = $1 AND local_path = '__user_queued__'", msg_id)
+    return {"ok": True}
+
+
+@app.post("/api/fetch/{msg_id}/resume")
+async def fetch_resume(msg_id: int):
+    """Fetch the rest, and finish it whether or not anyone is watching."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE messages SET fetch_wanted_at = NOW() + INTERVAL '1 day',
+                      local_path = '__user_queued__'
+               WHERE id = $1 AND (local_path IS NULL OR left(local_path, 2) <> '__'
+                                  OR local_path = '__user_queued__')""", msg_id)
+    return {"ok": True}
+
+
+@app.post("/api/fetch/{msg_id}/cancel")
+async def fetch_cancel(msg_id: int):
+    """Stop fetching a file someone opened, and forget what has arrived."""
+    async with db_pool.acquire() as conn:
+        lp = await conn.fetchval(
+            """UPDATE messages SET fetch_wanted_at = 'epoch'
+               WHERE id = $1 RETURNING local_path""", msg_id)
+        if lp is None:
+            return {"ok": True}
+        await conn.execute(
+            "UPDATE messages SET local_path = NULL, local_accessed_at = NULL "
+            "WHERE id = $1 AND local_path = $2", msg_id, lp)
+    if _is_local(lp) and lp.startswith(_CACHE_PREFIXES) and ".." not in lp:
+        await asyncio.to_thread(_cache_unlink, lp)
+    return {"ok": True}
+
+
+@app.post("/api/settings/cache")
+async def settings_cache(ttl_days: str = Form("30"), max_gb: str = Form("50")):
+    def _n(v, d):
+        try:
+            return str(max(0, min(100000, int(float(v)))))
+        except (TypeError, ValueError):
+            return str(d)
+    async with db_pool.acquire() as conn:
+        for k, v in (("cache_ttl_days", _n(ttl_days, CACHE_TTL_DAYS_DEFAULT)),
+                     ("cache_max_gb", _n(max_gb, CACHE_MAX_GB_DEFAULT))):
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    return RedirectResponse("/settings#cache", status_code=302)
+
+
+@app.post("/api/settings/cache_clear")
+async def settings_cache_clear():
+    n, freed = await _cache_sweep(clear_all=True)
+    log.info("[cache] cleared on request: %d file(s), %s", n, _fmt_size(freed))
+    return RedirectResponse("/settings#cache", status_code=302)
 
 
 _MY_DC_CACHE: Optional[int] = None
@@ -1225,7 +1924,7 @@ def _ebook_semaphore():
     import asyncio
     global _EBOOK_CONVERT_SEMAPHORE
     if _EBOOK_CONVERT_SEMAPHORE is None:
-        _EBOOK_CONVERT_SEMAPHORE = asyncio.Semaphore(2)
+        _EBOOK_CONVERT_SEMAPHORE = asyncio.Semaphore(1)
     return _EBOOK_CONVERT_SEMAPHORE
 _EBOOK_JOBS: dict = {}  # msg_id -> {state, started_at}
 
@@ -1245,6 +1944,66 @@ def _ebook_paths(local_path: str):
     pdf = src + ".pdf"
     cover = src + ".cover.jpg"
     return src, pdf, cover
+
+
+# calibre renders a book to PDF through a headless Chromium. On some books it
+# does not stop growing: a 3 MB illustrated EPUB reached 7.4 GB and took the
+# whole host into swap until the kernel's OOM killer stepped in (the comment
+# here used to say "mem bound via container cgroup"; nothing sets one).
+# So the conversion is watched: its whole process group is killed once it
+# holds more memory than EBOOK_MAX_RSS_MB or runs longer than
+# EBOOK_MAX_SECONDS, and a conversion stopped this way is not retried.
+EBOOK_MAX_RSS_MB = int(os.environ.get("TGARR_EBOOK_MAX_RSS_MB", "1500"))
+EBOOK_MAX_SECONDS = int(os.environ.get("TGARR_EBOOK_MAX_SECONDS", "600"))
+
+
+def _pgroup_rss_mb(pgid: int) -> int:
+    """Resident memory of every process in a process group, in MB."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    total = 0
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return 0
+    for d in pids:
+        try:
+            with open(f"/proc/{d}/stat", "rb") as f:
+                st = f.read().decode("ascii", "replace")
+            rest = st[st.rindex(")") + 2:].split()
+            # after "pid (comm)": state ppid pgrp ... ; rss is field 24 of the line
+            if int(rest[2]) == pgid:
+                total += int(rest[21]) * page
+        except (OSError, ValueError, IndexError):
+            continue
+    return total // (1024 * 1024)
+
+
+async def _ebook_watchdog(proc, src: str) -> str:
+    """Wait for the conversion; kill its process group if it misbehaves.
+    Returns "" when it ended by itself, else why it was stopped."""
+    import signal
+    import time as _t
+    t0 = _t.time()
+    while True:
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=2)
+            return ""
+        except asyncio.TimeoutError:
+            pass
+        rss = await asyncio.to_thread(_pgroup_rss_mb, proc.pid)
+        why = ""
+        if rss > EBOOK_MAX_RSS_MB:
+            why = f"used {rss} MB of memory (limit {EBOOK_MAX_RSS_MB})"
+        elif _t.time() - t0 > EBOOK_MAX_SECONDS:
+            why = f"ran longer than {EBOOK_MAX_SECONDS} s"
+        if why:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            await proc.wait()
+            print(f"[ebook-convert] stopped: {why} src={src}", flush=True)
+            return why
 
 
 async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
@@ -1277,23 +2036,28 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         tmp = pdf + ".inprogress.pdf"
         # preexec_fn: RLIMIT_CPU 240s + RLIMIT_FSIZE 200MB; mem bound via container cgroup
         def _set_limits():
-            import resource
-            # RLIMIT_AS dropped: Chromium virt mem >> resident, container mem_limit is real bound
-            resource.setrlimit(resource.RLIMIT_CPU, (1800, 1800))  # 30 min CPU cap
-            # RLIMIT_FSIZE dropped: calibre temp files can be >200MB
+            # (an address-space limit is no use here: Chromium maps a terabyte
+            # and touches little of it - memory is watched by _ebook_watchdog)
+            try:
+                os.nice(15)          # never compete with playback or the UI
+            except OSError:
+                pass
         proc = await asyncio.create_subprocess_exec(
             "ebook-convert", src, tmp,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env, preexec_fn=_set_limits)
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
-        except asyncio.TimeoutError:
-            proc.kill()
-            print(f'[ebook-convert] TIMEOUT src={src}', flush=True)
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env, preexec_fn=_set_limits, start_new_session=True)
+        stopped = await _ebook_watchdog(proc, src)
+        if stopped:
+            for _f in (tmp, src + ".queue"):     # not retried: it would do the same again
+                try: os.unlink(_f)
+                except OSError: pass
+            _EBOOK_JOBS[msg_id] = {"state": "failed", "reason":
+                                   "this book is too heavy to convert here (" + stopped + ")",
+                                   "started_at": _EBOOK_JOBS.get(msg_id, {}).get("started_at", 0)}
             return False
         if proc.returncode != 0:
-            print(f'[ebook-convert] rc={proc.returncode} stderr={stderr.decode(errors="replace")[-500:]!r}', flush=True)
+            print(f'[ebook-convert] rc={proc.returncode} src={src}', flush=True)
         if proc.returncode == 0 and os.path.exists(tmp):
             os.rename(tmp, pdf)
             _EBOOK_JOBS.pop(msg_id, None)
@@ -1303,7 +2067,9 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         if os.path.exists(tmp):
             os.unlink(tmp)
         _EBOOK_JOBS[msg_id] = {"state": "failed", "started_at": _EBOOK_JOBS.get(msg_id, {}).get("started_at", 0)}
-        # Keep .queue marker so restart will retry
+        # A conversion that failed will fail again: do not retry it on every restart.
+        try: os.unlink(src + ".queue")
+        except OSError: pass
         return False
 
 
@@ -1334,13 +2100,16 @@ async def ebook_status(msg_id: int, request: Request):
     import asyncio
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name, file_size FROM messages WHERE id=$1", msg_id)
     if not row or not row["local_path"] or row["local_path"].startswith("__"):
         return {"state": "no_source"}
     ext = (row["file_name"] or "").rsplit(".", 1)[-1].lower()
     src, pdf, _ = _ebook_paths(row["local_path"])
     if not os.path.exists(src):
         return {"state": "no_source"}
+    # Still arriving from Telegram: half an archive is not a broken archive.
+    if row["file_size"] and os.path.getsize(src) < row["file_size"]:
+        return {"state": "downloading", "src_size": os.path.getsize(src)}
     if ext == "pdf":
         return {"state": "ready", "url": f"/media/{msg_id}"}
     if ext not in _EBOOK_CONVERTIBLE:
@@ -1370,7 +2139,8 @@ async def ebook_status(msg_id: int, request: Request):
                 "eta_s": int(60 + ahead * 90 + src_mb * 2),
                 "waited_s": int(_t.time() - job["queued_at"])}
     if job and job.get("state") == "failed":
-        return {"state": "failed", "reason": "conversion error — check api logs"}
+        return {"state": "failed",
+                "reason": job.get("reason") or "conversion error — check api logs"}
     # Not started — fire background task. Lock prevents duplicate work.
     free_gb = _disk_free_gb("/downloads")
     if free_gb < 1.0:
@@ -1390,7 +2160,7 @@ async def ebook_pdf(msg_id: int):
     """
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name, file_size FROM messages WHERE id=$1", msg_id)
     if not row or not row["local_path"] or row["local_path"].startswith("__"):
         return Response("not cached — open via /watch to trigger download",
                         status_code=404)
@@ -1398,6 +2168,9 @@ async def ebook_pdf(msg_id: int):
     src, pdf, _ = _ebook_paths(row["local_path"])
     if not os.path.exists(src):
         return Response("source file missing", status_code=410)
+    if row["file_size"] and os.path.getsize(src) < row["file_size"]:
+        return Response("still downloading — retry in a moment", status_code=202)
+    await _touch_local(msg_id)
     # .pdf source: serve directly, no conversion
     if ext == "pdf":
         return FileResponse(src, media_type="application/pdf",
@@ -1434,134 +2207,816 @@ async def ebook_cover_unified(msg_id: int):
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
-@app.get("/epub/{msg_id}", response_class=HTMLResponse)
-async def epub_render(msg_id: int):
-    """Server-side epub renderer. Concatenates spine chapters into one
-    long HTML page, rewrites image refs, applies CJK-friendly typography.
-    """
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
-    epub_path = _epub_locate(msg_id, row)
-    if not epub_path:
-        return HTMLResponse("<h1>not cached</h1>", status_code=404)
-    title = row["file_name"] or f"book-{msg_id}"
-    try:
-        with _zipfile.ZipFile(epub_path) as zf:
-            # Find OPF via META-INF/container.xml
-            container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
-            from xml.etree import ElementTree as _ET
-            ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
-            opf_node = _ET.fromstring(container).find(".//c:rootfile", ns_c)
-            if opf_node is None:
-                raise RuntimeError("OPF not declared in container.xml")
-            opf_path = opf_node.attrib["full-path"]
-            opf_dir = os.path.dirname(opf_path).replace("\\", "/")
-            opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
-            ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
-            manifest = {item.attrib["id"]: item.attrib["href"]
-                        for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf)}
-            spine_ids = [item.attrib["idref"]
-                         for item in opf_root.findall(".//opf:spine/opf:itemref", ns_opf)]
+# ════════════════════════════════════════════════════════════════════
+# E-book reader
+#
+# /epub/{id}          the reader: our page, our script. Pages you turn with
+#                     buttons, arrow keys, the wheel or a swipe; contents;
+#                     font size; light / sepia / dark; it remembers where you
+#                     stopped.
+# /epub/{id}/toc      the book's reading order and chapter titles (JSON)
+# /epub/{id}/ch/{n}   one chapter, as a bare document
+#
+# The book itself is somebody else's HTML. It is shown one chapter at a time
+# (a 2,000-chapter web novel must not become one 40 MB page) inside a
+# sandboxed frame, and served with a Content-Security-Policy that allows no
+# script at all - so nothing inside a book can run, whatever the tag
+# stripping below misses. The reader lays the chapter out in columns from the
+# outside.
+# ════════════════════════════════════════════════════════════════════
+_EPUB_CSP = ("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; "
+             "font-src 'self' data:")
+_EPUB_INDEX_CACHE: dict = {}      # path -> (mtime, index)
 
-            chapters_html = []
-            for idref in spine_ids:
-                href = manifest.get(idref)
-                if not href:
+
+def _epub_index(epub_path: str) -> dict:
+    """Reading order + chapter titles of a book. Cached per file."""
+    mtime = os.path.getmtime(epub_path)
+    hit = _EPUB_INDEX_CACHE.get(epub_path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    from xml.etree import ElementTree as _ET
+    with _zipfile.ZipFile(epub_path) as zf:
+        container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+        ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+        opf_node = _ET.fromstring(container).find(".//c:rootfile", ns_c)
+        if opf_node is None:
+            raise RuntimeError("OPF not declared in container.xml")
+        opf_path = opf_node.attrib["full-path"]
+        opf_dir = os.path.dirname(opf_path).replace("\\", "/")
+        opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+        ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
+
+        def _in_zip(base_dir, href):
+            href = _uq(href.split("#", 1)[0])
+            path = (base_dir + "/" + href) if base_dir else href
+            return os.path.normpath(path).replace("\\", "/").lstrip("/")
+
+        items = {}
+        for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf):
+            items[item.attrib.get("id")] = item.attrib
+        chapters = []
+        for ref in opf_root.findall(".//opf:spine/opf:itemref", ns_opf):
+            it = items.get(ref.attrib.get("idref"))
+            if it and it.get("href"):
+                chapters.append(_in_zip(opf_dir, it["href"]))
+        names = set(zf.namelist())
+        chapters = [c for c in chapters if c in names]
+
+        # titles: EPUB 3 nav document, then the EPUB 2 NCX
+        titles = {}
+
+        def _clean(t):
+            return html.unescape(_re.sub(r"<[^>]+>", "", t or "")).strip()[:200]
+        for it in items.values():
+            href = it.get("href") or ""
+            try:
+                if "nav" in (it.get("properties") or "").split():
+                    nav_path = _in_zip(opf_dir, href)
+                    nav = zf.read(nav_path).decode("utf-8", "replace")
+                    nav_dir = os.path.dirname(nav_path)
+                    for m in _re.finditer(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+                                          nav, _re.DOTALL | _re.IGNORECASE):
+                        titles.setdefault(_in_zip(nav_dir, m.group(1)), _clean(m.group(2)))
+                elif it.get("media-type") == "application/x-dtbncx+xml":
+                    ncx_path = _in_zip(opf_dir, href)
+                    ncx = zf.read(ncx_path).decode("utf-8", "replace")
+                    ncx_dir = os.path.dirname(ncx_path)
+                    for m in _re.finditer(
+                            r"<navLabel>\s*<text>(.*?)</text>\s*</navLabel>\s*"
+                            r"<content\b[^>]*\bsrc=[\"']([^\"']+)[\"']",
+                            ncx, _re.DOTALL | _re.IGNORECASE):
+                        titles.setdefault(_in_zip(ncx_dir, m.group(2)), _clean(m.group(1)))
+            except (KeyError, ValueError):
+                continue
+        # a book without a usable table of contents: the first heading of each chapter
+        if chapters and sum(1 for c in chapters if titles.get(c)) * 2 < len(chapters) \
+                and len(chapters) <= 3000:
+            for c in chapters:
+                if titles.get(c):
                     continue
-                href = _uq(href)
-                chapter_path = (opf_dir + "/" + href).lstrip("/") if opf_dir else href
-                chapter_path = _re.sub(r"/+", "/", chapter_path)
                 try:
-                    raw = zf.read(chapter_path)
+                    head = zf.read(c)[:6000].decode("utf-8", "replace")
                 except KeyError:
                     continue
-                raw_html = raw.decode("utf-8", errors="replace")
-                # Extract <body>
-                m = _re.search(r"<body[^>]*>(.*?)</body>", raw_html,
-                              _re.DOTALL | _re.IGNORECASE)
-                body_html = m.group(1) if m else raw_html
+                m = (_re.search(r"<h[1-3][^>]*>(.*?)</h[1-3]>", head, _re.DOTALL | _re.IGNORECASE)
+                     or _re.search(r"<title[^>]*>(.*?)</title>", head, _re.DOTALL | _re.IGNORECASE))
+                if m and _clean(m.group(1)):
+                    titles[c] = _clean(m.group(1))
+        book_title = None
+        t = opf_root.find(".//{http://purl.org/dc/elements/1.1/}title")
+        if t is not None and (t.text or "").strip():
+            book_title = t.text.strip()[:200]
+    index = {"title": book_title, "chapters": chapters,
+             "titles": [titles.get(c) or "" for c in chapters]}
+    if len(_EPUB_INDEX_CACHE) > 32:
+        _EPUB_INDEX_CACHE.clear()
+    _EPUB_INDEX_CACHE[epub_path] = (mtime, index)
+    return index
 
-                # Rewrite img/css refs to /epub/{id}/asset/<absolute-in-zip>
-                chapter_dir = os.path.dirname(chapter_path).replace("\\", "/")
-                def fix_ref(match, attr):
-                    src = _uq(match.group(1))
-                    if src.startswith(("http://", "https://", "data:", "/")):
-                        return match.group(0)
-                    abs_in_zip = os.path.normpath(
-                        os.path.join(chapter_dir, src)).replace("\\", "/")
-                    new_url = f"/epub/{msg_id}/asset/{_q(abs_in_zip)}"
-                    return match.group(0).replace(match.group(1), new_url)
 
-                body_html = _re.sub(r"<img[^>]*\bsrc=[\"\']([^\"\']+)[\"\']",
-                                   lambda mm: fix_ref(mm, "src"), body_html)
-                # SVG covers use <image xlink:href="..."> or <image href="...">
-                body_html = _re.sub(r"<image[^>]*\b(?:xlink:)?href=[\"\']([^\"\']+)[\"\']",
-                                   lambda mm: fix_ref(mm, "href"), body_html)
-                # Strip <link rel=stylesheet> — chapter CSS would leak into reader
-                body_html = _re.sub(r"<link[^>]*\brel=[\"\']stylesheet[\"\'][^>]*/?>", "",
-                                   body_html, flags=_re.IGNORECASE)
-                # Strip <script> blocks (no JS in our reader)
-                body_html = _re.sub(r"<script[^>]*>.*?</script>", "",
-                                   body_html, flags=_re.DOTALL | _re.IGNORECASE)
-                # Strip inline event handlers (onclick="...")
-                body_html = _re.sub(r"\son[a-z]+\s*=\s*[\"\'][^\"\']*[\"\']", "",
-                                   body_html, flags=_re.IGNORECASE)
-                # Clamp SVG: epubs embed cover as <svg width="100%" height="100%">
-                # which expands to whole viewport. Strip width/height so our CSS wins.
-                body_html = _re.sub(r"(<svg[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
-                                   r"\1", body_html, count=2, flags=_re.IGNORECASE)
-                body_html = _re.sub(r"(<image[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
-                                   r"\1", body_html, count=2, flags=_re.IGNORECASE)
+def _epub_chapter_body(zf, msg_id: int, chapter_path: str) -> str:
+    """The <body> of one chapter, made safe to show: references rewritten to
+    /epub/{id}/asset/..., style sheets, scripts and event handlers removed."""
+    raw_html = zf.read(chapter_path).decode("utf-8", errors="replace")
+    m = _re.search(r"<body[^>]*>(.*?)</body>", raw_html, _re.DOTALL | _re.IGNORECASE)
+    body_html = m.group(1) if m else raw_html
+    chapter_dir = os.path.dirname(chapter_path).replace("\\", "/")
 
-                chapters_html.append(body_html)
+    def fix_ref(match):
+        src = _uq(match.group(1))
+        if src.startswith(("http://", "https://", "data:", "/")):
+            return match.group(0)
+        abs_in_zip = os.path.normpath(os.path.join(chapter_dir, src)).replace("\\", "/")
+        return match.group(0).replace(match.group(1), f"/epub/{msg_id}/asset/{_q(abs_in_zip)}")
 
-        body = "<hr class='chap-sep'/>".join(chapters_html)
-        css = (
-            "html,body{margin:0;padding:0}"
-            "body{background:#f5f7fa;font-family:'PingFang SC','Microsoft YaHei',"
-            "'Noto Sans CJK SC','Hiragino Sans GB',system-ui,sans-serif}"
-            ".bar{position:sticky;top:0;background:#fff;padding:12px 20px;"
-            "border-bottom:1px solid #e2e8f0;z-index:10;display:flex;gap:14px;"
-            "align-items:center;box-shadow:0 1px 4px rgba(0,0,0,0.04)}"
-            ".bar a{color:#64748b;text-decoration:none;font-size:14px}"
-            ".bar a:hover{color:#0f172a}"
-            ".bar .title{font-weight:600;color:#0f172a;flex:1;overflow:hidden;"
-            "text-overflow:ellipsis;white-space:nowrap}"
-            ".book{max-width:760px;margin:30px auto;padding:50px 56px;"
-            "background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,0.08);"
-            "font-size:17px;line-height:1.9;color:#1f2937}"
-            ".book h1,.book h2,.book h3,.book h4{color:#0f172a;font-weight:600;"
-            "margin:1.8em 0 0.6em;line-height:1.4}"
-            ".book h1{font-size:1.6em;border-bottom:2px solid #e2e8f0;padding-bottom:0.4em}"
-            ".book h2{font-size:1.35em}"
-            ".book h3{font-size:1.15em}"
-            ".book p{margin:1em 0;text-indent:2em}"
-            ".book img{max-width:100%;height:auto;display:block;margin:1.8em auto;"
-            "border-radius:4px}"
-            ".book svg{max-width:420px;width:100%;height:auto;display:block;margin:0 auto 2em}"
-            ".book svg image{width:100%;height:auto}"
-            ".book a{color:#3b82f6;text-decoration:none}"
-            ".book a:hover{text-decoration:underline}"
-            ".book blockquote{margin:1.4em 0;padding:0.4em 1.4em;border-left:4px solid #93c5fd;"
-            "color:#475569;background:#f1f5f9;border-radius:0 6px 6px 0}"
-            "hr.chap-sep{border:none;border-top:1px dashed #cbd5e1;margin:3em 0}"
-            "@media (max-width:768px){.book{margin:14px;padding:24px}}"
-        )
-        return HTMLResponse(
-            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            f"<title>{html.escape(title)}</title>"
-            f"<style>{css}</style></head><body>"
-            f"<div class='bar'><a href='javascript:history.back()'>\u2190 back</a>"
-            f"<div class='title'>{html.escape(title)}</div>"
-            f"<a href='/media/{msg_id}' download>\u2b07 raw</a></div>"
-            f"<div class='book'>{body}</div></body></html>"
-        )
+    body_html = _re.sub(r"<img[^>]*\bsrc=[\"\']([^\"\']+)[\"\']", fix_ref, body_html)
+    body_html = _re.sub(r"<image[^>]*\b(?:xlink:)?href=[\"\']([^\"\']+)[\"\']", fix_ref, body_html)
+    body_html = _re.sub(r"<link[^>]*\brel=[\"\']stylesheet[\"\'][^>]*/?>", "",
+                        body_html, flags=_re.IGNORECASE)
+    body_html = _re.sub(r"<(script|style|iframe|object|embed)\b[^>]*>.*?</\1>", "",
+                        body_html, flags=_re.DOTALL | _re.IGNORECASE)
+    body_html = _re.sub(r"<(script|iframe|object|embed|base|meta)\b[^>]*/?>", "",
+                        body_html, flags=_re.IGNORECASE)
+    body_html = _re.sub(r"\son[a-z]+\s*=\s*(\"[^\"]*\"|\'[^\']*\'|[^\s>]+)", "",
+                        body_html, flags=_re.IGNORECASE)
+    # links inside a book point at other files of the book: they would leave
+    # the reader. Keep the text, drop the jump.
+    body_html = _re.sub(r"(<a\b[^>]*?)\shref=(\"[^\"]*\"|\'[^\']*\')", r"\1", body_html,
+                        flags=_re.IGNORECASE)
+    # an EPUB cover is often <svg width="100%" height="100%">: let the reader size it
+    body_html = _re.sub(r"(<svg[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
+                        r"\1", body_html, count=2, flags=_re.IGNORECASE)
+    body_html = _re.sub(r"(<image[^>]*?)\s(?:width|height)=[\"\'][^\"\']*[\"\']",
+                        r"\1", body_html, count=2, flags=_re.IGNORECASE)
+    return body_html
+
+
+_EPUB_CHAPTER_CSS = (
+    "html,body{margin:0;padding:0}"
+    "body{font-family:'PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Hiragino Sans GB',"
+    "Georgia,system-ui,sans-serif;line-height:1.9;word-break:break-word}"
+    "h1,h2,h3,h4{font-weight:600;margin:1.2em 0 .6em;line-height:1.4}"
+    "h1{font-size:1.5em}h2{font-size:1.3em}h3{font-size:1.12em}"
+    "p{margin:.9em 0;text-indent:2em}"
+    "img{max-width:100%;height:auto;display:block;margin:1.2em auto;border-radius:4px}"
+    "svg{max-width:100%;height:auto;display:block;margin:0 auto 1.5em}"
+    "svg image{width:100%;height:auto}"
+    "blockquote{margin:1.2em 0;padding:.3em 1.2em;border-left:4px solid rgba(120,140,170,.5);"
+    "opacity:.85}"
+    "table{max-width:100%}pre{white-space:pre-wrap}"
+    "sup,sub{font-size:.65em;line-height:0}"
+)
+
+
+def _epub_row_sql():
+    return "SELECT local_path, file_name FROM messages WHERE id=$1"
+
+
+@app.get("/epub/{msg_id}/toc")
+async def epub_toc(msg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    epub_path = _epub_locate(msg_id, row)
+    if not epub_path:
+        return JSONResponse({"error": "not cached"}, status_code=404)
+    try:
+        idx = await asyncio.to_thread(_epub_index, epub_path)
     except Exception as e:
+        return JSONResponse({"error": f"cannot read this book: {e}"}, status_code=422)
+    return JSONResponse({"title": idx["title"] or row["file_name"] or f"book-{msg_id}",
+                         "chapters": idx["titles"]})
+
+
+@app.get("/epub/{msg_id}/ch/{n}", response_class=HTMLResponse)
+async def epub_chapter(msg_id: int, n: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    epub_path = _epub_locate(msg_id, row)
+    if not epub_path:
+        return HTMLResponse("not cached", status_code=404)
+    try:
+        idx = await asyncio.to_thread(_epub_index, epub_path)
+        if not 0 <= n < len(idx["chapters"]):
+            return HTMLResponse("no such chapter", status_code=404)
+
+        def _read():
+            with _zipfile.ZipFile(epub_path) as zf:
+                return _epub_chapter_body(zf, msg_id, idx["chapters"][n])
+        body = await asyncio.to_thread(_read)
+    except Exception as e:
+        return HTMLResponse(f"<p>cannot show this chapter: {html.escape(str(e))}</p>",
+                            status_code=500, headers={"Content-Security-Policy": _EPUB_CSP})
+    await _touch_local(msg_id)
+    return HTMLResponse(
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<style>{_EPUB_CHAPTER_CSS}</style></head><body>{body}</body></html>",
+        headers={"Content-Security-Policy": _EPUB_CSP,
+                 "X-Content-Type-Options": "nosniff",
+                 "Cache-Control": "private, max-age=3600"})
+
+
+_EPUB_READER_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>__TITLE__</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--fg);
+  --bg:#ffffff;--fg:#1f2937;--bar:#f8fafc;--line:#e2e8f0;--mut:#64748b;--acc:#2563eb}
+body[data-theme=sepia]{--bg:#f6efdc;--fg:#433422;--bar:#efe6cf;--line:#dccfae;--mut:#8a7a5c;--acc:#a0522d}
+body[data-theme=dark]{--bg:#15181d;--fg:#c9d1d9;--bar:#1c2128;--line:#30363d;--mut:#8b949e;--acc:#58a6ff}
+.bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bar);
+  border-bottom:1px solid var(--line);flex:none;min-height:50px}
+.bar.bottom{border-bottom:none;border-top:1px solid var(--line)}
+.ttl{flex:1;min-width:0;font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+button,.btn{font:inherit;font-size:14px;color:var(--fg);background:transparent;border:1px solid var(--line);
+  border-radius:8px;padding:7px 12px;cursor:pointer;text-decoration:none;white-space:nowrap;line-height:1.2}
+button:hover,.btn:hover{border-color:var(--acc);color:var(--acc)}
+button:disabled{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg)}
+button.big{font-size:15px;font-weight:600;padding:9px 18px;background:var(--acc);color:#fff;border-color:var(--acc)}
+button.big:hover{color:#fff;filter:brightness(1.1)}
+button.big:disabled{background:transparent;color:var(--fg);border-color:var(--line)}
+.stage{flex:1;position:relative;min-height:0}
+iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--bg)}
+.zone{position:absolute;top:0;bottom:0;width:16%;z-index:2;cursor:pointer;display:flex;align-items:center;
+  font-size:44px;color:var(--mut);opacity:0;transition:opacity .15s;user-select:none}
+.zone:hover{opacity:.55}
+.zone.l{left:0;justify-content:flex-start;padding-left:10px}
+.zone.r{right:0;justify-content:flex-end;padding-right:10px}
+body[data-mode=scroll] .zone{display:none}
+.pos{flex:1;min-width:0;text-align:center;font-size:13px;color:var(--mut)}
+.pos b{color:var(--fg);font-weight:600}
+.pos .chn{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+input[type=range]{width:100%;accent-color:var(--acc);margin:2px 0 0}
+.drawer{position:absolute;top:0;bottom:0;left:0;width:min(360px,86vw);background:var(--bar);
+  border-right:1px solid var(--line);z-index:5;transform:translateX(-102%);transition:transform .18s;
+  display:flex;flex-direction:column;box-shadow:4px 0 18px rgba(0,0,0,.12)}
+.drawer.open{transform:none}
+.drawer h3{margin:0;padding:14px 16px;font-size:15px;border-bottom:1px solid var(--line);display:flex;
+  justify-content:space-between;align-items:center}
+.drawer .list{overflow:auto;flex:1;padding:6px 0}
+.drawer a{display:block;padding:9px 16px;font-size:14px;color:var(--fg);text-decoration:none;cursor:pointer;
+  border-left:3px solid transparent}
+.drawer a:hover{background:rgba(127,127,127,.12)}
+.drawer a.cur{border-left-color:var(--acc);color:var(--acc);font-weight:600}
+.shade{position:absolute;inset:0;z-index:4;background:rgba(0,0,0,.25);display:none}
+.shade.open{display:block}
+.msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--mut);
+  z-index:1;pointer-events:none;font-size:15px}
+.tip{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:rgba(15,23,42,.88);color:#fff;
+  padding:9px 16px;border-radius:20px;font-size:13px;z-index:6;pointer-events:none;transition:opacity .6s}
+@media (max-width:640px){.hide-s{display:none}.bar{gap:5px;padding:6px 8px}button,.btn{padding:7px 9px}}
+</style></head>
+<body data-theme="light" data-mode="paged">
+<div class="bar">
+  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
+  <button id="tocBtn" title="table of contents">&#9776;<span class="hide-s"> Contents</span></button>
+  <div class="ttl" id="ttl">__TITLE__</div>
+  <button id="fsDown" title="smaller text">A&minus;</button>
+  <button id="fsUp" title="larger text">A+</button>
+  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
+  <button id="modeBtn" title="turn pages or scroll"><span id="modeLbl">Scroll</span></button>
+  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+</div>
+<div class="stage" id="stage">
+  <div class="msg" id="msg">opening the book…</div>
+  <iframe id="bk" sandbox="allow-same-origin" title="book"></iframe>
+  <div class="zone l" id="zl" title="previous page">&lsaquo;</div>
+  <div class="zone r" id="zr" title="next page">&rsaquo;</div>
+  <div class="shade" id="shade"></div>
+  <div class="drawer" id="drawer">
+    <h3><span>Contents</span><button id="tocClose">&times;</button></h3>
+    <div class="list" id="tocList"></div>
+  </div>
+  <div class="tip" id="tip">&larr; &rarr; or Space to turn pages &middot; click the edges &middot; swipe on a phone</div>
+</div>
+<div class="bar bottom">
+  <button class="big" id="prev">&lsaquo; Prev</button>
+  <div class="pos">
+    <span class="chn" id="chn"></span>
+    <span id="pg"></span>
+    <input type="range" id="slider" min="0" max="0" value="0" title="jump to a chapter">
+  </div>
+  <button class="big" id="next">Next &rsaquo;</button>
+</div>
+<script>
+(function(){
+const ID = __ID__, KEY = "tgarr.read." + ID;
+const $ = id => document.getElementById(id);
+const fr = $("bk");
+let titles = [], ch = 0, page = 0, pages = 1, W = 0, doc = null, pendingFrac = 0, busy = false;
+let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.reader") || "{}"); } catch (e) {}
+let fs = st.fs || 18, theme = st.theme || "light", mode = st.mode || "paged";
+const THEMES = {light: ["#ffffff", "#1f2937"], sepia: ["#f6efdc", "#433422"], dark: ["#15181d", "#c9d1d9"]};
+function saveSt(){ try { localStorage.setItem("tgarr.reader", JSON.stringify({fs, theme, mode})); } catch (e) {} }
+function frac(){
+  if (mode === "paged") return pages > 1 ? page / (pages - 1) : 0;
+  const se = doc && doc.scrollingElement; if (!se) return 0;
+  const max = se.scrollHeight - se.clientHeight; return max > 0 ? se.scrollTop / max : 0;
+}
+function savePos(){ try { localStorage.setItem(KEY, JSON.stringify({ch, frac: frac()})); } catch (e) {} }
+function css(){
+  const c = THEMES[theme];
+  let s = "html{background:" + c[0] + "}body{background:" + c[0] + ";color:" + c[1] + ";font-size:" + fs + "px}";
+  if (mode === "paged") {
+    const col = Math.min(W - 44, 860), P = Math.max(22, Math.round((W - col) / 2));
+    s += "html{height:100%;overflow:hidden}" +
+         "body{margin:0;height:100vh;box-sizing:border-box;padding:26px " + P + "px;column-width:" + (W - 2 * P) +
+         "px;column-gap:" + (2 * P) + "px;column-fill:auto;overflow:hidden}" +
+         "img,svg{max-height:calc(100vh - 90px);width:auto;max-width:100%;break-inside:avoid}" +
+         "h1,h2,h3,h4{break-after:avoid}";
+  } else {
+    s += "body{max-width:820px;margin:0 auto;padding:26px 22px 80px}";
+  }
+  return s;
+}
+function layout(keep){
+  if (!doc || !doc.body) return;
+  W = fr.clientWidth;
+  let el = doc.getElementById("tg-reader");
+  if (!el) { el = doc.createElement("style"); el.id = "tg-reader"; doc.head.appendChild(el); }
+  el.textContent = css();
+  document.body.dataset.theme = theme; document.body.dataset.mode = mode;
+  $("modeLbl").textContent = mode === "paged" ? "Scroll" : "Pages";
+  if (mode === "paged") {
+    pages = Math.max(1, Math.round(doc.body.scrollWidth / W));
+    page = Math.min(pages - 1, Math.max(0, Math.round(keep * (pages - 1))));
+    doc.body.scrollLeft = page * W;
+  } else {
+    const se = doc.scrollingElement, max = se.scrollHeight - se.clientHeight;
+    se.scrollTop = keep * Math.max(0, max);
+  }
+  ui();
+}
+function ui(){
+  const n = titles.length || 1;
+  $("chn").textContent = titles[ch] || ("Section " + (ch + 1));
+  let within = frac();
+  if (mode === "paged") $("pg").innerHTML = "page <b>" + (page + 1) + "</b> of " + pages + " &middot; chapter " + (ch + 1) + " of " + n +
+      " &middot; <b>" + Math.round((ch + (pages > 1 ? page / pages : 0)) / n * 100) + "%</b>";
+  else $("pg").innerHTML = "chapter " + (ch + 1) + " of " + n + " &middot; <b>" + Math.round((ch + within) / n * 100) + "%</b>";
+  $("slider").max = n - 1; $("slider").value = ch;
+  const first = ch === 0 && (mode === "paged" ? page === 0 : within <= 0.001);
+  const last = ch >= n - 1 && (mode === "paged" ? page >= pages - 1 : within >= 0.999);
+  $("prev").disabled = first; $("next").disabled = last;
+  document.querySelectorAll("#tocList a").forEach(a => a.classList.toggle("cur", +a.dataset.i === ch));
+  savePos();
+}
+function load(n, f){
+  n = Math.max(0, Math.min((titles.length || 1) - 1, n));
+  ch = n; pendingFrac = f || 0; busy = true;
+  $("msg").style.display = "flex"; $("msg").textContent = "loading…";
+  fr.src = "/epub/" + ID + "/ch/" + n;
+}
+function go(d){
+  if (busy || !doc) return;
+  hideTip();
+  if (mode === "paged") {
+    if (page + d >= 0 && page + d < pages) { page += d; doc.body.scrollLeft = page * W; ui(); return; }
+  } else {
+    const se = doc.scrollingElement, max = se.scrollHeight - se.clientHeight, step = se.clientHeight * 0.9;
+    if ((d > 0 && se.scrollTop < max - 2) || (d < 0 && se.scrollTop > 2)) { se.scrollTop += d * step; setTimeout(ui, 60); return; }
+  }
+  if (d > 0 && ch < titles.length - 1) load(ch + 1, 0);
+  else if (d < 0 && ch > 0) load(ch - 1, 1);
+}
+function onKey(e){
+  if (e.target && /INPUT|TEXTAREA/.test(e.target.tagName) && e.target.type !== "range") return;
+  const k = e.key;
+  if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey) || k === "ArrowDown" && mode === "paged") { e.preventDefault(); go(1); }
+  else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey) || k === "ArrowUp" && mode === "paged") { e.preventDefault(); go(-1); }
+  else if (k === "Home") { e.preventDefault(); load(0, 0); }
+  else if (k === "End") { e.preventDefault(); load(titles.length - 1, 1); }
+  else if (k === "Escape") toc(false);
+}
+let wheelAt = 0;
+function onWheel(e){
+  if (mode !== "paged") { setTimeout(ui, 80); return; }
+  e.preventDefault();
+  const now = Date.now(); if (now - wheelAt < 260) return;
+  if (Math.abs(e.deltaY) < 8 && Math.abs(e.deltaX) < 8) return;
+  wheelAt = now; go((Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX) > 0 ? 1 : -1);
+}
+let tx = null, ty = null;
+function onTouchStart(e){ const t = e.changedTouches[0]; tx = t.clientX; ty = t.clientY; }
+function onTouchEnd(e){
+  if (tx === null) return; const t = e.changedTouches[0], dx = t.clientX - tx, dy = t.clientY - ty; tx = null;
+  if (mode === "paged" && Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.5) go(dx < 0 ? 1 : -1);
+  else if (mode !== "paged") setTimeout(ui, 120);
+}
+function wire(target){
+  try {
+    target.addEventListener("keydown", onKey);
+    target.addEventListener("wheel", onWheel, {passive: false});
+    target.addEventListener("touchstart", onTouchStart, {passive: true});
+    target.addEventListener("touchend", onTouchEnd, {passive: true});
+  } catch (e) {}
+}
+fr.addEventListener("load", function(){
+  try { doc = fr.contentDocument; } catch (e) { doc = null; }
+  if (!doc || !doc.body) return;
+  busy = false; $("msg").style.display = "none";
+  wire(doc);
+  doc.addEventListener("scroll", () => { if (mode !== "paged") ui(); }, {passive: true});
+  layout(pendingFrac);
+  // pictures arriving change the page count: lay out again, stay where we are
+  let t = null;
+  Array.from(doc.images || []).forEach(im => { if (!im.complete) im.addEventListener("load", () => {
+    clearTimeout(t); t = setTimeout(() => layout(frac()), 120); }); });
+});
+wire(window);
+window.addEventListener("resize", () => { if (doc) layout(frac()); });
+$("prev").onclick = () => go(-1); $("next").onclick = () => go(1);
+$("zl").onclick = () => go(-1); $("zr").onclick = () => go(1);
+$("fsUp").onclick = () => { fs = Math.min(30, fs + 2); saveSt(); layout(frac()); };
+$("fsDown").onclick = () => { fs = Math.max(12, fs - 2); saveSt(); layout(frac()); };
+$("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); layout(frac()); };
+$("modeBtn").onclick = () => { const f = frac(); mode = mode === "paged" ? "scroll" : "paged"; saveSt(); layout(f); };
+$("slider").addEventListener("change", e => load(+e.target.value, 0));
+function toc(open){ $("drawer").classList.toggle("open", open); $("shade").classList.toggle("open", open);
+  if (open) { const c = document.querySelector("#tocList a.cur"); if (c) c.scrollIntoView({block: "center"}); } }
+$("tocBtn").onclick = () => toc(!$("drawer").classList.contains("open"));
+$("tocClose").onclick = () => toc(false); $("shade").onclick = () => toc(false);
+function hideTip(){ const t = $("tip"); if (t) { t.style.opacity = 0; setTimeout(() => t.remove(), 700); } }
+setTimeout(hideTip, 7000);
+// "back": players open in a new tab, where there is no page to go back to.
+// Go back if there is one; otherwise close the tab (the list is still open
+// behind it); if the browser will not close it, go to the list.
+function tgBack(fallback){
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  window.close();
+  setTimeout(function(){ location.href = fallback; }, 200);
+}
+$("back").onclick = e => { e.preventDefault(); tgBack("/library"); };
+document.body.dataset.theme = theme;
+fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
+  if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
+  titles = j.chapters || [];
+  if (j.title) { $("ttl").textContent = j.title; document.title = j.title; }
+  const list = $("tocList"), fragm = document.createDocumentFragment();
+  let listed = 0;
+  titles.forEach((t, i) => { if (!t) return; listed++;
+    const a = document.createElement("a"); a.textContent = t; a.dataset.i = i;
+    a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
+  if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "Section " + (i + 1);
+    a.dataset.i = i; a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
+  list.appendChild(fragm);
+  let pos = {}; try { pos = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
+  // /epub/123#40 opens chapter 40
+  const h = parseInt((location.hash || "").slice(1), 10);
+  if (h >= 1 && h <= titles.length) pos = {ch: h - 1, frac: 0};
+  load(pos.ch || 0, pos.frac || 0);
+}).catch(() => { $("msg").textContent = "✗ could not open this book"; });
+})();
+</script>
+</body></html>"""
+
+
+@app.get("/epub/{msg_id}", response_class=HTMLResponse)
+async def epub_render(msg_id: int):
+    """The e-book reader (see the block comment above)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    if not _epub_locate(msg_id, row):
         return HTMLResponse(
-            f"<h1>EPUB render failed</h1><pre>{html.escape(str(e))}</pre>"
-            f"<p><a href='/media/{msg_id}' download>Download raw .epub</a></p>",
-            status_code=500)
+            f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            status_code=404)
+    title = _re.sub(r"\.epub$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
+    return HTMLResponse(_EPUB_READER_HTML.replace("__ID__", str(int(msg_id)))
+                        .replace("__TITLE__", html.escape(title)))
+
+
+# ════════════════════════════════════════════════════════════════════
+# PDF reader
+#
+# /pdf/{id}                 the reader (same controls as the e-book reader)
+# /pdf/{id}/info            page count and shape
+# /pdf/{id}/page/{n}        one page as a picture (?w=width&clean=1)
+#
+# Pages are drawn on the server (poppler) and sent as pictures, so the reader
+# is the same on every browser and phone, and so a page can be cleaned on the
+# way: many PDFs passed around on Telegram carry a channel's address printed
+# across every page. When the watermark is part of a scanned page there is
+# nothing to delete from the file - but it is always pale and usually tinted,
+# and the text is always dark. "Hide watermark" redraws the page in grey,
+# turns pale and tinted pixels white, and darkens what is left so thin
+# strokes survive. The file itself is never changed; "Original" opens it
+# untouched in the browser's own viewer (text selection, search, printing).
+# ════════════════════════════════════════════════════════════════════
+_PDF_INFO_CACHE: dict = {}            # path -> (mtime, info)
+_PDF_PAGE_CACHE: "collections.OrderedDict" = None
+_PDF_PAGE_CACHE_MAX = 48
+_PDF_RENDER_SEM = None
+_PDF_WIDTHS = (800, 1000, 1200, 1400, 1600, 1800, 2000, 2400, 2800, 3200)
+
+
+def _pdf_source(row):
+    """The PDF to show for a library item: the file itself, or the PDF an
+    e-book in another format was converted to."""
+    if not row or not _is_local(row["local_path"]):
+        return None
+    src = os.path.join("/downloads", row["local_path"])
+    if (row["local_path"] or "").lower().endswith(".pdf"):
+        return src if os.path.exists(src) else None
+    conv = src + ".pdf"
+    return conv if os.path.exists(conv) else None
+
+
+def _pdf_info(path: str) -> dict:
+    import subprocess
+    mtime = os.path.getmtime(path)
+    hit = _PDF_INFO_CACHE.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    out = subprocess.run(["pdfinfo", path], capture_output=True, timeout=30).stdout.decode(
+        "utf-8", "replace")
+    m = _re.search(r"^Pages:\s+(\d+)", out, _re.MULTILINE)
+    if not m:
+        raise RuntimeError("not a readable PDF")
+    sz = _re.search(r"^Page size:\s+([\d.]+) x ([\d.]+)", out, _re.MULTILINE)
+    ratio = (float(sz.group(2)) / float(sz.group(1))) if sz and float(sz.group(1)) else 1.414
+    rot = _re.search(r"^Page rot:\s+(\d+)", out, _re.MULTILINE)
+    if rot and int(rot.group(1)) in (90, 270):
+        ratio = 1 / ratio
+    info = {"pages": int(m.group(1)), "ratio": round(ratio, 4)}
+    if len(_PDF_INFO_CACHE) > 64:
+        _PDF_INFO_CACHE.clear()
+    _PDF_INFO_CACHE[path] = (mtime, info)
+    return info
+
+
+def _pdf_clean(im):
+    """Pale and tinted pixels to white, the rest to strong grey (see above)."""
+    from PIL import ImageChops
+    r, g, b = im.split()
+    mx = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    mn = ImageChops.darker(ImageChops.darker(r, g), b)
+    tinted = ImageChops.multiply(
+        ImageChops.subtract(mx, mn).point(lambda v: 255 if v > 30 else 0),
+        mx.point(lambda v: 255 if v > 150 else 0))
+    grey = ImageChops.lighter(mn, tinted)
+    return grey.point([255 if v >= 205 else int(255 * (v / 205) ** 1.5) for v in range(256)])
+
+
+def _pdf_render(path: str, n: int, width: int, clean: bool):
+    """One page as a picture: (bytes, media type).
+
+    As it is: JPEG. Cleaned: the page is drawn without any lossy step
+    (PNG from poppler), filtered, sharpened a little so that strokes the
+    filter thinned get their edge back, and sent as a grey PNG - text on
+    white compresses well losslessly and keeps crisp edges, where JPEG
+    leaves a haze around every stroke."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        base = os.path.join(td, "p")
+
+        def _nice():
+            try:
+                os.nice(10)
+            except OSError:
+                pass
+        fmt = ["-png"] if clean else ["-jpeg", "-jpegopt", "quality=93"]
+        r = subprocess.run(
+            ["pdftoppm", "-f", str(n), "-l", str(n), "-singlefile",
+             "-scale-to-x", str(width), "-scale-to-y", "-1", *fmt, path, base],
+            capture_output=True, timeout=60, preexec_fn=_nice)
+        out = base + (".png" if clean else ".jpg")
+        if r.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError("could not draw this page")
+        if not clean:
+            with open(out, "rb") as f:
+                return f.read(), "image/jpeg"
+        import io as _io
+        from PIL import Image, ImageFilter
+        buf = _io.BytesIO()
+        with Image.open(out) as im:
+            page = _pdf_clean(im.convert("RGB"))
+            page = page.filter(ImageFilter.UnsharpMask(radius=1.2, percent=90, threshold=2))
+            page.save(buf, "PNG", optimize=False, compress_level=6)
+        return buf.getvalue(), "image/png"
+
+
+@app.get("/pdf/{msg_id}/info")
+async def pdf_info(msg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    path = _pdf_source(row)
+    if not path:
+        return JSONResponse({"error": "not downloaded yet"}, status_code=404)
+    try:
+        info = await asyncio.to_thread(_pdf_info, path)
+    except Exception as e:
+        return JSONResponse({"error": f"cannot read this PDF: {e}"}, status_code=422)
+    return JSONResponse(info)
+
+
+@app.get("/pdf/{msg_id}/page/{n}")
+async def pdf_page(msg_id: int, n: int, w: int = 1200, clean: int = 0):
+    global _PDF_PAGE_CACHE, _PDF_RENDER_SEM
+    import collections
+    if _PDF_PAGE_CACHE is None:
+        _PDF_PAGE_CACHE = collections.OrderedDict()
+        _PDF_RENDER_SEM = asyncio.Semaphore(2)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    path = _pdf_source(row)
+    if not path:
+        return Response("not downloaded yet", status_code=404)
+    # the smallest size that is not smaller than what the screen will show:
+    # a picture the browser has to enlarge is a blurred picture
+    _want = max(400, min(int(w), _PDF_WIDTHS[-1]))
+    width = next(x for x in _PDF_WIDTHS if x >= _want)
+    try:
+        info = await asyncio.to_thread(_pdf_info, path)
+        if not 1 <= n <= info["pages"]:
+            return Response("no such page", status_code=404)
+        key = (path, os.path.getmtime(path), n, width, bool(clean))
+        data = _PDF_PAGE_CACHE.get(key)
+        if data is None:
+            async with _PDF_RENDER_SEM:
+                data = _PDF_PAGE_CACHE.get(key)
+                if data is None:
+                    data = await asyncio.to_thread(_pdf_render, path, n, width, bool(clean))
+            _PDF_PAGE_CACHE[key] = data
+            while len(_PDF_PAGE_CACHE) > _PDF_PAGE_CACHE_MAX:
+                _PDF_PAGE_CACHE.popitem(last=False)
+        else:
+            _PDF_PAGE_CACHE.move_to_end(key)
+    except Exception as e:
+        return Response(f"cannot draw this page: {e}", status_code=500)
+    if n == 1:
+        await _touch_local(msg_id)
+    return Response(content=data[0], media_type=data[1],
+                    headers={"Cache-Control": "private, max-age=86400"})
+
+
+_PDF_READER_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,'PingFang SC','Microsoft YaHei',sans-serif}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--fg);
+  --bg:#eef1f5;--fg:#1f2937;--bar:#f8fafc;--line:#e2e8f0;--mut:#64748b;--acc:#2563eb}
+body[data-theme=dark]{--bg:#0f1115;--fg:#c9d1d9;--bar:#1c2128;--line:#30363d;--mut:#8b949e;--acc:#58a6ff}
+.bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bar);
+  border-bottom:1px solid var(--line);flex:none;min-height:50px}
+.bar.bottom{border-bottom:none;border-top:1px solid var(--line)}
+.ttl{flex:1;min-width:0;font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+button,.btn{font:inherit;font-size:14px;color:var(--fg);background:transparent;border:1px solid var(--line);
+  border-radius:8px;padding:7px 12px;cursor:pointer;text-decoration:none;white-space:nowrap;line-height:1.2}
+button:hover,.btn:hover{border-color:var(--acc);color:var(--acc)}
+button:disabled{opacity:.35;cursor:default}
+button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.big{font-size:15px;font-weight:600;padding:9px 18px;background:var(--acc);color:#fff;border-color:var(--acc)}
+button.big:hover{color:#fff;filter:brightness(1.1)}
+button.big:disabled{background:transparent;color:var(--fg);border-color:var(--line)}
+.stage{flex:1;overflow:auto;min-height:0;padding:14px 0 30px;-webkit-overflow-scrolling:touch}
+.pg{margin:0 auto 14px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.14);position:relative}
+.pg img{display:block;width:100%;height:100%}
+body[data-theme=sepia]{--bg:#e9dfc6;--fg:#433422;--bar:#efe6cf;--line:#dccfae;--mut:#8a7a5c;--acc:#a0522d}
+body[data-theme=sepia] .pg{background:#f6efdc}
+body[data-theme=sepia] .pg img{mix-blend-mode:multiply}
+body[data-theme=dark] .pg{background:#1b1d22}
+body[data-theme=dark] .pg img{filter:invert(.92) hue-rotate(180deg)}
+.pg .no{position:absolute;right:8px;bottom:6px;font-size:11px;color:#94a3b8;pointer-events:none}
+.pos{flex:1;min-width:0;text-align:center;font-size:13px;color:var(--mut)}
+.pos b{color:var(--fg)}
+.pos input[type=number]{width:64px;font:inherit;text-align:center;border:1px solid var(--line);border-radius:6px;
+  padding:3px;background:transparent;color:var(--fg)}
+input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
+.msg{padding:60px 20px;text-align:center;color:var(--mut)}
+@media (max-width:640px){.hide-s{display:none}.bar{gap:5px;padding:6px 8px}button,.btn{padding:7px 9px}}
+</style></head>
+<body data-theme="light">
+<div class="bar">
+  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
+  <div class="ttl">__TITLE__</div>
+  <button id="wmBtn" title="on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.">Hide watermark</button>
+  <button id="zOut" title="smaller (-)">A&minus;</button>
+  <button id="zIn" title="larger (+)">A+</button>
+  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
+  <a class="btn hide-s" href="/media/__ID__" target="_blank" title="the untouched file in the browser's own viewer: select text, search, print">Original</a>
+  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+</div>
+<div class="stage" id="stage"><div class="msg" id="msg">opening…</div></div>
+<div class="bar bottom">
+  <button class="big" id="prev">&lsaquo; Prev</button>
+  <div class="pos">
+    page <input type="number" id="pno" min="1" value="1"> of <b id="ptotal">…</b>
+    <input type="range" id="slider" min="1" max="1" value="1">
+  </div>
+  <button class="big" id="next">Next &rsaquo;</button>
+</div>
+<script>
+(function(){
+const ID = __ID__, KEY = "tgarr.pdf." + ID;
+const $ = id => document.getElementById(id);
+const stage = $("stage");
+let pages = 0, ratio = 1.414, cur = 1, els = [];
+let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.pdfreader") || "{}"); } catch (e) {}
+let book = {}; try { book = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
+let zoom = st.zoom || 1, theme = st.theme || "light";
+let clean = book.clean !== undefined ? book.clean : (st.clean !== undefined ? !!st.clean : true);
+const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean})); } catch (e) {} };
+const saveBook = () => { try { localStorage.setItem(KEY, JSON.stringify({page: cur, clean})); } catch (e) {} };
+function pageW(){ return Math.round(Math.min(stage.clientWidth - 16, 980) * zoom); }
+function reqW(){ return Math.min(3200, Math.round(pageW() * Math.min(3, window.devicePixelRatio || 1))); }
+function src(n){ return "/pdf/" + ID + "/page/" + n + "?w=" + reqW() + (clean ? "&clean=1" : ""); }
+function size(){
+  const w = pageW();
+  els.forEach(el => { el.style.width = w + "px"; el.style.height = Math.round(w * (el._ratio || ratio)) + "px"; });
+}
+const io = new IntersectionObserver(es => es.forEach(e => {
+  if (!e.isIntersecting) return;
+  const el = e.target, img = el.firstChild, want = src(+el.dataset.n);
+  if (img.dataset.src !== want) { img.dataset.src = want; img.src = want; }
+}), {root: stage, rootMargin: "1200px 0px"});
+function refresh(){ els.forEach(el => { io.unobserve(el); io.observe(el); }); }
+function build(){
+  const f = document.createDocumentFragment();
+  for (let n = 1; n <= pages; n++) {
+    const el = document.createElement("div"); el.className = "pg"; el.dataset.n = n;
+    const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+    img.onload = () => { if (img.naturalWidth) { const r = img.naturalHeight / img.naturalWidth;
+      if (Math.abs(r - (el._ratio || ratio)) > 0.01) { el._ratio = r; el.style.height = Math.round(pageW() * r) + "px"; } } };
+    const no = document.createElement("span"); no.className = "no"; no.textContent = n;
+    el.appendChild(img); el.appendChild(no); f.appendChild(el); els.push(el);
+  }
+  stage.innerHTML = ""; stage.appendChild(f); size(); refresh();
+}
+function go(n, smooth){
+  n = Math.max(1, Math.min(pages, n | 0)); if (!els[n - 1]) return;
+  stage.scrollTo({top: els[n - 1].offsetTop - 8, behavior: smooth ? "smooth" : "auto"});
+}
+function track(){
+  const mid = stage.scrollTop + stage.clientHeight * 0.35; let lo = 0, hi = els.length - 1, k = 0;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (els[m].offsetTop <= mid) { k = m; lo = m + 1; } else hi = m - 1; }
+  if (k + 1 !== cur) { cur = k + 1; ui(); saveBook(); }
+}
+function ui(){
+  if (document.activeElement !== $("pno")) $("pno").value = cur;
+  $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur >= pages;
+  $("wmBtn").classList.toggle("on", clean); document.body.dataset.theme = theme;
+}
+let tt = null; stage.addEventListener("scroll", () => { clearTimeout(tt); tt = setTimeout(track, 60); }, {passive: true});
+$("prev").onclick = () => go(cur - 1, true); $("next").onclick = () => go(cur + 1, true);
+$("pno").addEventListener("change", e => go(+e.target.value));
+$("slider").addEventListener("input", e => { $("pno").value = e.target.value; });
+$("slider").addEventListener("change", e => go(+e.target.value));
+function rezoom(z){ const keep = cur; zoom = Math.max(0.5, Math.min(2.5, z)); saveSt(); size(); refresh(); go(keep); }
+$("zIn").onclick = () => rezoom(zoom * 1.2); $("zOut").onclick = () => rezoom(zoom / 1.2);
+$("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); ui(); };
+$("wmBtn").onclick = () => { clean = !clean; saveSt(); saveBook(); ui(); refresh(); };
+window.addEventListener("resize", () => { const keep = cur; size(); refresh(); go(keep); });
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" && e.target.type === "number") return;
+  const k = e.key;
+  if (k === "ArrowRight" || k === "PageDown") { e.preventDefault(); go(cur + 1, true); }
+  else if (k === "ArrowLeft" || k === "PageUp") { e.preventDefault(); go(cur - 1, true); }
+  else if (k === "Home") go(1); else if (k === "End") go(pages);
+  else if (k === "+" || k === "=") rezoom(zoom * 1.2); else if (k === "-") rezoom(zoom / 1.2);
+});
+// "back": players open in a new tab, where there is no page to go back to.
+// Go back if there is one; otherwise close the tab (the list is still open
+// behind it); if the browser will not close it, go to the list.
+function tgBack(fallback){
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  window.close();
+  setTimeout(function(){ location.href = fallback; }, 200);
+}
+$("back").onclick = e => { e.preventDefault(); tgBack("/library"); };
+ui();
+fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
+  if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
+  pages = j.pages; ratio = j.ratio || 1.414;
+  $("ptotal").textContent = pages; $("slider").max = pages; $("pno").max = pages;
+  build();
+  const h = parseInt((location.hash || "").slice(1), 10);
+  cur = (h >= 1 && h <= pages) ? h : Math.min(pages, book.page || 1);
+  go(cur); ui();
+}).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
+})();
+</script>
+</body></html>"""
+
+
+@app.get("/pdf/{msg_id}", response_class=HTMLResponse)
+async def pdf_reader(msg_id: int):
+    """The PDF reader (see the block comment above)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    if not _pdf_source(row):
+        return HTMLResponse(
+            f'<p>This file is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            status_code=404)
+    title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
+    return HTMLResponse(_PDF_READER_HTML.replace("__ID__", str(int(msg_id)))
+                        .replace("__TITLE__", html.escape(title)))
 
 
 @app.get("/epub/{msg_id}/cover")
@@ -1677,7 +3132,9 @@ async def epub_asset(msg_id: int, asset_path: str):
     return Response(
         content=data,
         media_type=_EPUB_MIME.get(ext, "application/octet-stream"),
-        headers={"Cache-Control": "public, max-age=3600"})
+        headers={"Cache-Control": "public, max-age=3600",
+                 "Content-Security-Policy": "sandbox; " + _EPUB_CSP,
+                 "X-Content-Type-Options": "nosniff"})
 
 
 async def _tg_flood() -> Optional[dict]:
@@ -1710,6 +3167,8 @@ async def media_status(msg_id: int):
     total = row["file_size"] or 0
     file_dc = row["file_dc"] if (row["file_dc"] or 0) > 0 else None
     my_dc = await _get_my_dc()
+    if lp != "__failed__":
+        await _want_fetch(msg_id)
     cross_dc = bool(file_dc and my_dc and file_dc != my_dc)
     if lp == "__failed__":
         return JSONResponse({"status": "failed", "file_dc": file_dc,
@@ -1720,15 +3179,189 @@ async def media_status(msg_id: int):
                             "tg_wait": await _tg_flood()})
     path = os.path.join("/downloads", lp)
     bytes_ = os.path.getsize(path) if os.path.exists(path) else 0
+    if total and bytes_ < total:
+        # Not growing any more: the fetch died half-way (the crawler was
+        # restarted). The person is asking for it right now - fetch it again.
+        import time as _time
+        try:
+            idle = _time.time() - os.path.getmtime(path)
+        except OSError:
+            idle = 1e9
+        async with db_pool.acquire() as conn:
+            _by_hand = await conn.fetchval(
+                "SELECT fetch_wanted_at = 'epoch' FROM messages WHERE id = $1", msg_id)
+        if idle > 45 and not _by_hand:      # paused by hand stays paused
+            await _revive_fetch(msg_id, lp)
+            return JSONResponse({"status": "queued", "bytes": bytes_, "total": total,
+                                 "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc,
+                                 "tg_wait": await _tg_flood()})
     if total and bytes_ >= total:
         return JSONResponse({"status": "ready", "bytes": bytes_, "total": total,
                             "mime": row["mime_type"], "media_type": row["media_type"],
                             "file_name": row["file_name"],
                             "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
+    async with db_pool.acquire() as conn:
+        _paused = await conn.fetchval(
+            "SELECT fetch_wanted_at = 'epoch' FROM messages WHERE id = $1", msg_id)
     return JSONResponse({"status": "downloading", "bytes": bytes_, "total": total,
+                        "paused": bool(_paused),
                         "mime": row["mime_type"], "media_type": row["media_type"],
                         "file_name": row["file_name"],
                         "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
+
+
+# ── Video player ─────────────────────────────────────────────────────
+# The browser's own <video> controls stay (they are what people know, and
+# they work on every device); around them: a view that fills the window,
+# favourite, speed, 10-second skips, picture-in-picture, "continue where I
+# stopped", and - while the file is still arriving from Telegram - how much
+# of it is here, because seeking past that point has to wait.
+_WATCH_PLAYER_CSS = """
+.vshell { width:100%; display:flex; flex-direction:column; align-items:center; }
+.vstage { display:flex; align-items:center; justify-content:center; overflow:hidden; background:#000; border-radius:8px;
+  width:1200px; max-width:96vw; height:calc(100vh - 150px); }
+.vshell video { width:100%; height:100%; max-width:none; max-height:none; background:#000; object-fit:contain; transition:transform .2s; }
+body.wide { height:100vh; overflow:hidden; }
+body.wide main { padding:0; align-items:stretch; min-height:0; }
+body.wide .vshell { height:100%; }
+body.wide .vstage { flex:1; min-height:0; width:100%; max-width:100%; height:auto; border-radius:0; }
+.vbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:center; padding:10px 12px; width:100%; box-sizing:border-box; }
+.vbar button, .vbar select, .vbar a, .bar button { font:inherit; font-size:13px; color:#e2e8f0; background:#1e293b;
+  border:1px solid #334155; border-radius:8px; padding:7px 12px; cursor:pointer; text-decoration:none; line-height:1.2; }
+.vbar button:hover, .vbar a:hover, .vbar select:hover, .bar button:hover { border-color:#5eb6e5; color:#fff; }
+.vbar button.on, .bar button.on { background:#2563eb; border-color:#2563eb; color:#fff; }
+.bar button.fav.on { background:transparent; border-color:#fb7185; color:#fb7185; }
+.vbar .arr { font-size:12px; color:#94a3b8; display:flex; align-items:center; gap:8px; }
+.vbar .arr i { display:block; width:120px; height:5px; background:#1e293b; border-radius:3px; overflow:hidden; }
+.vbar .arr i b { display:block; height:100%; background:#5eb6e5; width:0; transition:width .4s; }
+.vtoast { position:fixed; left:50%; top:70px; transform:translateX(-50%); background:rgba(15,23,42,.92); border:1px solid #334155;
+  color:#e2e8f0; padding:9px 16px; border-radius:20px; font-size:13px; z-index:9; transition:opacity .5s; }
+.vtoast a { color:#5eb6e5; cursor:pointer; margin-left:10px; }
+@media (max-width:640px){ .vbar { gap:5px; padding:8px 6px } .vbar button, .vbar select, .vbar a { padding:7px 9px } }
+"""
+
+_WATCH_PLAYER_JS = r"""
+// "back": players open in a new tab, where there is no page to go back to.
+// Go back if there is one; otherwise close the tab (the list is still open
+// behind it); if the browser will not close it, go to the list.
+function tgBack(fallback){
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  window.close();
+  setTimeout(function(){ location.href = fallback; }, 200);
+}
+function tgFavBtn(){
+  const bk = document.getElementById("backBtn");
+  if (bk) bk.onclick = e => { e.preventDefault(); tgBack(MEDIA_TYPE === "video" ? "/videos" : MEDIA_TYPE === "audio" ? "/music" : "/library"); };
+  const b = document.getElementById("favBtn"); if (!b) return;
+  b.onclick = () => fetch("/api/fav/" + MSG_ID, {method: "POST"}).then(r => r.json()).then(j => {
+    if (j.fav === undefined) return; b.classList.toggle("on", j.fav); b.title = j.fav ? "in your favourites" : "add to favourites"; });
+}
+function tgVideo(main){
+  let prefs = {}; try { prefs = JSON.parse(localStorage.getItem("tgarr.video") || "{}"); } catch (e) {}
+  if (prefs.wide === undefined) prefs.wide = true;
+  const save = () => { try { localStorage.setItem("tgarr.video", JSON.stringify(prefs)); } catch (e) {} };
+  const KEY = "tgarr.v." + MSG_ID;
+  main.innerHTML =
+    '<div class="vshell"><div class="vstage" id="vStage"><video id="v" controls autoplay playsinline src="/media/' + MSG_ID + '"></video></div>' +
+    '<div class="vbar">' +
+    '<button id="vBack" title="back 10 seconds (left arrow)">&#8630; 10s</button>' +
+    '<button id="vFwd" title="forward 10 seconds (right arrow)">10s &#8631;</button>' +
+    '<select id="vSpeed" title="playback speed (&lt; and &gt;)">' +
+      [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(x => '<option value="' + x + '">' + x + '&times;</option>').join("") + '</select>' +
+    '<button id="vRot" title="turn the picture a quarter turn (r) - for phone videos lying on their side">&#8635; Rotate</button>' +
+    '<button id="vMir" title="mirror the picture left-right (h) - for selfie videos">&#8646; Mirror</button>' +
+    '<button id="vFill" title="fill the frame, cropping the edges (c)">Fill</button>' +
+    '<button id="vWide" title="fill the window (w)">Full width</button>' +
+    '<button id="vPip" title="keep playing in a small floating window">Picture-in-picture</button>' +
+    '<button id="vFull" title="full screen (f)">Full screen</button>' +
+    '<span class="arr" id="vArr" style="display:none"><i><b id="vArrBar"></b></i><span id="vArrTxt"></span></span>' +
+    '</div></div>';
+  const v = document.getElementById("v"), $ = id => document.getElementById(id);
+  const toast = (htmlText, ms) => { const t = document.createElement("div"); t.className = "vtoast"; t.innerHTML = htmlText;
+    document.body.appendChild(t); setTimeout(() => { t.style.opacity = 0; setTimeout(() => t.remove(), 600); }, ms || 5000); return t; };
+  const fmt = s => { s = Math.floor(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+    return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
+  // picture: quarter turns, mirror, fill. Phone videos are often sideways or
+  // mirrored; this is per video, and remembered for it.
+  let pic = {}; try { pic = JSON.parse(localStorage.getItem(KEY + ".pic") || "{}"); } catch (e) {}
+  const stage = $("vStage");
+  function picture(){
+    const rot = ((pic.rot || 0) % 360 + 360) % 360, side = rot === 90 || rot === 270;
+    // a turned picture must fit a frame of the other shape: give the video
+    // the frame's swapped size, then turn it
+    v.style.width = side ? stage.clientHeight + "px" : "100%";
+    v.style.height = side ? stage.clientWidth + "px" : "100%";
+    v.style.flex = "none";
+    v.style.transform = "rotate(" + rot + "deg)" + (pic.mir ? " scaleX(-1)" : "");
+    v.style.objectFit = pic.fill ? "cover" : "contain";
+    $("vRot").classList.toggle("on", rot !== 0); $("vMir").classList.toggle("on", !!pic.mir); $("vFill").classList.toggle("on", !!pic.fill);
+    try { if (rot || pic.mir || pic.fill) localStorage.setItem(KEY + ".pic", JSON.stringify(pic)); else localStorage.removeItem(KEY + ".pic"); } catch (e) {}
+  }
+  $("vRot").onclick = () => { pic.rot = ((pic.rot || 0) + 90) % 360; picture(); };
+  $("vMir").onclick = () => { pic.mir = !pic.mir; picture(); };
+  $("vFill").onclick = () => { pic.fill = !pic.fill; picture(); };
+  window.addEventListener("resize", picture);
+  // wide
+  const wide = on => { prefs.wide = on; save(); document.body.classList.toggle("wide", on); $("vWide").classList.toggle("on", on); picture(); };
+  wide(prefs.wide); $("vWide").onclick = () => wide(!prefs.wide);
+  // speed + volume
+  const speed = x => { x = Math.max(0.5, Math.min(2, x)); v.playbackRate = x; v.defaultPlaybackRate = x; prefs.speed = x; save(); $("vSpeed").value = String(x); };
+  $("vSpeed").onchange = e => speed(+e.target.value);
+  if (prefs.vol !== undefined) v.volume = prefs.vol;
+  v.addEventListener("volumechange", () => { prefs.vol = v.volume; save(); });
+  v.addEventListener("loadedmetadata", () => {
+    speed(prefs.speed || 1);
+    // continue where I stopped
+    let pos = 0; try { pos = +localStorage.getItem(KEY) || 0; } catch (e) {}
+    if (pos > 30 && (!v.duration || pos < v.duration - 30)) {
+      v.currentTime = pos;
+      const t = toast("continued from " + fmt(pos) + ' <a id="vRestart">start over</a>', 8000);
+      t.querySelector("#vRestart").onclick = () => { v.currentTime = 0; t.remove(); };
+    }
+  });
+  let lastSave = 0;
+  v.addEventListener("timeupdate", () => { const now = Date.now(); if (now - lastSave < 4000) return; lastSave = now;
+    try { if (v.duration && v.currentTime > v.duration - 20) localStorage.removeItem(KEY); else localStorage.setItem(KEY, String(Math.floor(v.currentTime))); } catch (e) {} });
+  // skips, pip, full screen
+  const skip = d => { v.currentTime = Math.max(0, Math.min(v.duration || 1e9, v.currentTime + d)); };
+  $("vBack").onclick = () => skip(-10); $("vFwd").onclick = () => skip(10);
+  const full = () => { if (document.fullscreenElement) document.exitFullscreen(); else (v.requestFullscreen || v.webkitRequestFullscreen || v.webkitEnterFullscreen).call(v); };
+  $("vFull").onclick = full;
+  if (document.pictureInPictureEnabled) $("vPip").onclick = () => { if (document.pictureInPictureElement) document.exitPictureInPicture(); else v.requestPictureInPicture().catch(() => {}); };
+  else $("vPip").style.display = "none";
+  document.addEventListener("keydown", e => {
+    if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+    const k = e.key;
+    if (k === "ArrowLeft") { e.preventDefault(); skip(-10); }
+    else if (k === "ArrowRight") { e.preventDefault(); skip(10); }
+    else if (k === " " || k === "k") { if (e.target !== v) { e.preventDefault(); v.paused ? v.play() : v.pause(); } }
+    else if (k === "f") full();
+    else if (k === "w") wide(!prefs.wide);
+    else if (k === "r") $("vRot").click();
+    else if (k === "h") $("vMir").click();
+    else if (k === "c") $("vFill").click();
+    else if (k === "m") v.muted = !v.muted;
+    else if (k === ">" || k === ".") speed((prefs.speed || 1) + 0.25);
+    else if (k === "<" || k === ",") speed((prefs.speed || 1) - 0.25);
+    else if (k === "ArrowUp") { e.preventDefault(); v.volume = Math.min(1, v.volume + 0.1); }
+    else if (k === "ArrowDown") { e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); }
+  });
+  // how much of the file has arrived
+  (async function arrival(){
+    try {
+      const j = await (await fetch("/api/media-status/" + MSG_ID)).json();
+      if (j.status === "downloading" && j.total) {
+        const pct = Math.min(100, j.bytes / j.total * 100);
+        $("vArr").style.display = "flex"; $("vArrBar").style.width = pct + "%";
+        $("vArrTxt").textContent = j.paused
+          ? "paused at " + pct.toFixed(0) + "% — resume it on the Downloads page, or reopen this film"
+          : "still arriving: " + pct.toFixed(0) + "% here — skipping further ahead will wait";
+      } else if (j.status === "ready") { $("vArr").style.display = "none"; return; }
+    } catch (e) {}
+    setTimeout(arrival, 3000);
+  })();
+}
+"""
 
 
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
@@ -1738,13 +3371,15 @@ async def watch_page(msg_id: int):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT m.local_path, m.file_name, m.file_size, m.media_type,
-                      m.mime_type, c.title AS ch_title
+                      m.mime_type, c.title AS ch_title,
+                      EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav
                FROM messages m LEFT JOIN channels c ON c.id=m.channel_id
                WHERE m.id=$1""", msg_id)
     if not row:
         return HTMLResponse("<h1>404 — message not indexed</h1>", status_code=404)
     title = row["file_name"] or f"msg-{msg_id}"
     mt = row["media_type"] or "document"
+    await _want_fetch(msg_id, opened=True)
 
     # Trigger queueing immediately so the user doesn\'t wait for first poll.
     if not row["local_path"]:
@@ -1755,7 +3390,7 @@ async def watch_page(msg_id: int):
                 msg_id)
 
     body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>{html.escape(title)} — tgarr</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(title)} — tgarr</title>
 <style>
 body {{ background:#0f172a; color:#e2e8f0; font-family:system-ui,sans-serif;
        margin:0; padding:0; min-height:100vh; display:flex; flex-direction:column; }}
@@ -1777,11 +3412,13 @@ main {{ flex:1; display:flex; align-items:center; justify-content:center;
 video, audio, iframe {{ max-width:96vw; max-height:80vh; }}
 video, iframe {{ width:1200px; max-width:96vw; }}
 audio {{ width:600px; max-width:96vw; }}
+{_WATCH_PLAYER_CSS}
 </style></head><body>
 <div class="bar">
-  <a href="javascript:history.back()">← back</a>
+  <a href="#" id="backBtn">← back</a>
   <div class="title">{html.escape(title)}</div>
-  <a href="/media/{msg_id}" download>⬇ download raw</a>
+  <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{'in your favourites' if row["fav"] else 'add to favourites'}">♥ Favourite</button>
+  <a href="/media/{msg_id}" download>⬇ download</a>
 </div>
 <main id="main">
   <div class="loader">
@@ -1796,6 +3433,8 @@ audio {{ width:600px; max-width:96vw; }}
 const MSG_ID = {msg_id};
 const MEDIA_TYPE = {_js_str(mt)};
 const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
+{_WATCH_PLAYER_JS}
+tgFavBtn();
 let started = false;
 function fmtBytes(b) {{
   if (!b) return "0 B";
@@ -1807,7 +3446,7 @@ function renderPlayer() {{
   if (started) return; started = true;
   const main = document.getElementById("main");
   if (MEDIA_TYPE === "video") {{
-    main.innerHTML = `<video controls autoplay src="/media/${{MSG_ID}}"></video>`;
+    tgVideo(main);
     return;
   }}
   if (MEDIA_TYPE === "audio") {{
@@ -1817,10 +3456,15 @@ function renderPlayer() {{
   // document — pick by extension
   const ext = (MEDIA_FILE_NAME || "").toLowerCase().split(".").pop();
   if (ext === "pdf") {{
-    main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+    location.replace("/pdf/" + MSG_ID);
     return;
   }}
-  if (["epub","mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
+  if (ext === "epub") {{
+    // Read in the built-in reader: instant, and no conversion to run.
+    location.replace("/epub/" + MSG_ID);
+    return;
+  }}
+  if (["mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
     // Calibre-converted PDF — poll status, swap to iframe on ready.
     const loader = document.createElement("div");
     loader.className = "loader";
@@ -1843,7 +3487,7 @@ function renderPlayer() {{
         const elapsed = ((Date.now()-startedAt)/1000).toFixed(0);
         document.getElementById("ebookElapsed").textContent = `elapsed: ${{elapsed}}s`;
         if (j.state === "ready") {{
-          main.innerHTML = `<iframe src="${{j.url}}" style="height:90vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>`;
+          location.replace("/pdf/" + MSG_ID);
           return;
         }}
         if (j.state === "failed") {{
@@ -1857,8 +3501,10 @@ function renderPlayer() {{
         }}
 
         let msg;
-        if (j.state === "queued") {{
-          msg = `queued — position ${{j.position}} in line`;
+        if (j.state === "downloading") {{
+          msg = "downloading…";
+        }} else if (j.state === "queued") {{
+          msg = `queued — position ${{j.position || 1}} in line`;
           if (j.eta_s) msg += ` · est wait ~${{Math.ceil(j.eta_s/60)}} min`;
         }} else {{
           msg = "converting…";
@@ -1916,8 +3562,10 @@ async function poll() {{
         `downloading ${{fmtBytes(j.bytes)}}${{j.total ? " / " + fmtBytes(j.total) : ""}} (${{pct.toFixed(0)}}%)`;
       document.getElementById("progBar").style.width = pct + "%";
       // Start the player as soon as ~2MB or 10% is on disk — progressive
-      // playback can then keep up with the download.
-      if (j.bytes > 2_000_000 || (j.total && pct > 10)) {{
+      // playback can then keep up with the download. Only for video and
+      // audio: a book or a PDF is useless until it is whole.
+      if ((MEDIA_TYPE === "video" || MEDIA_TYPE === "audio") &&
+          (j.bytes > 2_000_000 || (j.total && pct > 10))) {{
         renderPlayer();
         return;
       }}
@@ -1949,7 +3597,7 @@ poll();
 # ════════════════════════════════════════════════════════════════════
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
-<meta charset="utf-8"><title>tgarr — sign in to Telegram</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>tgarr — sign in to Telegram</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <style>
 :root { --bg:#f5f7fa; --bg2:#ffffff; --fg:#1e293b; --muted:#64748b; --accent:#229ED9; --tg-blue:#229ED9; --border:#e2e8f0; --ok:#15803d; --bad:#b91c1c; }
@@ -2362,6 +4010,53 @@ async def _is_nsfw_enabled() -> bool:
     return v == "true"
 
 
+# Which copy of a work to show first when there are several.
+#   quality (default): the higher resolution wins; among equal resolutions the
+#                      copy on the account's own Telegram data center wins.
+#   dc:                a copy on the account's own data center wins outright,
+#                      then resolution.
+# "Best" is per user: a file on DC5 is the fast path for a DC5 account and a
+# cross-DC fetch for everyone else, so this is decided here, on each install,
+# never centrally. Nothing is hidden for good - every version stays reachable.
+async def _version_pref() -> str:
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval("SELECT value FROM config WHERE key='version_preference'")
+    pref = v if v in ("quality", "dc") else "quality"
+    # While Telegram is refusing cross-DC work, another DC's copy cannot be
+    # fetched at all: lead with what can.
+    fl = await _tg_flood()
+    if fl and ("cross-DC" in (fl.get("what") or "") or "export" in (fl.get("what") or "").lower()):
+        return "dc"
+    return pref
+
+
+_QUALITY_RANK_SQL = ("(CASE r.quality WHEN '2160p' THEN 5 WHEN '1440p' THEN 4 WHEN '1080p' THEN 3 "
+                     "WHEN '720p' THEN 2 WHEN '576p' THEN 1 WHEN '480p' THEN 1 ELSE 0 END)")
+# Identity of a work, for grouping its versions: normalized title + year for a
+# movie, title + season + episode for an episode. NULL = not groupable.
+_WORK_KEY_SQL = (
+    "(CASE WHEN r.category = 'movie' AND COALESCE(NULLIF(r.canonical_title, ''), NULLIF(r.movie_title, '')) IS NOT NULL "
+    "      THEN 'm:' || lower(regexp_replace(COALESCE(NULLIF(r.canonical_title, ''), r.movie_title), "
+    "                         '[[:space:][:punct:]]+', '', 'g')) || ':' || COALESCE(r.movie_year::text, '') "
+    "           || COALESCE(':part' || r.part::text, '') "
+    "      WHEN r.category = 'tv' AND r.season IS NOT NULL "
+    "           AND COALESCE(NULLIF(r.canonical_title, ''), NULLIF(r.series_title, '')) IS NOT NULL "
+    "      THEN 't:' || lower(regexp_replace(COALESCE(NULLIF(r.canonical_title, ''), r.series_title), "
+    "                         '[[:space:][:punct:]]+', '', 'g')) || ':s' || r.season::text "
+    "           || 'e' || COALESCE(r.episode::text, 'x') "
+    " END)")
+
+
+@app.post("/api/settings/version_preference")
+async def settings_version_preference(value: str = Form("quality")):
+    val = "dc" if value == "dc" else "quality"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('version_preference', $1)
+               ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""", val)
+    return RedirectResponse("/settings", status_code=302)
+
+
 @app.post("/api/settings/nsfw_enabled")
 async def settings_nsfw_enabled(value: str = Form("false")):
     val = "true" if value == "true" else "false"
@@ -2369,6 +4064,12 @@ async def settings_nsfw_enabled(value: str = Form("false")):
         await conn.execute(
             """INSERT INTO config (key, value) VALUES ('nsfw_enabled', $1)
                ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""", val)
+        if val == "true":
+            # fetch the adult part of the Discover list now, not in 12 hours
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('registry_pull_force', $1)
+                   ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""",
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     return RedirectResponse("/settings", status_code=302)
 
 
@@ -2386,11 +4087,11 @@ async def settings_tmdb_key(value: str = Form("")):
                 INSERT INTO config (key, value) VALUES ('tmdb_api_key', $1)
                 ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()
             """, value)
-        # Reset wikipedia/miss results so the next worker pass retries with new key
+        # Reset keyless / negative results so the next worker pass retries with the new key
         await conn.execute("""
             UPDATE releases SET metadata_source=NULL, poster_url=NULL,
                    canonical_title=NULL, overview=NULL, metadata_lookup_at=NULL
-            WHERE metadata_source IN ('miss', 'wikipedia')
+            WHERE metadata_source IN ('miss', 'wikipedia', 'wikidata', 'unmatched')
         """)
     return RedirectResponse("/settings", status_code=302)
 
@@ -2507,9 +4208,43 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .poster-card .info { padding:10px 12px 4px; min-height:84px; flex:1; }
 .poster-card .info .title { font-weight:700; font-size:15px; line-height:1.3; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:39px; color:var(--fg); }
 .poster-card .info .sub { font-size:13px; color:var(--muted); margin-top:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.poster-card .pills { padding:0 12px 8px; display:flex; gap:4px; flex-wrap:nowrap; overflow:hidden; min-height:24px; }
+.poster-card .pills { padding:0 12px 8px; display:flex; gap:4px; flex-wrap:wrap; min-height:24px; }
 .poster-card .grab-row { padding:8px 14px 12px; border-top:1px solid var(--border); margin-top:auto; background:var(--surface2); }
 .poster-card .grab-row .btn { width:100%; text-align:center; padding:8px; font-size:13px; }
+/* the media card: one shape for films, episodes and plain videos */
+.mc { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; transition:transform .12s, box-shadow .12s, border-color .12s; min-width:0; }
+.mc:hover { transform:translateY(-3px); box-shadow:0 10px 24px rgba(15,23,42,.12); border-color:var(--accent); }
+.mc-img { position:relative; display:block; aspect-ratio:2/3; background:#e9eef4; overflow:hidden; }
+.mc.wide .mc-img { aspect-ratio:16/10; }
+.mc-img img { position:relative; z-index:1; width:100%; height:100%; object-fit:cover; display:block; }
+.mc-img .bq, .mc-img .bs, .mc-img .bp, .mc-img .pl { z-index:2; }
+.mc-img .fb { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:46px; color:#b8c4d2; }
+.mc-img .bq { position:absolute; top:8px; right:8px; padding:3px 8px; border-radius:6px; background:rgba(15,23,42,.8); color:#fff; font-size:10.5px; font-weight:700; letter-spacing:.4px; text-transform:uppercase; }
+.mc-img .bs { position:absolute; top:8px; left:8px; padding:3px 8px; border-radius:6px; background:rgba(5,150,105,.92); color:#fff; font-size:10.5px; font-weight:700; }
+.mc-img .bv { position:absolute; bottom:8px; right:8px; padding:3px 8px; border-radius:6px; background:rgba(37,99,235,.92); color:#fff; font-size:10.5px; font-weight:700; text-decoration:none; }
+.mc-img .bp { position:absolute; bottom:8px; left:8px; padding:3px 8px; border-radius:6px; background:rgba(15,23,42,.8); color:#fff; font-size:10.5px; font-weight:700; }
+.mc-img .pl { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(15,23,42,.28); opacity:0; transition:opacity .15s; }
+.mc-img .pl span { width:54px; height:54px; border-radius:50%; background:rgba(255,255,255,.94); color:#0f172a; display:flex; align-items:center; justify-content:center; font-size:22px; padding-left:4px; }
+.mc:hover .mc-img .pl { opacity:1; }
+.mc-over { position:relative; height:0; }
+.mc-over .bv { position:absolute; z-index:3; right:8px; bottom:8px; padding:3px 8px; border-radius:6px; background:rgba(37,99,235,.94); color:#fff; font-size:10.5px; font-weight:700; text-decoration:none; }
+.mc-over .bv:hover { background:#1d4ed8; }
+.mc-body { padding:10px 12px 8px; flex:1; min-width:0; }
+.mc-title { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; font-weight:700; font-size:14.5px; line-height:1.3; min-height:38px; color:var(--fg); text-decoration:none; word-break:break-word; }
+.mc-title:hover { color:var(--accent); }
+.mc-sub { font-size:12.5px; color:var(--muted); margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-height:17px; }
+.mc-meta { font-size:12px; color:var(--muted); margin-top:4px; display:flex; gap:8px; align-items:center; min-height:20px; white-space:nowrap; overflow:hidden; }
+.mc-meta .dc { font-weight:600; font-size:11px; padding:1px 6px; border-radius:8px; background:rgba(245,158,11,.16); color:#b45309; }
+.mc-meta .dc.same { background:rgba(16,185,129,.16); color:#047857; }
+.mc-act { display:flex; gap:6px; padding:8px 10px 10px; border-top:1px solid var(--border); background:var(--surface2); }
+.mc-act .b { flex:1 1 0; height:34px; display:inline-flex; align-items:center; justify-content:center; gap:5px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--fg); font:inherit; font-size:13px; font-weight:600; cursor:pointer; text-decoration:none; white-space:nowrap; padding:0 8px; min-width:0; }
+.mc-act .b:hover { border-color:var(--accent); color:var(--accent); }
+.mc-act .b.pri { background:var(--accent); border-color:var(--accent); color:#fff; }
+.mc-act .b.pri:hover { filter:brightness(1.08); color:#fff; }
+.mc-act .b.sq { flex:0 0 34px; padding:0; }
+.mc-act .b.on { color:#e11d48; }
+.mc-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(176px,1fr)); gap:16px; }
+.mc-grid.wide { grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); }
 .view-toggle { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
 .view-toggle a { padding:6px 14px; color:var(--muted); text-decoration:none; font-size:13px; font-weight:600; }
 .view-toggle a.active { background:var(--accent); color:#fff; }
@@ -2519,6 +4254,17 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 .gallery .item { break-inside:avoid; margin-bottom:14px; position:relative; border-radius:8px; overflow:hidden; cursor:zoom-in; box-shadow:var(--shadow); }
 .gallery .item img { width:100%; display:block; background:#f1f5f9; transition:transform 0.15s; }
 .gallery .item:hover img { transform:scale(1.02); }
+/* a tile whose picture has not arrived: visibly loading, not blank */
+.gallery .item { min-height:170px; background:linear-gradient(100deg,#e3e9f0 30%,#f4f7fa 50%,#e3e9f0 70%); background-size:200% 100%; animation:tgShim 1.3s linear infinite; }
+.gallery .item::before { content:'🖼'; position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:36px; opacity:.4; }
+.gallery .item img { opacity:0; }
+.gallery .item.loaded { min-height:0; background:none; animation:none; }
+.gallery .item.loaded::before { display:none; }
+.gallery .item.loaded img { opacity:1; transition:opacity .25s, transform .15s; }
+.gallery .item.nopic { animation:none; background:#eef1f5; cursor:default; }
+.gallery .item.nopic::before { content:'picture not available'; font-size:12.5px; opacity:.8; color:#64748b; }
+.gallery .item.nopic img { display:none; }
+@keyframes tgShim { to { background-position:-200% 0; } }
 .gallery .item .meta { position:absolute; left:0; right:0; bottom:0; padding:18px 12px 8px; background:linear-gradient(transparent, rgba(0,0,0,0.78)); color:#fff; font-size:12px; opacity:0; transition:opacity 0.15s; }
 .gallery .item:hover .meta { opacity:1; }
 .gallery .item .meta .ch { font-weight:700; }
@@ -2528,12 +4274,14 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
 /* ── Lightbox + slideshow ─────────────────── */
 .lightbox { position:fixed; inset:0; background:rgba(15,23,42,0.96); display:none; align-items:center; justify-content:center; z-index:9999; padding:20px; overflow:hidden; }
 .lightbox.open { display:flex; }
-.lightbox img { z-index:1; width:96vw; height:90vh; object-fit:contain; border-radius:6px; box-shadow:0 16px 50px rgba(0,0,0,0.5); will-change:transform,opacity,filter; image-rendering:auto; }
+.lightbox img { z-index:1; max-width:96vw; max-height:90vh; object-fit:contain; border-radius:6px; box-shadow:0 16px 50px rgba(0,0,0,0.5); will-change:transform,opacity,filter; image-rendering:auto; transition:filter .35s ease; }
+.lightbox img.soft { filter:blur(9px) brightness(.92); }
 .lightbox .lb-meta { position:absolute; left:32px; right:32px; bottom:80px; color:#fff; font-size:15px; line-height:1.55; max-width:660px; pointer-events:none; transition:opacity 0.3s; }
 .lightbox .lb-meta .ch { color:var(--accent-hi); font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
 .lightbox .lb-close { z-index:10; position:absolute; top:18px; right:24px; color:#fff; font-size:36px; cursor:pointer; opacity:0.6; line-height:1; padding:6px 12px; background:none; border:none; }
 .lightbox .lb-close:hover { opacity:1; }
-.lightbox .lb-prev, .lightbox .lb-next { z-index:10; position:absolute; top:50%; transform:translateY(-50%); width:56px; height:56px; border-radius:50%; background:rgba(255,255,255,0.10); color:#fff; border:none; font-size:32px; cursor:pointer; display:flex; align-items:center; justify-content:center; padding-bottom:4px; backdrop-filter:blur(6px); transition:background 0.2s, transform 0.2s; opacity:0.7; }
+.lightbox .lb-prev, .lightbox .lb-next { z-index:10; position:absolute; top:50%; margin-top:-28px; width:56px; height:56px; padding:0; border-radius:50%; background:rgba(255,255,255,0.10); color:#fff; border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; opacity:0.75; transition:opacity .15s, background .15s; }
+.lightbox .lb-prev svg, .lightbox .lb-next svg { width:26px; height:26px; display:block; }
 .lightbox .lb-prev { left:24px; } .lightbox .lb-next { right:24px; }
 .lightbox .lb-prev:hover, .lightbox .lb-next:hover { opacity:1; background:rgba(255,255,255,0.20); }
 .lightbox .lb-controls { z-index:10; position:absolute; bottom:24px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:14px; padding:8px 16px; background:rgba(255,255,255,0.08); border-radius:24px; backdrop-filter:blur(8px); }
@@ -2627,6 +4375,92 @@ def _fmt_size(n):
 
 def _fmt_time(t):
     return t.strftime("%Y-%m-%d %H:%M") if t else ""
+
+
+def _fmt_count(n) -> str:
+    """12 -> 12, 8700 -> 8.7K, 12521500 -> 12.5M. ("12521.5K" is not a number
+    anyone reads.)"""
+    if n is None:
+        return "–"
+    n = int(n)
+    for div, suf in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if abs(n) >= div:
+            v = n / div
+            return (f"{v:.0f}" if v >= 100 else f"{v:.1f}".rstrip("0").rstrip(".")) + suf
+    return str(n)
+
+
+def _n_things(n, word: str) -> str:
+    """ "1 film", "3.1K films" """
+    return f"{_fmt_count(n)} {word[:-1] if n == 1 and word.endswith('s') else word}"
+
+
+def _ago(dt) -> str:
+    """A moment as people say it: "3 min ago", "2 h ago", "5 d ago", then a date."""
+    if not dt:
+        return ""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    sec = (now - dt).total_seconds()
+    if sec < 0:
+        return dt.strftime("%Y-%m-%d")
+    if sec < 90:
+        return "just now"
+    if sec < 3600:
+        return f"{int(sec // 60)} min ago"
+    if sec < 86400:
+        return f"{int(sec // 3600)} h ago"
+    if sec < 86400 * 30:
+        return f"{int(sec // 86400)} d ago"
+    return dt.strftime("%Y-%m-%d")
+
+
+def _avatar(title: str, size: int = 40) -> str:
+    t = (title or "?").strip() or "?"
+    return (f'<div style="width:{size}px;height:{size}px;border-radius:50%;flex:none;'
+            f'background:{_color_for(t)};color:#fff;display:flex;align-items:center;'
+            f'justify-content:center;font-weight:700;font-size:{int(size * 0.42)}px">'
+            f'{html.escape(t[0].upper())}</div>')
+
+
+def _chip_link(label: str, href: str, on: bool, title: str = "") -> str:
+    style = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
+             "border-color:var(--accent);" if on else "")
+    return (f'<a class="btn ghost" href="{href}" title="{html.escape(title, quote=True)}" '
+            f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
+
+
+_LIST_CSS = """<style>
+.ls{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.ls-row{display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid var(--border)}
+.ls-row:last-child{border-bottom:none}
+.ls-row:hover{background:rgba(127,127,127,.05)}
+.ls-main{flex:1 1 0;min-width:0}
+.ls-title{font-weight:600;font-size:15px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ls-title a{color:inherit;text-decoration:none}.ls-title a:hover{color:var(--accent)}
+.ls-sub{font-size:13px;color:var(--muted);margin-top:3px;display:flex;gap:6px 12px;flex-wrap:wrap;align-items:center}
+.ls-sub a{color:var(--muted);text-decoration:none}.ls-sub a:hover{color:var(--accent)}
+.ls-num{flex:none;width:86px;text-align:right;font-variant-numeric:tabular-nums}
+.ls-num b{display:block;font-size:15px;color:var(--fg);font-weight:600}
+.ls-num span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.ls-act{flex:none;display:flex;gap:8px;justify-content:flex-end;min-width:118px}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;
+  background:rgba(127,127,127,.12);color:var(--muted);white-space:nowrap}
+.tag.ok{background:rgba(16,185,129,.14);color:#047857}.tag.warn{background:rgba(245,158,11,.16);color:#b45309}
+.tag.bad{background:rgba(239,68,68,.13);color:#b91c1c}.tag.acc{background:rgba(94,182,229,.16);color:var(--accent-hi)}
+.abtn{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-width:112px;height:34px;
+  padding:0 14px;font:inherit;font-size:13px;font-weight:500;border:1px solid var(--border);background:var(--surface);
+  color:var(--fg);border-radius:8px;cursor:pointer;text-decoration:none;white-space:nowrap}
+.abtn:hover{border-color:var(--accent);color:var(--accent)}
+.abtn.pri{background:var(--accent);border-color:var(--accent);color:#fff}.abtn.pri:hover{filter:brightness(1.08);color:#fff}
+.abtn:disabled{opacity:.55;cursor:default}
+.bar-tools{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.bar-tools .sep{width:1px;height:22px;background:var(--border);margin:0 6px}
+.bar-tools .lbl{font-size:12px;color:var(--muted);margin-right:2px}
+@media (max-width:820px){.ls-num{display:none}.ls-act{min-width:0}.abtn{min-width:0;padding:0 10px}}
+</style>"""
 
 
 def _color_for(s: str) -> str:
@@ -2844,6 +4678,18 @@ async def api_workers():
             "SELECT worker, last_seen, last_action, iter_count, "
             "error_count, last_error, last_error_at "
             "FROM worker_status ORDER BY last_seen DESC")
+        _rec_mode = (await conn.fetchval(
+            "SELECT value FROM config WHERE key='dialog_reconcile_mode'") or "off").lower()
+    # A job that is switched off, or that an older version ran and this one
+    # no longer has, is not a broken job: show it grey, not red.
+    off = set()
+    if _rec_mode not in ("report", "leave"):
+        off.add("dialog_reconcile_worker")
+    import datetime as _dt
+    for r in rows:
+        if (r["worker"] not in _EXPECTED_WORKERS and r["last_seen"]
+                and (_dt.datetime.now(r["last_seen"].tzinfo) - r["last_seen"]).days >= 7):
+            off.add(r["worker"])
     out = []
     seen = set()
     for r in rows:
@@ -2857,7 +4703,8 @@ async def api_workers():
             "error_count": r["error_count"],
             "last_error": r["last_error"],
             "last_error_at": r["last_error_at"].isoformat() if r["last_error_at"] else None,
-            "health": _worker_health(r["worker"], r["last_seen"], expected_max),
+            "health": ("off" if r["worker"] in off
+                       else _worker_health(r["worker"], r["last_seen"], expected_max)),
             "expected_max_sec": expected_max,
         })
     # Add expected-but-never-seen workers
@@ -3061,8 +4908,63 @@ async def api_deep_backfill_progress():
 async def page_system():
     if not login.session_exists():
         return RedirectResponse("/login")
+    # What the account's daily Telegram allowances went on today.
+    import json as _json
+    async with db_pool.acquire() as conn:
+        _cfg = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key LIKE 'mtproto_daily%' OR key = 'mtproto_caps'")}
+    try:
+        _caps = _json.loads(_cfg.get("mtproto_caps") or "{}")
+    except ValueError:
+        _caps = {}
+    _today = time.strftime("%Y-%m-%d", time.gmtime())
+    _names = {"resolveUsername": ("Looking a channel up by @username",
+                                  "needed the first time a channel is read; Telegram tolerates a few hundred a day"),
+              "join_chat": ("Joining a channel", "only when a file cannot be read without joining"),
+              "exportAuthorization": ("Opening another data center",
+                                      "once per data center a file lives on, then reused")}
+    _who = {"federation_validator": "checking channels for tgarr.me", "_thumb_get_messages": "thumbnails and previews",
+            "_channel_gone_ask": "checking whether a channel still exists",
+            "_mtproto_get_messages_with_auto_join": "opening a film, a song or a book",
+            "subscription_poller": "reading followed channels", "seed_validator": "checking channels for tgarr.me"}
+    _rows = []
+    for _m, (_label, _hint) in _names.items():
+        _cap = (_caps.get("caps") or {}).get(_m)
+        _v = _cfg.get(f"mtproto_daily:{_m}") or ""
+        _used = int(_v.partition(":")[2] or 0) if _v.startswith(_today) else 0
+        _by = {}
+        _vb = _cfg.get(f"mtproto_daily_by:{_m}") or ""
+        if _vb.startswith(_today):
+            try:
+                _by = _json.loads(_vb.partition("|")[2])
+            except ValueError:
+                _by = {}
+        _parts = []
+        for _k, _n in sorted(_by.items(), key=lambda x: -x[1]):
+            _bg = _k.startswith("bg:")
+            _name = _who.get(_k[3:] if _bg else _k, (_k[3:] if _bg else _k))
+            _parts.append(f'{html.escape(_name)} <b>{_n}</b>' + (' <span class="pill muted">background</span>' if _bg else ''))
+        _pct = min(100, _used * 100 // _cap) if _cap else 0
+        _col = "#ef4444" if _pct >= 100 else "#f59e0b" if _pct >= 75 else "#10b981"
+        _rows.append(
+            f'<tr><td><b>{_label}</b><div style="font-size:12px;color:var(--muted)">{_hint}</div></td>'
+            f'<td style="white-space:nowrap"><b>{_used}</b> of {_cap if _cap else "–"}'
+            f'<div style="height:6px;width:120px;background:var(--border);border-radius:3px;margin-top:5px">'
+            f'<div style="height:6px;width:{_pct}%;background:{_col};border-radius:3px"></div></div></td>'
+            f'<td style="font-size:13px">{" · ".join(_parts) or "<span style=color:var(--muted)>nothing yet today</span>"}</td></tr>')
+    _share = int(float(_caps.get("bg_share", 0.4)) * 100)
+    allowances_html = (
+        '<section style="margin-bottom:28px">'
+        '<h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 8px">'
+        'Telegram allowances today (resets at 00:00 UTC)</h3>'
+        '<table><thead><tr><th>what</th><th>used</th><th>who used it</th></tr></thead>'
+        f'<tbody>{"".join(_rows)}</tbody></table>'
+        f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr keeps well inside what Telegram '
+        f'tolerates so that your account is never slowed down. Background work may use at most {_share}% of an '
+        'allowance; the rest is kept for what you open yourself.</div></section>')
     body = """
 <h2 class="section">System</h2>
+__ALLOWANCES__
 <section style="margin-bottom:28px">
   <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Workers</h3>
   <div id="workersTable">loading...</div>
@@ -3081,7 +4983,7 @@ function fmtAgo(iso) {
   return Math.floor(sec/86400) + "d ago";
 }
 function healthDot(h) {
-  const c = {healthy:"#22c55e",idle:"#eab308",stale:"#ef4444",never:"#94a3b8"}[h] || "#94a3b8";
+  const c = {healthy:"#22c55e",idle:"#eab308",stale:"#ef4444",never:"#94a3b8",off:"#cbd5e1"}[h] || "#94a3b8";
   return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${c};margin-right:6px"></span>`;
 }
 async function loadWorkers() {
@@ -3167,6 +5069,7 @@ setInterval(loadDeepBackfill, 60000);
 }
 </style>
 """
+    body = body.replace("__ALLOWANCES__", allowances_html)
     return HTMLResponse(_layout("System", "/system", body))
 
 
@@ -3181,6 +5084,9 @@ async def health():
                             status_code=503)
     return {"status": "ok", "tgarr": TGARR_VERSION,
             "authed": login.session_exists(), "tg_wait": await _tg_flood()}
+
+
+_DASH_CACHE: dict = {"at": 0.0, "v": None}
 
 
 @app.get("/")
@@ -3219,9 +5125,12 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         return {"tgarr": TGARR_VERSION, "authed": authed,
                 "revoked": revoked, "browsable": browsable, **dict(stats)}
 
-    # Only bounce to /login when there's literally nothing to show — fresh
-    # install or post-full-wipe. Otherwise render the public-only dashboard.
-    if not browsable:
+    # Only bounce to /login when there is nothing to show AND nobody is signed
+    # in. Signed in with an empty index is the first minute of every new
+    # install (and the permanent state of an account that follows no
+    # channels): /login sends a signed-in visitor back here, so bouncing them
+    # was an endless redirect - the first thing a new user saw.
+    if not browsable and not authed:
         return RedirectResponse("/login")
 
     async with db_pool.acquire() as conn:
@@ -3232,194 +5141,284 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                JOIN releases r ON r.id = d.release_id
                ORDER BY d.requested_at DESC LIMIT 10""")
 
-    s = dict(stats)
-    # Worker health surfaced on /system page only; no dashboard banner.
-    worker_banner = ""
-    stats_html = "".join(
-        f'<div class="stat-card"><div class="n">{v:,}</div><div class="l">{label}</div></div>'
-        for v, label in [
-            (s["channels"], "channels"),
-            (s["messages"], "messages indexed"),
-            (s["releases"], "parsed releases"),
-            (s["videos"], "videos"),
-            (s["photos"], "photos"),
-            (s["audio"], "audio"),
-            (s["books"], "books"),
-            (s["pending"], "pending"),
-            (s["downloading"], "downloading"),
-            (s["completed"], "completed"),
-        ]
-    )
-    charts_html = """
-<section class="dashboard-charts">
-  <div class="chart-card chart-line">
-    <header>
-      <h3>Growth</h3>
-      <div class="chart-controls">
-        <select id="growthMetric">
-          <option value="messages" selected>messages</option>
-          <option value="videos">videos</option>
-          <option value="releases">releases</option>
-          <option value="channels">channels</option>
-          <option value="photos">photos</option>
-          <option value="books">books</option>
-        </select>
-        <select id="growthDays">
-          <option value="7" selected>7d</option>
-          <option value="30">30d</option>
-          <option value="90">90d</option>
-        </select>
-      </div>
-    </header>
-    <div class="chart-canvas-wrap"><canvas id="growthChart"></canvas></div>
-  </div>
-  <div class="chart-card chart-pie">
-    <header><h3>Media mix</h3></header>
-    <div class="chart-canvas-wrap"><canvas id="distChart"></canvas></div>
-  </div>
-</section>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-<script>
-(function() {
-  let growth = null, dist = null;
-  function fmtDate(iso) { return iso.slice(5, 10); }
-  function color(i) {
-    const c = ['#5eb6e5','#94d2bd','#e9c46a','#f4a261','#e76f51','#a8dadc','#bdb2ff'];
-    return c[i % c.length];
-  }
-  async function loadGrowth() {
-    const metric = document.getElementById('growthMetric').value;
-    const days   = document.getElementById('growthDays').value;
-    const r = await fetch(`/api/stats/history?metric=${metric}&days=${days}`);
-    const j = await r.json();
-    const labels = (j.points || []).map(p => fmtDate(p.at));
-    const data   = (j.points || []).map(p => p.value);
-    const ctx = document.getElementById('growthChart').getContext('2d');
-    if (growth) growth.destroy();
-    growth = new Chart(ctx, {
-      type: 'line',
-      data: { labels, datasets: [{
-        label: metric, data,
-        fill: true, backgroundColor: 'rgba(59,130,246,0.10)',
-        borderColor: '#3b82f6', borderWidth: 2, tension: 0.35,
-        pointRadius: 3, pointHoverRadius: 5
-      }]},
-      options: { responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          y: { beginAtZero: false, ticks: { color: '#475569' }, grid: { color: '#e2e8f0' } },
-          x: { ticks: { color: '#475569' }, grid: { color: '#f1f5f9' } } }
-      }
-    });
-  }
-  async function loadDist() {
-    const r = await fetch('/api/stats/distribution');
-    const j = await r.json();
-    const labels = (j.slices || []).map(s => s.label);
-    const data   = (j.slices || []).map(s => s.value);
-    const ctx = document.getElementById('distChart').getContext('2d');
-    if (dist) dist.destroy();
-    dist = new Chart(ctx, {
-      type: 'doughnut',
-      data: { labels, datasets: [{ data,
-        backgroundColor: labels.map((_, i) => color(i)),
-        borderColor: '#ffffff', borderWidth: 2
-      }]},
-      options: { responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { position: 'right',
-          labels: { color: '#334155', boxWidth: 14, padding: 8, font: { size: 12 } } } }
-      }
-    });
-  }
-  document.getElementById('growthMetric').addEventListener('change', loadGrowth);
-  document.getElementById('growthDays').addEventListener('change', loadGrowth);
-  loadGrowth();
-  loadDist();
-})();
-</script>
-<style>
-.dashboard-charts { display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
-  margin: 20px 0; }
-.dashboard-charts .chart-card { background: var(--surface, #fff);
-  border: 1px solid var(--border, #e2e8f0);
-  border-radius: 8px; padding: 14px 16px; }
-.dashboard-charts .chart-card header { display: flex; align-items: center;
-  justify-content: space-between; margin-bottom: 8px; }
-.dashboard-charts .chart-card h3 { margin: 0; font-size: 12px; font-weight: 600;
-  color: #64748b; text-transform: uppercase; letter-spacing: 0.06em; }
-.dashboard-charts .chart-controls select { background: #fff; color: #1e293b;
-  border: 1px solid var(--border, #e2e8f0); padding: 4px 8px; border-radius: 4px;
-  font-size: 12px; margin-left: 6px; }
-.dashboard-charts .chart-canvas-wrap { position: relative; height: 240px; width: 100%; }
-.dashboard-charts canvas { width: 100% !important; height: 100% !important; }
-@media (max-width: 900px) {
-  .dashboard-charts { grid-template-columns: 1fr; }
-}
-</style>
-"""
+    st = dict(stats)
+    import datetime as _dt
+    # The numbers below cost a few scans of the index. They change slowly:
+    # work them out at most once a minute, not on every visit.
+    if time.time() - _DASH_CACHE["at"] > 60:
+        async with db_pool.acquire() as conn:
+            lib = await conn.fetchrow(
+                """SELECT (SELECT count(*) FROM releases WHERE category = 'movie') AS films,
+                          (SELECT count(*) FROM releases WHERE category = 'tv')    AS episodes,
+                          (SELECT count(*) FROM releases
+                            WHERE category IN ('movie', 'tv')
+                              AND created_at > NOW() - INTERVAL '24 hours')        AS rel_new""")
+            new_today = {r["media_type"]: r["n"] for r in await conn.fetch(
+                """SELECT media_type, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '24 hours' GROUP BY 1""")}
+            per_day = await conn.fetch(
+                """SELECT date_trunc('day', indexed_at)::date AS d, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '14 days' GROUP BY 1 ORDER BY 1""")
+            latest = await conn.fetch(
+                """SELECT r.primary_msg_id, r.poster_url, r.category, r.season, r.episode,
+                          r.quality, r.movie_year,
+                          COALESCE(NULLIF(r.canonical_title, ''), r.movie_title, r.series_title, r.name) AS t
+                   FROM releases r
+                   JOIN messages m ON m.id = r.primary_msg_id
+                   JOIN channels c ON c.id = m.channel_id
+                   WHERE r.poster_url IS NOT NULL AND r.category IN ('movie', 'tv')
+                     AND COALESCE(c.audience, 'sfw') = 'sfw'
+                   ORDER BY r.created_at DESC, r.id DESC LIMIT 60""")
+            _seen, _uniq = set(), []
+            for _r in latest:                       # one poster per title
+                _k = ((_r["t"] or "").lower(), _r["movie_year"], _r["season"], _r["episode"])
+                if _k in _seen:
+                    continue
+                _seen.add(_k)
+                _uniq.append(_r)
+                if len(_uniq) == 12:
+                    break
+            latest = _uniq
+            try:
+                hb = await conn.fetchval("SELECT max(last_seen) FROM worker_status")
+            except Exception:
+                hb = None
+            try:
+                shared = await conn.fetchrow(
+                    """SELECT max(contributed_at) AS last,
+                              count(*) FILTER (WHERE contributed_at > NOW() - INTERVAL '24 hours') AS d1
+                       FROM messages WHERE contributed_at IS NOT NULL""")
+            except Exception:
+                shared = None
+        _DASH_CACHE.update(at=time.time(), v=(lib, new_today, per_day, latest, hb, shared))
+    lib, new_today, per_day, latest, hb, shared = _DASH_CACHE["v"]
+    fetches = await _player_fetches()
+    usage = await _cache_usage()
+    flood = await _tg_flood()
+    user = login.ensure_user_info() or {}
+    free_gb = _disk_free_gb("/downloads")
 
+    # ── status ──
+    def _status(dot, title, text, href=None):
+        col = {"ok": "#10b981", "warn": "#f59e0b", "bad": "#ef4444", "off": "#94a3b8"}[dot]
+        inner = (f'<div class="st-dot" style="background:{col}"></div><div class="st-txt">'
+                 f'<div class="st-t">{title}</div><div class="st-s">{text}</div></div>')
+        return (f'<a class="st-card" href="{href}">{inner}</a>' if href
+                else f'<div class="st-card">{inner}</div>')
+    if not authed:
+        tg = _status("bad", "Telegram", "not signed in — sign in to index and play", "/login")
+    elif flood:
+        tg = _status("warn", "Telegram",
+                     f'asked us to slow down — resumes in about {max(1, flood["seconds_left"] // 60)} min')
+    else:
+        who = user.get("username") or user.get("first_name") or ""
+        tg = _status("ok", "Telegram", f'signed in{(" as @" + html.escape(str(who))) if who else ""}', "/settings")
+    if hb:
+        age = (_dt.datetime.now(_dt.timezone.utc) - hb).total_seconds()
+        cr = (_status("ok", "Indexer", f"running · last activity {_ago(hb)}", "/system") if age < 900
+              else _status("bad", "Indexer", f"no activity since {_ago(hb)}", "/system"))
+    else:
+        cr = _status("off", "Indexer", "has not reported yet", "/system")
+    if shared and shared["last"]:
+        sh = _status("ok" if shared["d1"] else "off", "Shared with tgarr.me",
+                     f'{_fmt_count(shared["d1"])} files today · last {_ago(shared["last"])}')
+    else:
+        sh = _status("off", "Shared with tgarr.me", "nothing shared yet")
+    used = sum(r["bytes"] for r in usage)
+    sto = _status("warn" if free_gb < 10 else "ok", "Storage",
+                  f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
+    status_html = f'<div class="st-row">{tg}{cr}{sh}{sto}</div>'
+    if not browsable:
+        status_html = (
+            '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;'
+            'padding:16px 18px;margin-bottom:16px;line-height:1.6">'
+            '<b>You are signed in. Nothing is indexed yet.</b><br>'
+            'tgarr is reading the channels your Telegram account follows; they appear here '
+            'within a few minutes, and their files over the next hours. If the account follows '
+            'no channels with files, pick some on <a href="/discover">Discover</a>.'
+            '</div>' + status_html)
+
+    # ── library ──
+    def _tile(href, icon, n, label, plus=0):
+        return (f'<a class="tile" href="{href}"><div class="ti">{icon}</div>'
+                f'<div class="tn">{n:,}</div><div class="tl">{label}</div>'
+                + (f'<div class="tp">+{_fmt_count(plus)} today</div>' if plus else '<div class="tp">&nbsp;</div>')
+                + '</a>')
+    tiles = (
+        _tile("/releases?cat=movie", "🎬", lib["films"], "films", 0)
+        + _tile("/releases?cat=tv", "📺", lib["episodes"], "episodes", 0)
+        + _tile("/videos", "▶", st["videos"], "videos", new_today.get("video", 0))
+        + _tile("/music", "🎵", st["audio"], "songs", new_today.get("audio", 0))
+        + _tile("/library", "📚", st["books"], "books", 0)
+        + _tile("/gallery", "🖼", st["photos"], "photos", new_today.get("photo", 0))
+        + _tile("/channels", "📡", st["channels"], "channels", 0))
+
+    # ── now ──
+    now_bits = []
+    arriving = [f for f in fetches if f["state"] in ("queued", "fetching")]
+    if arriving:
+        now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {len(arriving)} arriving for a player</a>')
+    if st["pending"] or st["downloading"]:
+        now_bits.append(f'<a class="now-pill" href="/downloads?tab=grabs">⬇ {st["pending"] + st["downloading"]} '
+                        f'grab(s) in the queue</a>')
+    if lib["rel_new"]:
+        now_bits.append(f'<a class="now-pill" href="/releases">✨ {lib["rel_new"]:,} films and episodes '
+                        f'recognised in the last day</a>')
+    now_html = f'<div class="now-row">{"".join(now_bits)}</div>' if now_bits else ""
+
+    # ── recently added ──
+    if latest:
+        cards = []
+        for r in latest:
+            sub = (f'S{r["season"]:02d}' + (f'E{r["episode"]:02d}' if r["episode"] is not None else "")
+                   if r["category"] == "tv" and r["season"] is not None
+                   else (str(r["movie_year"]) if r["movie_year"] else ""))
+            cards.append(
+                f'<a class="pc" href="/watch/{r["primary_msg_id"]}" title="{html.escape(r["t"] or "", quote=True)}">'
+                f'<div class="pi"><img src="{html.escape(r["poster_url"], quote=True)}" loading="lazy" alt="" '
+                f'onerror="this.remove()"/>'
+                + (f'<span class="pq">{html.escape(r["quality"])}</span>' if r["quality"] else '')
+                + f'</div><div class="pt">{html.escape(r["t"] or "")}</div>'
+                f'<div class="ps">{html.escape(sub)}</div></a>')
+        latest_html = (
+            '<h2 class="section">Recently added <span class="extra"><a href="/releases">all releases →</a></span></h2>'
+            f'<div class="strip">{"".join(cards)}</div>')
+    else:
+        latest_html = ""
+
+    # ── added per day (drawn here: no chart library, nothing loaded from elsewhere) ──
+    days = {r["d"]: r["n"] for r in per_day}
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    series = [(today - _dt.timedelta(days=i), days.get(today - _dt.timedelta(days=i), 0))
+              for i in range(13, -1, -1)]
+    peak = max((n for _, n in series), default=0) or 1
+    W, H, PAD = 560, 150, 22
+    bw = (W - 8) / len(series)
+    bars = []
+    for i, (d, n) in enumerate(series):
+        h = (H - PAD - 8) * n / peak
+        x = 4 + i * bw
+        bars.append(
+            f'<g><rect x="{x + bw * 0.16:.1f}" y="{H - PAD - h:.1f}" width="{bw * 0.68:.1f}" '
+            f'height="{max(h, 1.5):.1f}" rx="3" fill="{"var(--accent)" if d == today else "rgba(94,182,229,.55)"}">'
+            f'<title>{d.strftime("%b %d")}: {n:,} added</title></rect>'
+            + (f'<text x="{x + bw / 2:.1f}" y="{H - 6}" text-anchor="middle" font-size="10" '
+               f'fill="var(--muted)">{d.strftime("%m-%d")}</text>' if i % 2 == 1 else '')
+            + '</g>')
+    total14 = sum(n for _, n in series)
+    growth_html = (
+        '<div class="panel"><div class="ph"><span>Added per day</span>'
+        f'<span class="pn">{total14:,} in two weeks · peak {peak:,}</span></div>'
+        f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block">'
+        f'<line x1="0" y1="{H - PAD}" x2="{W}" y2="{H - PAD}" stroke="var(--border)"/>'
+        f'{"".join(bars)}</svg></div>')
+    mix = [("photos", st["photos"], "#5eb6e5"), ("videos", st["videos"], "#94d2bd"),
+           ("songs", st["audio"], "#f4a261"), ("books", st["books"], "#e9c46a")]
+    other = max(0, st["messages"] - sum(v for _, v, _ in mix))
+    if other:
+        mix.append(("other files", other, "#cbd5e1"))
+    tot = sum(v for _, v, _ in mix) or 1
+    mix_html = (
+        '<div class="panel"><div class="ph"><span>What is indexed</span>'
+        f'<span class="pn">{st["messages"]:,} items</span></div>'
+        '<div class="mixbar">'
+        + "".join(f'<div style="width:{v * 100 / tot:.2f}%;background:{c}" title="{k}: {v:,}"></div>'
+                  for k, v, c in mix if v)
+        + '</div><div class="mixleg">'
+        + "".join(f'<div><i style="background:{c}"></i>{k}<b>{v:,}</b>'
+                  f'<span>{v * 100 / tot:.0f}%</span></div>' for k, v, c in mix if v)
+        + '</div></div>')
+
+    # ── grabs + wiring ──
     if recent:
         items = []
-        for d in recent:
+        for d in recent[:6]:
             icon = ({"pending": "⏳", "downloading": "⬇", "completed": "✓",
                      "failed": "✗", "cancelled": "—"}).get(d["status"], "?")
-            pill_cls = ({"pending": "warn", "downloading": "accent",
-                        "completed": "ok", "failed": "bad", "cancelled": "muted"}
-                       ).get(d["status"], "muted")
-            err = (f'<div class="err">{html.escape(d["error_message"])}</div>'
-                   if d["error_message"] else "")
+            cls = ({"pending": "warn", "downloading": "acc", "completed": "ok",
+                    "failed": "bad"}).get(d["status"], "")
             items.append(
-                f'<div class="dl-item">'
-                f'<div class="icon">{icon}</div>'
-                f'<div class="info">'
-                f'<div class="name">{html.escape(d["name"])}</div>'
-                f'<div class="meta">'
-                f'<span class="pill {pill_cls}">{d["status"]}</span>'
-                f'<span>· {_fmt_size(d["size_bytes"])}</span>'
-                f'<span>· {_fmt_time(d["requested_at"])}</span>'
-                f'</div>{err}'
-                f'</div>'
-                f'<div class="right">{_fmt_time(d["finished_at"]) or "—"}</div>'
-                f'</div>'
-            )
-        recent_html = f'<div class="dl-list">{"".join(items)}</div>'
+                f'<div class="ls-row"><div style="width:26px;text-align:center">{icon}</div>'
+                f'<div class="ls-main"><div class="ls-title">{html.escape(d["name"])}</div>'
+                f'<div class="ls-sub"><span class="tag {cls}">{d["status"]}</span>'
+                f'<span>{_fmt_size(d["size_bytes"])}</span><span>{_ago(d["requested_at"])}</span></div></div></div>')
+        grabs_html = (
+            '<h2 class="section">Recent grabs <span class="extra"><a href="/downloads?tab=grabs">all →</a></span></h2>'
+            f'<div class="ls">{"".join(items)}</div>')
     else:
-        recent_html = (
-            '<div class="empty-state">'
-            '<div class="icon">⬇</div>'
-            '<div>No downloads yet — grab something from Sonarr or Radarr to see activity here.</div>'
-            '</div>'
-        )
+        grabs_html = ""
 
     base_url = html.escape(_base_url(request)) or "http://&lt;host&gt;:8765"
 
-    body = f"""
-{worker_banner}
-<div class="stats">{stats_html}</div>{charts_html}
+    def _wire(icon, name, where, value):
+        return (f'<div class="ls-row"><div style="width:26px;text-align:center">{icon}</div>'
+                f'<div class="ls-main"><div class="ls-title">{name}</div><div class="ls-sub">{where}</div></div>'
+                f'<code class="wv">{value}</code>'
+                f'<button class="abtn" style="min-width:74px" onclick="tgCopy(this)" '
+                f'data-v="{value}">Copy</button></div>')
+    wiring_html = (
+        '<h2 class="section">Connect Sonarr / Radarr</h2><div class="ls">'
+        + _wire("🔌", "Newznab indexer", "Settings → Indexers → + → Newznab → URL", f"{base_url}/newznab/")
+        + _wire("⬇", "SABnzbd download client",
+                "Settings → Download Clients → + → SABnzbd → same host and port, URL Base", "/sabnzbd")
+        + '</div><script>function tgCopy(b){const v=b.dataset.v;const done=()=>{const o=b.textContent;'
+          'b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)};'
+          'if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);'
+          'else{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();'
+          'try{document.execCommand("copy");done()}catch(e){}t.remove()}}</script>')
 
-<h2 class="section">Recent activity <span class="extra"><a href="/downloads">view all →</a></span></h2>
-{recent_html}
+    dash_css = """<style>
+.st-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}
+.st-card{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--border);
+  border-radius:10px;padding:12px 14px;text-decoration:none;color:inherit;min-width:0}
+a.st-card:hover{border-color:var(--accent)}
+.st-dot{width:10px;height:10px;border-radius:50%;flex:none;box-shadow:0 0 0 4px rgba(127,127,127,.10)}
+.st-txt{min-width:0}.st-t{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:600}
+.st-s{font-size:13.5px;color:var(--fg);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tiles{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px;margin-bottom:14px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 14px 10px;
+  text-decoration:none;color:inherit;transition:border-color .12s,transform .12s;min-width:0}
+.tile:hover{border-color:var(--accent);transform:translateY(-2px)}
+.tile .ti{font-size:20px;line-height:1}.tile .tn{font-size:24px;font-weight:700;color:var(--accent-hi);margin-top:8px;
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .tl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin-top:2px}
+.tile .tp{font-size:11.5px;color:#059669;margin-top:6px;height:15px}
+.now-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.now-pill{font-size:13px;padding:6px 12px;border-radius:16px;background:rgba(94,182,229,.13);color:var(--accent-hi);
+  text-decoration:none;border:1px solid rgba(94,182,229,.35)}
+.now-pill:hover{background:rgba(94,182,229,.22)}
+.strip{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}
+.pc{text-decoration:none;color:inherit;min-width:0}
+.pc .pi{position:relative;aspect-ratio:2/3;border-radius:8px;overflow:hidden;background:var(--surface2,#e2e8f0);
+  border:1px solid var(--border)}
+.pc .pi img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .2s}
+.pc:hover .pi img{transform:scale(1.05)}
+.pc .pq{position:absolute;right:4px;top:4px;font-size:9.5px;font-weight:700;background:rgba(15,23,42,.78);color:#fff;
+  padding:2px 5px;border-radius:5px}
+.pc .pt{font-size:12.5px;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pc .ps{font-size:11px;color:var(--muted)}
+.panels{display:grid;grid-template-columns:3fr 2fr;gap:14px;margin-top:22px}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+.panel .ph{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--muted);font-weight:600;margin-bottom:10px}
+.panel .pn{text-transform:none;letter-spacing:0;font-weight:400;font-size:12px}
+.mixbar{display:flex;height:16px;border-radius:8px;overflow:hidden;background:var(--border);margin:14px 0 16px}
+.mixleg div{display:flex;align-items:center;gap:8px;font-size:13.5px;padding:4px 0}
+.mixleg i{width:10px;height:10px;border-radius:3px;flex:none}.mixleg b{margin-left:auto;font-variant-numeric:tabular-nums}
+.mixleg span{width:38px;text-align:right;color:var(--muted);font-size:12px}
+.wv{font-size:12.5px;background:rgba(127,127,127,.10);padding:5px 9px;border-radius:6px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:46%}
+@media (max-width:1100px){.tiles{grid-template-columns:repeat(4,minmax(0,1fr))}.strip{grid-template-columns:repeat(6,minmax(0,1fr))}
+  .st-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:700px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.strip{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .st-row,.panels{grid-template-columns:1fr}.wv{display:none}}
+</style>"""
 
-<h2 class="section">Wiring info</h2>
-<div class="dl-list">
-  <div class="dl-item">
-    <div class="icon">🔌</div>
-    <div class="info">
-      <div class="name">Newznab indexer</div>
-      <div class="meta">For Sonarr / Radarr / Lidarr → Settings → Indexers → ➕ Newznab</div>
-    </div>
-    <div class="right"><code>{base_url}/newznab/</code></div>
-  </div>
-  <div class="dl-item">
-    <div class="icon">⬇</div>
-    <div class="info">
-      <div class="name">SABnzbd download client</div>
-      <div class="meta">For Sonarr / Radarr → Settings → Download Clients → ➕ SABnzbd</div>
-    </div>
-    <div class="right"><code>/sabnzbd</code> · same host/port</div>
-  </div>
-</div>
-"""
+    body = (f'{_LIST_CSS}{dash_css}{status_html}'
+            f'<div class="tiles">{tiles}</div>{now_html}'
+            f'{latest_html}'
+            f'<div class="panels">{growth_html}{mix_html}</div>'
+            f'{grabs_html}{wiring_html}')
     return HTMLResponse(_layout("Dashboard", "/", body))
 
 
@@ -3530,34 +5529,15 @@ async def api_set_audience(tg_chat_id: int, value: str = Form(...)):
 
 
 @app.get("/channels", response_class=HTMLResponse)
-async def page_channels(min_members: int = 500,
-                        max_members: Optional[int] = None,
-                        eligible: int = 0,
+async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = "films",
+                        offset: int = 0, limit: int = 50,
+                        min_members: Optional[int] = None, eligible: int = 0,
                         audience: str = ""):
     if not login.session_exists():
         return RedirectResponse("/login")
-    # Range filter: COALESCE NULL members to a big number so unresolved
-    # channels stay in the default "500+" view rather than disappearing.
-    where_extra = f"AND COALESCE(c.members_count, 999999) >= {max(0, min_members)}"
-    if max_members:
-        where_extra += f" AND COALESCE(c.members_count, 0) < {max_members}"
-    if eligible:
-        where_extra += (
-            f" AND c.members_count >= {CONTRIB_MIN_MEMBERS} "
-            f"AND (SELECT count(*) FROM messages m WHERE m.channel_id = c.id "
-            f"AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}"
-        )
+    if eligible:                       # old links
+        show = "shared"
     nsfw_on = await _is_nsfw_enabled()
-    if audience == "sfw":
-        where_extra += " AND COALESCE(c.audience, 'sfw') = 'sfw'"
-    elif audience == "nsfw" and nsfw_on:
-        where_extra += " AND c.audience = 'nsfw'"
-    elif audience == "unknown":
-        where_extra += " AND c.audience IS NULL"
-    if not nsfw_on:
-        where_extra += " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"
-    # CSAM hard-block — no setting can unblock this.
-    where_extra += " AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
     async with db_pool.acquire() as conn:
         # Lazy classify (Python-side) — pulls untagged rows and tags them
         # before listing. Manual overrides untouched.
@@ -3569,122 +5549,207 @@ async def page_channels(min_members: int = 500,
             await conn.execute(
                 "UPDATE channels SET audience=$1 WHERE tg_chat_id=$2",
                 classify_audience(u["title"], u["username"]), u["tg_chat_id"])
-
+        # One pass over messages for every channel's numbers (the page used to
+        # run three sub-queries per channel).
         rows = await conn.fetch(
-            f"""SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
-                      c.members_count, c.audience, c.audience_manual,
-                      (SELECT count(*) FROM messages m WHERE m.channel_id = c.id)
-                                                                AS msg_count,
-                      (SELECT count(*) FROM messages m
-                         WHERE m.channel_id = c.id AND m.file_name IS NOT NULL)
-                                                                AS media_count,
-                      (c.members_count >= {CONTRIB_MIN_MEMBERS} AND
-                       (SELECT count(*) FROM messages m WHERE m.channel_id = c.id
-                          AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}
-                      ) AS eligible_moat
+            """WITH agg AS (
+                 SELECT channel_id, count(*) AS msgs, count(file_name) AS media,
+                        count(*) FILTER (WHERE media_type = 'video') AS videos,
+                        count(*) FILTER (WHERE media_type = 'audio') AS songs,
+                        count(*) FILTER (WHERE media_type = 'photo') AS photos,
+                        count(*) FILTER (WHERE media_type = 'document') AS docs,
+                        max(posted_at) AS last_post
+                 FROM messages GROUP BY channel_id),
+               rel AS (
+                 SELECT m.channel_id, count(*) AS films FROM releases r
+                 JOIN messages m ON m.id = r.primary_msg_id
+                 WHERE r.category IN ('movie', 'tv') GROUP BY 1)
+               SELECT c.tg_chat_id, c.username, c.title, c.backfilled, c.members_count,
+                      c.audience, c.subscribed, c.is_joined, c.dead_at, c.subscribe_error,
+                      c.purged_at,
+                      COALESCE(a.msgs, 0) AS msgs, COALESCE(a.media, 0) AS media,
+                      COALESCE(a.videos, 0) AS videos, COALESCE(a.songs, 0) AS songs,
+                      COALESCE(a.photos, 0) AS photos, COALESCE(a.docs, 0) AS docs,
+                      a.last_post, COALESCE(rel.films, 0) AS films
                FROM channels c
-               WHERE 1=1 {where_extra}
-               ORDER BY COALESCE(c.members_count, 0) DESC, msg_count DESC""")
-        total = await conn.fetchval("SELECT count(*) FROM channels")
-        with_meta = await conn.fetchval(
-            "SELECT count(*) FROM channels WHERE members_count IS NOT NULL")
-        eligible_total = await conn.fetchval(
-            f"""SELECT count(*) FROM channels c
-               WHERE c.members_count >= {CONTRIB_MIN_MEMBERS}
-                 AND (SELECT count(*) FROM messages m WHERE m.channel_id = c.id
-                      AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}""")
+               LEFT JOIN agg a ON a.channel_id = c.id
+               LEFT JOIN rel ON rel.channel_id = c.id
+               WHERE COALESCE(c.audience, 'sfw') <> 'blocked_csam'""")
+    rows = [r for r in rows if nsfw_on or (r["audience"] or "sfw") != "nsfw"]
+    # Does this install clean a channel out of its index once nobody follows
+    # it? (TGARR_INDEX_PURGE on the crawler; off unless switched on.) What
+    # "Unfollow" means depends on it, and the page has to say which.
+    async with db_pool.acquire() as conn:
+        purge_on = (await conn.fetchval(
+            "SELECT value FROM config WHERE key = 'index_purge'")) == "on"
 
-    def _chip(lo: int, hi: Optional[int], label: str) -> str:
-        active = (min_members == lo and max_members == hi and not eligible)
-        style = ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
-                'border-color:var(--accent);') if active else ''
-        href = f"/channels?min_members={lo}"
-        if hi is not None:
-            href += f"&max_members={hi}"
-        return (f'<a class="btn ghost" href="{href}" '
-               f'style="{style}padding:6px 12px;font-size:13px">{label}</a>')
+    def _shared(r):
+        return (r["members_count"] or 0) >= CONTRIB_MIN_MEMBERS and r["media"] >= CONTRIB_MIN_MEDIA
+    kinds = {
+        "all": lambda r: True,
+        "films": lambda r: r["films"] > 0,
+        "joined": lambda r: r["is_joined"],
+        "subscribed": lambda r: r["subscribed"] and not r["is_joined"],
+        "shared": _shared,
+        "loose": lambda r: not r["is_joined"] and not r["subscribed"] and not r["dead_at"],
+        "empty": lambda r: r["media"] == 0,
+        "dead": lambda r: r["dead_at"] is not None,
+    }
+    if show not in kinds:
+        show = "all"
+    counts = {k: sum(1 for r in rows if f(r)) for k, f in kinds.items()}
+    view = [r for r in rows if kinds[show](r)]
+    if q:
+        words = [w.lower() for w in q.split()]
+        view = [r for r in view
+                if all(w in ((r["title"] or "") + " " + (r["username"] or "")).lower() for w in words)]
+    sorts = {
+        "films": lambda r: (-r["films"], -r["media"]),
+        "media": lambda r: (-r["media"], -r["films"]),
+        "members": lambda r: (-(r["members_count"] or 0),),
+        "recent": lambda r: (-(r["last_post"].timestamp() if r["last_post"] else 0),),
+        "name": lambda r: ((r["title"] or r["username"] or "~").lower(),),
+    }
+    if sort not in sorts:
+        sort = "films"
+    view.sort(key=sorts[sort])
+    page_size = max(10, min(limit, 200))
+    page_offset = max(0, offset)
+    page = view[page_offset:page_offset + page_size]
 
-    def _eligible_chip() -> str:
-        active = bool(eligible)
-        style = ('background:rgba(74,222,128,0.18);color:var(--ok);'
-                'border-color:var(--ok);') if active else ''
-        return (f'<a class="btn ghost" href="/channels?eligible=1" '
-               f'style="{style}padding:6px 12px;font-size:13px">'
-               f'✓ moat ({eligible_total})</a>')
+    def _cqs(**over):
+        cur = {"q": q, "show": show if show != "all" else None,
+               "sort": sort if sort != "films" else None,
+               "limit": limit if limit != 50 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
 
-    def _aud_chip(val: str, label: str, color: str = "var(--accent)") -> str:
-        active = (audience == val)
-        style = (f'background:{color}22;color:{color};border-color:{color};') if active else ''
-        return (f'<a class="btn ghost" href="/channels?audience={val}" '
-               f'style="{style}padding:6px 12px;font-size:13px">{label}</a>')
+    def _n(k):
+        return f' <span style="opacity:.6">{counts[k]:,}</span>'
+    chips = (
+        _chip_link("all" + _n("all"), "/channels" + _cqs(show=None, offset=None), show == "all")
+        + _chip_link("🎬 with films" + _n("films"), "/channels" + _cqs(show="films", offset=None),
+                     show == "films", "channels that carry recognised films or episodes")
+        + _chip_link("joined" + _n("joined"), "/channels" + _cqs(show="joined", offset=None),
+                     show == "joined", "channels your Telegram account is a member of")
+        + _chip_link("followed" + _n("subscribed"), "/channels" + _cqs(show="subscribed", offset=None),
+                     show == "subscribed", "public channels tgarr reads without joining")
+        + _chip_link("shared" + _n("shared"), "/channels" + _cqs(show="shared", offset=None),
+                     show == "shared",
+                     f"{CONTRIB_MIN_MEMBERS}+ members and {CONTRIB_MIN_MEDIA}+ files: listed on tgarr.me "
+                     "for other people to find. Private chats and small groups never are.")
+        + (_chip_link("not followed" + _n("loose"), "/channels" + _cqs(show="loose", offset=None),
+                      show == "loose",
+                      "channels this install knows but no longer reads"
+                      + (": their files are being cleared from this index" if purge_on else ""))
+           if counts["loose"] else "")
+        + _chip_link("no files" + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
+        + (_chip_link("gone" + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
+                      show == "dead", "channels Telegram no longer serves") if counts["dead"] else "")
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("films", "/channels" + _cqs(sort=None, offset=None), sort == "films")
+        + _chip_link("files", "/channels" + _cqs(sort="media", offset=None), sort == "media")
+        + _chip_link("members", "/channels" + _cqs(sort="members", offset=None), sort == "members")
+        + _chip_link("latest post", "/channels" + _cqs(sort="recent", offset=None), sort == "recent")
+        + _chip_link("name", "/channels" + _cqs(sort="name", offset=None), sort == "name"))
+    search = (
+        '<form method="GET" action="/channels" style="display:flex;gap:8px;margin:0 0 12px">'
+        + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
+                  for k, v in (("show", show if show != "all" else None),
+                               ("sort", sort if sort != "films" else None)) if v)
+        + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+          'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
+          '<button class="btn" type="submit">Search</button>'
+        + (f'<a class="btn ghost" href="/channels{_cqs(q=None, offset=None)}">clear</a>' if q else '')
+        + '</form>')
 
-    filter_bar = (
-        '<div style="display:flex;gap:6px;margin-bottom:20px;align-items:center;flex-wrap:wrap">'
-        f'{_chip(0, None, f"all ({total})")}'
-        f'{_chip(0, 20, "20")}'
-        f'{_chip(20, 50, "50")}'
-        f'{_chip(50, 100, "100")}'
-        f'{_chip(100, 500, "500")}'
-        f'{_chip(500, 1000, "1K")}'
-        f'{_chip(1000, 5000, "5K")}'
-        f'{_chip(500, None, "500+ ⭐")}'
-        f'{_eligible_chip()}'
-        '<span style="border-left:1px solid var(--border);margin:0 4px;height:24px"></span>'
-        f'{_aud_chip("sfw", "✓ SFW", "#15803d")}'
-        f'{_aud_chip("nsfw", "🔞 NSFW", "#b91c1c")}'
-        + (f'<span style="margin-left:auto;color:var(--muted);font-size:12px">'
-           f'members resolved {with_meta}/{total}</span>' if with_meta < total else '')
-        + '</div>'
-        f'<div style="font-size:12px;color:var(--muted);margin-bottom:18px">'
-        f'<strong>✓ moat</strong> = ≥{CONTRIB_MIN_MEMBERS} members AND ≥{CONTRIB_MIN_MEDIA} media files. '
-        f'Only these get pushed to <code>registry.tgarr.me</code> when federation is enabled. '
-        f'Private chats and small groups stay local.'
-        f'</div>'
-    )
+    def _row(r):
+        title = r["title"] or (("@" + r["username"]) if r["username"] else "(untitled)")
+        handle = (f'<a href="https://t.me/{html.escape(r["username"])}" target="_blank" rel="noopener" '
+                  f'title="open in Telegram">@{html.escape(r["username"])}</a>'
+                  if r["username"] else '<span>private chat</span>')
+        tags = []
+        if r["dead_at"]:
+            tags.append('<span class="tag bad" title="Telegram no longer serves this channel">gone</span>')
+        elif r["is_joined"]:
+            tags.append('<span class="tag ok" title="your account is a member">joined</span>')
+        elif r["subscribed"]:
+            tags.append('<span class="tag acc" title="read without joining">followed</span>')
+        elif purge_on and r["purged_at"]:
+            tags.append('<span class="tag" title="not followed any more; its files have been cleared '
+                        'from this index. tgarr.me still lists it: follow it again to get them back.">'
+                        'not followed · cleared</span>')
+        elif purge_on:
+            tags.append('<span class="tag warn" title="not followed any more: its films and files are '
+                        'being cleared from this index (tgarr.me keeps the record). Follow it again '
+                        'to keep them.">not followed · being cleared</span>')
+        else:
+            tags.append('<span class="tag" title="not read any more; what was indexed stays">'
+                        'not followed</span>')
+        if _shared(r):
+            tags.append('<span class="tag" title="listed on tgarr.me">shared</span>')
+        if (r["audience"] or "sfw") == "nsfw":
+            tags.append('<span class="tag warn">18+</span>')
+        if not r["backfilled"] and not r["dead_at"]:
+            tags.append('<span class="tag warn" title="still reading its history">reading…</span>')
+        if r["subscribe_error"] and not r["dead_at"]:
+            tags.append(f'<span class="tag bad" title="{html.escape(r["subscribe_error"], quote=True)}">'
+                        'cannot read</span>')
+        has = []
+        for n, ico, word, href in (
+                (r["films"], "🎬", "films", None),
+                (r["videos"], "▶", "videos", None),
+                (r["songs"], "🎵", "songs", None),
+                (r["docs"], "📄", "files", None),
+                (r["photos"], "🖼", "photos",
+                 f'/gallery?channel={_q(r["username"])}' if r["username"] else None)):
+            if n:
+                txt = f'{ico} {_n_things(n, word)}'
+                has.append(f'<a href="{href}">{txt}</a>' if href else f'<span>{txt}</span>')
+        act = ""
+        if r["subscribed"] and not r["is_joined"]:
+            act = (f'<button class="abtn" onclick="tgUnfollow(this,{r["tg_chat_id"]})" '
+                   f'title="stop reading this channel">Unfollow</button>')
+        elif not r["is_joined"] and not r["dead_at"] and r["username"]:
+            act = (f'<button class="abtn pri" data-uname="{html.escape(r["username"], quote=True)}" '
+                   f'onclick="tgFollow(this)" title="read this public channel again, without joining it">'
+                   f'+ Follow</button>')
+        return (
+            f'<div class="ls-row">{_avatar(title)}'
+            f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
+            f'{" ".join(tags)}</div>'
+            f'<div class="ls-sub">{handle}{"".join(has) or "<span>no files indexed</span>"}</div></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
+            f'<div class="ls-num" style="width:104px"><b style="font-size:13px;font-weight:500">'
+            f'{_ago(r["last_post"]) or "–"}</b><span>latest post</span></div>'
+            f'<div class="ls-act">{act}</div></div>')
 
-    if not rows:
-        body = (f'<h2 class="section">Indexed channels <span class="count">0 of {total}</span></h2>'
-               + filter_bar +
-               '<div class="empty-state">'
-               '<div class="icon">📡</div>'
-               f'<div>No channels with ≥{min_members} members match this filter.</div>'
-               '<div style="margin-top:8px;font-size:13px">Try a lower threshold above, or join more active channels in Telegram.</div>'
-               '</div>')
+    if not page:
+        listing = ('<div class="empty-state"><div class="icon">📡</div><div>'
+                   + ("No channel matches." if (q or show != "all") else
+                      "No channels yet. Join channels in Telegram, or follow some from Discover.")
+                   + '</div></div>')
     else:
-        cards_html = []
-        for r in rows:
-            title = r["title"] or "(untitled)"
-            initial = (title.strip() or "?")[0].upper()
-            color = _color_for(title)
-            handle = ("@" + r["username"]) if r["username"] else f"id {r['tg_chat_id']}"
-            status_pill = ('<span class="pill ok">backfilled</span>' if r["backfilled"]
-                          else '<span class="pill warn">backfilling…</span>')
-            members_pill = ''
-            if r["members_count"] is not None:
-                m = r["members_count"]
-                m_str = (f"{m/1000:.1f}K" if m >= 1000 else str(m)).replace(".0K", "K")
-                members_pill = f'<span class="pill accent">👥 {m_str}</span>'
-            moat_pill = ('<span class="pill ok" title="eligible for federation">✓ moat</span>'
-                        if r["eligible_moat"] else '')
-            cards_html.append(
-                f'<div class="card">'
-                f'<div class="avatar" style="background:{color}">{html.escape(initial)}</div>'
-                f'<div class="body">'
-                f'<div class="title">{html.escape(title)}</div>'
-                f'<div class="sub">{html.escape(handle)}</div>'
-                f'</div>'
-                f'<div class="footer">'
-                f'{members_pill}'
-                f'<span class="pill muted">{r["msg_count"]:,} msgs</span>'
-                f'<span class="pill muted">{r["media_count"]:,} media</span>'
-                f'{moat_pill}'
-                f'{status_pill}'
-                f'</div>'
-                f'</div>'
-            )
-        body = (f'<h2 class="section">Indexed channels <span class="count">{len(rows)} of {total}</span></h2>'
-               + filter_bar
-               + f'<div class="cards">{"".join(cards_html)}</div>')
+        listing = (f'<div class="ls">{"".join(_row(r) for r in page)}</div>'
+                   + _page_nav("/channels", _cqs, page_offset, page_size, len(page), len(view)))
+    body = (
+        f'{_LIST_CSS}'
+        f'<h2 class="section">Channels <span class="count">{len(view):,}'
+        + (f' of {len(rows):,}' if len(view) != len(rows) else '') + '</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
+        'letter-spacing:0;margin-left:10px"><a href="/discover">find more on Discover →</a></span></h2>'
+        f'{search}<div class="bar-tools">{chips}</div>{listing}'
+        '<script>function tgUnfollow(b,id){if(!confirm(' + _js_str(
+            "Stop reading this channel?\n\nIts films and files will be CLEARED from this index once tgarr.me "
+            "holds a record of them. You can follow it again later, from here or from Discover, to get them back."
+            if purge_on else
+            "Stop reading this channel?\n\nNothing new will be indexed from it. What is already indexed stays.")
+        + '))return;'
+        'b.disabled=true;b.textContent="…";fetch("/api/channel/unsubscribe/"+id,{method:"POST"}).then(()=>location.reload())}'
+        'function tgFollow(b){b.disabled=true;b.textContent="…";fetch("/api/channel/subscribe",{method:"POST",'
+        'headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"username="+encodeURIComponent(b.dataset.uname)})'
+        '.then(()=>location.reload())}</script>')
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 
@@ -3704,161 +5769,197 @@ def _profile_pills(r) -> str:
 
 
 @app.get("/discover", response_class=HTMLResponse)
-async def page_discover(audience: str = "sfw", kind: str = ""):
+async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] = None,
+                        sort: str = "best", mine: int = 0, offset: int = 0, limit: int = 50):
     async with db_pool.acquire() as conn:
-        # Auth check
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
         if not login.session_exists() and not n_channels:
             return RedirectResponse("/login")
-        # Auto-subscribed check — TG sometimes returns differently-cased username
-        # (eBookRoom vs ebookroom) so match case-insensitively.
-        known = {r["username"].lower(): r["subscribed"]
+        # Telegram sometimes returns a differently-cased username
+        # (eBookRoom vs ebookroom): match case-insensitively.
+        known = {r["username"].lower(): (r["subscribed"] or r["is_joined"])
                  for r in await conn.fetch(
-                     "SELECT username, subscribed FROM channels "
+                     "SELECT username, subscribed, is_joined FROM channels "
                      "WHERE username IS NOT NULL")}
+        nsfw_on = await _is_nsfw_enabled()
+        if audience == "nsfw" and not nsfw_on:
+            audience = "sfw"
         where = ["dismissed = FALSE"]
         if audience in ("sfw", "nsfw"):
             where.append(f"audience = '{audience}'")
-        # What the channel actually carries, per the registry's content
-        # profile. Default view leads with movie/TV release channels — the
-        # reason most people install tgarr — instead of with whatever the
-        # most instances happened to have seen.
         kind = kind if kind in ("video", "books", "music") else ""
         kind_col = {"video": "release_files", "books": "book_files",
                     "music": "audio_files"}.get(kind)
         if kind_col:
             where.append(f"COALESCE({kind_col}, 0) > 0")
-        order = (f"COALESCE({kind_col}, 0) DESC, " if kind_col
-                 else "COALESCE(release_files, 0) DESC, ")
         rows = await conn.fetch(f"""
             SELECT username, title, members_count, media_count, audience,
                    language, category, distinct_contributors, verified,
                    last_pulled_at, release_files, video_files, book_files, audio_files
             FROM discovered
-            WHERE {' AND '.join(where)}
-            ORDER BY {order} verified DESC, distinct_contributors DESC,
-                     COALESCE(members_count, 0) DESC
-            LIMIT 200
-        """)
-        total = await conn.fetchval("SELECT count(*) FROM discovered")
-        last_pull = await conn.fetchval(
-            "SELECT max(last_pulled_at) FROM discovered")
+            WHERE {' AND '.join(where)}""")
+        total = await conn.fetchval("SELECT count(*) FROM discovered WHERE dismissed = FALSE")
+        last_pull = await conn.fetchval("SELECT max(last_pulled_at) FROM discovered")
 
-    if not rows:
-        body = (
-            f'<h2 class="section">Discover <span class="count">'
-            f'0 of {total or 0}</span></h2>'
-            '<div class="empty-state">'
-            '<div class="icon">🔭</div>'
-            '<div>No channels pulled from registry yet.</div>'
-            '<div style="margin-top:8px;font-size:13px">'
-            'The registry_puller fires every 12h on a deterministic offset '
-            '(or hit <code>POST /api/registry/pull-now</code> to force it).'
-            '</div></div>'
-        )
-        return HTMLResponse(_layout("Discover", "/discover", body))
+    have = [r for r in rows if known.get(r["username"].lower())]
+    view = rows if mine else [r for r in rows if not known.get(r["username"].lower())]
+    if q:
+        words = [w.lower() for w in q.split()]
+        view = [r for r in view
+                if all(w in ((r["title"] or "") + " " + r["username"]).lower() for w in words)]
+    lead = kind_col or "release_files"
+    sorts = {
+        # what the channel carries first - the reason most people install
+        # tgarr - then how many installs vouch for it
+        "best": lambda r: (-(r[lead] or 0), -int(bool(r["verified"])),
+                           -(r["distinct_contributors"] or 0), -(r["members_count"] or 0)),
+        "seen": lambda r: (-(r["distinct_contributors"] or 0), -(r[lead] or 0)),
+        "members": lambda r: (-(r["members_count"] or 0),),
+        "files": lambda r: (-(r["media_count"] or 0),),
+    }
+    if sort not in sorts:
+        sort = "best"
+    view = sorted(view, key=sorts[sort])
+    page_size = max(10, min(limit, 200))
+    page_offset = max(0, offset)
+    page = view[page_offset:page_offset + page_size]
+
+    def _dq(**over):
+        cur = {"kind": kind or None, "audience": audience if audience != "sfw" else None,
+               "q": q, "sort": sort if sort != "best" else None, "mine": 1 if mine else None,
+               "limit": limit if limit != 50 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
+
+    chips = (
+        _chip_link("All", "/discover" + _dq(kind=None, offset=None), not kind)
+        + _chip_link("🎬 Movies &amp; TV", "/discover" + _dq(kind="video", offset=None), kind == "video")
+        + _chip_link("📚 Books", "/discover" + _dq(kind="books", offset=None), kind == "books")
+        + _chip_link("🎵 Music", "/discover" + _dq(kind="music", offset=None), kind == "music")
+        + ('<span class="sep"></span>'
+           + _chip_link("SFW", "/discover" + _dq(audience=None, offset=None), audience == "sfw")
+           + _chip_link("18+", "/discover" + _dq(audience="nsfw", offset=None), audience == "nsfw")
+           if nsfw_on else '')
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("best match", "/discover" + _dq(sort=None, offset=None), sort == "best",
+                     "most of what you are looking at, then how many installs vouch for it")
+        + _chip_link("most seen", "/discover" + _dq(sort="seen", offset=None), sort == "seen",
+                     "indexed by the most tgarr installs")
+        + _chip_link("members", "/discover" + _dq(sort="members", offset=None), sort == "members")
+        + _chip_link("files", "/discover" + _dq(sort="files", offset=None), sort == "files")
+        + '<span class="sep"></span>'
+        + _chip_link(f'include the {len(have):,} I already have', "/discover" + _dq(mine=None if mine else 1, offset=None),
+                     bool(mine)))
+    search = (
+        '<form method="GET" action="/discover" style="display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;align-items:center">'
+        + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
+                  for k, v in (("kind", kind), ("audience", audience if audience != "sfw" else None),
+                               ("sort", sort if sort != "best" else None),
+                               ("mine", 1 if mine else None)) if v)
+        + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+          'placeholder="find a channel by name or @username…" style="flex:1;min-width:150px;max-width:420px"/>'
+          '<button class="btn" type="submit">Search</button>'
+        + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">clear</a>' if q else '')
+        + '<span style="flex:1"></span>'
+          '<span id="tgPullToast" style="font-size:13px;color:var(--muted);display:none"></span>'
+          '<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
+          'title="ask tgarr.me for its current list now">↻ Refresh list</button></form>')
 
     def _card(r):
         u = r["username"]
-        state = known.get(u.lower())
-        if state is True:
-            btn = (f'<button class="ghost" disabled '
-                  f'style="font-size:12px;padding:6px 12px">✓ subscribed</button>')
-        else:
-            btn = (f'<button data-uname="{html.escape(u)}" '
-                  f'onclick="tgDiscoverSubscribe(this)" '
-                  f'style="font-size:12px;padding:6px 12px">+ Subscribe</button>')
-        members = (f"{r['members_count']/1000:.1f}K".replace(".0K", "K")
-                  if r['members_count'] and r['members_count'] >= 1000
-                  else str(r['members_count'] or '-'))
-        verified_pill = ('<span class="pill ok">✓ verified</span>'
-                       if r["verified"] else '')
+        mine_ = known.get(u.lower())
+        btn = ('<button class="abtn" disabled>✓ Following</button>' if mine_ else
+               f'<button class="abtn pri" data-uname="{html.escape(u, quote=True)}" '
+               f'onclick="tgDiscoverSubscribe(this)" '
+               f'title="tgarr reads this public channel without your account joining it">+ Follow</button>')
+        title = r["title"] or ("@" + u)
+        has = []
+        for n, ico, word in ((r["release_files"], "🎬", "films"), (r["book_files"], "📚", "books"),
+                             (r["audio_files"], "🎵", "songs")):
+            if n:
+                has.append(f'<span style="color:var(--fg)">{ico} {_n_things(n, word)}</span>')
+        if r["media_count"]:
+            has.append(f'<span>{_n_things(r["media_count"], "files")}</span>')
+        seen = r["distinct_contributors"] or 1
         return (
-            f'<div class="dl-item">'
-            f'<div class="icon">📡</div>'
-            f'<div class="info">'
-            f'<div class="name">@{html.escape(u)}'
-            f'{" — " + html.escape(r["title"]) if r["title"] else ""}</div>'
-            f'<div class="meta">'
-            f'{verified_pill}'
-            f'<span class="pill accent">👥 {members}</span>'
-            f'{_profile_pills(r)}'
-            f'<span class="pill muted">{r["media_count"] or 0} media</span>'
-            f'<span class="pill muted">{r["audience"]}</span>'
-            f'<span>· seen by {r["distinct_contributors"] or 1} instances</span>'
-            f'</div></div>'
-            f'<div class="right">{btn}</div>'
-            f'</div>'
-        )
+            f'<div class="ls-row">{_avatar(title)}'
+            f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
+            + ('<span class="tag ok" title="tgarr.me checked that this channel exists and is public">✓ verified</span> '
+               if r["verified"] else '')
+            + ('<span class="tag warn">18+</span>' if r["audience"] == "nsfw" else '')
+            + f'</div><div class="ls-sub"><a href="https://t.me/{html.escape(u)}" target="_blank" rel="noopener" '
+            f'title="open in Telegram">@{html.escape(u)}</a>{"".join(has)}</div></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
+            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b>'
+            f'<span>installs</span></div>'
+            f'<div class="ls-act">{btn}</div></div>')
 
-    def _kc(val, label):
-        on = kind == val
-        st = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
-              "border-color:var(--accent);") if on else ""
-        q = [f"kind={val}"] if val else []
-        if audience != "sfw":
-            q.append(f"audience={audience}")
-        href = "/discover" + ("?" + "&".join(q) if q else "")
-        return (f'<a class="btn ghost" href="{href}" '
-                f'style="{st}padding:5px 12px;font-size:12px">{label}</a>')
-    _kind_chips = (_kc("", "All") + _kc("video", "🎬 Movies &amp; TV")
-                   + _kc("books", "📚 Books") + _kc("music", "🎵 Music"))
+    if not rows and not total:
+        listing = ('<div class="empty-state"><div class="icon">🔭</div>'
+                   '<div>The list from tgarr.me has not arrived yet.</div>'
+                   '<div style="margin-top:8px;font-size:13px">It is fetched every 12 hours; '
+                   '“Refresh list” asks for it now.</div></div>')
+    elif not page:
+        listing = ('<div class="empty-state"><div class="icon">🔭</div><div>'
+                   + ("No channel matches." if (q or kind) else
+                      "This part of the list has not arrived yet." if not rows else
+                      "You already follow everything on the list.") + '</div>'
+                   + ('<div style="margin-top:8px;font-size:13px">“Refresh list” asks tgarr.me for it now.</div>'
+                      if not rows and not (q or kind) else '') + '</div>')
+    else:
+        listing = (f'<div class="ls">{"".join(_card(r) for r in page)}</div>'
+                   + _page_nav("/discover", _dq, page_offset, page_size, len(page), len(view)))
 
     body = (
-        f'<h2 class="section">Discover <span class="count">'
-        f'{len(rows)} of {total} from registry.tgarr.me</span>'
-        + (f'<span class="extra" style="color:var(--muted);font-size:12px">'
-           f'last pull {_fmt_time(last_pull)}</span>'
-           if last_pull else '')
-        + '</h2>'
-        '<div style="margin-bottom:18px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-        + _kind_chips +
-        '  <button type="button" class="ghost" id="tgPullBtn" style="font-size:13px" onclick="tgRegistryPull(this)">↻ Pull now</button>'
-        '  <span id="tgPullToast" style="font-size:13px;color:var(--muted);align-self:center;display:none"></span>'
-        '</div>'
-        f'<div class="dl-list">{"".join(_card(r) for r in rows)}</div>'
+        f'{_LIST_CSS}'
+        f'<h2 class="section">Discover <span class="count">{len(view):,}</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
+        f'letter-spacing:0;margin-left:10px">public channels other tgarr installs index · '
+        f'{total or 0:,} on tgarr.me'
+        + (f' · list from {_ago(last_pull)}' if last_pull else '') + '</span></h2>'
+        f'{search}<div class="bar-tools">{chips}</div>{listing}'
         '<script>'
         '(() => {'
         '  window.tgRegistryPull = async function(btn) {'
         '    const toast = document.getElementById("tgPullToast");'
-        '    btn.disabled = true; btn.textContent = "Pulling…";'
+        '    btn.disabled = true; btn.textContent = "Refreshing…";'
         '    toast.style.display = "inline";'
-        '    toast.textContent = "waiting for crawler (up to 70s)…";'
+        '    toast.textContent = "asking tgarr.me (up to a minute)…";'
         '    toast.style.color = "var(--muted)";'
         '    try {'
         '      const r = await fetch("/api/registry/pull-now", {method:"POST"});'
         '      const j = await r.json();'
         '      if (j.status === "ok") {'
-        '        toast.textContent = `\u2713 pull complete \u2014 ${j.affected} channel(s) updated`;'
+        '        toast.textContent = "✓ " + j.affected + " channel(s) updated";'
         '        toast.style.color = "var(--ok)";'
         '        if (j.affected > 0) setTimeout(() => location.reload(), 1200);'
         '      } else if (j.status === "queued") {'
-        '        toast.textContent = "\u23F3 queued \u2014 crawler busy, will run soon";'
+        '        toast.textContent = "queued — it will run shortly";'
         '        toast.style.color = "var(--warn)";'
         '      } else {'
-        '        toast.textContent = "\u2717 " + (j.message || "error");'
+        '        toast.textContent = "✗ " + (j.message || "error");'
         '        toast.style.color = "var(--err)";'
         '      }'
         '    } catch (e) {'
-        '      toast.textContent = "\u2717 network error";'
+        '      toast.textContent = "✗ network error";'
         '      toast.style.color = "var(--err)";'
         '    } finally {'
-        '      btn.disabled = false; btn.textContent = "\u21BB Pull now";'
+        '      btn.disabled = false; btn.textContent = "↻ Refresh list";'
         '    }'
         '  };'
         '  window.tgDiscoverSubscribe = async function(btn) {'
         '    const u = btn.dataset.uname;'
-        '    btn.disabled = true; btn.textContent = "...";'
+        '    btn.disabled = true; btn.textContent = "…";'
         '    try {'
         '      const r = await fetch("/api/channel/subscribe", {method:"POST", '
         '          headers:{"Content-Type":"application/x-www-form-urlencoded"}, '
         '          body: "username=" + encodeURIComponent(u)});'
         '      const j = await r.json();'
         '      if (j.status === "queued" || j.status === "ok") {'
-        '        btn.textContent = "✓ queued";'
-        '        btn.style.background = "var(--ok)"; btn.style.color = "#fff";'
-        '      } else { btn.textContent = "✗ " + (j.message || "error"); }'
-        '    } catch(e) { btn.textContent = "✗ network"; }'
+        '        btn.textContent = "✓ Following"; btn.classList.remove("pri");'
+        '      } else { btn.disabled = false; btn.textContent = "✗ " + (j.message || "error"); }'
+        '    } catch(e) { btn.disabled = false; btn.textContent = "✗ network"; }'
         '  };'
         '})();'
         '</script>'
@@ -3910,7 +6011,9 @@ async def api_registry_pull_now():
 # ════════════════════════════════════════════════════════════════════
 @app.get("/gallery", response_class=HTMLResponse)
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
-                       q: Optional[str] = None, dc: Optional[str] = None):
+                       q: Optional[str] = None, dc: Optional[str] = None,
+                       ch: Optional[int] = None, private: int = 0,
+                       offset: int = 0, sort: str = "new"):
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -3928,13 +6031,22 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     if channel:
         params.append(channel)
         where.append(f"c.username = ${len(params)}")
+    if ch:
+        # any chat, by its own id: a private chat has no @username to go by
+        params.append(int(ch))
+        where.append(f"c.id = ${len(params)}")
+    if private:
+        where.append("c.username IS NULL")
     if q:
         for w in q.split():
             params.append(f"%{w}%")
             where.append(f"(m.caption ILIKE ${len(params)} OR m.file_name ILIKE ${len(params)})")
     # Gate NSFW unless user has explicitly opted in via /settings.
-    if not await _is_nsfw_enabled():
+    _nsfw_on = await _is_nsfw_enabled()
+    if not _nsfw_on:
         where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
     # CSAM hard-block — overrides every setting, always.
     where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
 
@@ -3963,16 +6075,22 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                WHERE thumb_path IS NULL AND (media_type='photo' OR
                      (media_type IS NULL AND file_name IS NULL
                       AND COALESCE(mime_type,'')='' AND file_unique_id IS NOT NULL))""")
-        # Top channels by photo count for chip filter
-        top_channels = await conn.fetch(
-            """SELECT c.username, c.title, count(*) AS n
-               FROM messages m JOIN channels c ON c.id=m.channel_id
-               WHERE m.media_type='photo'
-                 AND c.username IS NOT NULL
-                 AND COALESCE(c.audience,'sfw') <> 'blocked_csam'
-               GROUP BY c.id, c.username, c.title
-               HAVING count(*) > 50
-               ORDER BY count(*) DESC LIMIT 12""")
+        # Every chat that has photos - private chats and groups included -
+        # for the channel picker. (This used to be the twelve public channels
+        # with the most photos, shown as unexplained chips; a chat without a
+        # @username could not be chosen at all.)
+        all_channels = await conn.fetch(
+            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, count(*) AS n
+               FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE m.media_type = 'photo'
+                 AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+                 {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}
+               GROUP BY c.id
+               ORDER BY count(*) DESC""")
+        matched = await conn.fetchval(f"""
+            SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where)}""", *params)
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -3995,60 +6113,107 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
               WHERE {' AND '.join(where)}
               ORDER BY COALESCE(m.thumb_md5, 'id-' || m.id::text), m.posted_at DESC NULLS LAST
             ) sub
-            ORDER BY posted_at DESC NULLS LAST
-            LIMIT {max(1, min(limit, 500))}
+            ORDER BY posted_at {"ASC NULLS LAST" if sort == "old" else "DESC NULLS LAST"}
+            LIMIT {page_size} OFFSET {page_offset}
         """, *params)
 
-    # Channel filter chips
-    def _ch_chip(uname, title, n):
-        active = channel == uname
-        bg = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
-              "border-color:var(--accent);") if active else ""
-        label = title or f"@{uname}"
-        if len(label) > 18:
-            label = label[:16] + '…'
-        return (f'<a class="btn ghost" href="/gallery?channel={_q(uname or "")}{_dc_q}" '
-                f'style="{bg}padding:5px 12px;font-size:12px">'
-                f'{html.escape(label)} <span style="opacity:0.6">{n:,}</span></a>')
+    # ── which photos: all / my private chats / one chat ──────────────
+    def _gqs(**over):
+        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "q": q,
+               "dc": "mine" if same_dc_only else None,
+               "sort": sort if sort == "old" else None,
+               "limit": limit if limit != 240 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
 
-    ch_chips = (
-        f'<a class="btn ghost" href="/gallery{"?dc=mine" if same_dc_only else ""}" style="' +
-        ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
-         'border-color:var(--accent);' if not channel else '') +
-        'padding:5px 12px;font-size:12px">all</a>' +
-        "".join(_ch_chip(r["username"], r["title"], r["n"]) for r in top_channels)
-    )
-    # DC toggle: same-DC (fast) ⇄ all DCs. Preserves the channel filter.
-    dc_toggle = ''
-    if my_dc:
-        _ch = f"&channel={_q(channel)}" if channel else ""
-        if same_dc_only:
-            dc_toggle = (
-                f'<a class="btn ghost" href="/gallery?dc=all{_ch}" '
-                f'style="padding:5px 12px;font-size:12px;'
-                f'background:rgba(16,185,129,0.15);color:#10b981;border-color:#10b981" '
-                f'title="showing only your DC {my_dc}. Click to show all DCs.">'
-                f'● DC {my_dc} only</a>')
-        else:
-            dc_toggle = (
-                f'<a class="btn ghost" href="/gallery?dc=mine{_ch}" '
-                f'style="padding:5px 12px;font-size:12px" '
-                f'title="showing all DCs. Click to show only your DC {my_dc}.">'
-                f'all DCs</a>')
+    picked = None
+    for r in all_channels:
+        if (ch and r["id"] == ch) or (channel and r["username"] == channel):
+            picked = r
+            break
+    priv = [r for r in all_channels if not r["username"]]
+    priv_n = sum(r["n"] for r in priv)
+
+    def _name(r):
+        return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
+    opts = "".join(
+        f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, offset=None)}" '
+        f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
+        f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
+        + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
+           else '<small>🔒 private</small>')
+        + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
+        for r in all_channels)
+    picker = (
+        '<div class="gp" id="gp">'
+        f'<button type="button" class="btn ghost gp-btn{" on" if picked else ""}" id="gpBtn">'
+        + (f'📡 {html.escape(_name(picked)[:28])} <span style="opacity:.6">{picked["n"]:,}</span>'
+           if picked else f'📡 Choose a channel… <span style="opacity:.6">{len(all_channels):,}</span>')
+        + ' ▾</button>'
+        '<div class="gp-pop" id="gpPop">'
+        '<input type="text" id="gpQ" placeholder="type to find a channel or chat…" autocomplete="off"/>'
+        f'<div class="gp-list" id="gpList">{opts}</div></div></div>')
     ch_chips_html = (
-        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">'
-        + dc_toggle + ch_chips + '</div>')
+        '<style>'
+        '.gp{position:relative}'
+        '.gp-btn{padding:5px 12px;font-size:12px}'
+        '.gp-btn.on{background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent)}'
+        '.gp-pop{display:none;position:absolute;z-index:50;top:calc(100% + 6px);left:0;width:min(380px,86vw);'
+        'background:var(--surface);border:1px solid var(--border);border-radius:10px;'
+        'box-shadow:0 14px 40px rgba(15,23,42,.18);padding:10px}'
+        '.gp.open .gp-pop{display:block}'
+        '.gp-pop input{width:100%;box-sizing:border-box;margin-bottom:8px}'
+        '.gp-list{max-height:52vh;overflow:auto}'
+        '.gp-opt{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:8px;'
+        'text-decoration:none;color:var(--fg)}'
+        '.gp-opt:hover{background:rgba(127,127,127,.10)}'
+        '.gp-n{flex:1;min-width:0;font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;'
+        'text-overflow:ellipsis}'
+        '.gp-n small{display:block;font-weight:400;font-size:11.5px;color:var(--muted)}'
+        '.gp-c{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}'
+        '</style>'
+        '<div class="bar-tools" style="margin-bottom:16px">'
+        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, offset=None),
+                     not (picked or private))
+        + (_chip_link(f'🔒 My private chats <span style="opacity:.6">{priv_n:,}</span>',
+                      "/gallery" + _gqs(ch=None, channel=None, private=1, offset=None), bool(private),
+                      "photos from chats and groups that have no public @username - yours alone")
+           if priv else "")
+        + picker
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
+        + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
+        + (('<span class="sep"></span>'
+            + _chip_link(f"only my data center (DC {my_dc})",
+                         "/gallery" + _gqs(dc=None if same_dc_only else "mine", offset=None),
+                         same_dc_only,
+                         "photos stored on your own Telegram data center load fastest; "
+                         "the others work too")) if my_dc else "")
+        + '</div>'
+        '<script>(function(){const gp=document.getElementById("gp"),q=document.getElementById("gpQ");'
+        'document.getElementById("gpBtn").onclick=e=>{e.stopPropagation();gp.classList.toggle("open");'
+        'if(gp.classList.contains("open"))q.focus()};'
+        'document.addEventListener("click",e=>{if(!gp.contains(e.target))gp.classList.remove("open")});'
+        'q.addEventListener("input",()=>{const v=q.value.trim().toLowerCase();'
+        'document.querySelectorAll("#gpList .gp-opt").forEach(o=>{o.style.display=!v||o.dataset.k.includes(v)?"flex":"none"})});'
+        'q.addEventListener("keydown",e=>{if(e.key==="Escape")gp.classList.remove("open");'
+        'if(e.key==="Enter"){const f=[...document.querySelectorAll("#gpList .gp-opt")].find(o=>o.style.display!=="none");'
+        'if(f)location.href=f.href}})})()</script>')
+    _where_txt = (f'in {html.escape(_name(picked))}' if picked else
+                  'in my private chats' if private else '')
 
     if not rows:
         body = (
-            '<h2 class="section">Gallery <span class="count">0</span></h2>'
+            f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">0</span></h2>'
             f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
-            '<div>No photos cached yet.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending:,} photo messages indexed — '
-            'crawler is downloading thumbnails in the background. Refresh in a minute.</div>'
-            '</div>'
+            + ('<div>No photo matches.</div>' if (picked or private or q or same_dc_only or page_offset) else
+               '<div>No photos yet.</div>'
+               f'<div style="margin-top:8px;font-size:13px">{pending:,} photos are indexed; their '
+               'thumbnails are fetched as pages are opened.</div>')
+            + '</div>'
         )
         return HTMLResponse(_layout("Gallery", "/gallery", body))
 
@@ -4068,21 +6233,20 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         for r in rows
     )
 
-    dup_saved = max(0, total - unique_total) if unique_total else 0
     body = (
-        f'<h2 class="section">Gallery <span class="count">{len(rows)} unique · {unique_total:,} total dedup</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{dup_saved:,} dup'
-           f'{f" · {pending:,} indexed (click to fetch)" if pending else ""}</span>'
-           if dup_saved or pending else '')
-        + ' <span class="extra" style="color:var(--muted);font-size:13px">'
-        '← → arrows · Space pause · Del delete · Esc close</span></h2>'
+        f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">{matched:,}</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
+        f'letter-spacing:0;margin-left:10px">photos {_where_txt}'
+        + (f' matching “{html.escape(q)}”' if q else '')
+        + ' · the same picture posted in several places is shown once · click one for the slideshow</span></h2>'
         f'{ch_chips_html}'
         f'<div class="gallery">{items}</div>'
+        + _page_nav("/gallery", _gqs, page_offset, page_size, len(rows), matched or 0) +
         '<div class="lightbox">'
         '  <div class="lb-progress"><div class="lb-progress-bar" id="lbProgress"></div></div>'
         '  <button class="lb-close" id="lbClose">×</button>'
-        '  <button class="lb-prev" id="lbPrev">‹</button>'
-        '  <button class="lb-next" id="lbNext">›</button>'
+        '  <button class="lb-prev" id="lbPrev" title="previous"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>'
+        '  <button class="lb-next" id="lbNext" title="next"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></button>'
         '  <img id="lbImg" alt="" />'
         '  <div class="lb-controls">'
         '    <button id="lbPlay" title="play / pause (Space)">▶</button>'
@@ -4093,16 +6257,23 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '</div>'
         '<script>'
         '(() => {'
+        '  /* A thumbnail that has not arrived yet is a 1x1 placeholder from the server.'
+        '     Until the real picture is there the tile shows a moving shimmer; it is'
+        '     asked for again a few times, then the tile says there is no picture. */'
         '  function hookLazy(img) {'
         '    if (img._tgHook) return; img._tgHook = true; img._tgTry = 0;'
-        '    img.addEventListener("load", () => {'
-        '      if (img.naturalWidth <= 1 && img._tgTry < 4) {'
+        '    const fig = img.closest(".item");'
+        '    const check = () => {'
+        '      if (img.naturalWidth > 1) { fig.classList.remove("nopic"); fig.classList.add("loaded"); return; }'
+        '      if (img._tgTry < 6) {'
         '        img._tgTry++;'
         '        const base = img.src.split("?")[0];'
-        '        const delay = 3000 + img._tgTry * 2000;'
-        '        setTimeout(() => { img.src = base + "?r=" + Date.now(); }, delay);'
-        '      }'
-        '    });'
+        '        setTimeout(() => { img.src = base + "?r=" + Date.now(); }, 2500 + img._tgTry * 1500);'
+        '      } else { fig.classList.add("nopic"); }'
+        '    };'
+        '    img.addEventListener("load", check);'
+        '    img.addEventListener("error", () => fig.classList.add("nopic"));'
+        '    if (img.complete && img.naturalWidth) check();'
         '  }'
         '  document.querySelectorAll("img.lazy-thumb").forEach(hookLazy);'
         '  const items = [...document.querySelectorAll(".gallery .item")];'
@@ -4118,66 +6289,120 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '  const FX = ["fxFade","fxZoomIn","fxZoomOut","fxSlideRight","fxSlideLeft","fxFlip","fxRotateScale","fxBlur"];'
         '  const DELAY = 4500;'
         '  let cur = -1, playing = false, timer = null, startTimer = null, lastFx = -1;'
+        '  /* The large image of a slide.'
+        '     The grid thumbnail (12 KB) is shown at once, softened, and the full image'
+        '     replaces it when it has arrived AND been decoded - the swap is a de-blur,'
+        '     not a jump. Full images are fetched with fetch() so the answer can be'
+        '     told apart: 200 = here it is, 202 = still being fetched (ask again),'
+        '     anything else = it will never come (do not wait 30 s on it). What has'
+        '     been fetched is kept, so going back - or reaching a slide that was'
+        '     prefetched - shows the full image immediately with no thumbnail flash. */'
+        '  const sharp = new Map();'
+        '  const pending = new Map();'
+        '  const sleep = ms => new Promise(r => setTimeout(r, ms));'
+        '  function loadSharp(id) {'
+        '    if (sharp.has(id)) return Promise.resolve(sharp.get(id));'
+        '    if (pending.has(id)) return pending.get(id);'
+        '    const job = (async () => {'
+        '      const t0 = Date.now();'
+        '      for (let t = 0; t < 10 && Date.now() - t0 < 30000; t++) {'
+        '        let r;'
+        '        try { r = await fetch("/api/photo-preview/" + id + (t ? "?r=" + t : "")); }'
+        '        catch (e) { await sleep(1500); continue; }'
+        '        if (r.status === 200) {'
+        '          const url = URL.createObjectURL(await r.blob());'
+        '          const im = new Image(); im.src = url;'
+        '          try { await im.decode(); } catch (e) {}'
+        '          if (im.naturalWidth > 1) {'
+        '            const v = {url: url, w: im.naturalWidth, h: im.naturalHeight};'
+        '            sharp.set(id, v);'
+        '            if (sharp.size > 60) { const k = sharp.keys().next().value; const o = sharp.get(k);'
+        '              if (o && o.url) URL.revokeObjectURL(o.url); sharp.delete(k); }'
+        '            return v;'
+        '          }'
+        '          URL.revokeObjectURL(url);'
+        '        } else if (r.status !== 202) {'
+        '          sharp.set(id, null);'
+        '          return null;'
+        '        }'
+        '        await sleep(900 + t * 600);'
+        '      }'
+        '      return null;'
+        '    })();'
+        '    pending.set(id, job);'
+        '    job.finally(() => pending.delete(id));'
+        '    return job;'
+        '  }'
+        '  /* Size the picture to the window without blowing a small one up into a'
+        '     smear: at most 2.5x its own pixels. */'
+        '  function fit(w, h, cap) {'
+        '    const k = Math.min(window.innerWidth * 0.96 / w, window.innerHeight * 0.9 / h, cap || 99);'
+        '    img.style.width = Math.round(w * k) + "px";'
+        '    img.style.height = Math.round(h * k) + "px";'
+        '  }'
+        '  function armAdvance(myIdx, delay) {'
+        '    if (cur !== myIdx || !playing) return;'
+        '    clearTimeout(timer);'
+        '    timer = setTimeout(() => show(cur + 1), delay);'
+        '    prog.style.transition = "none"; prog.style.width = "0";'
+        '    void prog.offsetHeight;'
+        '    prog.style.transition = "width " + delay + "ms linear";'
+        '    prog.style.width = "100%";'
+        '  }'
+        '  function prefetch(myIdx) {'
+        '    for (let d = 1; d <= 2; d++) { const n = photos[(myIdx + d) % photos.length]; if (n) loadSharp(n.id); }'
+        '  }'
         '  function show(idx) {'
         '    if (!photos.length) return;'
         '    idx = ((idx % photos.length) + photos.length) % photos.length;'
         '    cur = idx;'
-        '    const p = photos[idx];'
+        '    const p = photos[idx], myIdx = idx;'
+        '    clearTimeout(timer);'
+        '    prog.style.transition = "none"; prog.style.width = "0";'
         '    FX.forEach(c => img.classList.remove(c));'
         '    void img.offsetHeight;'
-        '    img.src = p.src;'  # instant 12KB thumb
-        '    /* Gate advance on preview load. Timer starts when full-size paints, '
-        '       not when thumb does. Prevents slide from changing while user still '
-        '       sees the blurry thumb. */'
-        '    const previewBase = "/api/photo-preview/" + p.id;'
-        '    const myIdx = idx;'
-        '    let tries = 0;'
-        '    const startedAt = Date.now();'
-        '    const MAX_PREVIEW_WAIT = 30000;'
-        '    let advanceArmed = false;'
-        '    const armAdvance = (sharp) => {'
-        '      if (cur !== myIdx || advanceArmed) return;'
-        '      advanceArmed = true;'
-        '      if (playing) {'
-        '        clearTimeout(timer);'
-        '        timer = setTimeout(() => show(cur+1), DELAY);'
-        '        prog.style.transition = "none"; prog.style.width = "0";'
-        '        void prog.offsetHeight;'
-        '        prog.style.transition = "width " + DELAY + "ms linear";'
-        '        prog.style.width = "100%";'
-        '      }'
-        '      if (sharp) {'
-        '        const next = photos[((myIdx+1) % photos.length)];'
-        '        if (next) { const pf = new Image(); pf.src = "/api/photo-preview/" + next.id; }'
-        '      }'
-        '    };'
-        '    const tryUpgrade = () => {'
-        '      if (cur !== myIdx) return;'
-        '      if (Date.now() - startedAt > MAX_PREVIEW_WAIT) { armAdvance(false); return; }'
-        '      const u = new Image();'
-        '      u.onload = () => {'
-        '        if (cur !== myIdx) return;'
-        '        if (u.naturalWidth > 1) {'
-        '          img.src = u.src;'
-        '          armAdvance(true);'
-        '        } else if (tries < 8) {'
-        '          tries++;'
-        '          setTimeout(tryUpgrade, 1500 + tries * 1000);'
-        '        } else {'
-        '          armAdvance(false);'
-        '        }'
-        '      };'
-        '      u.onerror = () => { if (cur === myIdx) armAdvance(false); };'
-        '      u.src = previewBase;'
-        '    };'
-        '    tryUpgrade();'
         '    let fx; do { fx = Math.floor(Math.random() * FX.length); } while (fx === lastFx && FX.length > 1);'
         '    lastFx = fx;'
-        '    img.classList.add(FX[fx]);'
         '    chEl.textContent = p.ch || "";'
         '    capEl.textContent = p.cap || "";'
-        '    counter.textContent = (idx+1) + " / " + photos.length;'
+        '    counter.textContent = (idx + 1) + " / " + photos.length;'
+        '    const have = sharp.get(p.id);'
+        '    if (have) {'
+        '      img.classList.remove("soft");'
+        '      fit(have.w, have.h, 2.5);'
+        '      img.src = have.url;'
+        '      img.classList.add(FX[fx]);'
+        '      armAdvance(myIdx, DELAY);'
+        '      prefetch(myIdx);'
+        '      return;'
+        '    }'
+        '    /* thumbnail first, softened */'
+        '    img.classList.add("soft");'
+        '    const th = p.el.querySelector("img");'
+        '    if (th && th.naturalWidth > 1) fit(th.naturalWidth, th.naturalHeight); else { img.style.width = ""; img.style.height = ""; }'
+        '    img.src = p.src;'
+        '    img.classList.add(FX[fx]);'
+        '    loadSharp(p.id).then(v => {'
+        '      if (cur !== myIdx) return;'
+        '      if (v) {'
+        '        fit(v.w, v.h, 2.5);'
+        '        img.src = v.url;'
+        '        img.classList.remove("soft");'
+        '        armAdvance(myIdx, DELAY);'
+        '        prefetch(myIdx);'
+        '      } else {'
+        '        /* no full image for this one: show what there is, move on sooner */'
+        '        img.classList.remove("soft");'
+        '        if (th && th.naturalWidth > 1) fit(th.naturalWidth, th.naturalHeight, 2.5);'
+        '        armAdvance(myIdx, 2200);'
+        '      }'
+        '    });'
         '  }'
+        '  window.addEventListener("resize", () => {'
+        '    if (!lb.classList.contains("open") || cur < 0) return;'
+        '    const v = sharp.get(photos[cur].id);'
+        '    if (v) fit(v.w, v.h, 2.5);'
+        '  });'
         '  function updateProg() {'
         '    /* Progress bar is now driven by armAdvance() in show(). */'
         '    prog.style.transition = "none"; prog.style.width = "0";'
@@ -4236,9 +6461,276 @@ def _fmt_dur(secs):
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
+# ── Music player ─────────────────────────────────────────────────────
+# The bar at the bottom plays; "Now playing" opens a panel with the cover,
+# the lyrics (timed when lrclib.net has them, highlighted as the song goes)
+# and a spectrum. The spectrum can be switched off: it routes the sound
+# through Web Audio, which a few browsers / Bluetooth setups dislike, so with
+# it off playback is the plain <audio> element.
+_MUSIC_PLAYER_HTML = r"""
+<style>
+.music-list .act { white-space:nowrap; text-align:right; }
+.mbtn { display:inline-block; border:1px solid transparent; background:transparent; color:var(--muted);
+  font-size:16px; line-height:1; padding:6px 8px; border-radius:8px; cursor:pointer; text-decoration:none; }
+.mbtn:hover { border-color:var(--border); color:var(--accent); }
+.mbtn.fav.on { color:#e11d48; }
+.player-bar { gap:12px; padding:10px 18px; }
+.player-bar .np { cursor:pointer; min-width:0; flex:0 1 300px; }
+.player-bar .np-icon { overflow:hidden; flex:none; }
+.player-bar .np-icon img { width:100%; height:100%; object-fit:cover; display:block; }
+.player-bar .ctl { display:flex; gap:6px; align-items:center; flex:none; }
+.player-bar .ctl button, .player-bar .ctl a { padding:8px 11px; font-size:16px; line-height:1; }
+.player-bar #pp { font-size:20px; padding:9px 15px; }
+.player-bar #mini { width:110px; height:38px; flex:none; }
+.player-bar .seek { flex:1; min-width:80px; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); }
+.player-bar .seek input { flex:1; accent-color:var(--accent); }
+.player-bar audio { display:none; }
+.np-panel { position:fixed; left:260px; right:0; bottom:66px; top:0; z-index:99; display:none; color:#e5e7eb;
+  background:linear-gradient(160deg,#0b1220 0%,#111a2e 55%,#1b1033 100%); overflow:hidden; }
+.np-panel.open { display:flex; flex-direction:column; }
+.np-panel .bgimg { position:absolute; inset:-40px; background-size:cover; background-position:center;
+  filter:blur(46px) brightness(.38); opacity:.9; }
+.np-panel .top { position:relative; display:flex; justify-content:flex-end; gap:8px; padding:14px 18px; }
+.np-panel .top button { background:rgba(255,255,255,.08); color:#e5e7eb; border:1px solid rgba(255,255,255,.16);
+  border-radius:18px; padding:7px 14px; font-size:13px; cursor:pointer; }
+.np-panel .top button.on { background:rgba(96,165,250,.28); border-color:#60a5fa; }
+.np-panel .mid { position:relative; flex:1; min-height:0; display:flex; gap:44px; padding:6px 48px 0; align-items:center; }
+.np-panel .art { flex:none; width:min(300px,28vw); text-align:center; }
+.np-panel .art .cv { width:100%; aspect-ratio:1; border-radius:14px; background:rgba(255,255,255,.07);
+  display:flex; align-items:center; justify-content:center; font-size:84px; overflow:hidden;
+  box-shadow:0 18px 50px rgba(0,0,0,.5); }
+.np-panel .art .cv img { width:100%; height:100%; object-fit:cover; }
+.np-panel .art .t { font-size:20px; font-weight:700; margin-top:18px; color:#fff; }
+.np-panel .art .a { font-size:14px; color:#9ca3af; margin-top:6px; }
+.np-panel .lyr { flex:1; min-width:0; height:100%; overflow-y:auto; scrollbar-width:none; padding:38vh 0;
+  -webkit-mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent);
+  mask-image:linear-gradient(transparent,#000 18%,#000 82%,transparent); }
+.np-panel .lyr::-webkit-scrollbar { display:none; }
+.np-panel .lyr div { font-size:19px; line-height:1.5; padding:9px 0; color:#6b7280; transition:color .25s,transform .25s;
+  transform-origin:left center; cursor:pointer; }
+.np-panel .lyr div.on { color:#fff; font-weight:700; transform:scale(1.08); }
+.np-panel .lyr.plain { padding:20px 0; }
+.np-panel .lyr.plain div { cursor:default; color:#cbd5e1; font-size:16px; padding:3px 0; }
+.np-panel .lyr .none { color:#6b7280; font-size:15px; cursor:default; }
+.np-panel canvas#viz { position:relative; width:100%; height:120px; flex:none; display:block; }
+@media (max-width:900px){ .np-panel{ left:0 } .np-panel .mid{ flex-direction:column; gap:14px; padding:0 20px }
+  .np-panel .art{ width:150px } .np-panel .art .t{ font-size:16px; margin-top:10px } .np-panel .lyr{ width:100%; padding:20vh 0 }
+  .player-bar #mini, .player-bar .seek span { display:none } .player-bar .np { flex:1 1 120px } }
+/* phone: the side menu is a top bar, so the player spans the whole width
+   and wraps onto two rows; the list keeps title, length and the two buttons */
+@media (max-width:820px){
+  .player-bar { left:0; flex-wrap:wrap; padding:8px 10px; gap:6px 8px; }
+  .player-bar .np { min-width:0; flex:1 1 100%; }
+  .player-bar .np-icon { width:34px; height:34px; font-size:17px; }
+  .player-bar .np-text { min-width:0; flex:1; }
+  .player-bar .np-t, .player-bar .np-a { max-width:none; }
+  .player-bar .seek { flex:1 1 100%; order:5; }
+  .player-bar .ctl button, .player-bar .ctl a { padding:7px 9px; font-size:15px; }
+  .player-bar #npBtn { font-size:12px; }
+  .music-list th:nth-child(4), .music-list td:nth-child(4),
+  .music-list th:nth-child(5), .music-list td:nth-child(5) { display:none; }
+  .music-list td, .music-list th { padding-left:8px; padding-right:8px; }
+  .music-list { margin-bottom:130px; }
+}
+</style>
+<div class="np-panel" id="npPanel">
+  <div class="bgimg" id="npBg"></div>
+  <div class="top">
+    <button id="vizBtn" title="moving spectrum on / off">Spectrum</button>
+    <button id="lyrBtn" title="lyrics on / off">Lyrics</button>
+    <button id="npClose">Close ✕</button>
+  </div>
+  <div class="mid">
+    <div class="art"><div class="cv" id="npCover">🎵</div><div class="t" id="npT2"></div><div class="a" id="npA2"></div></div>
+    <div class="lyr" id="lyr"></div>
+  </div>
+  <canvas id="viz"></canvas>
+</div>
+<div class="player-bar">
+  <div class="np" id="npOpen" title="open the now-playing view">
+    <div class="np-icon" id="npIcon">🎵</div>
+    <div class="np-text"><div class="np-t" id="npT">— select a track —</div><div class="np-a" id="npA"></div></div>
+  </div>
+  <div class="ctl">
+    <button class="ghost" id="prevBtn" title="previous (p)">⏮</button>
+    <button id="pp" title="play / pause (space)">▶</button>
+    <button class="ghost" id="nextBtn" title="next (n)">⏭</button>
+  </div>
+  <div class="seek"><span id="tCur">0:00</span><input type="range" id="seek" min="0" max="1000" value="0"><span id="tDur">0:00</span></div>
+  <canvas id="mini"></canvas>
+  <div class="ctl">
+    <button class="ghost" id="shuffleBtn" title="shuffle">🔀</button>
+    <button class="ghost" id="favBtn" title="favourite (f)">♥</button>
+    <a class="btn ghost" id="dlBtn" title="download this file" download>⬇</a>
+    <button class="ghost" id="npBtn" title="cover, lyrics and spectrum (l)">♪ Now playing</button>
+  </div>
+  <audio id="audio" preload="metadata"></audio>
+</div>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const rows = [...document.querySelectorAll(".music-list tbody tr")];
+  const audio = $("audio");
+  let cur = -1, shuffled = false, lines = null, lineEls = [], lineIdx = -1;
+  let prefs = {}; try { prefs = JSON.parse(localStorage.getItem("tgarr.music") || "{}"); } catch (e) {}
+  if (prefs.viz === undefined) prefs.viz = true;
+  if (prefs.lyr === undefined) prefs.lyr = true;
+  const save = () => { try { localStorage.setItem("tgarr.music", JSON.stringify(prefs)); } catch (e) {} };
+  const fmt = s => { s = Math.max(0, Math.floor(s || 0)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+  // ── spectrum ──
+  let ctx = null, an = null, data = null, raf = 0;
+  function vizStart(){
+    if (!prefs.viz) return;
+    try {
+      if (!ctx) {
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        an = ctx.createAnalyser(); an.fftSize = 256; an.smoothingTimeConstant = 0.82;
+        ctx.createMediaElementSource(audio).connect(an); an.connect(ctx.destination);
+        data = new Uint8Array(an.frequencyBinCount);
+      }
+      if (ctx.state === "suspended") ctx.resume();
+      if (!raf) raf = requestAnimationFrame(draw);
+    } catch (e) { prefs.viz = false; vizUi(); }
+  }
+  function bars(cv, n, big){
+    const w = cv.clientWidth, h = cv.clientHeight; if (!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    const bw = w / n, used = Math.floor(data.length * 0.72);
+    for (let i = 0; i < n; i++) {
+      let v = 0; const a = Math.floor(i * used / n), b = Math.max(a + 1, Math.floor((i + 1) * used / n));
+      for (let j = a; j < b; j++) v = Math.max(v, data[j]);
+      const bh = Math.max(2, (v / 255) * h * (big ? 0.95 : 0.9));
+      if (big) { const gr = g.createLinearGradient(0, h - bh, 0, h); gr.addColorStop(0, "rgba(167,139,250,.95)"); gr.addColorStop(1, "rgba(56,189,248,.35)"); g.fillStyle = gr; }
+      else g.fillStyle = "rgba(56,160,220,.85)";
+      g.fillRect(i * bw + bw * 0.18, h - bh, bw * 0.64, bh);
+    }
+  }
+  function draw(){
+    raf = 0;
+    if (!prefs.viz || !an || audio.paused) { clear(); return; }
+    an.getByteFrequencyData(data);
+    bars($("mini"), 18, false);
+    if ($("npPanel").classList.contains("open")) bars($("viz"), 72, true);
+    raf = requestAnimationFrame(draw);
+  }
+  function clear(){ for (const id of ["mini", "viz"]) { const c = $(id); const g = c.getContext("2d"); g.clearRect(0, 0, c.width, c.height); } }
+  function vizUi(){ $("vizBtn").classList.toggle("on", !!prefs.viz); $("viz").style.display = prefs.viz ? "block" : "none";
+    $("mini").style.visibility = prefs.viz ? "visible" : "hidden"; }
+  $("vizBtn").onclick = () => { prefs.viz = !prefs.viz; save(); vizUi();
+    if (prefs.viz && !audio.paused) vizStart();
+    else if (!prefs.viz && ctx) { clear(); } };
+
+  // ── lyrics ──
+  function lyrUi(){ $("lyrBtn").classList.toggle("on", !!prefs.lyr); $("lyr").style.visibility = prefs.lyr ? "visible" : "hidden"; }
+  $("lyrBtn").onclick = () => { prefs.lyr = !prefs.lyr; save(); lyrUi(); if (prefs.lyr && cur >= 0 && lines === null) loadLyrics(rows[cur].dataset.id); };
+  function loadLyrics(id){
+    const box = $("lyr"); lines = null; lineEls = []; lineIdx = -1;
+    box.className = "lyr"; box.innerHTML = '<div class="none">looking for lyrics…</div>';
+    if (!prefs.lyr) return;
+    fetch("/api/lyrics/" + id).then(r => r.json()).then(j => {
+      if (cur < 0 || rows[cur].dataset.id !== String(id)) return;
+      if (!j.found) { lines = []; box.innerHTML = '<div class="none">No lyrics found for this track.</div>'; return; }
+      if (j.synced) {
+        lines = j.lines;
+        box.innerHTML = lines.map((l, i) => '<div data-i="' + i + '">' + (esc(l[1]) || "♪") + "</div>").join("");
+        lineEls = [...box.children];
+        lineEls.forEach(el => el.onclick = () => { audio.currentTime = lines[+el.dataset.i][0]; });
+      } else {
+        lines = []; box.className = "lyr plain";
+        box.innerHTML = j.text.split("\n").map(t => "<div>" + (esc(t) || "&nbsp;") + "</div>").join("");
+      }
+    }).catch(() => { lines = []; box.innerHTML = '<div class="none">Could not load lyrics.</div>'; });
+  }
+  function lyrTick(){
+    if (!lines || !lines.length || !lineEls.length) return;
+    const t = audio.currentTime + 0.15; let lo = 0, hi = lines.length - 1, k = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (lines[m][0] <= t) { k = m; lo = m + 1; } else hi = m - 1; }
+    if (k === lineIdx) return;
+    if (lineIdx >= 0 && lineEls[lineIdx]) lineEls[lineIdx].classList.remove("on");
+    lineIdx = k;
+    if (k >= 0) { lineEls[k].classList.add("on");
+      if ($("npPanel").classList.contains("open")) lineEls[k].scrollIntoView({block: "center", behavior: "smooth"}); }
+  }
+
+  // ── playing ──
+  function setCover(url){
+    const img = url ? '<img src="' + esc(url) + '" alt="" onerror="this.replaceWith(document.createTextNode(\'🎵\'))">' : "🎵";
+    $("npIcon").innerHTML = img; $("npCover").innerHTML = img;
+    $("npBg").style.backgroundImage = url ? 'url("' + url.replace(/"/g, "%22") + '")' : "none";
+  }
+  function favUi(){ const on = cur >= 0 && rows[cur].dataset.fav === "1"; $("favBtn").style.color = on ? "#e11d48" : ""; }
+  window.tgMusicPlay = function(row){
+    cur = rows.indexOf(row);
+    rows.forEach(r => r.classList.remove("playing")); row.classList.add("playing");
+    const d = row.dataset;
+    audio.src = "/media/" + d.id;
+    $("npT").textContent = $("npT2").textContent = d.title;
+    $("npA").textContent = $("npA2").textContent = d.artist;
+    $("dlBtn").href = "/media/" + d.id; $("dlBtn").setAttribute("download", d.file || "");
+    setCover(d.cover); favUi(); loadLyrics(d.id);
+    if ("mediaSession" in navigator) { try { navigator.mediaSession.metadata = new MediaMetadata({title: d.title, artist: d.artist,
+      artwork: d.cover ? [{src: d.cover}] : []}); } catch (e) {} }
+    vizStart();
+    audio.play().catch(() => {});
+  };
+  window.tgMusicNext = function(){ if (!rows.length) return;
+    tgMusicPlay(rows[shuffled ? Math.floor(Math.random() * rows.length) : (cur + 1) % rows.length]); };
+  function prev(){ if (!rows.length) return; if (audio.currentTime > 4) { audio.currentTime = 0; return; }
+    tgMusicPlay(rows[(cur - 1 + rows.length) % rows.length]); }
+  function toggle(){ if (cur < 0) { if (rows.length) tgMusicPlay(rows[0]); return; } audio.paused ? audio.play() : audio.pause(); }
+  window.tgFav = function(row){
+    fetch("/api/fav/" + row.dataset.id, {method: "POST"}).then(r => r.json()).then(j => {
+      if (j.fav === undefined) return;
+      row.dataset.fav = j.fav ? "1" : "0";
+      const b = row.querySelector(".mbtn.fav"); if (b) b.classList.toggle("on", j.fav);
+      favUi();
+    });
+  };
+  $("pp").onclick = toggle; $("nextBtn").onclick = tgMusicNext; $("prevBtn").onclick = prev;
+  $("favBtn").onclick = () => { if (cur >= 0) tgFav(rows[cur]); };
+  $("shuffleBtn").onclick = e => { shuffled = !shuffled; const b = e.currentTarget;
+    b.style.background = shuffled ? "var(--accent)" : ""; b.style.color = shuffled ? "#fff" : ""; };
+  const panel = on => { $("npPanel").classList.toggle("open", on); $("npBtn").classList.toggle("on", on);
+    if (on) { lineIdx = -1; lyrTick(); if (!audio.paused) vizStart(); } };
+  $("npBtn").onclick = () => panel(!$("npPanel").classList.contains("open"));
+  $("npOpen").onclick = () => panel(true); $("npClose").onclick = () => panel(false);
+  audio.addEventListener("play", () => { $("pp").textContent = "⏸"; vizStart(); });
+  audio.addEventListener("pause", () => { $("pp").textContent = "▶"; });
+  audio.addEventListener("ended", tgMusicNext);
+  audio.addEventListener("error", () => { if (cur >= 0) $("npA").textContent = "could not play this file — try the next one"; });
+  audio.addEventListener("timeupdate", () => {
+    $("tCur").textContent = fmt(audio.currentTime); $("tDur").textContent = fmt(audio.duration);
+    if (audio.duration && !seeking) $("seek").value = Math.round(audio.currentTime / audio.duration * 1000);
+    lyrTick();
+  });
+  let seeking = false;
+  $("seek").addEventListener("input", () => { seeking = true; });
+  $("seek").addEventListener("change", e => { seeking = false; if (audio.duration) audio.currentTime = e.target.value / 1000 * audio.duration; });
+  document.addEventListener("keydown", e => {
+    if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) && e.target.type !== "range") return;
+    if (e.key === "n") tgMusicNext();
+    else if (e.key === "p") prev();
+    else if (e.key === "f" && cur >= 0) tgFav(rows[cur]);
+    else if (e.key === "l") panel(!$("npPanel").classList.contains("open"));
+    else if (e.key === "Escape") panel(false);
+    else if (e.key === " ") { e.preventDefault(); toggle(); }
+  });
+  vizUi(); lyrUi();
+  // /music#now opens the now-playing view on the first track
+  if (location.hash === "#now" && rows.length) { tgMusicPlay(rows[0]); panel(true); }
+})();
+</script>
+"""
+
+
 @app.get("/music", response_class=HTMLResponse)
-async def page_music(limit: int = 200, q: Optional[str] = None,
-                     lang: Optional[str] = None, sort: str = "quality"):
+async def page_music(limit: int = 100, q: Optional[str] = None,
+                     lang: Optional[str] = None, sort: str = "quality",
+                     offset: int = 0, local: int = 0, fav: int = 0):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -4280,8 +6772,16 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
     if lang:
         params.append(lang)
         where_parts.append(f"m.detected_lang = ${len(params)}")
+    if local:
+        where_parts.append(_LOCAL_SQL)
+    if fav:
+        where_parts.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
 
     async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
         pending_n = await conn.fetchval(
             "SELECT count(*) FROM messages WHERE media_type='audio' AND local_path IS NULL")
         lang_dist = await conn.fetch(
@@ -4293,16 +6793,19 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
                    m.file_name, m.file_size, m.posted_at, m.file_dc,
                    m.audio_canonical_title, m.audio_album, m.audio_year,
                    m.audio_cover_url, m.local_path, m.detected_lang,
+                   EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav,
                    c.title AS ch_title, c.username AS ch_user
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
             WHERE {' AND '.join(where_parts)}
-            ORDER BY {sort_clause}
-            LIMIT {max(1, min(limit, 500))}
+            ORDER BY {sort_clause}, m.id
+            LIMIT {page_size} OFFSET {page_offset}
         """, *params)
 
     def _music_qs(**overrides):
-        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None}
+        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None,
+                    "local": 1 if local else None, "fav": 1 if fav else None,
+                    "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
@@ -4336,12 +6839,16 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
         _music_sort_chip("quality", "★ Best") +
         _music_sort_chip("recent",  "Recent") +
         _music_sort_chip("longest", "Longest") +
-        _music_sort_chip("size",    "Largest"))
+        _music_sort_chip("size",    "Largest") +
+        '<span style="margin-left:10px"></span>' + _saved_chip("/music", _music_qs, local) +
+        f'<a class="btn ghost" href="/music{_music_qs(fav=None if fav else 1)}" '
+        f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
+        f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
         + lang_chips_html + '</div>'
-        '<div style="display:flex;gap:6px;margin-bottom:18px;align-items:center">'
+        '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;align-items:center">'
         '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>'
         + sort_chips_html + '</div>'
     )
@@ -4358,71 +6865,49 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
         )
         return HTMLResponse(_layout("Music", "/music", body))
 
-    rows_html = "".join(
-        f'<tr data-id="{r["id"]}" onclick="tgMusicPlay(this)">'
-        f'<td class="play-cell"><div class="play-ico">▶</div></td>'
-        f'<td class="title-cell">'
-        f'<div class="t">{html.escape(r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)")}</div>'
-        f'<div class="a">{_dc_badge(r.get("file_dc"), _music_my_dc)} {html.escape((r["audio_performer"] or "") + ((" · " + (r["audio_album"] or r["ch_title"])) if (r["audio_album"] or r["ch_title"]) else ""))}{(" · " + str(r["audio_year"])) if r.get("audio_year") else ""}</div>'
-        f'</td>'
-        f'<td class="num">{_fmt_dur(r["audio_duration_sec"])}</td>'
-        f'<td class="num">{_fmt_size(r["file_size"])}</td>'
-        f'<td class="num">{_fmt_time(r["posted_at"])[:10]}</td>'
-        f'</tr>'
-        for r in rows
-    )
+    def _row(r):
+        title = r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)"
+        artist = r["audio_performer"] or ""
+        album = r["audio_album"] or r["ch_title"] or ""
+        sub = artist + ((" · " + album) if album else "") + \
+            ((" · " + str(r["audio_year"])) if r.get("audio_year") else "")
+        return (
+            f'<tr data-id="{r["id"]}" data-title="{html.escape(title, quote=True)}" '
+            f'data-artist="{html.escape(artist, quote=True)}" '
+            f'data-cover="{html.escape(r["audio_cover_url"] or "", quote=True)}" '
+            f'data-fav="{1 if r["fav"] else 0}" '
+            f'data-file="{html.escape(r["file_name"] or "", quote=True)}" onclick="tgMusicPlay(this)">'
+            f'<td class="play-cell"><div class="play-ico">▶</div></td>'
+            f'<td class="title-cell">'
+            f'<div class="t">{html.escape(title)} {_local_pill(r["local_path"])}</div>'
+            f'<div class="a">{_dc_badge(r.get("file_dc"), _music_my_dc)} {html.escape(sub)}</div>'
+            f'</td>'
+            f'<td class="num">{_fmt_dur(r["audio_duration_sec"])}</td>'
+            f'<td class="num">{_fmt_size(r["file_size"])}</td>'
+            f'<td class="num">{_fmt_time(r["posted_at"])[:10]}</td>'
+            f'<td class="act">'
+            f'<button class="mbtn fav{" on" if r["fav"] else ""}" title="favourite" '
+            f'onclick="event.stopPropagation();tgFav(this.closest(\'tr\'))">♥</button>'
+            f'<a class="mbtn" title="download this file" href="/media/{r["id"]}" '
+            f'download="{html.escape(r["file_name"] or "", quote=True)}" '
+            f'onclick="event.stopPropagation()">⬇</a>'
+            f'</td>'
+            f'</tr>')
+
+    rows_html = "".join(_row(r) for r in rows)
 
     body = (
-        f'<h2 class="section">Music <span class="count">{len(rows)} of {sum(r["n"] for r in lang_dist):,}</span>'
+        f'<h2 class="section">Music <span class="count">{len(rows)} of {total:,}</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
         f'{toolbar}'
         '<table class="music-list">'
-        '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th><th>posted</th></tr></thead>'
+        '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th>'
+        '<th>posted</th><th style="width:84px"></th></tr></thead>'
         f'<tbody>{rows_html}</tbody></table>'
-        '<div class="player-bar">'
-        '  <div class="np">'
-        '    <div class="np-icon">🎵</div>'
-        '    <div class="np-text"><div class="np-t" id="npT">— select a track —</div><div class="np-a" id="npA"></div></div>'
-        '  </div>'
-        '  <audio id="audio" controls preload="metadata" style="flex:1;min-width:0"></audio>'
-        '  <button class="ghost" onclick="tgMusicNext()" title="next (n)">⏭</button>'
-        '  <button class="ghost" id="shuffleBtn" onclick="tgMusicShuffle(this)" title="shuffle">🔀</button>'
-        '</div>'
-        '<script>'
-        '(() => {'
-        '  const rows = [...document.querySelectorAll(".music-list tbody tr")];'
-        '  const ids = rows.map(r => r.dataset.id);'
-        '  const audio = document.getElementById("audio");'
-        '  let cur = -1, shuffled = false;'
-        '  window.tgMusicPlay = function(row) {'
-        '    cur = rows.indexOf(row);'
-        '    rows.forEach(r => r.classList.remove("playing"));'
-        '    row.classList.add("playing");'
-        '    audio.src = "/media/" + row.dataset.id;'
-        '    document.getElementById("npT").textContent = row.querySelector(".t").textContent;'
-        '    document.getElementById("npA").textContent = row.querySelector(".a").textContent;'
-        '    audio.play().catch(() => {});'
-        '  };'
-        '  window.tgMusicNext = function() {'
-        '    if (!rows.length) return;'
-        '    let nxt = shuffled ? Math.floor(Math.random()*rows.length) : (cur+1) % rows.length;'
-        '    tgMusicPlay(rows[nxt]);'
-        '  };'
-        '  window.tgMusicShuffle = function(btn) {'
-        '    shuffled = !shuffled;'
-        '    btn.style.background = shuffled ? "var(--accent)" : "";'
-        '    btn.style.color = shuffled ? "#fff" : "";'
-        '  };'
-        '  audio.addEventListener("ended", tgMusicNext);'
-        '  document.addEventListener("keydown", e => {'
-        '    if (e.target.tagName === "INPUT") return;'
-        '    if (e.key === "n") tgMusicNext();'
-        '    else if (e.key === " " && audio.src) { e.preventDefault(); audio.paused ? audio.play() : audio.pause(); }'
-        '  });'
-        '})();'
-        '</script>'
+        + _page_nav("/music", _music_qs, page_offset, page_size, len(rows), total)
+        + _MUSIC_PLAYER_HTML
     )
     return HTMLResponse(_layout("Music", "/music", body))
 
@@ -4439,9 +6924,9 @@ _LANG_LABELS = {
 
 
 @app.get("/library", response_class=HTMLResponse)
-async def page_library(limit: int = 200, q: Optional[str] = None,
+async def page_library(limit: int = 100, q: Optional[str] = None,
                        lang: Optional[str] = None, sort: str = "quality",
-                       fmt: Optional[str] = None):
+                       fmt: Optional[str] = None, offset: int = 0, local: int = 0):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -4482,8 +6967,14 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
     if fmt:
         params.append(f".{fmt.lower()}$")
         where_parts.append(f"m.file_name ~* ${len(params)}")
+    if local:
+        where_parts.append(_LOCAL_SQL)
+    page_size = max(1, min(limit, 500))
+    page_offset = max(0, offset)
 
     async with db_pool.acquire() as conn:
+        total = await conn.fetchval(
+            f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
         pending_n = await conn.fetchval(
             r"""SELECT count(*) FROM messages
                WHERE media_type='document' AND local_path IS NULL
@@ -4502,8 +6993,8 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
             WHERE {' AND '.join(where_parts)}
-            ORDER BY {sort_clause}
-            LIMIT {max(1, min(limit, 500))}
+            ORDER BY {sort_clause}, m.id
+            LIMIT {page_size} OFFSET {page_offset}
         """, *params)
 
     def _ext(fn):
@@ -4525,7 +7016,9 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         return HTMLResponse(_layout("Library", "/library", body))
 
     def _qs(**overrides):
-        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None, "fmt": fmt}
+        defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None, "fmt": fmt,
+                    "local": 1 if local else None,
+                    "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
@@ -4559,7 +7052,8 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         _sort_chip("quality", "★ Best") +
         _sort_chip("recent",  "Recent") +
         _sort_chip("size",    "Largest") +
-        _sort_chip("title",   "Title"))
+        _sort_chip("title",   "Title") +
+        '<span style="margin-left:10px"></span>' + _saved_chip("/library", _qs, local))
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">' +
@@ -4598,13 +7092,14 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         f'<div class="book-meta">'
         f'{_dc_badge(r.get("file_dc"), _lib_my_dc)}'
         f'{_lang_badge(r.get("detected_lang"))}'
+        f'{_local_pill(r["local_path"])}'
         f'<span class="pill accent">{_ext(r["file_name"])}</span>'
         f'<span class="pill muted">{_fmt_size(r["file_size"])}</span>'
         f'<span>· {html.escape(r["ch_title"] or "")}</span>'
         f'</div>'
         f'</div>'
         f'<div class="book-actions">'
-        f'<a class="btn" href="/watch/{r["id"]}" target="_blank">Open</a>'
+        f'<a class="btn" href="/watch/{r["id"]}">Open</a>'
         f'<a class="btn ghost" href="/media/{r["id"]}" download="{html.escape(r["file_name"] or "")}">Download</a>'
         f'</div>'
         f'</div>'
@@ -4612,12 +7107,13 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
     )
 
     body = (
-        f'<h2 class="section">Library <span class="count">{len(rows)} of {sum(r["n"] for r in lang_dist):,}</span>'
+        f'<h2 class="section">Library <span class="count">{len(rows)} of {total:,}</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
         f'{toolbar}'
         f'<div class="book-grid">{items}</div>'
+        + _page_nav("/library", _qs, page_offset, page_size, len(rows), total)
     )
     return HTMLResponse(_layout("Library", "/library", body))
 
@@ -4628,7 +7124,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
 @app.get("/videos", response_class=HTMLResponse)
 async def page_videos(q: Optional[str] = None, limit: int = 120,
                       offset: int = 0, aud: str = "sfw",
-                      min_mb: int = 50):
+                      min_mb: int = 50, local: int = 0, fav: int = 0, sort: str = "new"):
     if not login.session_exists():
         async with db_pool.acquire() as conn:
             n = await conn.fetchval("SELECT count(*) FROM channels")
@@ -4648,6 +7144,10 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         where.append("c.audience = 'nsfw'")
     if min_mb and min_mb > 0:
         where.append(f"COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024}")
+    if local:
+        where.append(_LOCAL_SQL)
+    if fav:
+        where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
 
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
@@ -4661,13 +7161,15 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         rows = await conn.fetch(
             f"SELECT m.id, m.file_name, m.file_size, m.caption, m.posted_at, "
             f"m.thumb_path, m.local_path, m.file_dc, "
+            f"EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav, "
             f"c.title AS ch_title, c.username AS ch_user, c.audience, "
-            f"r.id AS release_id, r.canonical_title, r.quality "
+            f"r.id AS release_id, r.canonical_title, r.quality, r.movie_title, r.series_title, "
+            f"r.part AS rel_part, r.movie_year, m.duration_sec "
             f"FROM messages m "
             f"JOIN channels c ON c.id = m.channel_id "
             f"LEFT JOIN releases r ON r.primary_msg_id = m.id "
             f"WHERE {where_sql} "
-            f"ORDER BY m.posted_at DESC NULLS LAST "
+            f"ORDER BY {'m.file_size DESC NULLS LAST, m.id DESC' if sort == 'size' else 'm.posted_at DESC NULLS LAST'} "
             f"LIMIT {page_size} OFFSET {page_offset}",
             *params)
 
@@ -4675,97 +7177,70 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         defaults = {"q": q,
                     "aud": aud if aud != "sfw" else None,
                     "min_mb": min_mb if min_mb != 50 else None,
+                    "local": 1 if local else None, "fav": 1 if fav else None,
+                    "sort": sort if sort != "new" else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
-            if v not in (None, "", 0, "sfw"):
+            if v not in (None, "", "sfw") and not (v == 0 and k != "min_mb"):
                 bits.append(f"{k}={html.escape(str(v))}")
         return "?" + "&".join(bits) if bits else ""
 
-    def _aud_chip(val, label):
-        active = aud == val or (val == "sfw" and not aud)
-        href = f"/videos{_qs(aud=val if val != 'sfw' else None)}"
-        bg = "rgba(245,158,11,0.18)" if val == "nsfw" and active else "rgba(94,182,229,0.15)"
-        fg = "var(--warn)" if val == "nsfw" else "var(--accent-hi)"
-        style = (f'background:{bg};color:{fg};border-color:{fg};') if active else ''
-        return (f'<a class="btn ghost" href="{href}" '
-                f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
+    _nsfw_on = await _is_nsfw_enabled()
 
+    def _vc(label, href, on, tip=""):
+        return _chip_link(label, "/videos" + href, on, tip)
     toolbar = (
-        '<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
-        + _aud_chip("sfw", "SFW")
-        + _aud_chip("nsfw", "NSFW")
-        + _aud_chip("any", "all")
-        + '</div>'
-    )
+        '<div class="bar-tools" style="margin-bottom:18px">'
+        + ((_vc("SFW", _qs(aud=None, offset=None), aud == "sfw")
+            + _vc("18+", _qs(aud="nsfw", offset=None), aud == "nsfw")
+            + _vc("both", _qs(aud="any", offset=None), aud == "any")
+            + '<span class="sep"></span>') if _nsfw_on else '')
+        + '<span class="lbl">Size:</span>'
+        + _vc("any", _qs(min_mb=0, offset=None), min_mb <= 0)
+        + _vc("50 MB+", _qs(min_mb=None, offset=None), min_mb == 50, "leaves out clips")
+        + _vc("300 MB+", _qs(min_mb=300, offset=None), min_mb == 300, "film-sized")
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _vc("newest", _qs(sort=None, offset=None), sort != "size")
+        + _vc("largest", _qs(sort="size", offset=None), sort == "size")
+        + '<span class="sep"></span>'
+        + _saved_chip("/videos", _qs, local)
+        + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1, offset=None)}" '
+          f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
+          f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>'
+        + '</div>' + _FAV_CARD_JS + _THUMB_RETRY_JS)
 
     def _card(r):
-        title = (r["canonical_title"] or r["file_name"]
-                 or (r["caption"] or "")[:80] or f"video-{r['id']}")
-        size = _fmt_size(r["file_size"]) if r["file_size"] else ""
-        date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
+        title = (r["canonical_title"] or r["movie_title"] or r["series_title"]
+                 or r["file_name"] or (r["caption"] or "")[:80] or f"video {r['id']}")
+        if r["rel_part"]:
+            title += f" — part {r['rel_part']}"
         ch = r["ch_title"] or r["ch_user"] or ""
-        parsed_pill = ('<span class="pill ok" style="font-size:11px" title="parsed">P</span>'
-                       if r["release_id"] else
-                       '<span class="pill muted" style="font-size:11px" title="unparsed">U</span>')
-        return (
-            f'<div class="poster-card">'
-            f'<div class="poster">'
-            f'<img class="poster-img" src="/api/thumb/{r["id"]}" loading="lazy" alt="" '
-            f'onerror="this.outerHTML=\'<div class=&quot;fallback&quot;>🎬</div>\'" />'
-            f'</div>'
-            f'<div class="info">'
-            f'<div class="title">{html.escape(title)}</div>'
-            f'<div class="sub">{html.escape(ch)} · {date}</div>'
-            f'</div>'
-            f'<div class="pills">'
-            f'{_dc_badge(r.get("file_dc"), _vid_my_dc)}'
-            f'{parsed_pill}'
-            + (f'<span class="pill accent" style="font-size:11px">{html.escape(r["quality"])}</span>'
-               if r.get("quality") else '')
-            + f'<span class="pill muted" style="font-size:11px">{size}</span>'
-            f'</div>'
-            f'<div class="grab-row" style="margin-top:8px;display:flex;gap:6px">'
-            f'<a class="btn" href="/watch/{r["id"]}" target="_blank">▶ watch</a>'
-            f'<a class="btn ghost" href="/media/{r["id"]}" download>⬇</a>'
-            f'</div>'
-            f'</div>'
-        )
+        date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
+        return _media_card(
+            msg_id=r["id"], title=title, sub=" · ".join(x for x in (ch, date) if x),
+            img=f'/api/thumb/{r["id"]}', size=r["file_size"], file_dc=r.get("file_dc"),
+            my_dc=_vid_my_dc, quality=r.get("quality"), saved=_is_local(r["local_path"]),
+            fav=r["fav"], wide=True, duration=r["duration_sec"])
 
-    grid_html = ('<div class="poster-grid">'
-                 + ''.join(_card(r) for r in rows)
-                 + '</div>')
     start_idx = page_offset + 1 if rows else 0
     end_idx = page_offset + len(rows)
-    filter_parts = [f"aud={aud}"]
-    if min_mb > 0:
-        filter_parts.append(f"≥{min_mb}MB")
+    if rows:
+        grid_html = '<div class="mc-grid wide">' + ''.join(_card(r) for r in rows) + '</div>'
+    else:
+        grid_html = ('<div class="empty-state"><div class="icon">🎬</div>'
+                     '<div>No video matches.</div></div>')
+    _note = []
     if q:
-        filter_parts.append(f'q="{html.escape(q)}"')
-    filter_desc = " · ".join(filter_parts)
-    prev_offset = max(0, page_offset - page_size)
-    next_offset = page_offset + page_size
-    nav_links = []
-    if page_offset > 0:
-        nav_links.append(
-            f'<a class="btn ghost" href="/videos{_qs(offset=prev_offset if prev_offset else None)}">← prev</a>')
-    if next_offset < (total or 0):
-        nav_links.append(
-            f'<a class="btn ghost" href="/videos{_qs(offset=next_offset)}">next →</a>')
-    pagination = (
-        f'<div style="display:flex;justify-content:space-between;align-items:center;'
-        f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
-        f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {start_idx}–{end_idx} of {total:,} '
-        f'<span style="opacity:0.7">({filter_desc})</span></span>'
-        f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div></div>')
+        _note.append(f'matching “{html.escape(q)}”')
     body = (
-        f'<h2 class="section">Videos '
-        f'<span class="count">{len(rows)} of {total:,}</span>'
-        f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;'
-        f'margin-left:10px">{filter_desc}</span></h2>'
-        f'{toolbar}{grid_html}{pagination}')
+        f'{_LIST_CSS}'
+        f'<h2 class="section">Videos <span class="count">{total:,}</span>'
+        f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
+        f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
+        f'{toolbar}{grid_html}'
+        + _page_nav("/videos", _qs, page_offset, page_size, len(rows), total or 0))
     return HTMLResponse(_layout("Videos", "/videos", body))
 
 
@@ -4791,70 +7266,146 @@ def _dc_badge(file_dc, my_dc) -> str:
     return f'<span class="pill warn" title="cross-DC ({file_dc} vs your {my_dc}) — may hit FloodWait" style="font-size:11px">🟡 DC{file_dc}</span>'
 
 
-def _release_card(r, my_dc=None) -> str:
-    """Sonarr/Radarr-style poster card with 3-tier fallback +
-    DC badge (so users can pick same-DC items without clicking)."""
-    title_disp = r["canonical_title"] or r["name"].replace(".", " ")
-    poster = r["poster_url"]
-    pmid = r["primary_msg_id"]
-    se = ""
-    if r["season"] and r["episode"]:
-        se = f"S{r['season']:02}E{r['episode']:02}"
-    elif r["season"]:
-        se = f"Season {r['season']}"
-    posted = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
-    sub_bits = [b for b in (se, posted) if b]
-    cat_pill = ("accent" if r["category"] == "movie"
-                else "ok" if r["category"] == "tv" else "muted")
-    cat_label = {"movie": "MV", "tv": "TV"}.get(r["category"], "NA")  # 2-letter, fits card
-    # Always render the emoji fallback in the DOM and let the <img> overlay
-    # cover it. If the img 404s/410s the browser onerror hides the img and
-    # the emoji shows through. CSS .poster .fallback is absolute-positioned;
-    # .poster-img is z-index:2 stacked on top.
-    if poster:
-        img_src = html.escape(poster)
-    elif pmid:
-        img_src = f"/api/thumb/{pmid}"
+def _part_pill(r) -> str:
+    """A film posted in pieces: say which piece this card is."""
+    try:
+        n = r["part"] if "part" in r.keys() else None
+    except Exception:
+        return ""
+    return f'<span class="pill muted" title="this film was posted in several parts">part {int(n)}</span>' if n else ""
+
+
+def _versions_pill(r) -> str:
+    try:
+        n = r["versions"] if "versions" in r.keys() else 1
+        wk = r["wk"] if "wk" in r.keys() else None
+    except Exception:
+        return ""
+    if not wk or not n or n < 2:
+        return ""
+    return (f'<a class="pill accent" href="/releases?work={_q(wk)}" '
+            f'title="all versions of this title" style="text-decoration:none">{n} versions</a>')
+
+
+def _rk(r, k, default=None):
+    """Field of a row that may or may not carry it (pages select different columns)."""
+    try:
+        return r[k] if k in r.keys() else default
+    except Exception:
+        return default
+
+
+def _dc_mark(file_dc, my_dc) -> str:
+    if not file_dc:
+        return ""
+    same = bool(my_dc and file_dc == my_dc)
+    tip = ("on your Telegram data center: the fast path" if same else
+           "on another Telegram data center: it works, a little slower to start")
+    return f'<span class="dc{" same" if same else ""}" title="{tip}">DC{file_dc}</span>'
+
+
+def _fmt_dur_short(sec) -> str:
+    if not sec:
+        return ""
+    sec = int(sec)
+    return f"{sec // 3600}h {sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60} min"
+
+
+def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=None,
+                quality=None, saved=False, versions=0, work=None, part=None,
+                guid=None, fav=None, wide=False, duration=None, fallback="🎬") -> str:
+    """One card for a film, an episode or a plain video."""
+    watch = f"/watch/{msg_id}"
+    img_html = (f'<img src="{html.escape(img, quote=True)}" loading="lazy" alt="" '
+                f'onerror="this.remove()"/>' if img else "")
+    badges = ""
+    if quality:
+        badges += f'<span class="bq">{html.escape(quality)}</span>'
+    if saved:
+        badges += '<span class="bs" title="already downloaded: opens instantly">● saved</span>'
+    if part:
+        badges += f'<span class="bp" title="this film was posted in several parts">part {int(part)}</span>'
+    more = ""
+    if work and versions and versions > 1:
+        more = (f'<a class="bv" href="/releases?work={_q(work)}" '
+                f'title="other copies of this title: other resolutions or uploads">{versions} versions</a>')
+    meta = [x for x in (_fmt_size(size), _fmt_dur_short(duration)) if x]
+    acts = f'<a class="b pri" href="{watch}">▶ Play</a>'
+    if guid:
+        acts += (f'<button class="b grab-btn" data-guid="{guid}" onclick="tgGrab(this)" '
+                 f'title="save it to the download folder (the one Sonarr/Radarr read)">⬇ Grab</button>')
     else:
-        img_src = ""
-    poster_style = ""
-    if img_src:
-        # onerror swaps the <img> for a fallback emoji div (no CSS :has() needed)
-        poster_img = (f'<img class="poster-img" src="{img_src}" loading="lazy" alt="" '
-                      f'onerror="this.outerHTML=\'&lt;div class=&quot;fallback&quot;&gt;\🎬&lt;/div&gt;\'" />')
-        fallback = ""
-    else:
-        poster_img = ""
-        fallback = '<div class="fallback">\U0001F3AC</div>'
-    quality_badge = (f'<div class="badge">{html.escape(r["quality"])}</div>'
-                     if r["quality"] else "")
+        acts += (f'<a class="b sq" href="/media/{msg_id}" download title="download to this device">⬇</a>')
+    if fav is not None:
+        acts += (f'<button class="b sq{" on" if fav else ""}" onclick="tgFavCard(this,{msg_id})" '
+                 f'title="{"in your favourites" if fav else "add to favourites"}">♥</button>')
     return (
-        f'<div class="poster-card">'
-        f'<div class="poster" {poster_style}>{fallback}{poster_img}{quality_badge}</div>'
-        f'<div class="info">'
-        f'<div class="title">{html.escape(title_disp)}</div>'
-        f'<div class="sub">{" · ".join(html.escape(x) for x in sub_bits)}</div>'
-        f'</div>'
-        f'<div class="pills">'
-        f'{_dc_badge(r.get("file_dc") if hasattr(r,"get") else r["file_dc"], my_dc)}'
-        f'<span class="pill {cat_pill}">{cat_label}</span>'
-        f'<span class="pill muted">{_fmt_size(r["size_bytes"])}</span>'
-        f'</div>'
-        f'<div class="grab-row" style="display:flex;gap:6px">'
-        f'<button class="btn play-btn" onclick="window.open(\'/watch/{r["primary_msg_id"]}\', \'_blank\')">▶ Play</button>'
-        f'<button class="btn grab-btn" data-guid="{r["guid"]}" onclick="tgGrab(this)">⬇ Grab</button>'
-        f'</div>'
-        f'</div>'
-    )
+        f'<div class="mc{" wide" if wide else ""}">'
+        f'<a class="mc-img" href="{watch}"><span class="fb">{fallback}</span>{img_html}'
+        f'<span class="pl"><span>▶</span></span>{badges}</a>'
+        f'{("<div class=mc-over>" + more + "</div>") if more else ""}'
+        f'<div class="mc-body"><a class="mc-title" href="{watch}" title="{html.escape(title, quote=True)}">'
+        f'{html.escape(title)}</a>'
+        f'<div class="mc-sub">{html.escape(sub)}</div>'
+        f'<div class="mc-meta">{" · ".join(meta)}{_dc_mark(file_dc, my_dc)}</div></div>'
+        f'<div class="mc-act">{acts}</div></div>')
+
+
+# Cards whose picture is a thumbnail still being fetched: the server answers
+# with a 1x1 placeholder at first. Shimmer until the real one is there, ask
+# again a few times, then leave the plain icon.
+_THUMB_RETRY_JS = (
+    '<style>.mc-img{background:linear-gradient(100deg,#e3e9f0 30%,#f4f7fa 50%,#e3e9f0 70%);'
+    'background-size:200% 100%;animation:tgShim 1.3s linear infinite}'
+    '.mc-img.done{animation:none;background:#e9eef4}'
+    '@keyframes tgShim{to{background-position:-200% 0}}</style>'
+    '<script>document.addEventListener("DOMContentLoaded",function(){'
+    'document.querySelectorAll(".mc-img img").forEach(function(img){var box=img.closest(".mc-img"),n=0;'
+    'function chk(){if(img.naturalWidth>1){box.classList.add("done");return}'
+    'if(img.src.indexOf("/api/thumb/")<0||n>=6){img.style.display="none";box.classList.add("done");return}'
+    'n++;var b=img.src.split("?")[0];setTimeout(function(){img.src=b+"?r="+Date.now()},2500+n*1500)}'
+    'img.addEventListener("load",chk);img.addEventListener("error",function(){box.classList.add("done")});'
+    'if(img.complete&&img.naturalWidth)chk()})})</script>')
+
+_FAV_CARD_JS = ('<script>function tgFavCard(b,id){fetch("/api/fav/"+id,{method:"POST"}).then(r=>r.json())'
+                '.then(j=>{if(j.fav===undefined)return;b.classList.toggle("on",j.fav);'
+                'b.title=j.fav?"in your favourites":"add to favourites"})}</script>')
+
+
+def _release_card(r, my_dc=None) -> str:
+    """A film or an episode."""
+    title = _rk(r, "canonical_title") or (r["name"] or "").replace(".", " ")
+    bits = []
+    if r["category"] == "tv" and r["season"] is not None:
+        bits.append(f'S{r["season"]:02}' + (f'E{r["episode"]:02}' if r["episode"] is not None else ""))
+    if _rk(r, "movie_year"):
+        bits.append(str(r["movie_year"]))
+    if not bits and r["posted_at"]:
+        bits.append("posted " + _fmt_time(r["posted_at"])[:10])
+    pmid = r["primary_msg_id"]
+    return _media_card(
+        msg_id=pmid, title=title, sub=" · ".join(bits),
+        img=r["poster_url"] or (f"/api/thumb/{pmid}" if pmid else ""),
+        size=r["size_bytes"], file_dc=_rk(r, "file_dc"), my_dc=my_dc,
+        quality=r["quality"], saved=_is_local(_rk(r, "local_path")),
+        versions=_rk(r, "versions") or 0, work=_rk(r, "wk"), part=_rk(r, "part"),
+        guid=r["guid"], wide=not r["poster_url"])
 
 
 @app.get("/releases", response_class=HTMLResponse)
 async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         view: str = "grid", limit: int = 120,
                         offset: int = 0,
-                        min_mb: int = 100, aud: str = "sfw"):
+                        min_mb: int = 100, aud: str = "sfw",
+                        work: Optional[str] = None, sort: str = "best"):
     if not login.session_exists():
         return RedirectResponse("/login")
+    _sorts = {"best": "composite_score DESC NULLS LAST, posted_at DESC NULLS LAST",
+              "new": "posted_at DESC NULLS LAST, id DESC",
+              "size": "size_bytes DESC NULLS LAST, id DESC",
+              "name": "lower(COALESCE(NULLIF(canonical_title, ''), name)), id"}
+    if sort not in _sorts:
+        sort = "best"
     where = ["1=1"]
     params = []
     if q:
@@ -4885,38 +7436,66 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     page_offset = max(0, offset)
     # Composite quality score: parse confidence × tmdb verification × quality tier
     # × grab popularity × recency. Show "best version of any content" first.
-    sql = (f"SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
+    # Several files can be the same work (a 1080p and a 2160p, or the same
+    # film uploaded by different people to different data centers). Show one
+    # card per work - the copy that is best FOR THIS ACCOUNT - with the number
+    # of versions; ?work=<key> lists them all. Nothing is removed.
+    _release_my_dc = await _get_my_dc()
+    _pref = await _version_pref()
+    _count_params = list(params)        # the count query takes the text filters only
+    params.append(_release_my_dc or -1)
+    _same_dc = f"(CASE WHEN m.file_dc = ${len(params)} THEN 1 ELSE 0 END)"
+    _order = (f"same_dc DESC, qr DESC" if _pref == "dc" else f"qr DESC, same_dc DESC")
+    _order += ", size_bytes DESC NULLS LAST, id"
+    _work_filter = ""
+    if work:
+        params.append(work[:300])
+        _work_filter = f"WHERE wk = ${len(params)}"
+    sql = (f"WITH base AS (SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality, "
           f"r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title, "
-          f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, "
+          f"r.primary_msg_id, r.grab_count, m.file_dc, c.audience, r.part, m.local_path, "
+          f"r.movie_year, "
+          f"{_WORK_KEY_SQL} AS wk, {_QUALITY_RANK_SQL} AS qr, {_same_dc} AS same_dc, "
           f"  (r.parse_score "
-          f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
+          f"   * (CASE r.metadata_source WHEN 'tmdb' THEN 1.3 WHEN 'wikidata' THEN 1.2 WHEN 'wikipedia' THEN 1.1 WHEN 'miss' THEN 0.7 ELSE 1.0 END) "
           f"   * (CASE r.quality WHEN '2160p' THEN 1.4 WHEN '1080p' THEN 1.2 WHEN '720p' THEN 1.0 ELSE 0.8 END) "
           f"   * (1 + LEAST(LOG(r.grab_count + 1) / 3.0, 1.0)) "
           f"   * (1.0 / (1 + EXTRACT(EPOCH FROM (NOW() - COALESCE(r.posted_at, NOW())))/86400 * 0.005)) "
           f"  ) AS composite_score "
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
           f"LEFT JOIN channels c ON c.id = m.channel_id "
-          f"WHERE {' AND '.join([_qual(w) for w in where])} "
-          f"ORDER BY composite_score DESC NULLS LAST, r.posted_at DESC NULLS LAST "
-          f"LIMIT {page_size} OFFSET {page_offset}")
-    count_sql = (f"SELECT count(*) FROM releases r "
+          f"WHERE {' AND '.join([_qual(w) for w in where])}), "
+          f"ranked AS (SELECT *, "
+          f"  row_number() OVER (PARTITION BY COALESCE(wk, 'id:' || id::text) ORDER BY {_order}) AS rn, "
+          f"  count(*) OVER (PARTITION BY COALESCE(wk, 'id:' || id::text)) AS versions "
+          f"  FROM base {_work_filter}) "
+          + (f"SELECT * FROM ranked ORDER BY {_order} "
+             if work else
+             f"SELECT * FROM ranked WHERE rn = 1 "
+             f"ORDER BY {_sorts[sort]} ")
+          + f"LIMIT {page_size} OFFSET {page_offset}")
+    count_sql = (f"WITH base AS (SELECT r.id, {_WORK_KEY_SQL} AS wk FROM releases r "
                  f"LEFT JOIN messages m ON m.id = r.primary_msg_id "
                  f"LEFT JOIN channels c ON c.id = m.channel_id "
-                 f"WHERE {' AND '.join([_qual(w) for w in where])}")
-    _release_my_dc = await _get_my_dc()
+                 f"WHERE {' AND '.join([_qual(w) for w in where])}) "
+                 + (f"SELECT count(*) FROM base WHERE wk = ${len(_count_params) + 1}" if work else
+                    f"SELECT count(DISTINCT COALESCE(wk, 'id:' || id::text)) FROM base"))
+    if work:
+        _count_params.append(work[:300])
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
-        total_matched = await conn.fetchval(count_sql, *params)
+        total_matched = await conn.fetchval(count_sql, *_count_params)
 
     def _qs(**overrides) -> str:
-        defaults = {"q": q, "cat": cat, "view": view,
+        defaults = {"q": q, "cat": cat, "view": view if view != "grid" else None,
                     "aud": aud if aud != "sfw" else None,
+                    "sort": sort if sort != "best" else None,
                     "min_mb": min_mb if min_mb != 100 else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
-            if v not in (None, "", 0, "sfw"):
+            if v not in (None, "", "sfw") and not (v == 0 and k != "min_mb"):
                 bits.append(f"{k}={html.escape(str(v))}")
         return "?" + "&".join(bits) if bits else ""
 
@@ -4937,14 +7516,22 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         return (f'<a class="btn ghost" href="{href}" '
                f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
 
+    _nsfw_on = await _is_nsfw_enabled()
     grid_active = "active" if view != "list" else ""
     list_active = "active" if view == "list" else ""
     toolbar = (
         f'<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
-        f'{_chip("","all")}{_chip("movie","movies")}{_chip("tv","tv")}'
-        f'<span style="color:var(--muted);font-size:12px;margin:0 4px">·</span>'
-        f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","NSFW")}{_aud_chip("any","all")}'
-        f'<div style="margin-left:auto" class="view-toggle">'
+        f'{_chip("","all")}{_chip("movie","🎬 films")}{_chip("tv","📺 episodes")}'
+        + (f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
+           f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","18+")}{_aud_chip("any","both")}'
+           if _nsfw_on else '')
+        + f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
+        f'<span style="font-size:12px;color:var(--muted)">Sort:</span>'
+        + "".join(_chip_link(lbl, "/releases" + _qs(sort=None if k == "best" else k, offset=None), sort == k, tip)
+                  for k, lbl, tip in (("best", "best", "known titles and good copies first"),
+                                      ("new", "newest", "most recently posted"),
+                                      ("size", "largest", ""), ("name", "name", "")))
+        + f'<div style="margin-left:auto" class="view-toggle">'
         f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ Grid</a>'
         f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ List</a>'
         f'</div></div>'
@@ -4988,6 +7575,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         body_html = (f'<div class="poster-grid">'
                     f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
                     f'</div>')
+        body_html = body_html.replace('<div class="poster-grid">', '<div class="mc-grid">', 1)
 
     # Build pagination nav
     start_idx = page_offset + 1 if rows else 0
@@ -5011,14 +7599,22 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         f'<div style="display:flex;justify-content:space-between;align-items:center;'
         f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
         f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {start_idx}–{end_idx} of {total_matched:,} '
-        f'<span style="opacity:0.7">({filter_desc})</span></span>'
+        f'showing {start_idx}–{end_idx} of {total_matched:,}</span>'
         f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div>'
         f'</div>')
-    body = (f'<h2 class="section">Parsed releases '
-           f'<span class="count">{len(rows)} of {total_matched:,}</span>'
-           f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;'
-           f'margin-left:10px">{filter_desc}</span></h2>'
+    _what = ("Versions of this title" if work else
+             {"movie": "Films", "tv": "Episodes"}.get(cat or "", "Films and episodes"))
+    _note = []
+    if q:
+        _note.append(f'matching “{html.escape(q)}”')
+    if min_mb > 0 and not work:
+        _note.append(f'{min_mb} MB and larger · <a href="/releases{_qs(min_mb=0, offset=None)}">show smaller too</a>')
+    if work:
+        _note.append('<a href="/releases">← all releases</a>')
+    body = (f'{_THUMB_RETRY_JS}<h2 class="section">{_what} '
+           f'<span class="count">{total_matched:,}</span>'
+           f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
+           f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
            f'{toolbar}{body_html}{pagination_html}')
     actions = (f'<form action="/releases" method="GET" style="margin-left:auto">'
               f'<input type="text" name="q" class="search" placeholder="filter…" '
@@ -5030,9 +7626,14 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 # Page: Downloads (queue + history)
 # ════════════════════════════════════════════════════════════════════
 @app.get("/downloads", response_class=HTMLResponse)
-async def page_downloads():
+async def page_downloads(tab: str = "players", q: Optional[str] = None,
+                         kind: Optional[str] = None, sort: str = "recent",
+                         fav: int = 0, offset: int = 0, limit: int = 50):
     if not login.session_exists():
         return RedirectResponse("/login")
+    tab = "grabs" if tab == "grabs" else "players"
+    page_size = max(10, min(limit, 200))
+    page_offset = max(0, offset)
     _my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
         active = await conn.fetch(
@@ -5053,6 +7654,172 @@ async def page_downloads():
                LEFT JOIN messages m ON m.id = r.primary_msg_id
                WHERE d.status IN ('completed','failed','cancelled')
                ORDER BY d.finished_at DESC NULLS LAST LIMIT 100""")
+
+    fetches = await _player_fetches()
+    saved = (await _player_saved(q, kind, sort, fav, page_size, page_offset)
+             if tab == "players" else None)
+
+    def _dqs(**over):
+        cur = {"tab": None if tab == "players" else tab, "q": q, "kind": kind,
+               "sort": sort if sort != "recent" else None, "fav": 1 if fav else None,
+               "limit": limit if limit != 50 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
+
+    def _render_saved():
+        if saved is None:
+            return ""
+        kinds = saved["kinds"]
+        all_n = sum(kinds.values())
+
+        def chip(label, href, on, extra=""):
+            style = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
+                     "border-color:var(--accent);" if on else "")
+            return (f'<a class="btn ghost" href="/downloads{href}" '
+                    f'style="{style}padding:5px 12px;font-size:12px">{label}{extra}</a>')
+
+        def cnt(n):
+            return f' <span style="opacity:.6">{n:,}</span>'
+        chips = (
+            chip("all", _dqs(kind=None, offset=None), not kind, cnt(all_n))
+            + chip("🎬 films", _dqs(kind="video", offset=None), kind == "video", cnt(kinds.get("video", 0)))
+            + chip("🎵 songs", _dqs(kind="audio", offset=None), kind == "audio", cnt(kinds.get("audio", 0)))
+            + chip("📄 books", _dqs(kind="book", offset=None), kind == "book", cnt(kinds.get("library", 0)))
+            + '<span style="margin-left:8px"></span>'
+            + chip("♥ favourites", _dqs(fav=None if fav else 1, offset=None), bool(fav))
+            + '<span style="margin-left:14px;color:var(--muted);font-size:12px">Sort:</span>'
+            + chip("last opened", _dqs(sort=None, offset=None), sort == "recent")
+            + chip("oldest", _dqs(sort="oldest", offset=None), sort == "oldest")
+            + chip("largest", _dqs(sort="size", offset=None), sort == "size")
+            + chip("name", _dqs(sort="name", offset=None), sort == "name"))
+        search = (
+            '<form method="GET" action="/downloads" style="display:flex;gap:8px;margin:0 0 12px">'
+            + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
+                      for k, v in (("kind", kind), ("sort", sort if sort != "recent" else None),
+                                   ("fav", 1 if fav else None)) if v)
+            + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+              'placeholder="find a saved file by name…" style="flex:1;max-width:420px"/>'
+              '<button class="btn" type="submit">Search</button>'
+            + (f'<a class="btn ghost" href="/downloads{_dqs(q=None, offset=None)}">clear</a>' if q else '')
+            + '</form>')
+        head = (f'<h2 class="section">Saved from players <span class="count">{saved["total"]:,}</span>'
+                f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
+                f'text-transform:none;letter-spacing:0;margin-left:10px">'
+                f'{_fmt_size(saved["bytes"]) or "0 MB"} · '
+                f'<a href="/settings#cache">clean-up rules</a></span></h2>'
+                f'{search}'
+                f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
+        if not saved["rows"]:
+            return head + ('<div class="empty-state"><div class="icon">💾</div><div>'
+                           + ("Nothing saved matches." if (q or kind or fav or page_offset) else
+                              "Films, songs and books you open are kept here so they open "
+                              "instantly next time.") + '</div></div>')
+        ico = {"video": "🎬", "audio": "🎵"}
+        trs = []
+        for r, have in zip(saved["rows"], saved["have"]):
+            total = r["file_size"] or 0
+            if have is None:
+                state = '<span class="pill bad" title="the file is no longer on disk">missing</span>'
+            elif total and have < total:
+                state = (f'<span class="pill warn" title="not all of it has arrived">'
+                         f'{have * 100 // total}%</span>')
+            else:
+                state = ""
+            trs.append(
+                f'<tr data-id="{r["id"]}">'
+                f'<td class="ck"><input type="checkbox" class="sv"/></td>'
+                f'<td class="ic">{ico.get(r["media_type"], "📄")}</td>'
+                f'<td class="nm"><a href="/watch/{r["id"]}">'
+                f'{html.escape(r["file_name"] or r["local_path"].rsplit("/", 1)[-1])}</a> '
+                f'{"<span style=color:#e11d48>♥</span>" if r["fav"] else ""} {state}</td>'
+                f'<td class="num">{_fmt_size(total)}</td>'
+                f'<td class="num">{_fmt_time(r["used"]) if r["used"] else ""}</td>'
+                f'<td class="ac"><div class="dl-ctrls">'
+                f'<a class="dl-btn sq" href="/media/{r["id"]}" download '
+                f'title="download to this device">⬇</a>'
+                f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
+                f'title="remove from the server">✗</button></div></td></tr>')
+        table = (
+            '<style>.sv-list{width:100%;border-collapse:collapse;background:var(--surface);'
+            'border:1px solid var(--border);border-radius:10px;overflow:hidden}'
+            '.sv-list th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);'
+            'text-align:left;padding:9px 10px;border-bottom:1px solid var(--border)}'
+            '.sv-list td{padding:7px 10px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}'
+            '.sv-list tr:last-child td{border-bottom:none}.sv-list tr:hover td{background:rgba(127,127,127,.06)}'
+            '.sv-list .ck{width:30px}.sv-list .ic{width:30px}.sv-list .num{white-space:nowrap;color:var(--muted);'
+            'font-size:13px}.sv-list .ac{white-space:nowrap;text-align:right}'
+            '.sv-list .nm a{color:var(--fg);text-decoration:none;word-break:break-all}'
+            '.sv-list .nm a:hover{color:var(--accent)}</style>'
+            '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
+            '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
+            '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
+            '<span id="svN" style="color:var(--muted)"></span></div>'
+            '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
+            '<th>last opened</th><th></th></tr></thead>'
+            f'<tbody>{"".join(trs)}</tbody></table>'
+            + _page_nav("/downloads", _dqs, page_offset, page_size, len(saved["rows"]), saved["total"])
+            + '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
+              'n=document.getElementById("svN");const boxes=()=>[...document.querySelectorAll(".sv")];'
+              'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;n.textContent=c?c+" selected":""}'
+              'all.onchange=()=>{boxes().forEach(b=>b.checked=all.checked);upd()};'
+              'boxes().forEach(b=>b.onchange=upd);'
+              'window.svRemove=function(){const ids=boxes().filter(b=>b.checked).map(b=>+b.closest("tr").dataset.id);'
+              'if(!ids.length||!confirm("Remove "+ids.length+" file(s) from the server? They stay in the index '
+              'and can be fetched again."))return;'
+              'fetch("/api/fetch/remove",{method:"POST",headers:{"Content-Type":"application/json"},'
+              'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>')
+        return head + table
+
+    _fetch_js = ('<script>function fetchCancel(id){fetch("/api/fetch/"+id+"/cancel",{method:"POST"})'
+                 '.then(()=>location.reload())}'
+                 'function fetchAct(id,a){fetch("/api/fetch/"+id+"/"+a,{method:"POST"})'
+                 '.then(()=>setTimeout(()=>location.reload(),600))}'
+                 'function fetchRemove(id){if(confirm("Remove this file from the server? '
+                 'It stays in the index and can be fetched again."))fetchCancel(id)}</script>')
+
+    def _render_fetches():
+        if not fetches:
+            return ""
+        items = []
+        for it in fetches:
+            r, have, total = it["r"], it["have"], it["r"]["file_size"] or 0
+            pct = round(have * 100 / total, 1) if total else 0
+            label, cls, icon = {
+                "queued": ("queued", "warn", "⏳"),
+                "fetching": ("arriving", "accent", "⬇"),
+                "stopped": ("stopped — nobody is watching", "muted", "⏸"),
+                "paused": ("paused", "muted", "⏸"),
+            }[it["state"]]
+            if it.get("pinned") and it["state"] in ("queued", "fetching"):
+                label += " · will finish on its own"
+            if it["state"] in ("queued", "fetching"):
+                act = (f'<button class="dl-btn" onclick="fetchAct({r["id"]},\'pause\')" '
+                       f'title="stop for now and keep what has arrived">⏸ Pause</button>')
+            else:
+                act = (f'<button class="dl-btn ok" onclick="fetchAct({r["id"]},\'resume\')" '
+                       f'title="fetch the rest, even with no player open">▶ Resume</button>')
+            dc = _dc_badge(r["file_dc"], _my_dc) if r["file_dc"] else ""
+            items.append(
+                f'<div class="dl-item"><div class="icon">{icon}</div><div class="info">'
+                f'<div class="name"><a href="/watch/{r["id"]}" style="color:inherit;text-decoration:none">'
+                f'{html.escape(r["file_name"] or "(no name)")}</a></div>'
+                f'<div class="meta"><span class="pill {cls}">{label}</span>{dc}'
+                f'<span>· {_fmt_size(total)}</span></div>'
+                f'<div class="dl-progress"><div class="dl-progress-bar"><div class="dl-progress-fill" '
+                f'style="width:{pct}%"></div></div>'
+                f'<div class="dl-progress-meta">{pct:.1f}% · {_fmt_size(have) or "0"} / {_fmt_size(total)}</div></div>'
+                f'</div><div class="right"><div class="dl-ctrls">{act}'
+                f'<button class="dl-btn bad" onclick="fetchCancel({r["id"]})" '
+                f'title="stop, and remove what has arrived">✗ Cancel</button></div></div></div>')
+        return (
+            f'<h2 class="section">Opened in a player <span class="count">{len(fetches)}</span></h2>'
+            '<div style="color:var(--muted);font-size:13px;margin:-6px 0 12px">'
+            'Opening a film fetches it from Telegram. It keeps arriving while its player is open, '
+            'stops when it is closed, and continues from the same point when it is opened again. '
+            '<b>Resume</b> here fetches the rest with no player open; <b>Pause</b> stops it and keeps '
+            'what has arrived.</div>'
+            f'<div class="dl-list">{"".join(items)}</div>')
 
     def _render(rows, show_finished):
         if not rows:
@@ -5145,7 +7912,9 @@ async def page_downloads():
     # Auto-refresh while any download is in flight, so progress bar updates
     # without manual reload. Stops refreshing when queue empties.
     refresh_js = ('<script>setTimeout(()=>location.reload(),5000)</script>'
-                  if active else '')
+                  if ((tab == "grabs" and active) or
+                      (tab == "players" and any(f["state"] != "stopped" for f in fetches)
+                       and not page_offset and not q)) else '')
     ctrl_js = '''<script>
 function dlAct(id, action){
   if(action==='delete' && !confirm('Delete this download?')) return;
@@ -5155,22 +7924,48 @@ function dlAct(id, action){
     .catch(e=>alert('failed: '+e));
 }
 </script>
-<style>
-.dl-ctrls{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;margin-bottom:4px}
-.dl-btn{font-size:11px;padding:4px 10px;border:1px solid #d1d5db;background:#f9fafb;border-radius:4px;cursor:pointer;color:#374151}
-.dl-btn:hover{background:#e5e7eb}
-.dl-btn.ok{color:#065f46;border-color:#a7f3d0;background:#ecfdf5}
-.dl-btn.ok:hover{background:#d1fae5}
-.dl-btn.bad{color:#991b1b;border-color:#fecaca;background:#fef2f2}
-.dl-btn.bad:hover{background:#fee2e2}
-.dl-time{font-size:11px;color:#888;text-align:right;margin-top:2px}
-</style>'''
-    body = (f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
-           f'{_render(active, show_finished=False)}'
-           f'<h2 class="section">History <span class="count">last 100</span></h2>'
-           f'{_render(done, show_finished=True)}'
-           f'{ctrl_js}'
-           f'{refresh_js}')
+'''
+    # one look for every action button on this page: same height, same width
+    # for the worded ones, square for the icon-only ones in the table
+    dl_css = """<style>
+.dl-item .right{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:4px}
+.dl-ctrls{display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:nowrap}
+.dl-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;box-sizing:border-box;
+  min-width:104px;height:34px;padding:0 14px;font:inherit;font-size:13px;font-weight:500;line-height:1;
+  border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;
+  cursor:pointer;text-decoration:none;white-space:nowrap;transition:background .12s,border-color .12s,color .12s}
+.dl-btn:hover{border-color:var(--accent);color:var(--accent)}
+.dl-btn:disabled{opacity:.4;cursor:default;border-color:var(--border);color:var(--fg)}
+.dl-btn.ok{color:#047857;border-color:#a7f3d0;background:#ecfdf5}
+.dl-btn.ok:hover{background:#d1fae5;border-color:#34d399;color:#047857}
+.dl-btn.bad{color:#b91c1c;border-color:#fecaca;background:#fef2f2}
+.dl-btn.bad:hover{background:#fee2e2;border-color:#f87171;color:#b91c1c}
+.dl-btn.sq{min-width:34px;width:34px;padding:0}
+.dl-time{font-size:11px;color:#888;text-align:right}
+@media (max-width:640px){.dl-btn{min-width:0;padding:0 10px}.dl-ctrls{flex-wrap:wrap}}
+</style>"""
+
+    def _tab(key, label, n):
+        on = tab == key
+        style = ("border-bottom:2px solid var(--accent);color:var(--accent-hi);font-weight:600;"
+                 if on else "border-bottom:2px solid transparent;color:var(--muted);")
+        href = "/downloads" if key == "players" else "/downloads?tab=grabs"
+        return (f'<a href="{href}" style="{style}padding:8px 4px;margin-right:22px;'
+                f'text-decoration:none;font-size:15px">{label}'
+                + (f' <span style="font-size:12px;opacity:.7">{n}</span>' if n else '') + '</a>')
+    tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
+            + _tab("players", "Opened in players", len(fetches))
+            + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active)) + '</div>')
+    if tab == "players":
+        body = f'{dl_css}{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
+    else:
+        body = (f'{dl_css}{tabs}'
+                f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
+                f'{_render(active, show_finished=False)}'
+                f'<h2 class="section">History <span class="count">last 100</span></h2>'
+                f'{_render(done, show_finished=True)}'
+                f'{ctrl_js}'
+                f'{refresh_js}')
     return HTMLResponse(_layout("Downloads", "/downloads", body))
 
 
@@ -5182,105 +7977,133 @@ async def page_search(q: Optional[str] = None,
                       scope: Optional[str] = None):
     if not login.session_exists():
         return RedirectResponse("/login")
-
-    scope = scope or "releases"  # releases | messages | channels
-    results_html = ""
-    elapsed_ms = 0
+    scope = scope if scope in ("releases", "messages", "channels") else "releases"
+    nsfw_on = await _is_nsfw_enabled()
+    # what may be shown: never the hard-blocked, adult only when switched on
+    gate = ("COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
+            + ("" if nsfw_on else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"))
+    results_html, elapsed_ms, found = "", 0, 0
     if q:
         t0 = time.time()
+        my_dc = await _get_my_dc()
         if scope == "messages":
-            res = await meili_search("messages", q, limit=120)
+            res = await meili_search("messages", q, limit=150)
             ids = [h["id"] for h in res.get("hits", [])]
+            rows = []
             if ids:
                 async with db_pool.acquire() as conn:
                     rows = await conn.fetch(f"""
-                        SELECT m.id, m.file_name, m.media_type, m.file_size,
-                               m.posted_at, m.local_path, m.thumb_path,
-                               c.username AS channel_username, c.title AS channel_title
-                        FROM messages m JOIN channels c ON c.id=m.channel_id
-                        WHERE m.id = ANY($1::bigint[])
-                        ORDER BY array_position($1::bigint[], m.id)
-                    """, ids)
-                cards = []
-                for r in rows:
-                    fname = html.escape((r["file_name"] or "(no name)")[:120])
-                    sz = (r["file_size"] or 0) // 1024 // 1024
-                    ch = html.escape(r["channel_username"] or r["channel_title"] or "")
-                    cards.append(
-                        f'<div class="card" style="padding:12px"><div style="font-weight:600;font-size:13px">{fname}</div>'
-                        f'<div style="font-size:11px;color:#888;margin-top:4px">'
-                        f'{html.escape(r["media_type"] or "")} · {sz}MB · @{ch}</div></div>')
-                results_html = (
-                    f'<h2 class="section">Messages <span class="count">{res.get("estimatedTotalHits", len(ids))}</span></h2>'
-                    f'<div class="poster-grid">{"".join(cards)}</div>')
+                        SELECT m.id, m.file_name, m.media_type, m.file_size, m.caption,
+                               m.posted_at, m.local_path, m.file_dc,
+                               c.username AS ch_user, c.title AS ch_title
+                        FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE m.id = ANY($1::bigint[]) AND {gate}
+                        ORDER BY array_position($1::bigint[], m.id)""", ids)
+            found = len(rows)
+            ico = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
+            items = []
+            for r in rows:
+                name = r["file_name"] or (r["caption"] or "")[:90] or f'{r["media_type"] or "file"} {r["id"]}'
+                href = (f'/gallery?q={_q(q)}' if r["media_type"] == "photo" else f'/watch/{r["id"]}')
+                items.append(
+                    f'<div class="ls-row"><div style="width:30px;text-align:center;font-size:20px">'
+                    f'{ico.get(r["media_type"], "📄")}</div>'
+                    f'<div class="ls-main"><div class="ls-title"><a href="{href}">{html.escape(name)}</a> '
+                    + ('<span class="tag ok">saved</span>' if _is_local(r["local_path"]) else '')
+                    + f'</div><div class="ls-sub"><span>{html.escape(r["ch_title"] or r["ch_user"] or "")}</span>'
+                    f'<span>{_fmt_size(r["file_size"])}</span>'
+                    f'<span>{_fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""}</span></div></div>'
+                    f'<div class="ls-act"><a class="abtn" href="{href}">Open</a></div></div>')
+            results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         elif scope == "channels":
-            res = await meili_search("channels", q, limit=60)
-            hits = res.get("hits", [])
-            cards = []
-            for h in hits:
-                title = html.escape((h.get("title") or "")[:80])
-                un = html.escape(h.get("username") or "")
-                members = h.get("members_count", 0)
-                sub = "★" if h.get("subscribed") else ""
-                cards.append(
-                    f'<div class="card" style="padding:14px"><div style="font-weight:600">{title} {sub}</div>'
-                    f'<div style="font-size:12px;color:#888;margin-top:4px">@{un} · {members:,} members · {html.escape(h.get("content_category") or "")}</div></div>')
-            results_html = (
-                f'<h2 class="section">Channels <span class="count">{res.get("estimatedTotalHits", len(hits))}</span></h2>'
-                f'<div class="poster-grid">{"".join(cards)}</div>')
+            res = await meili_search("channels", q, limit=80)
+            unames = [h.get("username") for h in res.get("hits", []) if h.get("username")]
+            rows = []
+            if unames:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(f"""
+                        SELECT c.username, c.title, c.members_count, c.subscribed, c.is_joined,
+                               c.audience, c.dead_at
+                        FROM channels c WHERE c.username = ANY($1::text[]) AND {gate}
+                        ORDER BY array_position($1::text[], c.username)""", unames)
+            found = len(rows)
+            items = []
+            for r in rows:
+                title = r["title"] or ("@" + r["username"])
+                tag = ('<span class="tag bad">gone</span>' if r["dead_at"] else
+                       '<span class="tag ok">joined</span>' if r["is_joined"] else
+                       '<span class="tag acc">followed</span>' if r["subscribed"] else '')
+                items.append(
+                    f'<div class="ls-row">{_avatar(title)}'
+                    f'<div class="ls-main"><div class="ls-title">{html.escape(title)} {tag}</div>'
+                    f'<div class="ls-sub"><a href="https://t.me/{html.escape(r["username"])}" target="_blank" '
+                    f'rel="noopener">@{html.escape(r["username"])}</a></div></div>'
+                    f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
+                    f'<div class="ls-act"><a class="abtn" href="/channels?q={_q(r["username"])}">Details</a></div></div>')
+            results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         else:
-            res = await meili_search("releases", q, limit=120)
+            res = await meili_search("releases", q, limit=150)
             ids = [h["id"] for h in res.get("hits", [])]
             rows = []
-            _release_my_dc = await _get_my_dc()
             if ids:
                 async with db_pool.acquire() as conn:
-                    rows = await conn.fetch("""
+                    rows = await conn.fetch(f"""
                         SELECT r.id, r.guid, r.name, r.category, r.season, r.episode, r.quality,
-                               r.size_bytes, r.posted_at, r.parse_score, r.poster_url, r.canonical_title,
-                               r.primary_msg_id, m.file_dc
-                        FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id
-                        WHERE r.id = ANY($1::bigint[])
-                        ORDER BY array_position($1::bigint[], r.id)
-                    """, ids)
-            if not rows:
-                results_html = ('<div class="empty-state">'
-                              '<div class="icon">🔍</div>'
-                              f'<div>No matches for <strong>{html.escape(q)}</strong></div>'
-                              '<div style="margin-top:8px;font-size:12px">Try fewer words or different spelling.</div>'
-                              '</div>')
-            else:
-                results_html = (
-                    f'<h2 class="section">Releases <span class="count">{res.get("estimatedTotalHits", len(rows))}</span></h2>'
-                    f'<div class="poster-grid">'
-                    f'{"".join(_release_card(r, _release_my_dc) for r in rows)}'
-                    f'</div>')
+                               r.size_bytes, r.posted_at, r.poster_url, r.canonical_title,
+                               r.primary_msg_id, r.movie_year, r.part, m.file_dc, m.local_path,
+                               {_WORK_KEY_SQL} AS wk
+                        FROM releases r
+                        JOIN messages m ON m.id = r.primary_msg_id
+                        JOIN channels c ON c.id = m.channel_id
+                        WHERE r.id = ANY($1::bigint[]) AND {gate}
+                        ORDER BY array_position($1::bigint[], r.id)""", ids)
+            # one card per title: the best-ranked copy leads, the rest are one click away
+            groups, order = {}, []
+            for r in rows:
+                k = r["wk"] or f"id:{r['id']}"
+                if k not in groups:
+                    groups[k] = []
+                    order.append(k)
+                groups[k].append(r)
+            found = len(order)
+            cards = []
+            for k in order:
+                lead = dict(groups[k][0])
+                lead["versions"] = len(groups[k])
+                cards.append(_release_card(lead, my_dc))
+            results_html = f'<div class="mc-grid">{"".join(cards)}</div>' if cards else ""
         elapsed_ms = int((time.time() - t0) * 1000)
+        if not results_html:
+            results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
+                            f'<div>Nothing found for <strong>{html.escape(q)}</strong></div>'
+                            '<div style="margin-top:8px;font-size:13px">Try fewer words, another spelling, '
+                            'or one of the other tabs.</div></div>')
+    else:
+        results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
+                        '<div>Search everything tgarr has indexed.</div>'
+                        '<div style="margin-top:8px;font-size:13px">Films and episodes by title · '
+                        'any file by its name · channels by name or @username.</div></div>')
 
     def tab(name, label):
-        active = (scope == name)
-        style = ("background:var(--accent);color:#fff;" if active
-                 else "background:var(--card);color:var(--fg);")
-        return (f'<a href="/search?q={html.escape(q or "")}&scope={name}" '
-                f'style="{style}padding:6px 14px;border-radius:6px;text-decoration:none;font-size:13px">{label}</a>')
-
-    timing = f'<span style="font-size:11px;color:#888;margin-left:10px">({elapsed_ms}ms · Meili)</span>' if q else ""
-
-    body = f"""
-<form action="/search" method="GET" style="margin-bottom:14px;display:flex;gap:10px">
-  <input type="text" name="q" value="{html.escape(q) if q else ''}"
-         placeholder="Search across releases, messages, channels…"
-         style="flex:1;font-size:15px;padding:11px 16px" autofocus />
-  <input type="hidden" name="scope" value="{scope}">
-  <button type="submit">Search</button>
-</form>
-<div style="display:flex;gap:8px;margin-bottom:18px;align-items:center">
-  {tab("releases","Releases")}
-  {tab("messages","Messages")}
-  {tab("channels","Channels")}
-  {timing}
-</div>
-{results_html}"""
+        on = scope == name
+        style = ("border-bottom:2px solid var(--accent);color:var(--accent-hi);font-weight:600;"
+                 if on else "border-bottom:2px solid transparent;color:var(--muted);")
+        return (f'<a href="/search?q={_q(q or "")}&scope={name}" style="{style}padding:8px 4px;'
+                f'margin-right:22px;text-decoration:none;font-size:15px">{label}'
+                + (f' <span style="font-size:12px;opacity:.7">{found:,}</span>' if on and q else '') + '</a>')
+    body = (
+        f'{_LIST_CSS}{_THUMB_RETRY_JS}'
+        '<form action="/search" method="GET" style="margin-bottom:16px;display:flex;gap:10px">'
+        f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+        'placeholder="a film, a file name, a channel…" '
+        'style="flex:1;font-size:16px;padding:12px 16px" autofocus />'
+        f'<input type="hidden" name="scope" value="{scope}">'
+        '<button type="submit" style="padding:0 22px">Search</button></form>'
+        '<div style="display:flex;align-items:flex-end;border-bottom:1px solid var(--border);margin-bottom:20px">'
+        + tab("releases", "Films &amp; episodes") + tab("messages", "All files") + tab("channels", "Channels")
+        + (f'<span style="margin-left:auto;font-size:11px;color:var(--muted);padding-bottom:10px">'
+           f'{elapsed_ms} ms</span>' if q else '')
+        + f'</div>{results_html}')
     return HTMLResponse(_layout("Search", "/search", body, top_actions_html=""))
 
 
@@ -5297,13 +8120,24 @@ async def page_settings(request: Request):
         meta_stats = await conn.fetchrow("""
             SELECT count(*) AS total,
                    count(*) FILTER (WHERE metadata_source='tmdb') AS tmdb,
-                   count(*) FILTER (WHERE metadata_source='wikipedia') AS wiki,
+                   count(*) FILTER (WHERE metadata_source IN ('wikidata', 'wikipedia')) AS wiki,
                    count(*) FILTER (WHERE metadata_source='miss') AS missed,
                    count(*) FILTER (WHERE metadata_source IS NULL) AS pending
             FROM releases
         """)
     tmdb_masked = (tmdb_raw[:6] + "…" + tmdb_raw[-4:]) if tmdb_raw else ""
     nsfw_on = await _is_nsfw_enabled()
+    async with db_pool.acquire() as conn:
+        version_pref = await conn.fetchval(
+            "SELECT value FROM config WHERE key='version_preference'") or "quality"
+    my_dc_disp = (await _get_my_dc()) or "?"
+    cache_ttl, cache_gb = await _cache_settings()
+    _usage = await _cache_usage()
+    _kind = {"video": "videos", "audio": "songs", "library": "books"}
+    cache_total = _fmt_size(sum(r["bytes"] for r in _usage)) or "0 MB"
+    cache_detail = " · ".join(
+        f'{r["n"]:,} {_kind.get(r["kind"], r["kind"])} ({_fmt_size(r["bytes"]) or "0"})'
+        for r in _usage) or "nothing downloaded yet"
     user_html = (
         f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
         f'<span class="pill ok">signed in</span></div>'
@@ -5316,6 +8150,16 @@ async def page_settings(request: Request):
     )
 
     body = f"""
+<style>
+.settings .dl-item .meta {{ display:block; line-height:1.65; }}
+.settings .dl-item .meta .pill {{ vertical-align:middle; }}
+.settings input[type=number] {{ font:inherit; font-size:14px; padding:6px 8px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--fg); text-align:center; }}
+.settings details.adv {{ margin-top:26px; }}
+.settings details.adv summary {{ cursor:pointer; font-size:13px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.07em; }}
+.settings details.adv summary:hover {{ color:var(--accent); }}
+</style>
+<script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
+<div class="settings">
 <h2 class="section">Telegram account</h2>
 <div class="dl-list">
   <div class="dl-item">
@@ -5327,46 +8171,61 @@ async def page_settings(request: Request):
   </div>
 </div>
 
-<h2 class="section">Crawler</h2>
+<h2 class="section">Library</h2>
 <div class="dl-list">
   <div class="dl-item">
-    <div class="icon">⚙</div>
-    <div class="info"><div class="name">Parser score threshold</div>
-      <div class="meta">Messages below this score don't become releases</div></div>
-    <div class="right"><code>{os.environ.get("TG_PARSE_SCORE_MIN","0.30")}</code></div>
+    <div class="icon">🎯</div>
+    <div class="info">
+      <div class="name">When a title has several versions, show first — <span class="pill ok">{'my data center' if version_pref == 'dc' else 'best quality'}</span></div>
+      <div class="meta">
+        The same film is often posted more than once: different resolutions, or
+        the same file uploaded to different Telegram data centers. tgarr shows
+        one card per title and keeps every version one click away.
+        Your account is on <strong>DC {my_dc_disp}</strong>; a copy on that data
+        center is your fastest path.
+      </div>
+      <form method="POST" action="/api/settings/version_preference" style="margin-top:12px;font-size:14px;line-height:1.7">
+        <label style="display:block;cursor:pointer">
+          <input type="radio" name="value" value="quality" {'checked' if version_pref != 'dc' else ''} onchange="this.form.submit()" />
+          <strong>Best quality first</strong> — higher resolution wins; between equal resolutions, the copy on my data center wins.
+        </label>
+        <label style="display:block;cursor:pointer">
+          <input type="radio" name="value" value="dc" {'checked' if version_pref == 'dc' else ''} onchange="this.form.submit()" />
+          <strong>My data center first</strong> — a copy on my data center wins, then resolution.
+        </label>
+        <div style="color:var(--muted);font-size:12px;margin-top:6px">
+          While Telegram is rate-limiting cross-data-center access, tgarr leads with your data center regardless of this choice.
+        </div>
+      </form>
+    </div>
   </div>
-  <div class="dl-item">
-    <div class="icon">📁</div>
-    <div class="info"><div class="name">Download root</div>
-      <div class="meta">Where MTProto-fetched files land</div></div>
-    <div class="right"><code>{os.environ.get("TG_DOWNLOAD_ROOT","/downloads/tgarr")}</code></div>
+  <div class="dl-item" id="cache">
+    <div class="icon">💾</div>
+    <div class="info">
+      <div class="name">Downloaded files — <span class="pill ok">{cache_total}</span></div>
+      <div class="meta">
+        Opening a film, a song or a book downloads it here so it plays, and
+        opens instantly next time. Saved items carry a
+        <span class="pill ok" style="font-size:11px">● saved</span> mark in the lists.
+        Now on disk: {cache_detail}.<br/>
+        tgarr tidies up by itself: a file nobody opened for a while is removed
+        (it stays in the index; opening it again fetches it again). Files
+        grabbed through Sonarr/Radarr are never touched.
+      </div>
+      <form method="POST" action="/api/settings/cache" style="margin-top:12px;font-size:14px;line-height:2.2">
+        Remove a file not opened for
+        <input type="number" name="ttl_days" value="{cache_ttl}" min="0" style="width:70px" /> days,
+        and keep the total under
+        <input type="number" name="max_gb" value="{cache_gb}" min="0" style="width:70px" /> GB
+        <span style="color:var(--muted);font-size:12px">(0 = no limit)</span>
+        <button class="btn" type="submit" style="margin-left:8px">Save</button>
+      </form>
+      <form method="POST" action="/api/settings/cache_clear" style="margin-top:6px"
+            onsubmit="return confirm('Remove every downloaded film, song and book from this server? They stay in the index and can be fetched again.')">
+        <button class="ghost" type="submit">Remove all downloaded files now</button>
+      </form>
+    </div>
   </div>
-  <div class="dl-item">
-    <div class="icon">🔢</div>
-    <div class="info"><div class="name">Backfill limit per channel</div>
-      <div class="meta">Max historical messages scanned on first run</div></div>
-    <div class="right"><code>{os.environ.get("TG_BACKFILL_LIMIT","5000")}</code></div>
-  </div>
-</div>
-
-<h2 class="section">External endpoints</h2>
-<div class="dl-list">
-  <div class="dl-item">
-    <div class="icon">🔌</div>
-    <div class="info"><div class="name">Newznab indexer URL</div>
-      <div class="meta">Paste into Sonarr / Radarr → Settings → Indexers → ➕ Newznab</div></div>
-    <div class="right"><code>{html.escape(_base_url(request))}/newznab/</code></div>
-  </div>
-  <div class="dl-item">
-    <div class="icon">⬇</div>
-    <div class="info"><div class="name">SABnzbd URL base</div>
-      <div class="meta">Paste into Sonarr / Radarr → Download Clients → ➕ SABnzbd → URL Base</div></div>
-    <div class="right"><code>/sabnzbd</code></div>
-  </div>
-</div>
-
-<h2 class="section">Content policy</h2>
-<div class="dl-list">
   <div class="dl-item">
     <div class="icon">🔞</div>
     <div class="info">
@@ -5412,8 +8271,8 @@ async def page_settings(request: Request):
   <div class="dl-item">
     <div class="icon">🔑</div>
     <div class="info">
-      <div class="name">TMDB API key <span class="pill {('ok' if tmdb_raw else 'muted')}">{('configured' if tmdb_raw else 'not set — using Wikipedia fallback')}</span></div>
-      <div class="meta">Posters &amp; canonical titles from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a> (free, personal use). If empty, tgarr falls back to free Wikipedia REST — lower coverage but no key needed.</div>
+      <div class="name">TMDB API key <span class="pill {('ok' if tmdb_raw else 'muted')}">{('configured' if tmdb_raw else 'not set — using Wikidata only')}</span></div>
+      <div class="meta">Posters &amp; canonical titles from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a> (free, personal use). Without a key, titles are still recognised through Wikidata (free, no key), with fewer posters.</div>
       <form method="POST" action="/api/settings/tmdb_key" style="margin-top:12px;display:flex;gap:10px;max-width:600px">
         <input type="text" name="value" placeholder="paste your TMDB API key (or leave blank to clear)" value="{html.escape(tmdb_masked)}" style="flex:1" />
         <button type="submit">Save</button>
@@ -5426,7 +8285,7 @@ async def page_settings(request: Request):
       <div class="name">Enrichment progress</div>
       <div class="meta">
         <span class="pill accent">TMDB {meta_stats['tmdb']:,}</span>
-        <span class="pill ok">Wikipedia {meta_stats['wiki']:,}</span>
+        <span class="pill ok">Wikidata {meta_stats['wiki']:,}</span>
         <span class="pill warn">Not found {meta_stats['missed']:,}</span>
         <span class="pill muted">Pending {meta_stats['pending']:,}</span>
         / total {meta_stats['total']:,}
@@ -5434,6 +8293,48 @@ async def page_settings(request: Request):
     </div>
   </div>
 </div>
+
+<h2 class="section">Connect Sonarr / Radarr</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🔌</div>
+    <div class="info"><div class="name">Newznab indexer</div>
+      <div class="meta">Settings → Indexers → + → Newznab → URL</div></div>
+    <div class="right" style="display:flex;gap:8px;align-items:center"><code>{html.escape(_base_url(request))}/newznab/</code>
+      <button class="ghost" onclick="tgCopy(this)" data-v="{html.escape(_base_url(request))}/newznab/">Copy</button></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">⬇</div>
+    <div class="info"><div class="name">SABnzbd download client</div>
+      <div class="meta">Settings → Download Clients → + → SABnzbd → same host and port, URL Base</div></div>
+    <div class="right" style="display:flex;gap:8px;align-items:center"><code>/sabnzbd</code>
+      <button class="ghost" onclick="tgCopy(this)" data-v="/sabnzbd">Copy</button></div>
+  </div>
+</div>
+
+<details class="adv"><summary>Advanced — values set when the containers were started</summary>
+<div class="dl-list" style="margin-top:12px">
+  <div class="dl-item">
+    <div class="icon">⚙</div>
+    <div class="info"><div class="name">Parser score threshold</div>
+      <div class="meta">A file whose name scores below this is not treated as a film or an episode · TG_PARSE_SCORE_MIN</div></div>
+    <div class="right"><code>{os.environ.get("TG_PARSE_SCORE_MIN","0.30")}</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">📁</div>
+    <div class="info"><div class="name">Download root</div>
+      <div class="meta">Where grabbed files are written · TG_DOWNLOAD_ROOT</div></div>
+    <div class="right"><code>{os.environ.get("TG_DOWNLOAD_ROOT","/downloads/tgarr")}</code></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">🔢</div>
+    <div class="info"><div class="name">Backfill limit per channel</div>
+      <div class="meta">How far back a channel is read the first time · TG_BACKFILL_LIMIT</div></div>
+    <div class="right"><code>{os.environ.get("TG_BACKFILL_LIMIT","5000")}</code></div>
+  </div>
+</div>
+<div style="font-size:12.5px;color:var(--muted);margin:10px 4px">Change them in <code>docker-compose.yml</code> / <code>.env</code> and restart. Background jobs and their state: <a href="/system">System</a>.</div>
+</details>
 
 <h2 class="section">About</h2>
 <div class="dl-list">
@@ -5443,6 +8344,7 @@ async def page_settings(request: Request):
       <div class="meta">Self-hosted Telegram-as-source bridge · MIT license</div></div>
     <div class="right"><a class="btn ghost" href="https://tgarr.me" target="_blank">tgarr.me ↗</a></div>
   </div>
+</div>
 </div>
 """
     return HTMLResponse(_layout("Settings", "/settings", body))

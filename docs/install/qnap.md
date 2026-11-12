@@ -31,7 +31,7 @@ Fill in:
 Then the standard flow:
 
 ```bash
-docker compose run --rm crawler python login.py   # SMS code prompt
+# then sign in in the browser: http://<your-host>:8765
 docker compose up -d
 docker compose logs -f crawler
 ```
