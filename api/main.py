@@ -6913,7 +6913,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
             f"JOIN channels c ON c.id = m.channel_id "
             f"LEFT JOIN releases r ON r.primary_msg_id = m.id "
             f"WHERE {where_sql} "
-            f"ORDER BY {'m.file_size DESC NULLS LAST, m.id DESC' if sort == 'size' else 'm.posted_at DESC NULLS LAST, m.id DESC'} "
+            f"ORDER BY {'m.file_size DESC NULLS LAST, m.id DESC' if sort == 'size' else 'm.posted_at DESC NULLS LAST'} "
             f"LIMIT {page_size} OFFSET {page_offset}",
             *params)
 
