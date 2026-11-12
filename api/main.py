@@ -4293,6 +4293,92 @@ def _fmt_time(t):
     return t.strftime("%Y-%m-%d %H:%M") if t else ""
 
 
+def _fmt_count(n) -> str:
+    """12 -> 12, 8700 -> 8.7K, 12521500 -> 12.5M. ("12521.5K" is not a number
+    anyone reads.)"""
+    if n is None:
+        return "–"
+    n = int(n)
+    for div, suf in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if abs(n) >= div:
+            v = n / div
+            return (f"{v:.0f}" if v >= 100 else f"{v:.1f}".rstrip("0").rstrip(".")) + suf
+    return str(n)
+
+
+def _n_things(n, word: str) -> str:
+    """ "1 film", "3.1K films" """
+    return f"{_fmt_count(n)} {word[:-1] if n == 1 and word.endswith('s') else word}"
+
+
+def _ago(dt) -> str:
+    """A moment as people say it: "3 min ago", "2 h ago", "5 d ago", then a date."""
+    if not dt:
+        return ""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    sec = (now - dt).total_seconds()
+    if sec < 0:
+        return dt.strftime("%Y-%m-%d")
+    if sec < 90:
+        return "just now"
+    if sec < 3600:
+        return f"{int(sec // 60)} min ago"
+    if sec < 86400:
+        return f"{int(sec // 3600)} h ago"
+    if sec < 86400 * 30:
+        return f"{int(sec // 86400)} d ago"
+    return dt.strftime("%Y-%m-%d")
+
+
+def _avatar(title: str, size: int = 40) -> str:
+    t = (title or "?").strip() or "?"
+    return (f'<div style="width:{size}px;height:{size}px;border-radius:50%;flex:none;'
+            f'background:{_color_for(t)};color:#fff;display:flex;align-items:center;'
+            f'justify-content:center;font-weight:700;font-size:{int(size * 0.42)}px">'
+            f'{html.escape(t[0].upper())}</div>')
+
+
+def _chip_link(label: str, href: str, on: bool, title: str = "") -> str:
+    style = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
+             "border-color:var(--accent);" if on else "")
+    return (f'<a class="btn ghost" href="{href}" title="{html.escape(title, quote=True)}" '
+            f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
+
+
+_LIST_CSS = """<style>
+.ls{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.ls-row{display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid var(--border)}
+.ls-row:last-child{border-bottom:none}
+.ls-row:hover{background:rgba(127,127,127,.05)}
+.ls-main{flex:1 1 0;min-width:0}
+.ls-title{font-weight:600;font-size:15px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ls-title a{color:inherit;text-decoration:none}.ls-title a:hover{color:var(--accent)}
+.ls-sub{font-size:13px;color:var(--muted);margin-top:3px;display:flex;gap:6px 12px;flex-wrap:wrap;align-items:center}
+.ls-sub a{color:var(--muted);text-decoration:none}.ls-sub a:hover{color:var(--accent)}
+.ls-num{flex:none;width:86px;text-align:right;font-variant-numeric:tabular-nums}
+.ls-num b{display:block;font-size:15px;color:var(--fg);font-weight:600}
+.ls-num span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.ls-act{flex:none;display:flex;gap:8px;justify-content:flex-end;min-width:118px}
+.tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;
+  background:rgba(127,127,127,.12);color:var(--muted);white-space:nowrap}
+.tag.ok{background:rgba(16,185,129,.14);color:#047857}.tag.warn{background:rgba(245,158,11,.16);color:#b45309}
+.tag.bad{background:rgba(239,68,68,.13);color:#b91c1c}.tag.acc{background:rgba(94,182,229,.16);color:var(--accent-hi)}
+.abtn{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-width:112px;height:34px;
+  padding:0 14px;font:inherit;font-size:13px;font-weight:500;border:1px solid var(--border);background:var(--surface);
+  color:var(--fg);border-radius:8px;cursor:pointer;text-decoration:none;white-space:nowrap}
+.abtn:hover{border-color:var(--accent);color:var(--accent)}
+.abtn.pri{background:var(--accent);border-color:var(--accent);color:#fff}.abtn.pri:hover{filter:brightness(1.08);color:#fff}
+.abtn:disabled{opacity:.55;cursor:default}
+.bar-tools{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.bar-tools .sep{width:1px;height:22px;background:var(--border);margin:0 6px}
+.bar-tools .lbl{font-size:12px;color:var(--muted);margin-right:2px}
+@media (max-width:820px){.ls-num{display:none}.ls-act{min-width:0}.abtn{min-width:0;padding:0 10px}}
+</style>"""
+
+
 def _color_for(s: str) -> str:
     """Deterministic accent color for an avatar."""
     palette = ["#229ED9", "#7c3aed", "#06b6d4", "#10b981", "#f59e0b",
@@ -4847,6 +4933,9 @@ async def health():
             "authed": login.session_exists(), "tg_wait": await _tg_flood()}
 
 
+_DASH_CACHE: dict = {"at": 0.0, "v": None}
+
+
 @app.get("/")
 async def root(request: Request, accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
@@ -4896,194 +4985,275 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                JOIN releases r ON r.id = d.release_id
                ORDER BY d.requested_at DESC LIMIT 10""")
 
-    s = dict(stats)
-    # Worker health surfaced on /system page only; no dashboard banner.
-    worker_banner = ""
-    stats_html = "".join(
-        f'<div class="stat-card"><div class="n">{v:,}</div><div class="l">{label}</div></div>'
-        for v, label in [
-            (s["channels"], "channels"),
-            (s["messages"], "messages indexed"),
-            (s["releases"], "parsed releases"),
-            (s["videos"], "videos"),
-            (s["photos"], "photos"),
-            (s["audio"], "audio"),
-            (s["books"], "books"),
-            (s["pending"], "pending"),
-            (s["downloading"], "downloading"),
-            (s["completed"], "completed"),
-        ]
-    )
-    charts_html = """
-<section class="dashboard-charts">
-  <div class="chart-card chart-line">
-    <header>
-      <h3>Growth</h3>
-      <div class="chart-controls">
-        <select id="growthMetric">
-          <option value="messages" selected>messages</option>
-          <option value="videos">videos</option>
-          <option value="releases">releases</option>
-          <option value="channels">channels</option>
-          <option value="photos">photos</option>
-          <option value="books">books</option>
-        </select>
-        <select id="growthDays">
-          <option value="7" selected>7d</option>
-          <option value="30">30d</option>
-          <option value="90">90d</option>
-        </select>
-      </div>
-    </header>
-    <div class="chart-canvas-wrap"><canvas id="growthChart"></canvas></div>
-  </div>
-  <div class="chart-card chart-pie">
-    <header><h3>Media mix</h3></header>
-    <div class="chart-canvas-wrap"><canvas id="distChart"></canvas></div>
-  </div>
-</section>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-<script>
-(function() {
-  let growth = null, dist = null;
-  function fmtDate(iso) { return iso.slice(5, 10); }
-  function color(i) {
-    const c = ['#5eb6e5','#94d2bd','#e9c46a','#f4a261','#e76f51','#a8dadc','#bdb2ff'];
-    return c[i % c.length];
-  }
-  async function loadGrowth() {
-    const metric = document.getElementById('growthMetric').value;
-    const days   = document.getElementById('growthDays').value;
-    const r = await fetch(`/api/stats/history?metric=${metric}&days=${days}`);
-    const j = await r.json();
-    const labels = (j.points || []).map(p => fmtDate(p.at));
-    const data   = (j.points || []).map(p => p.value);
-    const ctx = document.getElementById('growthChart').getContext('2d');
-    if (growth) growth.destroy();
-    growth = new Chart(ctx, {
-      type: 'line',
-      data: { labels, datasets: [{
-        label: metric, data,
-        fill: true, backgroundColor: 'rgba(59,130,246,0.10)',
-        borderColor: '#3b82f6', borderWidth: 2, tension: 0.35,
-        pointRadius: 3, pointHoverRadius: 5
-      }]},
-      options: { responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: {
-          y: { beginAtZero: false, ticks: { color: '#475569' }, grid: { color: '#e2e8f0' } },
-          x: { ticks: { color: '#475569' }, grid: { color: '#f1f5f9' } } }
-      }
-    });
-  }
-  async function loadDist() {
-    const r = await fetch('/api/stats/distribution');
-    const j = await r.json();
-    const labels = (j.slices || []).map(s => s.label);
-    const data   = (j.slices || []).map(s => s.value);
-    const ctx = document.getElementById('distChart').getContext('2d');
-    if (dist) dist.destroy();
-    dist = new Chart(ctx, {
-      type: 'doughnut',
-      data: { labels, datasets: [{ data,
-        backgroundColor: labels.map((_, i) => color(i)),
-        borderColor: '#ffffff', borderWidth: 2
-      }]},
-      options: { responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { position: 'right',
-          labels: { color: '#334155', boxWidth: 14, padding: 8, font: { size: 12 } } } }
-      }
-    });
-  }
-  document.getElementById('growthMetric').addEventListener('change', loadGrowth);
-  document.getElementById('growthDays').addEventListener('change', loadGrowth);
-  loadGrowth();
-  loadDist();
-})();
-</script>
-<style>
-.dashboard-charts { display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
-  margin: 20px 0; }
-.dashboard-charts .chart-card { background: var(--surface, #fff);
-  border: 1px solid var(--border, #e2e8f0);
-  border-radius: 8px; padding: 14px 16px; }
-.dashboard-charts .chart-card header { display: flex; align-items: center;
-  justify-content: space-between; margin-bottom: 8px; }
-.dashboard-charts .chart-card h3 { margin: 0; font-size: 12px; font-weight: 600;
-  color: #64748b; text-transform: uppercase; letter-spacing: 0.06em; }
-.dashboard-charts .chart-controls select { background: #fff; color: #1e293b;
-  border: 1px solid var(--border, #e2e8f0); padding: 4px 8px; border-radius: 4px;
-  font-size: 12px; margin-left: 6px; }
-.dashboard-charts .chart-canvas-wrap { position: relative; height: 240px; width: 100%; }
-.dashboard-charts canvas { width: 100% !important; height: 100% !important; }
-@media (max-width: 900px) {
-  .dashboard-charts { grid-template-columns: 1fr; }
-}
-</style>
-"""
+    st = dict(stats)
+    import datetime as _dt
+    # The numbers below cost a few scans of the index. They change slowly:
+    # work them out at most once a minute, not on every visit.
+    if time.time() - _DASH_CACHE["at"] > 60:
+        async with db_pool.acquire() as conn:
+            lib = await conn.fetchrow(
+                """SELECT (SELECT count(*) FROM releases WHERE category = 'movie') AS films,
+                          (SELECT count(*) FROM releases WHERE category = 'tv')    AS episodes,
+                          (SELECT count(*) FROM releases
+                            WHERE category IN ('movie', 'tv')
+                              AND created_at > NOW() - INTERVAL '24 hours')        AS rel_new""")
+            new_today = {r["media_type"]: r["n"] for r in await conn.fetch(
+                """SELECT media_type, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '24 hours' GROUP BY 1""")}
+            per_day = await conn.fetch(
+                """SELECT date_trunc('day', indexed_at)::date AS d, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '14 days' GROUP BY 1 ORDER BY 1""")
+            latest = await conn.fetch(
+                """SELECT r.primary_msg_id, r.poster_url, r.category, r.season, r.episode,
+                          r.quality, r.movie_year,
+                          COALESCE(NULLIF(r.canonical_title, ''), r.movie_title, r.series_title, r.name) AS t
+                   FROM releases r
+                   JOIN messages m ON m.id = r.primary_msg_id
+                   JOIN channels c ON c.id = m.channel_id
+                   WHERE r.poster_url IS NOT NULL AND r.category IN ('movie', 'tv')
+                     AND COALESCE(c.audience, 'sfw') = 'sfw'
+                   ORDER BY r.created_at DESC, r.id DESC LIMIT 60""")
+            _seen, _uniq = set(), []
+            for _r in latest:                       # one poster per title
+                _k = ((_r["t"] or "").lower(), _r["movie_year"], _r["season"], _r["episode"])
+                if _k in _seen:
+                    continue
+                _seen.add(_k)
+                _uniq.append(_r)
+                if len(_uniq) == 12:
+                    break
+            latest = _uniq
+            try:
+                hb = await conn.fetchval("SELECT max(last_seen) FROM worker_status")
+            except Exception:
+                hb = None
+            try:
+                shared = await conn.fetchrow(
+                    """SELECT max(contributed_at) AS last,
+                              count(*) FILTER (WHERE contributed_at > NOW() - INTERVAL '24 hours') AS d1
+                       FROM messages WHERE contributed_at IS NOT NULL""")
+            except Exception:
+                shared = None
+        _DASH_CACHE.update(at=time.time(), v=(lib, new_today, per_day, latest, hb, shared))
+    lib, new_today, per_day, latest, hb, shared = _DASH_CACHE["v"]
+    fetches = await _player_fetches()
+    usage = await _cache_usage()
+    flood = await _tg_flood()
+    user = login.ensure_user_info() or {}
+    free_gb = _disk_free_gb("/downloads")
 
+    # ── status ──
+    def _status(dot, title, text, href=None):
+        col = {"ok": "#10b981", "warn": "#f59e0b", "bad": "#ef4444", "off": "#94a3b8"}[dot]
+        inner = (f'<div class="st-dot" style="background:{col}"></div><div class="st-txt">'
+                 f'<div class="st-t">{title}</div><div class="st-s">{text}</div></div>')
+        return (f'<a class="st-card" href="{href}">{inner}</a>' if href
+                else f'<div class="st-card">{inner}</div>')
+    if not authed:
+        tg = _status("bad", "Telegram", "not signed in — sign in to index and play", "/login")
+    elif flood:
+        tg = _status("warn", "Telegram",
+                     f'asked us to slow down — resumes in about {max(1, flood["seconds_left"] // 60)} min')
+    else:
+        who = user.get("username") or user.get("first_name") or ""
+        tg = _status("ok", "Telegram", f'signed in{(" as @" + html.escape(str(who))) if who else ""}', "/settings")
+    if hb:
+        age = (_dt.datetime.now(_dt.timezone.utc) - hb).total_seconds()
+        cr = (_status("ok", "Indexer", f"running · last activity {_ago(hb)}", "/system") if age < 900
+              else _status("bad", "Indexer", f"no activity since {_ago(hb)}", "/system"))
+    else:
+        cr = _status("off", "Indexer", "has not reported yet", "/system")
+    if shared and shared["last"]:
+        sh = _status("ok" if shared["d1"] else "off", "Shared with tgarr.me",
+                     f'{_fmt_count(shared["d1"])} files today · last {_ago(shared["last"])}')
+    else:
+        sh = _status("off", "Shared with tgarr.me", "nothing shared yet")
+    used = sum(r["bytes"] for r in usage)
+    sto = _status("warn" if free_gb < 10 else "ok", "Storage",
+                  f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
+    status_html = f'<div class="st-row">{tg}{cr}{sh}{sto}</div>'
+
+    # ── library ──
+    def _tile(href, icon, n, label, plus=0):
+        return (f'<a class="tile" href="{href}"><div class="ti">{icon}</div>'
+                f'<div class="tn">{n:,}</div><div class="tl">{label}</div>'
+                + (f'<div class="tp">+{_fmt_count(plus)} today</div>' if plus else '<div class="tp">&nbsp;</div>')
+                + '</a>')
+    tiles = (
+        _tile("/releases?cat=movie", "🎬", lib["films"], "films", 0)
+        + _tile("/releases?cat=tv", "📺", lib["episodes"], "episodes", 0)
+        + _tile("/videos", "▶", st["videos"], "videos", new_today.get("video", 0))
+        + _tile("/music", "🎵", st["audio"], "songs", new_today.get("audio", 0))
+        + _tile("/library", "📚", st["books"], "books", 0)
+        + _tile("/gallery", "🖼", st["photos"], "photos", new_today.get("photo", 0))
+        + _tile("/channels", "📡", st["channels"], "channels", 0))
+
+    # ── now ──
+    now_bits = []
+    arriving = [f for f in fetches if f["state"] in ("queued", "fetching")]
+    if arriving:
+        now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {len(arriving)} arriving for a player</a>')
+    if st["pending"] or st["downloading"]:
+        now_bits.append(f'<a class="now-pill" href="/downloads?tab=grabs">⬇ {st["pending"] + st["downloading"]} '
+                        f'grab(s) in the queue</a>')
+    if lib["rel_new"]:
+        now_bits.append(f'<a class="now-pill" href="/releases">✨ {lib["rel_new"]:,} films and episodes '
+                        f'recognised in the last day</a>')
+    now_html = f'<div class="now-row">{"".join(now_bits)}</div>' if now_bits else ""
+
+    # ── recently added ──
+    if latest:
+        cards = []
+        for r in latest:
+            sub = (f'S{r["season"]:02d}' + (f'E{r["episode"]:02d}' if r["episode"] is not None else "")
+                   if r["category"] == "tv" and r["season"] is not None
+                   else (str(r["movie_year"]) if r["movie_year"] else ""))
+            cards.append(
+                f'<a class="pc" href="/watch/{r["primary_msg_id"]}" title="{html.escape(r["t"] or "", quote=True)}">'
+                f'<div class="pi"><img src="{html.escape(r["poster_url"], quote=True)}" loading="lazy" alt="" '
+                f'onerror="this.remove()"/>'
+                + (f'<span class="pq">{html.escape(r["quality"])}</span>' if r["quality"] else '')
+                + f'</div><div class="pt">{html.escape(r["t"] or "")}</div>'
+                f'<div class="ps">{html.escape(sub)}</div></a>')
+        latest_html = (
+            '<h2 class="section">Recently added <span class="extra"><a href="/releases">all releases →</a></span></h2>'
+            f'<div class="strip">{"".join(cards)}</div>')
+    else:
+        latest_html = ""
+
+    # ── added per day (drawn here: no chart library, nothing loaded from elsewhere) ──
+    days = {r["d"]: r["n"] for r in per_day}
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    series = [(today - _dt.timedelta(days=i), days.get(today - _dt.timedelta(days=i), 0))
+              for i in range(13, -1, -1)]
+    peak = max((n for _, n in series), default=0) or 1
+    W, H, PAD = 560, 150, 22
+    bw = (W - 8) / len(series)
+    bars = []
+    for i, (d, n) in enumerate(series):
+        h = (H - PAD - 8) * n / peak
+        x = 4 + i * bw
+        bars.append(
+            f'<g><rect x="{x + bw * 0.16:.1f}" y="{H - PAD - h:.1f}" width="{bw * 0.68:.1f}" '
+            f'height="{max(h, 1.5):.1f}" rx="3" fill="{"var(--accent)" if d == today else "rgba(94,182,229,.55)"}">'
+            f'<title>{d.strftime("%b %d")}: {n:,} added</title></rect>'
+            + (f'<text x="{x + bw / 2:.1f}" y="{H - 6}" text-anchor="middle" font-size="10" '
+               f'fill="var(--muted)">{d.strftime("%m-%d")}</text>' if i % 2 == 1 else '')
+            + '</g>')
+    total14 = sum(n for _, n in series)
+    growth_html = (
+        '<div class="panel"><div class="ph"><span>Added per day</span>'
+        f'<span class="pn">{total14:,} in two weeks · peak {peak:,}</span></div>'
+        f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block">'
+        f'<line x1="0" y1="{H - PAD}" x2="{W}" y2="{H - PAD}" stroke="var(--border)"/>'
+        f'{"".join(bars)}</svg></div>')
+    mix = [("photos", st["photos"], "#5eb6e5"), ("videos", st["videos"], "#94d2bd"),
+           ("songs", st["audio"], "#f4a261"), ("books", st["books"], "#e9c46a")]
+    other = max(0, st["messages"] - sum(v for _, v, _ in mix))
+    if other:
+        mix.append(("other files", other, "#cbd5e1"))
+    tot = sum(v for _, v, _ in mix) or 1
+    mix_html = (
+        '<div class="panel"><div class="ph"><span>What is indexed</span>'
+        f'<span class="pn">{st["messages"]:,} items</span></div>'
+        '<div class="mixbar">'
+        + "".join(f'<div style="width:{v * 100 / tot:.2f}%;background:{c}" title="{k}: {v:,}"></div>'
+                  for k, v, c in mix if v)
+        + '</div><div class="mixleg">'
+        + "".join(f'<div><i style="background:{c}"></i>{k}<b>{v:,}</b>'
+                  f'<span>{v * 100 / tot:.0f}%</span></div>' for k, v, c in mix if v)
+        + '</div></div>')
+
+    # ── grabs + wiring ──
     if recent:
         items = []
-        for d in recent:
+        for d in recent[:6]:
             icon = ({"pending": "⏳", "downloading": "⬇", "completed": "✓",
                      "failed": "✗", "cancelled": "—"}).get(d["status"], "?")
-            pill_cls = ({"pending": "warn", "downloading": "accent",
-                        "completed": "ok", "failed": "bad", "cancelled": "muted"}
-                       ).get(d["status"], "muted")
-            err = (f'<div class="err">{html.escape(d["error_message"])}</div>'
-                   if d["error_message"] else "")
+            cls = ({"pending": "warn", "downloading": "acc", "completed": "ok",
+                    "failed": "bad"}).get(d["status"], "")
             items.append(
-                f'<div class="dl-item">'
-                f'<div class="icon">{icon}</div>'
-                f'<div class="info">'
-                f'<div class="name">{html.escape(d["name"])}</div>'
-                f'<div class="meta">'
-                f'<span class="pill {pill_cls}">{d["status"]}</span>'
-                f'<span>· {_fmt_size(d["size_bytes"])}</span>'
-                f'<span>· {_fmt_time(d["requested_at"])}</span>'
-                f'</div>{err}'
-                f'</div>'
-                f'<div class="right">{_fmt_time(d["finished_at"]) or "—"}</div>'
-                f'</div>'
-            )
-        recent_html = f'<div class="dl-list">{"".join(items)}</div>'
+                f'<div class="ls-row"><div style="width:26px;text-align:center">{icon}</div>'
+                f'<div class="ls-main"><div class="ls-title">{html.escape(d["name"])}</div>'
+                f'<div class="ls-sub"><span class="tag {cls}">{d["status"]}</span>'
+                f'<span>{_fmt_size(d["size_bytes"])}</span><span>{_ago(d["requested_at"])}</span></div></div></div>')
+        grabs_html = (
+            '<h2 class="section">Recent grabs <span class="extra"><a href="/downloads?tab=grabs">all →</a></span></h2>'
+            f'<div class="ls">{"".join(items)}</div>')
     else:
-        recent_html = (
-            '<div class="empty-state">'
-            '<div class="icon">⬇</div>'
-            '<div>No downloads yet — grab something from Sonarr or Radarr to see activity here.</div>'
-            '</div>'
-        )
+        grabs_html = ""
 
     base_url = html.escape(_base_url(request)) or "http://&lt;host&gt;:8765"
 
-    body = f"""
-{worker_banner}
-<div class="stats">{stats_html}</div>{charts_html}
+    def _wire(icon, name, where, value):
+        return (f'<div class="ls-row"><div style="width:26px;text-align:center">{icon}</div>'
+                f'<div class="ls-main"><div class="ls-title">{name}</div><div class="ls-sub">{where}</div></div>'
+                f'<code class="wv">{value}</code>'
+                f'<button class="abtn" style="min-width:74px" onclick="tgCopy(this)" '
+                f'data-v="{value}">Copy</button></div>')
+    wiring_html = (
+        '<h2 class="section">Connect Sonarr / Radarr</h2><div class="ls">'
+        + _wire("🔌", "Newznab indexer", "Settings → Indexers → + → Newznab → URL", f"{base_url}/newznab/")
+        + _wire("⬇", "SABnzbd download client",
+                "Settings → Download Clients → + → SABnzbd → same host and port, URL Base", "/sabnzbd")
+        + '</div><script>function tgCopy(b){const v=b.dataset.v;const done=()=>{const o=b.textContent;'
+          'b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)};'
+          'if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);'
+          'else{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();'
+          'try{document.execCommand("copy");done()}catch(e){}t.remove()}}</script>')
 
-<h2 class="section">Recent activity <span class="extra"><a href="/downloads">view all →</a></span></h2>
-{recent_html}
+    dash_css = """<style>
+.st-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}
+.st-card{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--border);
+  border-radius:10px;padding:12px 14px;text-decoration:none;color:inherit;min-width:0}
+a.st-card:hover{border-color:var(--accent)}
+.st-dot{width:10px;height:10px;border-radius:50%;flex:none;box-shadow:0 0 0 4px rgba(127,127,127,.10)}
+.st-txt{min-width:0}.st-t{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:600}
+.st-s{font-size:13.5px;color:var(--fg);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tiles{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px;margin-bottom:14px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 14px 10px;
+  text-decoration:none;color:inherit;transition:border-color .12s,transform .12s;min-width:0}
+.tile:hover{border-color:var(--accent);transform:translateY(-2px)}
+.tile .ti{font-size:20px;line-height:1}.tile .tn{font-size:24px;font-weight:700;color:var(--accent-hi);margin-top:8px;
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .tl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin-top:2px}
+.tile .tp{font-size:11.5px;color:#059669;margin-top:6px;height:15px}
+.now-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.now-pill{font-size:13px;padding:6px 12px;border-radius:16px;background:rgba(94,182,229,.13);color:var(--accent-hi);
+  text-decoration:none;border:1px solid rgba(94,182,229,.35)}
+.now-pill:hover{background:rgba(94,182,229,.22)}
+.strip{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}
+.pc{text-decoration:none;color:inherit;min-width:0}
+.pc .pi{position:relative;aspect-ratio:2/3;border-radius:8px;overflow:hidden;background:var(--surface2,#e2e8f0);
+  border:1px solid var(--border)}
+.pc .pi img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .2s}
+.pc:hover .pi img{transform:scale(1.05)}
+.pc .pq{position:absolute;right:4px;top:4px;font-size:9.5px;font-weight:700;background:rgba(15,23,42,.78);color:#fff;
+  padding:2px 5px;border-radius:5px}
+.pc .pt{font-size:12.5px;font-weight:600;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pc .ps{font-size:11px;color:var(--muted)}
+.panels{display:grid;grid-template-columns:3fr 2fr;gap:14px;margin-top:22px}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+.panel .ph{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--muted);font-weight:600;margin-bottom:10px}
+.panel .pn{text-transform:none;letter-spacing:0;font-weight:400;font-size:12px}
+.mixbar{display:flex;height:16px;border-radius:8px;overflow:hidden;background:var(--border);margin:14px 0 16px}
+.mixleg div{display:flex;align-items:center;gap:8px;font-size:13.5px;padding:4px 0}
+.mixleg i{width:10px;height:10px;border-radius:3px;flex:none}.mixleg b{margin-left:auto;font-variant-numeric:tabular-nums}
+.mixleg span{width:38px;text-align:right;color:var(--muted);font-size:12px}
+.wv{font-size:12.5px;background:rgba(127,127,127,.10);padding:5px 9px;border-radius:6px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:46%}
+@media (max-width:1100px){.tiles{grid-template-columns:repeat(4,minmax(0,1fr))}.strip{grid-template-columns:repeat(6,minmax(0,1fr))}
+  .st-row{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:700px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.strip{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .st-row,.panels{grid-template-columns:1fr}.wv{display:none}}
+</style>"""
 
-<h2 class="section">Wiring info</h2>
-<div class="dl-list">
-  <div class="dl-item">
-    <div class="icon">🔌</div>
-    <div class="info">
-      <div class="name">Newznab indexer</div>
-      <div class="meta">For Sonarr / Radarr / Lidarr → Settings → Indexers → ➕ Newznab</div>
-    </div>
-    <div class="right"><code>{base_url}/newznab/</code></div>
-  </div>
-  <div class="dl-item">
-    <div class="icon">⬇</div>
-    <div class="info">
-      <div class="name">SABnzbd download client</div>
-      <div class="meta">For Sonarr / Radarr → Settings → Download Clients → ➕ SABnzbd</div>
-    </div>
-    <div class="right"><code>/sabnzbd</code> · same host/port</div>
-  </div>
-</div>
-"""
+    body = (f'{_LIST_CSS}{dash_css}{status_html}'
+            f'<div class="tiles">{tiles}</div>{now_html}'
+            f'{latest_html}'
+            f'<div class="panels">{growth_html}{mix_html}</div>'
+            f'{grabs_html}{wiring_html}')
     return HTMLResponse(_layout("Dashboard", "/", body))
 
 
@@ -5194,34 +5364,15 @@ async def api_set_audience(tg_chat_id: int, value: str = Form(...)):
 
 
 @app.get("/channels", response_class=HTMLResponse)
-async def page_channels(min_members: int = 500,
-                        max_members: Optional[int] = None,
-                        eligible: int = 0,
+async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = "films",
+                        offset: int = 0, limit: int = 50,
+                        min_members: Optional[int] = None, eligible: int = 0,
                         audience: str = ""):
     if not login.session_exists():
         return RedirectResponse("/login")
-    # Range filter: COALESCE NULL members to a big number so unresolved
-    # channels stay in the default "500+" view rather than disappearing.
-    where_extra = f"AND COALESCE(c.members_count, 999999) >= {max(0, min_members)}"
-    if max_members:
-        where_extra += f" AND COALESCE(c.members_count, 0) < {max_members}"
-    if eligible:
-        where_extra += (
-            f" AND c.members_count >= {CONTRIB_MIN_MEMBERS} "
-            f"AND (SELECT count(*) FROM messages m WHERE m.channel_id = c.id "
-            f"AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}"
-        )
+    if eligible:                       # old links
+        show = "shared"
     nsfw_on = await _is_nsfw_enabled()
-    if audience == "sfw":
-        where_extra += " AND COALESCE(c.audience, 'sfw') = 'sfw'"
-    elif audience == "nsfw" and nsfw_on:
-        where_extra += " AND c.audience = 'nsfw'"
-    elif audience == "unknown":
-        where_extra += " AND c.audience IS NULL"
-    if not nsfw_on:
-        where_extra += " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"
-    # CSAM hard-block — no setting can unblock this.
-    where_extra += " AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
     async with db_pool.acquire() as conn:
         # Lazy classify (Python-side) — pulls untagged rows and tags them
         # before listing. Manual overrides untouched.
@@ -5233,122 +5384,171 @@ async def page_channels(min_members: int = 500,
             await conn.execute(
                 "UPDATE channels SET audience=$1 WHERE tg_chat_id=$2",
                 classify_audience(u["title"], u["username"]), u["tg_chat_id"])
-
+        # One pass over messages for every channel's numbers (the page used to
+        # run three sub-queries per channel).
         rows = await conn.fetch(
-            f"""SELECT c.tg_chat_id, c.username, c.title, c.backfilled,
-                      c.members_count, c.audience, c.audience_manual,
-                      (SELECT count(*) FROM messages m WHERE m.channel_id = c.id)
-                                                                AS msg_count,
-                      (SELECT count(*) FROM messages m
-                         WHERE m.channel_id = c.id AND m.file_name IS NOT NULL)
-                                                                AS media_count,
-                      (c.members_count >= {CONTRIB_MIN_MEMBERS} AND
-                       (SELECT count(*) FROM messages m WHERE m.channel_id = c.id
-                          AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}
-                      ) AS eligible_moat
+            """WITH agg AS (
+                 SELECT channel_id, count(*) AS msgs, count(file_name) AS media,
+                        count(*) FILTER (WHERE media_type = 'video') AS videos,
+                        count(*) FILTER (WHERE media_type = 'audio') AS songs,
+                        count(*) FILTER (WHERE media_type = 'photo') AS photos,
+                        count(*) FILTER (WHERE media_type = 'document') AS docs,
+                        max(posted_at) AS last_post
+                 FROM messages GROUP BY channel_id),
+               rel AS (
+                 SELECT m.channel_id, count(*) AS films FROM releases r
+                 JOIN messages m ON m.id = r.primary_msg_id
+                 WHERE r.category IN ('movie', 'tv') GROUP BY 1)
+               SELECT c.tg_chat_id, c.username, c.title, c.backfilled, c.members_count,
+                      c.audience, c.subscribed, c.is_joined, c.dead_at, c.subscribe_error,
+                      COALESCE(a.msgs, 0) AS msgs, COALESCE(a.media, 0) AS media,
+                      COALESCE(a.videos, 0) AS videos, COALESCE(a.songs, 0) AS songs,
+                      COALESCE(a.photos, 0) AS photos, COALESCE(a.docs, 0) AS docs,
+                      a.last_post, COALESCE(rel.films, 0) AS films
                FROM channels c
-               WHERE 1=1 {where_extra}
-               ORDER BY COALESCE(c.members_count, 0) DESC, msg_count DESC""")
-        total = await conn.fetchval("SELECT count(*) FROM channels")
-        with_meta = await conn.fetchval(
-            "SELECT count(*) FROM channels WHERE members_count IS NOT NULL")
-        eligible_total = await conn.fetchval(
-            f"""SELECT count(*) FROM channels c
-               WHERE c.members_count >= {CONTRIB_MIN_MEMBERS}
-                 AND (SELECT count(*) FROM messages m WHERE m.channel_id = c.id
-                      AND m.file_name IS NOT NULL) >= {CONTRIB_MIN_MEDIA}""")
+               LEFT JOIN agg a ON a.channel_id = c.id
+               LEFT JOIN rel ON rel.channel_id = c.id
+               WHERE COALESCE(c.audience, 'sfw') <> 'blocked_csam'""")
+    rows = [r for r in rows if nsfw_on or (r["audience"] or "sfw") != "nsfw"]
 
-    def _chip(lo: int, hi: Optional[int], label: str) -> str:
-        active = (min_members == lo and max_members == hi and not eligible)
-        style = ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
-                'border-color:var(--accent);') if active else ''
-        href = f"/channels?min_members={lo}"
-        if hi is not None:
-            href += f"&max_members={hi}"
-        return (f'<a class="btn ghost" href="{href}" '
-               f'style="{style}padding:6px 12px;font-size:13px">{label}</a>')
+    def _shared(r):
+        return (r["members_count"] or 0) >= CONTRIB_MIN_MEMBERS and r["media"] >= CONTRIB_MIN_MEDIA
+    kinds = {
+        "all": lambda r: True,
+        "films": lambda r: r["films"] > 0,
+        "joined": lambda r: r["is_joined"],
+        "subscribed": lambda r: r["subscribed"] and not r["is_joined"],
+        "shared": _shared,
+        "empty": lambda r: r["media"] == 0,
+        "dead": lambda r: r["dead_at"] is not None,
+    }
+    if show not in kinds:
+        show = "all"
+    counts = {k: sum(1 for r in rows if f(r)) for k, f in kinds.items()}
+    view = [r for r in rows if kinds[show](r)]
+    if q:
+        words = [w.lower() for w in q.split()]
+        view = [r for r in view
+                if all(w in ((r["title"] or "") + " " + (r["username"] or "")).lower() for w in words)]
+    sorts = {
+        "films": lambda r: (-r["films"], -r["media"]),
+        "media": lambda r: (-r["media"], -r["films"]),
+        "members": lambda r: (-(r["members_count"] or 0),),
+        "recent": lambda r: (-(r["last_post"].timestamp() if r["last_post"] else 0),),
+        "name": lambda r: ((r["title"] or r["username"] or "~").lower(),),
+    }
+    if sort not in sorts:
+        sort = "films"
+    view.sort(key=sorts[sort])
+    page_size = max(10, min(limit, 200))
+    page_offset = max(0, offset)
+    page = view[page_offset:page_offset + page_size]
 
-    def _eligible_chip() -> str:
-        active = bool(eligible)
-        style = ('background:rgba(74,222,128,0.18);color:var(--ok);'
-                'border-color:var(--ok);') if active else ''
-        return (f'<a class="btn ghost" href="/channels?eligible=1" '
-               f'style="{style}padding:6px 12px;font-size:13px">'
-               f'✓ moat ({eligible_total})</a>')
+    def _cqs(**over):
+        cur = {"q": q, "show": show if show != "all" else None,
+               "sort": sort if sort != "films" else None,
+               "limit": limit if limit != 50 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
 
-    def _aud_chip(val: str, label: str, color: str = "var(--accent)") -> str:
-        active = (audience == val)
-        style = (f'background:{color}22;color:{color};border-color:{color};') if active else ''
-        return (f'<a class="btn ghost" href="/channels?audience={val}" '
-               f'style="{style}padding:6px 12px;font-size:13px">{label}</a>')
+    def _n(k):
+        return f' <span style="opacity:.6">{counts[k]:,}</span>'
+    chips = (
+        _chip_link("all" + _n("all"), "/channels" + _cqs(show=None, offset=None), show == "all")
+        + _chip_link("🎬 with films" + _n("films"), "/channels" + _cqs(show="films", offset=None),
+                     show == "films", "channels that carry recognised films or episodes")
+        + _chip_link("joined" + _n("joined"), "/channels" + _cqs(show="joined", offset=None),
+                     show == "joined", "channels your Telegram account is a member of")
+        + _chip_link("followed" + _n("subscribed"), "/channels" + _cqs(show="subscribed", offset=None),
+                     show == "subscribed", "public channels tgarr reads without joining")
+        + _chip_link("shared" + _n("shared"), "/channels" + _cqs(show="shared", offset=None),
+                     show == "shared",
+                     f"{CONTRIB_MIN_MEMBERS}+ members and {CONTRIB_MIN_MEDIA}+ files: listed on tgarr.me "
+                     "for other people to find. Private chats and small groups never are.")
+        + _chip_link("no files" + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
+        + (_chip_link("gone" + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
+                      show == "dead", "channels Telegram no longer serves") if counts["dead"] else "")
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("films", "/channels" + _cqs(sort=None, offset=None), sort == "films")
+        + _chip_link("files", "/channels" + _cqs(sort="media", offset=None), sort == "media")
+        + _chip_link("members", "/channels" + _cqs(sort="members", offset=None), sort == "members")
+        + _chip_link("latest post", "/channels" + _cqs(sort="recent", offset=None), sort == "recent")
+        + _chip_link("name", "/channels" + _cqs(sort="name", offset=None), sort == "name"))
+    search = (
+        '<form method="GET" action="/channels" style="display:flex;gap:8px;margin:0 0 12px">'
+        + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
+                  for k, v in (("show", show if show != "all" else None),
+                               ("sort", sort if sort != "films" else None)) if v)
+        + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+          'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
+          '<button class="btn" type="submit">Search</button>'
+        + (f'<a class="btn ghost" href="/channels{_cqs(q=None, offset=None)}">clear</a>' if q else '')
+        + '</form>')
 
-    filter_bar = (
-        '<div style="display:flex;gap:6px;margin-bottom:20px;align-items:center;flex-wrap:wrap">'
-        f'{_chip(0, None, f"all ({total})")}'
-        f'{_chip(0, 20, "20")}'
-        f'{_chip(20, 50, "50")}'
-        f'{_chip(50, 100, "100")}'
-        f'{_chip(100, 500, "500")}'
-        f'{_chip(500, 1000, "1K")}'
-        f'{_chip(1000, 5000, "5K")}'
-        f'{_chip(500, None, "500+ ⭐")}'
-        f'{_eligible_chip()}'
-        '<span style="border-left:1px solid var(--border);margin:0 4px;height:24px"></span>'
-        f'{_aud_chip("sfw", "✓ SFW", "#15803d")}'
-        f'{_aud_chip("nsfw", "🔞 NSFW", "#b91c1c")}'
-        + (f'<span style="margin-left:auto;color:var(--muted);font-size:12px">'
-           f'members resolved {with_meta}/{total}</span>' if with_meta < total else '')
-        + '</div>'
-        f'<div style="font-size:12px;color:var(--muted);margin-bottom:18px">'
-        f'<strong>✓ moat</strong> = ≥{CONTRIB_MIN_MEMBERS} members AND ≥{CONTRIB_MIN_MEDIA} media files. '
-        f'Only these get pushed to <code>registry.tgarr.me</code> when federation is enabled. '
-        f'Private chats and small groups stay local.'
-        f'</div>'
-    )
+    def _row(r):
+        title = r["title"] or (("@" + r["username"]) if r["username"] else "(untitled)")
+        handle = (f'<a href="https://t.me/{html.escape(r["username"])}" target="_blank" rel="noopener" '
+                  f'title="open in Telegram">@{html.escape(r["username"])}</a>'
+                  if r["username"] else '<span>private chat</span>')
+        tags = []
+        if r["dead_at"]:
+            tags.append('<span class="tag bad" title="Telegram no longer serves this channel">gone</span>')
+        elif r["is_joined"]:
+            tags.append('<span class="tag ok" title="your account is a member">joined</span>')
+        elif r["subscribed"]:
+            tags.append('<span class="tag acc" title="read without joining">followed</span>')
+        if _shared(r):
+            tags.append('<span class="tag" title="listed on tgarr.me">shared</span>')
+        if (r["audience"] or "sfw") == "nsfw":
+            tags.append('<span class="tag warn">18+</span>')
+        if not r["backfilled"] and not r["dead_at"]:
+            tags.append('<span class="tag warn" title="still reading its history">reading…</span>')
+        if r["subscribe_error"] and not r["dead_at"]:
+            tags.append(f'<span class="tag bad" title="{html.escape(r["subscribe_error"], quote=True)}">'
+                        'cannot read</span>')
+        has = []
+        for n, ico, word, href in (
+                (r["films"], "🎬", "films", None),
+                (r["videos"], "▶", "videos", None),
+                (r["songs"], "🎵", "songs", None),
+                (r["docs"], "📄", "files", None),
+                (r["photos"], "🖼", "photos",
+                 f'/gallery?channel={_q(r["username"])}' if r["username"] else None)):
+            if n:
+                txt = f'{ico} {_n_things(n, word)}'
+                has.append(f'<a href="{href}">{txt}</a>' if href else f'<span>{txt}</span>')
+        act = ""
+        if r["subscribed"] and not r["is_joined"]:
+            act = (f'<button class="abtn" onclick="tgUnfollow(this,{r["tg_chat_id"]})" '
+                   f'title="stop reading this channel">Unfollow</button>')
+        return (
+            f'<div class="ls-row">{_avatar(title)}'
+            f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
+            f'{" ".join(tags)}</div>'
+            f'<div class="ls-sub">{handle}{"".join(has) or "<span>no files indexed</span>"}</div></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
+            f'<div class="ls-num" style="width:104px"><b style="font-size:13px;font-weight:500">'
+            f'{_ago(r["last_post"]) or "–"}</b><span>latest post</span></div>'
+            f'<div class="ls-act">{act}</div></div>')
 
-    if not rows:
-        body = (f'<h2 class="section">Indexed channels <span class="count">0 of {total}</span></h2>'
-               + filter_bar +
-               '<div class="empty-state">'
-               '<div class="icon">📡</div>'
-               f'<div>No channels with ≥{min_members} members match this filter.</div>'
-               '<div style="margin-top:8px;font-size:13px">Try a lower threshold above, or join more active channels in Telegram.</div>'
-               '</div>')
+    if not page:
+        listing = ('<div class="empty-state"><div class="icon">📡</div><div>'
+                   + ("No channel matches." if (q or show != "all") else
+                      "No channels yet. Join channels in Telegram, or follow some from Discover.")
+                   + '</div></div>')
     else:
-        cards_html = []
-        for r in rows:
-            title = r["title"] or "(untitled)"
-            initial = (title.strip() or "?")[0].upper()
-            color = _color_for(title)
-            handle = ("@" + r["username"]) if r["username"] else f"id {r['tg_chat_id']}"
-            status_pill = ('<span class="pill ok">backfilled</span>' if r["backfilled"]
-                          else '<span class="pill warn">backfilling…</span>')
-            members_pill = ''
-            if r["members_count"] is not None:
-                m = r["members_count"]
-                m_str = (f"{m/1000:.1f}K" if m >= 1000 else str(m)).replace(".0K", "K")
-                members_pill = f'<span class="pill accent">👥 {m_str}</span>'
-            moat_pill = ('<span class="pill ok" title="eligible for federation">✓ moat</span>'
-                        if r["eligible_moat"] else '')
-            cards_html.append(
-                f'<div class="card">'
-                f'<div class="avatar" style="background:{color}">{html.escape(initial)}</div>'
-                f'<div class="body">'
-                f'<div class="title">{html.escape(title)}</div>'
-                f'<div class="sub">{html.escape(handle)}</div>'
-                f'</div>'
-                f'<div class="footer">'
-                f'{members_pill}'
-                f'<span class="pill muted">{r["msg_count"]:,} msgs</span>'
-                f'<span class="pill muted">{r["media_count"]:,} media</span>'
-                f'{moat_pill}'
-                f'{status_pill}'
-                f'</div>'
-                f'</div>'
-            )
-        body = (f'<h2 class="section">Indexed channels <span class="count">{len(rows)} of {total}</span></h2>'
-               + filter_bar
-               + f'<div class="cards">{"".join(cards_html)}</div>')
+        listing = (f'<div class="ls">{"".join(_row(r) for r in page)}</div>'
+                   + _page_nav("/channels", _cqs, page_offset, page_size, len(page), len(view)))
+    body = (
+        f'{_LIST_CSS}'
+        f'<h2 class="section">Channels <span class="count">{len(view):,}'
+        + (f' of {len(rows):,}' if len(view) != len(rows) else '') + '</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
+        'letter-spacing:0;margin-left:10px"><a href="/discover">find more on Discover →</a></span></h2>'
+        f'{search}<div class="bar-tools">{chips}</div>{listing}'
+        '<script>function tgUnfollow(b,id){if(!confirm("Stop reading this channel? What is already indexed stays."))return;'
+        'b.disabled=true;fetch("/api/channel/unsubscribe/"+id,{method:"POST"}).then(()=>location.reload())}</script>')
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 
@@ -5368,161 +5568,194 @@ def _profile_pills(r) -> str:
 
 
 @app.get("/discover", response_class=HTMLResponse)
-async def page_discover(audience: str = "sfw", kind: str = ""):
+async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] = None,
+                        sort: str = "best", mine: int = 0, offset: int = 0, limit: int = 50):
     async with db_pool.acquire() as conn:
-        # Auth check
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
         if not login.session_exists() and not n_channels:
             return RedirectResponse("/login")
-        # Auto-subscribed check — TG sometimes returns differently-cased username
-        # (eBookRoom vs ebookroom) so match case-insensitively.
-        known = {r["username"].lower(): r["subscribed"]
+        # Telegram sometimes returns a differently-cased username
+        # (eBookRoom vs ebookroom): match case-insensitively.
+        known = {r["username"].lower(): (r["subscribed"] or r["is_joined"])
                  for r in await conn.fetch(
-                     "SELECT username, subscribed FROM channels "
+                     "SELECT username, subscribed, is_joined FROM channels "
                      "WHERE username IS NOT NULL")}
+        nsfw_on = await _is_nsfw_enabled()
+        if audience == "nsfw" and not nsfw_on:
+            audience = "sfw"
         where = ["dismissed = FALSE"]
         if audience in ("sfw", "nsfw"):
             where.append(f"audience = '{audience}'")
-        # What the channel actually carries, per the registry's content
-        # profile. Default view leads with movie/TV release channels — the
-        # reason most people install tgarr — instead of with whatever the
-        # most instances happened to have seen.
         kind = kind if kind in ("video", "books", "music") else ""
         kind_col = {"video": "release_files", "books": "book_files",
                     "music": "audio_files"}.get(kind)
         if kind_col:
             where.append(f"COALESCE({kind_col}, 0) > 0")
-        order = (f"COALESCE({kind_col}, 0) DESC, " if kind_col
-                 else "COALESCE(release_files, 0) DESC, ")
         rows = await conn.fetch(f"""
             SELECT username, title, members_count, media_count, audience,
                    language, category, distinct_contributors, verified,
                    last_pulled_at, release_files, video_files, book_files, audio_files
             FROM discovered
-            WHERE {' AND '.join(where)}
-            ORDER BY {order} verified DESC, distinct_contributors DESC,
-                     COALESCE(members_count, 0) DESC
-            LIMIT 200
-        """)
-        total = await conn.fetchval("SELECT count(*) FROM discovered")
-        last_pull = await conn.fetchval(
-            "SELECT max(last_pulled_at) FROM discovered")
+            WHERE {' AND '.join(where)}""")
+        total = await conn.fetchval("SELECT count(*) FROM discovered WHERE dismissed = FALSE")
+        last_pull = await conn.fetchval("SELECT max(last_pulled_at) FROM discovered")
 
-    if not rows:
-        body = (
-            f'<h2 class="section">Discover <span class="count">'
-            f'0 of {total or 0}</span></h2>'
-            '<div class="empty-state">'
-            '<div class="icon">🔭</div>'
-            '<div>No channels pulled from registry yet.</div>'
-            '<div style="margin-top:8px;font-size:13px">'
-            'The registry_puller fires every 12h on a deterministic offset '
-            '(or hit <code>POST /api/registry/pull-now</code> to force it).'
-            '</div></div>'
-        )
-        return HTMLResponse(_layout("Discover", "/discover", body))
+    have = [r for r in rows if known.get(r["username"].lower())]
+    view = rows if mine else [r for r in rows if not known.get(r["username"].lower())]
+    if q:
+        words = [w.lower() for w in q.split()]
+        view = [r for r in view
+                if all(w in ((r["title"] or "") + " " + r["username"]).lower() for w in words)]
+    lead = kind_col or "release_files"
+    sorts = {
+        # what the channel carries first - the reason most people install
+        # tgarr - then how many installs vouch for it
+        "best": lambda r: (-(r[lead] or 0), -int(bool(r["verified"])),
+                           -(r["distinct_contributors"] or 0), -(r["members_count"] or 0)),
+        "seen": lambda r: (-(r["distinct_contributors"] or 0), -(r[lead] or 0)),
+        "members": lambda r: (-(r["members_count"] or 0),),
+        "files": lambda r: (-(r["media_count"] or 0),),
+    }
+    if sort not in sorts:
+        sort = "best"
+    view = sorted(view, key=sorts[sort])
+    page_size = max(10, min(limit, 200))
+    page_offset = max(0, offset)
+    page = view[page_offset:page_offset + page_size]
+
+    def _dq(**over):
+        cur = {"kind": kind or None, "audience": audience if audience != "sfw" else None,
+               "q": q, "sort": sort if sort != "best" else None, "mine": 1 if mine else None,
+               "limit": limit if limit != 50 else None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
+
+    chips = (
+        _chip_link("All", "/discover" + _dq(kind=None, offset=None), not kind)
+        + _chip_link("🎬 Movies &amp; TV", "/discover" + _dq(kind="video", offset=None), kind == "video")
+        + _chip_link("📚 Books", "/discover" + _dq(kind="books", offset=None), kind == "books")
+        + _chip_link("🎵 Music", "/discover" + _dq(kind="music", offset=None), kind == "music")
+        + ('<span class="sep"></span>'
+           + _chip_link("SFW", "/discover" + _dq(audience=None, offset=None), audience == "sfw")
+           + _chip_link("18+", "/discover" + _dq(audience="nsfw", offset=None), audience == "nsfw")
+           if nsfw_on else '')
+        + '<span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("best match", "/discover" + _dq(sort=None, offset=None), sort == "best",
+                     "most of what you are looking at, then how many installs vouch for it")
+        + _chip_link("most seen", "/discover" + _dq(sort="seen", offset=None), sort == "seen",
+                     "indexed by the most tgarr installs")
+        + _chip_link("members", "/discover" + _dq(sort="members", offset=None), sort == "members")
+        + _chip_link("files", "/discover" + _dq(sort="files", offset=None), sort == "files")
+        + '<span class="sep"></span>'
+        + _chip_link(f'include the {len(have):,} I already have', "/discover" + _dq(mine=None if mine else 1, offset=None),
+                     bool(mine)))
+    search = (
+        '<form method="GET" action="/discover" style="display:flex;gap:8px;margin:0 0 12px;align-items:center">'
+        + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
+                  for k, v in (("kind", kind), ("audience", audience if audience != "sfw" else None),
+                               ("sort", sort if sort != "best" else None),
+                               ("mine", 1 if mine else None)) if v)
+        + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+          'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
+          '<button class="btn" type="submit">Search</button>'
+        + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">clear</a>' if q else '')
+        + '<span style="flex:1"></span>'
+          '<span id="tgPullToast" style="font-size:13px;color:var(--muted);display:none"></span>'
+          '<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
+          'title="ask tgarr.me for its current list now">↻ Refresh list</button></form>')
 
     def _card(r):
         u = r["username"]
-        state = known.get(u.lower())
-        if state is True:
-            btn = (f'<button class="ghost" disabled '
-                  f'style="font-size:12px;padding:6px 12px">✓ subscribed</button>')
-        else:
-            btn = (f'<button data-uname="{html.escape(u)}" '
-                  f'onclick="tgDiscoverSubscribe(this)" '
-                  f'style="font-size:12px;padding:6px 12px">+ Subscribe</button>')
-        members = (f"{r['members_count']/1000:.1f}K".replace(".0K", "K")
-                  if r['members_count'] and r['members_count'] >= 1000
-                  else str(r['members_count'] or '-'))
-        verified_pill = ('<span class="pill ok">✓ verified</span>'
-                       if r["verified"] else '')
+        mine_ = known.get(u.lower())
+        btn = ('<button class="abtn" disabled>✓ Following</button>' if mine_ else
+               f'<button class="abtn pri" data-uname="{html.escape(u, quote=True)}" '
+               f'onclick="tgDiscoverSubscribe(this)" '
+               f'title="tgarr reads this public channel without your account joining it">+ Follow</button>')
+        title = r["title"] or ("@" + u)
+        has = []
+        for n, ico, word in ((r["release_files"], "🎬", "films"), (r["book_files"], "📚", "books"),
+                             (r["audio_files"], "🎵", "songs")):
+            if n:
+                has.append(f'<span style="color:var(--fg)">{ico} {_n_things(n, word)}</span>')
+        if r["media_count"]:
+            has.append(f'<span>{_n_things(r["media_count"], "files")}</span>')
+        seen = r["distinct_contributors"] or 1
         return (
-            f'<div class="dl-item">'
-            f'<div class="icon">📡</div>'
-            f'<div class="info">'
-            f'<div class="name">@{html.escape(u)}'
-            f'{" — " + html.escape(r["title"]) if r["title"] else ""}</div>'
-            f'<div class="meta">'
-            f'{verified_pill}'
-            f'<span class="pill accent">👥 {members}</span>'
-            f'{_profile_pills(r)}'
-            f'<span class="pill muted">{r["media_count"] or 0} media</span>'
-            f'<span class="pill muted">{r["audience"]}</span>'
-            f'<span>· seen by {r["distinct_contributors"] or 1} instances</span>'
-            f'</div></div>'
-            f'<div class="right">{btn}</div>'
-            f'</div>'
-        )
+            f'<div class="ls-row">{_avatar(title)}'
+            f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
+            + ('<span class="tag ok" title="tgarr.me checked that this channel exists and is public">✓ verified</span> '
+               if r["verified"] else '')
+            + ('<span class="tag warn">18+</span>' if r["audience"] == "nsfw" else '')
+            + f'</div><div class="ls-sub"><a href="https://t.me/{html.escape(u)}" target="_blank" rel="noopener" '
+            f'title="open in Telegram">@{html.escape(u)}</a>{"".join(has)}</div></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
+            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b>'
+            f'<span>installs</span></div>'
+            f'<div class="ls-act">{btn}</div></div>')
 
-    def _kc(val, label):
-        on = kind == val
-        st = ("background:rgba(94,182,229,0.15);color:var(--accent-hi);"
-              "border-color:var(--accent);") if on else ""
-        q = [f"kind={val}"] if val else []
-        if audience != "sfw":
-            q.append(f"audience={audience}")
-        href = "/discover" + ("?" + "&".join(q) if q else "")
-        return (f'<a class="btn ghost" href="{href}" '
-                f'style="{st}padding:5px 12px;font-size:12px">{label}</a>')
-    _kind_chips = (_kc("", "All") + _kc("video", "🎬 Movies &amp; TV")
-                   + _kc("books", "📚 Books") + _kc("music", "🎵 Music"))
+    if not rows and not total:
+        listing = ('<div class="empty-state"><div class="icon">🔭</div>'
+                   '<div>The list from tgarr.me has not arrived yet.</div>'
+                   '<div style="margin-top:8px;font-size:13px">It is fetched every 12 hours; '
+                   '“Refresh list” asks for it now.</div></div>')
+    elif not page:
+        listing = ('<div class="empty-state"><div class="icon">🔭</div><div>'
+                   + ("No channel matches." if (q or kind) else
+                      "You already follow everything on the list.") + '</div></div>')
+    else:
+        listing = (f'<div class="ls">{"".join(_card(r) for r in page)}</div>'
+                   + _page_nav("/discover", _dq, page_offset, page_size, len(page), len(view)))
 
     body = (
-        f'<h2 class="section">Discover <span class="count">'
-        f'{len(rows)} of {total} from registry.tgarr.me</span>'
-        + (f'<span class="extra" style="color:var(--muted);font-size:12px">'
-           f'last pull {_fmt_time(last_pull)}</span>'
-           if last_pull else '')
-        + '</h2>'
-        '<div style="margin-bottom:18px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-        + _kind_chips +
-        '  <button type="button" class="ghost" id="tgPullBtn" style="font-size:13px" onclick="tgRegistryPull(this)">↻ Pull now</button>'
-        '  <span id="tgPullToast" style="font-size:13px;color:var(--muted);align-self:center;display:none"></span>'
-        '</div>'
-        f'<div class="dl-list">{"".join(_card(r) for r in rows)}</div>'
+        f'{_LIST_CSS}'
+        f'<h2 class="section">Discover <span class="count">{len(view):,}</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
+        f'letter-spacing:0;margin-left:10px">public channels other tgarr installs index · '
+        f'{total or 0:,} on tgarr.me'
+        + (f' · list from {_ago(last_pull)}' if last_pull else '') + '</span></h2>'
+        f'{search}<div class="bar-tools">{chips}</div>{listing}'
         '<script>'
         '(() => {'
         '  window.tgRegistryPull = async function(btn) {'
         '    const toast = document.getElementById("tgPullToast");'
-        '    btn.disabled = true; btn.textContent = "Pulling…";'
+        '    btn.disabled = true; btn.textContent = "Refreshing…";'
         '    toast.style.display = "inline";'
-        '    toast.textContent = "waiting for crawler (up to 70s)…";'
+        '    toast.textContent = "asking tgarr.me (up to a minute)…";'
         '    toast.style.color = "var(--muted)";'
         '    try {'
         '      const r = await fetch("/api/registry/pull-now", {method:"POST"});'
         '      const j = await r.json();'
         '      if (j.status === "ok") {'
-        '        toast.textContent = `\u2713 pull complete \u2014 ${j.affected} channel(s) updated`;'
+        '        toast.textContent = "✓ " + j.affected + " channel(s) updated";'
         '        toast.style.color = "var(--ok)";'
         '        if (j.affected > 0) setTimeout(() => location.reload(), 1200);'
         '      } else if (j.status === "queued") {'
-        '        toast.textContent = "\u23F3 queued \u2014 crawler busy, will run soon";'
+        '        toast.textContent = "queued — it will run shortly";'
         '        toast.style.color = "var(--warn)";'
         '      } else {'
-        '        toast.textContent = "\u2717 " + (j.message || "error");'
+        '        toast.textContent = "✗ " + (j.message || "error");'
         '        toast.style.color = "var(--err)";'
         '      }'
         '    } catch (e) {'
-        '      toast.textContent = "\u2717 network error";'
+        '      toast.textContent = "✗ network error";'
         '      toast.style.color = "var(--err)";'
         '    } finally {'
-        '      btn.disabled = false; btn.textContent = "\u21BB Pull now";'
+        '      btn.disabled = false; btn.textContent = "↻ Refresh list";'
         '    }'
         '  };'
         '  window.tgDiscoverSubscribe = async function(btn) {'
         '    const u = btn.dataset.uname;'
-        '    btn.disabled = true; btn.textContent = "...";'
+        '    btn.disabled = true; btn.textContent = "…";'
         '    try {'
         '      const r = await fetch("/api/channel/subscribe", {method:"POST", '
         '          headers:{"Content-Type":"application/x-www-form-urlencoded"}, '
         '          body: "username=" + encodeURIComponent(u)});'
         '      const j = await r.json();'
         '      if (j.status === "queued" || j.status === "ok") {'
-        '        btn.textContent = "✓ queued";'
-        '        btn.style.background = "var(--ok)"; btn.style.color = "#fff";'
-        '      } else { btn.textContent = "✗ " + (j.message || "error"); }'
-        '    } catch(e) { btn.textContent = "✗ network"; }'
+        '        btn.textContent = "✓ Following"; btn.classList.remove("pri");'
+        '      } else { btn.disabled = false; btn.textContent = "✗ " + (j.message || "error"); }'
+        '    } catch(e) { btn.disabled = false; btn.textContent = "✗ network"; }'
         '  };'
         '})();'
         '</script>'
