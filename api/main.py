@@ -3744,11 +3744,14 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     # CSAM hard-block — overrides every setting, always.
     where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
 
-    # Same-DC filter (DEFAULT ON): the photo library is huge and cross-DC
-    # fetches are slow + FloodWait-prone, so by default show only images on the
-    # client's own DC (fast path). ?dc=all shows every DC.
+    # Every DC by default. Restricting the gallery to the account's own DC used
+    # to be the default because each cross-DC image cost a fresh media session
+    # and authorization; with cached per-DC sessions that cost is gone, and the
+    # restriction hid most of the library (about 9 in 10 photos on a typical
+    # install). ?dc=mine is the opt-in "my DC only" filter.
     my_dc = await _get_my_dc()
-    same_dc_only = (dc != "all") and bool(my_dc)
+    same_dc_only = (dc == "mine") and bool(my_dc)
+    _dc_q = "&dc=mine" if same_dc_only else ""
     if same_dc_only:
         params.append(my_dc)
         where.append(f"m.file_dc = ${len(params)}")
@@ -3810,12 +3813,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         label = title or f"@{uname}"
         if len(label) > 18:
             label = label[:16] + '…'
-        return (f'<a class="btn ghost" href="/gallery?channel={uname}" '
+        return (f'<a class="btn ghost" href="/gallery?channel={_q(uname or "")}{_dc_q}" '
                 f'style="{bg}padding:5px 12px;font-size:12px">'
                 f'{html.escape(label)} <span style="opacity:0.6">{n:,}</span></a>')
 
     ch_chips = (
-        '<a class="btn ghost" href="/gallery" style="' +
+        f'<a class="btn ghost" href="/gallery{"?dc=mine" if same_dc_only else ""}" style="' +
         ('background:rgba(94,182,229,0.15);color:var(--accent-hi);'
          'border-color:var(--accent);' if not channel else '') +
         'padding:5px 12px;font-size:12px">all</a>' +
@@ -3824,20 +3827,19 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     # DC toggle: same-DC (fast) ⇄ all DCs. Preserves the channel filter.
     dc_toggle = ''
     if my_dc:
-        _ch = f"&channel={channel}" if channel else ""
+        _ch = f"&channel={_q(channel)}" if channel else ""
         if same_dc_only:
             dc_toggle = (
                 f'<a class="btn ghost" href="/gallery?dc=all{_ch}" '
                 f'style="padding:5px 12px;font-size:12px;'
                 f'background:rgba(16,185,129,0.15);color:#10b981;border-color:#10b981" '
-                f'title="showing only your DC {my_dc} (fast). Click to show all DCs.">'
+                f'title="showing only your DC {my_dc}. Click to show all DCs.">'
                 f'● DC {my_dc} only</a>')
         else:
-            _ch2 = f"?channel={channel}" if channel else ""
             dc_toggle = (
-                f'<a class="btn ghost" href="/gallery{_ch2}" '
+                f'<a class="btn ghost" href="/gallery?dc=mine{_ch}" '
                 f'style="padding:5px 12px;font-size:12px" '
-                f'title="showing all DCs. Click to show only your DC {my_dc} (fast).">'
+                f'title="showing all DCs. Click to show only your DC {my_dc}.">'
                 f'all DCs</a>')
     ch_chips_html = (
         '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">'
@@ -4056,6 +4058,16 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
             " * CASE WHEN m.audio_cover_url IS NOT NULL THEN 1.2 ELSE 1.0 END "
             " * CASE WHEN m.audio_duration_sec >= 60 THEN 1.0 "
             "        WHEN m.audio_duration_sec >= 20 THEN 0.5 ELSE 0.2 END "
+            # Actual audio quality: lossless containers first, then the
+            # average bitrate implied by size / duration (kbit/s).
+            " * CASE WHEN m.file_name ~* '\.(flac|ape|wav|alac|aiff?|dsf|wv)$' "
+            "             OR m.mime_type ~* '(flac|wav|x-ape|aiff)' THEN 1.25 "
+            "        WHEN COALESCE(m.audio_duration_sec, 0) < 20 "
+            "             OR COALESCE(m.file_size, 0) = 0 THEN 1.0 "
+            "        WHEN m.file_size * 8.0 / 1000 / m.audio_duration_sec >= 256 THEN 1.15 "
+            "        WHEN m.file_size * 8.0 / 1000 / m.audio_duration_sec >= 160 THEN 1.0 "
+            "        WHEN m.file_size * 8.0 / 1000 / m.audio_duration_sec >= 96  THEN 0.85 "
+            "        ELSE 0.7 END "
             ") DESC NULLS LAST, m.posted_at DESC NULLS LAST"
         ),
         "recent":   "m.posted_at DESC NULLS LAST",
@@ -4127,7 +4139,7 @@ async def page_music(limit: int = 200, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips_html = (
-        _music_sort_chip("quality", "★ Quality") +
+        _music_sort_chip("quality", "★ Best") +
         _music_sort_chip("recent",  "Recent") +
         _music_sort_chip("longest", "Longest") +
         _music_sort_chip("size",    "Largest"))
@@ -4350,7 +4362,7 @@ async def page_library(limit: int = 200, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips = (
-        _sort_chip("quality", "★ Quality") +
+        _sort_chip("quality", "★ Best") +
         _sort_chip("recent",  "Recent") +
         _sort_chip("size",    "Largest") +
         _sort_chip("title",   "Title"))
