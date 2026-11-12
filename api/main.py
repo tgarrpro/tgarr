@@ -9257,6 +9257,19 @@ async def _refresh_series_aliases():
     _series_aliases_loaded_at = time.time()
 
 
+_OFFERED_SE_RX = re.compile(r"\.S(\d{1,3})E\d{1,4}")
+
+
+def _offered_season(r) -> int:
+    """The season a release is offered to an *arr under: its own; else the one
+    in the name it is given on the way out (an alias can name a season, and a
+    release without one goes out as season 1); else 1."""
+    if r["season"] is not None:
+        return int(r["season"])
+    m = _OFFERED_SE_RX.search(_rewrite_release_title_sync(r))
+    return int(m.group(1)) if m else 1
+
+
 def _rewrite_release_title_sync(r, my_dc=None) -> str:
     """Outbound rewrite (release → newznab feed). Substring match against
     cached alias map. DC tag included as release-group suffix so Sonarr sees
@@ -9507,8 +9520,12 @@ async def newznab_api(
     if t == "tvsearch":
         where_parts.append("r.category = 'tv'")
         if season is not None:
+            # A release with no season of its own ("第 12 集", "EP12" - most
+            # Chinese series) is offered as season 1, or as the season its
+            # alias names; it must be findable under that season too. Sonarr
+            # always asks with a season, so "r.season = N" alone hid them all.
             params.append(season)
-            where_parts.append(f"r.season = ${len(params)}")
+            where_parts.append(f"(r.season = ${len(params)} OR r.season IS NULL)")
         if ep is not None:
             params.append(ep)
             where_parts.append(f"r.episode = ${len(params)}")
@@ -9557,9 +9574,12 @@ async def newznab_api(
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
+    total = rows[0]["_total"] if rows else 0
+    if t == "tvsearch" and season is not None:
+        rows = [r for r in rows if _offered_season(r) == season]
+        total = max(0, offset) + len(rows)
     items = "\n".join(_item_xml(r, base_url, apikey or "tgarr",
                                  my_dc=_release_my_dc) for r in rows)
-    total = rows[0]["_total"] if rows else 0
     return Response(
         _feed_envelope(items, f"search t={t} q={q or ''}", base_url,
                        offset=max(0, offset), total=total),

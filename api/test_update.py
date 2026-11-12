@@ -108,4 +108,23 @@ ok(L(0, 0) == "off", "unknown disk")
 ok(main._fmt_uptime(12 * 86400 + 21 * 3600) == "12 d 21 h" and main._fmt_uptime(3 * 3600 + 120) == "3 h 2 min",
    "uptime wording")
 
+# ---- the season a release is offered under (Newznab TV search) ----------
+_saved_aliases = main._series_aliases_cache
+main._series_aliases_cache = [("舌尖上的中国第三季", "A Bite of China", 3, "tv"),
+                              ("京城奇探", "Cases Between Us", None, "tv")]
+
+
+def _rel(name, season, episode):
+    return {"name": name, "category": "tv", "season": season, "episode": episode,
+            "quality": "2160p", "movie_year": None, "file_dc": 5}
+
+
+ok(main._offered_season(_rel("#京城奇探.2160p", None, 12)) == 1, "no season of its own: offered as season 1")
+ok(main._rewrite_release_title_sync(_rel("#京城奇探.2160p", None, 12)).startswith("Cases.Between.Us.S01E12."),
+   "and named that way on the way out")
+ok(main._offered_season(_rel("舌尖上的中国第三季.第2集", None, 2)) == 3, "the alias names the season")
+ok(main._offered_season(_rel("Some.Show.S04E01.1080p", 4, 1)) == 4, "its own season wins")
+ok(main._offered_season(_rel("没有别名的剧.第5集", None, 5)) == 1, "no alias and no season: 1")
+main._series_aliases_cache = _saved_aliases
+
 print(f"ok - {n} checks")
