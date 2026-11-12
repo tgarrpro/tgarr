@@ -1934,6 +1934,8 @@ async def _player_saved(q=None, kind=None, sort="recent", fav=0, limit=50, offse
         where.append(_SAVED_KINDS[kind])
     if fav:
         where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
+    if _pub_m("m"):
+        where.append(_pub_m("m")[5:])           # signed out: public channels only
     wsql = " AND ".join(where)
     order = _SAVED_SORTS.get(sort, _SAVED_SORTS["recent"])
     async with db_pool.acquire() as conn:
@@ -1941,9 +1943,10 @@ async def _player_saved(q=None, kind=None, sort="recent", fav=0, limit=50, offse
             f"SELECT count(*) AS n, COALESCE(sum(m.file_size), 0) AS bytes FROM messages m WHERE {wsql}",
             *params)
         kinds = await conn.fetch(
-            """SELECT split_part(local_path, '/', 1) AS k, count(*) AS n
+            f"""SELECT split_part(local_path, '/', 1) AS k, count(*) AS n
                FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
                  AND split_part(local_path, '/', 1) IN ('video', 'audio', 'library')
+                 {_pub_m("messages")}
                GROUP BY 1""")
         rows = await conn.fetch(
             f"""SELECT m.id, m.file_name, m.file_size, m.media_type, m.local_path,
@@ -4837,7 +4840,12 @@ MOBILE_CSS = """
              border-left:none; border-bottom:3px solid transparent; white-space:nowrap; }
   .navlink.active { border-left-color:transparent; border-bottom-color:var(--accent); }
   .navlink svg { width:20px; height:20px; }
-  aside.nav .user { display:none; }
+  aside.nav .user { flex:none; padding:4px 8px; border-top:none; }
+  aside.nav .user .ub-txt, aside.nav .user .ub-ch, aside.nav .user div.ub { display:none; }
+  aside.nav .user .ub { padding:4px; width:auto; }
+  aside.nav .user .ub-av { width:32px; height:32px; font-size:14px; }
+  aside.nav .user .ub-menu { top:calc(100% + 8px); bottom:auto; left:auto; right:0; width:220px; }
+  aside.nav .user .ub-in { margin:0; padding:7px 10px; font-size:12px; white-space:nowrap; }
   main.main { min-height:0; }
   .topbar { height:auto; padding:10px 14px; gap:10px; flex-wrap:wrap; }
   .topbar h1 { font-size:20px; }
@@ -8120,9 +8128,10 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 async def page_downloads(tab: str = "players", q: Optional[str] = None,
                          kind: Optional[str] = None, sort: str = "recent",
                          fav: int = 0, offset: int = 0, limit: int = 50):
-    if not login.session_exists():
-        return RedirectResponse("/login")
-    tab = "grabs" if tab == "grabs" else "players"
+    # signed out: what is already saved from public channels can still be
+    # opened; nothing can be fetched, paused or removed
+    ro = not _signed_in()
+    tab = "grabs" if (tab == "grabs" and not ro) else "players"
     page_size = max(10, min(limit, 200))
     page_offset = max(0, offset)
     _my_dc = await _get_my_dc()
@@ -8146,7 +8155,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                WHERE d.status IN ('completed','failed','cancelled')
                ORDER BY d.finished_at DESC NULLS LAST LIMIT 100""")
 
-    fetches = await _player_fetches()
+    fetches = [] if ro else await _player_fetches()
     saved = (await _player_saved(q, kind, sort, fav, page_size, page_offset)
              if tab == "players" else None)
 
@@ -8197,8 +8206,8 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
         head = (f'<h2 class="section">Saved from players <span class="count">{saved["total"]:,}</span>'
                 f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
                 f'text-transform:none;letter-spacing:0;margin-left:10px">'
-                f'{_fmt_size(saved["bytes"]) or "0 MB"} · '
-                f'<a href="/settings#cache">clean-up rules</a></span></h2>'
+                f'{_fmt_size(saved["bytes"]) or "0 MB"}'
+                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>') + '</span></h2>'
                 f'{search}'
                 f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
         if not saved["rows"]:
@@ -8219,7 +8228,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 state = ""
             trs.append(
                 f'<tr data-id="{r["id"]}">'
-                f'<td class="ck"><input type="checkbox" class="sv"/></td>'
+                f'<td class="ck">{"" if ro else "<input type=checkbox class=sv />"}</td>'
                 f'<td class="ic">{ico.get(r["media_type"], "📄")}</td>'
                 f'<td class="nm"><a href="/watch/{r["id"]}">'
                 f'{html.escape(r["file_name"] or r["local_path"].rsplit("/", 1)[-1])}</a> '
@@ -8229,8 +8238,9 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<td class="ac"><div class="dl-ctrls">'
                 f'<a class="dl-btn sq" href="/media/{r["id"]}" download '
                 f'title="download to this device">⬇</a>'
-                f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
-                f'title="remove from the server">✗</button></div></td></tr>')
+                + ('' if ro else
+                   f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
+                   f'title="remove from the server">✗</button>') + '</div></td></tr>')
         table = (
             '<style>.sv-list{width:100%;border-collapse:collapse;background:var(--surface);'
             'border:1px solid var(--border);border-radius:10px;overflow:hidden}'
@@ -8242,15 +8252,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             'font-size:13px}.sv-list .ac{white-space:nowrap;text-align:right}'
             '.sv-list .nm a{color:var(--fg);text-decoration:none;word-break:break-all}'
             '.sv-list .nm a:hover{color:var(--accent)}</style>'
-            '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
-            '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
-            '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
-            '<span id="svN" style="color:var(--muted)"></span></div>'
-            '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
+            + ('' if ro else
+               '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
+               '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
+               '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
+               '<span id="svN" style="color:var(--muted)"></span></div>')
+            + '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
             '<th>last opened</th><th></th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table>'
             + _page_nav("/downloads", _dqs, page_offset, page_size, len(saved["rows"]), saved["total"])
-            + '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
+            + ('' if ro else '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
               'n=document.getElementById("svN");const boxes=()=>[...document.querySelectorAll(".sv")];'
               'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;n.textContent=c?c+" selected":""}'
               'all.onchange=()=>{boxes().forEach(b=>b.checked=all.checked);upd()};'
@@ -8259,7 +8270,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
               'if(!ids.length||!confirm("Remove "+ids.length+" file(s) from the server? They stay in the index '
               'and can be fetched again."))return;'
               'fetch("/api/fetch/remove",{method:"POST",headers:{"Content-Type":"application/json"},'
-              'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>')
+              'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>'))
         return head + table
 
     _fetch_js = ('<script>function fetchCancel(id){fetch("/api/fetch/"+id+"/cancel",{method:"POST"})'
@@ -8447,6 +8458,11 @@ function dlAct(id, action){
     tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
             + _tab("players", "Opened in players", len(fetches))
             + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active)) + '</div>')
+    if ro:
+        tabs = ('<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;'
+                'padding:12px 16px;margin-bottom:20px;color:var(--muted);font-size:14px">'
+                'Not signed in: files already saved from public channels can be opened and downloaded. '
+                '<a href="/login">Sign in to Telegram</a> to fetch more or to remove any.</div>')
     if tab == "players":
         body = f'{dl_css}{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
     else:
