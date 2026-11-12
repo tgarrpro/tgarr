@@ -2392,8 +2392,15 @@ $("tocBtn").onclick = () => toc(!$("drawer").classList.contains("open"));
 $("tocClose").onclick = () => toc(false); $("shade").onclick = () => toc(false);
 function hideTip(){ const t = $("tip"); if (t) { t.style.opacity = 0; setTimeout(() => t.remove(), 700); } }
 setTimeout(hideTip, 7000);
-if (document.referrer && document.referrer.indexOf(location.host) > 0 && history.length > 1)
-  $("back").onclick = e => { e.preventDefault(); history.back(); };
+// "back": players open in a new tab, where there is no page to go back to.
+// Go back if there is one; otherwise close the tab (the list is still open
+// behind it); if the browser will not close it, go to the list.
+function tgBack(fallback){
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  window.close();
+  setTimeout(function(){ location.href = fallback; }, 200);
+}
+$("back").onclick = e => { e.preventDefault(); tgBack("/library"); };
 document.body.dataset.theme = theme;
 fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
   if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
@@ -2725,8 +2732,15 @@ document.addEventListener("keydown", e => {
   else if (k === "Home") go(1); else if (k === "End") go(pages);
   else if (k === "+" || k === "=") rezoom(zoom * 1.2); else if (k === "-") rezoom(zoom / 1.2);
 });
-if (document.referrer && document.referrer.indexOf(location.host) > 0 && history.length > 1)
-  $("back").onclick = e => { e.preventDefault(); history.back(); };
+// "back": players open in a new tab, where there is no page to go back to.
+// Go back if there is one; otherwise close the tab (the list is still open
+// behind it); if the browser will not close it, go to the list.
+function tgBack(fallback){
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  window.close();
+  setTimeout(function(){ location.href = fallback; }, 200);
+}
+$("back").onclick = e => { e.preventDefault(); tgBack("/library"); };
 ui();
 fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
   if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
@@ -2949,11 +2963,13 @@ async def media_status(msg_id: int):
 # of it is here, because seeking past that point has to wait.
 _WATCH_PLAYER_CSS = """
 .vshell { width:100%; display:flex; flex-direction:column; align-items:center; }
-.vshell video { width:1200px; max-width:96vw; max-height:calc(100vh - 150px); background:#000; border-radius:8px; }
+.vstage { display:flex; align-items:center; justify-content:center; overflow:hidden; background:#000; border-radius:8px;
+  width:1200px; max-width:96vw; height:calc(100vh - 150px); }
+.vshell video { width:100%; height:100%; max-width:none; max-height:none; background:#000; object-fit:contain; transition:transform .2s; }
 body.wide { height:100vh; overflow:hidden; }
 body.wide main { padding:0; align-items:stretch; min-height:0; }
 body.wide .vshell { height:100%; }
-body.wide .vshell video { flex:1; min-height:0; width:100%; max-width:100%; max-height:none; border-radius:0; }
+body.wide .vstage { flex:1; min-height:0; width:100%; max-width:100%; height:auto; border-radius:0; }
 .vbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:center; padding:10px 12px; width:100%; box-sizing:border-box; }
 .vbar button, .vbar select, .vbar a, .bar button { font:inherit; font-size:13px; color:#e2e8f0; background:#1e293b;
   border:1px solid #334155; border-radius:8px; padding:7px 12px; cursor:pointer; text-decoration:none; line-height:1.2; }
@@ -2970,7 +2986,17 @@ body.wide .vshell video { flex:1; min-height:0; width:100%; max-width:100%; max-
 """
 
 _WATCH_PLAYER_JS = r"""
+// "back": players open in a new tab, where there is no page to go back to.
+// Go back if there is one; otherwise close the tab (the list is still open
+// behind it); if the browser will not close it, go to the list.
+function tgBack(fallback){
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  window.close();
+  setTimeout(function(){ location.href = fallback; }, 200);
+}
 function tgFavBtn(){
+  const bk = document.getElementById("backBtn");
+  if (bk) bk.onclick = e => { e.preventDefault(); tgBack(MEDIA_TYPE === "video" ? "/videos" : MEDIA_TYPE === "audio" ? "/music" : "/library"); };
   const b = document.getElementById("favBtn"); if (!b) return;
   b.onclick = () => fetch("/api/fav/" + MSG_ID, {method: "POST"}).then(r => r.json()).then(j => {
     if (j.fav === undefined) return; b.classList.toggle("on", j.fav); b.title = j.fav ? "in your favourites" : "add to favourites"; });
@@ -2981,12 +3007,15 @@ function tgVideo(main){
   const save = () => { try { localStorage.setItem("tgarr.video", JSON.stringify(prefs)); } catch (e) {} };
   const KEY = "tgarr.v." + MSG_ID;
   main.innerHTML =
-    '<div class="vshell"><video id="v" controls autoplay playsinline src="/media/' + MSG_ID + '"></video>' +
+    '<div class="vshell"><div class="vstage" id="vStage"><video id="v" controls autoplay playsinline src="/media/' + MSG_ID + '"></video></div>' +
     '<div class="vbar">' +
     '<button id="vBack" title="back 10 seconds (left arrow)">&#8630; 10s</button>' +
     '<button id="vFwd" title="forward 10 seconds (right arrow)">10s &#8631;</button>' +
     '<select id="vSpeed" title="playback speed (&lt; and &gt;)">' +
       [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(x => '<option value="' + x + '">' + x + '&times;</option>').join("") + '</select>' +
+    '<button id="vRot" title="turn the picture a quarter turn (r) - for phone videos lying on their side">&#8635; Rotate</button>' +
+    '<button id="vMir" title="mirror the picture left-right (h) - for selfie videos">&#8646; Mirror</button>' +
+    '<button id="vFill" title="fill the frame, cropping the edges (c)">Fill</button>' +
     '<button id="vWide" title="fill the window (w)">Full width</button>' +
     '<button id="vPip" title="keep playing in a small floating window">Picture-in-picture</button>' +
     '<button id="vFull" title="full screen (f)">Full screen</button>' +
@@ -2997,8 +3026,28 @@ function tgVideo(main){
     document.body.appendChild(t); setTimeout(() => { t.style.opacity = 0; setTimeout(() => t.remove(), 600); }, ms || 5000); return t; };
   const fmt = s => { s = Math.floor(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
     return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
+  // picture: quarter turns, mirror, fill. Phone videos are often sideways or
+  // mirrored; this is per video, and remembered for it.
+  let pic = {}; try { pic = JSON.parse(localStorage.getItem(KEY + ".pic") || "{}"); } catch (e) {}
+  const stage = $("vStage");
+  function picture(){
+    const rot = ((pic.rot || 0) % 360 + 360) % 360, side = rot === 90 || rot === 270;
+    // a turned picture must fit a frame of the other shape: give the video
+    // the frame's swapped size, then turn it
+    v.style.width = side ? stage.clientHeight + "px" : "100%";
+    v.style.height = side ? stage.clientWidth + "px" : "100%";
+    v.style.flex = "none";
+    v.style.transform = "rotate(" + rot + "deg)" + (pic.mir ? " scaleX(-1)" : "");
+    v.style.objectFit = pic.fill ? "cover" : "contain";
+    $("vRot").classList.toggle("on", rot !== 0); $("vMir").classList.toggle("on", !!pic.mir); $("vFill").classList.toggle("on", !!pic.fill);
+    try { if (rot || pic.mir || pic.fill) localStorage.setItem(KEY + ".pic", JSON.stringify(pic)); else localStorage.removeItem(KEY + ".pic"); } catch (e) {}
+  }
+  $("vRot").onclick = () => { pic.rot = ((pic.rot || 0) + 90) % 360; picture(); };
+  $("vMir").onclick = () => { pic.mir = !pic.mir; picture(); };
+  $("vFill").onclick = () => { pic.fill = !pic.fill; picture(); };
+  window.addEventListener("resize", picture);
   // wide
-  const wide = on => { prefs.wide = on; save(); document.body.classList.toggle("wide", on); $("vWide").classList.toggle("on", on); };
+  const wide = on => { prefs.wide = on; save(); document.body.classList.toggle("wide", on); $("vWide").classList.toggle("on", on); picture(); };
   wide(prefs.wide); $("vWide").onclick = () => wide(!prefs.wide);
   // speed + volume
   const speed = x => { x = Math.max(0.5, Math.min(2, x)); v.playbackRate = x; v.defaultPlaybackRate = x; prefs.speed = x; save(); $("vSpeed").value = String(x); };
@@ -3033,6 +3082,9 @@ function tgVideo(main){
     else if (k === " " || k === "k") { if (e.target !== v) { e.preventDefault(); v.paused ? v.play() : v.pause(); } }
     else if (k === "f") full();
     else if (k === "w") wide(!prefs.wide);
+    else if (k === "r") $("vRot").click();
+    else if (k === "h") $("vMir").click();
+    else if (k === "c") $("vFill").click();
     else if (k === "m") v.muted = !v.muted;
     else if (k === ">" || k === ".") speed((prefs.speed || 1) + 0.25);
     else if (k === "<" || k === ",") speed((prefs.speed || 1) - 0.25);
@@ -3105,7 +3157,7 @@ audio {{ width:600px; max-width:96vw; }}
 {_WATCH_PLAYER_CSS}
 </style></head><body>
 <div class="bar">
-  <a href="javascript:history.back()">← back</a>
+  <a href="#" id="backBtn">← back</a>
   <div class="title">{html.escape(title)}</div>
   <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{'in your favourites' if row["fav"] else 'add to favourites'}">♥ Favourite</button>
   <a href="/media/{msg_id}" download>⬇ download</a>
