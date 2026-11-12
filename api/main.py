@@ -372,6 +372,7 @@ async def _migrate_schema():
             ALTER TABLE discovered ADD COLUMN IF NOT EXISTS video_files INTEGER;
             ALTER TABLE discovered ADD COLUMN IF NOT EXISTS book_files INTEGER;
             ALTER TABLE discovered ADD COLUMN IF NOT EXISTS audio_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS last_file_at TIMESTAMPTZ;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
@@ -4605,8 +4606,48 @@ _LIST_CSS = """<style>
 .bar-tools{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 .bar-tools .sep{width:1px;height:22px;background:var(--border);margin:0 6px}
 .bar-tools .lbl{font-size:12px;color:var(--muted);margin-right:2px}
-@media (max-width:820px){.ls-num{display:none}.ls-act{min-width:0}.abtn{min-width:0;padding:0 10px}}
+.ls-head{display:flex;align-items:center;gap:14px;padding:9px 16px;border-bottom:1px solid var(--border);
+  background:rgba(127,127,127,.06);font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted);user-select:none}
+.ls-head a{color:inherit;text-decoration:none;cursor:pointer;white-space:nowrap}
+.ls-head a:hover,.ls-head a.on{color:var(--accent)}
+.ls-head i{font-style:normal;font-size:9px;margin-left:4px;display:inline-block;width:8px}
+.ls-head .ls-num{font-variant-numeric:normal}
+.sort-chips{display:none;gap:6px;flex-wrap:wrap;align-items:center}
+@media (max-width:820px){.ls-num{display:none}.ls-act{min-width:0}.abtn{min-width:0;padding:0 10px}
+  .ls-head{display:none}.sort-chips{display:inline-flex}}
 </style>"""
+
+
+def _ls_head(cols, sort: str, order: str, href) -> str:
+    """The clickable column header of a .ls list.
+
+    cols: (key, label, css class, first direction). key None = not sortable.
+    Clicking the column that is already sorted turns it round; clicking
+    another sorts by it in the direction that is useful first (biggest /
+    newest first for numbers and dates, A-Z for names)."""
+    out = ['<div class="ls-head"><span style="width:40px;flex:none"></span>']
+    for key, label, css, first in cols:
+        if not key:
+            out.append(f'<span class="{css}">{label}</span>')
+            continue
+        on = key == sort
+        nxt = ("asc" if order == "desc" else "desc") if on else first
+        arrow = ("▲" if order == "asc" else "▼") if on else ""
+        out.append(f'<a class="{css}{" on" if on else ""}" href="{href(key, nxt)}" '
+                   f'title="sort by {label}{" (click again to reverse)" if on else ""}">'
+                   f'{label}<i>{arrow}</i></a>')
+    return "".join(out) + "</div>"
+
+
+def _ls_sort(view: list, keyfn, order: str, name) -> list:
+    """Sort by keyfn in the given direction; rows without a value always go
+    last, whichever way round; equal rows stay in name order."""
+    view = sorted(view, key=name)
+    have = [r for r in view if keyfn(r) not in (None, "")]
+    rest = [r for r in view if keyfn(r) in (None, "")]
+    have.sort(key=keyfn, reverse=(order == "desc"))
+    return have + rest
 
 
 def _color_for(s: str) -> str:
@@ -5699,7 +5740,7 @@ async def api_set_audience(tg_chat_id: int, value: str = Form(...)):
 
 @app.get("/channels", response_class=HTMLResponse)
 async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = "films",
-                        offset: int = 0, limit: int = 50,
+                        order: str = "", offset: int = 0, limit: int = 50,
                         min_members: Optional[int] = None, eligible: int = 0,
                         audience: str = ""):
     if not login.session_exists():
@@ -5754,15 +5795,21 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
 
     def _shared(r):
         return (r["members_count"] or 0) >= CONTRIB_MIN_MEMBERS and r["media"] >= CONTRIB_MIN_MEDIA
+    # A channel the user unfollowed has left the list as far as they are
+    # concerned, even while its index is still being cleared: it shows only
+    # under "being cleared" (where it can be followed again in time).
+    def _uf(r):
+        return bool(r["unfollowed_at"]) and not r["subscribed"] and not r["is_joined"]
     kinds = {
-        "all": lambda r: True,
-        "films": lambda r: r["films"] > 0,
+        "all": lambda r: not _uf(r),
+        "films": lambda r: r["films"] > 0 and not _uf(r),
         "joined": lambda r: r["is_joined"],
         "subscribed": lambda r: r["subscribed"] and not r["is_joined"],
-        "shared": _shared,
-        "loose": lambda r: not r["is_joined"] and not r["subscribed"] and not r["dead_at"],
-        "empty": lambda r: r["media"] == 0,
-        "dead": lambda r: r["dead_at"] is not None,
+        "shared": lambda r: _shared(r) and not _uf(r),
+        "loose": lambda r: not r["is_joined"] and not r["subscribed"] and not r["dead_at"] and not _uf(r),
+        "empty": lambda r: r["media"] == 0 and not _uf(r),
+        "dead": lambda r: r["dead_at"] is not None and not _uf(r),
+        "clearing": _uf,
     }
     if show not in kinds:
         show = "all"
@@ -5772,16 +5819,21 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         words = [w.lower() for w in q.split()]
         view = [r for r in view
                 if all(w in ((r["title"] or "") + " " + (r["username"] or "")).lower() for w in words)]
+    def _name(r):
+        return (r["title"] or r["username"] or "~").lower()
     sorts = {
-        "films": lambda r: (-r["films"], -r["media"]),
-        "media": lambda r: (-r["media"], -r["films"]),
-        "members": lambda r: (-(r["members_count"] or 0),),
-        "recent": lambda r: (-(r["last_post"].timestamp() if r["last_post"] else 0),),
-        "name": lambda r: ((r["title"] or r["username"] or "~").lower(),),
+        "films": lambda r: (r["films"], r["media"]),
+        "media": lambda r: (r["media"], r["films"]),
+        "members": lambda r: r["members_count"],
+        "recent": lambda r: r["last_post"],
+        "name": _name,
     }
     if sort not in sorts:
         sort = "films"
-    view.sort(key=sorts[sort])
+    first_dir = {"name": "asc"}
+    if order not in ("asc", "desc"):
+        order = first_dir.get(sort, "desc")
+    view = _ls_sort(view, sorts[sort], order, _name)
     page_size = max(10, min(limit, 200))
     page_offset = max(0, offset)
     page = view[page_offset:page_offset + page_size]
@@ -5789,6 +5841,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
     def _cqs(**over):
         cur = {"q": q, "show": show if show != "all" else None,
                "sort": sort if sort != "films" else None,
+               "order": order if order != first_dir.get(sort, "desc") else None,
                "limit": limit if limit != 50 else None}
         cur.update(over)
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
@@ -5816,17 +5869,31 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         + _chip_link("no files" + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
         + (_chip_link("gone" + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
                       show == "dead", "channels Telegram no longer serves") if counts["dead"] else "")
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("films", "/channels" + _cqs(sort=None, offset=None), sort == "films")
-        + _chip_link("files", "/channels" + _cqs(sort="media", offset=None), sort == "media")
-        + _chip_link("members", "/channels" + _cqs(sort="members", offset=None), sort == "members")
-        + _chip_link("latest post", "/channels" + _cqs(sort="recent", offset=None), sort == "recent")
-        + _chip_link("name", "/channels" + _cqs(sort="name", offset=None), sort == "name"))
+        + (_chip_link("being cleared" + _n("clearing"), "/channels" + _cqs(show="clearing", offset=None),
+                      show == "clearing",
+                      "channels you unfollowed: their index is being cleared and they then disappear. "
+                      "Follow one again here to keep it.") if counts["clearing"] else "")
+        # on a phone there is no room for the column header: the same sorts as chips
+        + '<span class="sort-chips"><span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("films", "/channels" + _cqs(sort=None, order=None, offset=None), sort == "films")
+        + _chip_link("files", "/channels" + _cqs(sort="media", order=None, offset=None), sort == "media")
+        + _chip_link("members", "/channels" + _cqs(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link("latest post", "/channels" + _cqs(sort="recent", order=None, offset=None), sort == "recent")
+        + _chip_link("name", "/channels" + _cqs(sort="name", order=None, offset=None), sort == "name")
+        + '</span>')
+    head = _ls_head(
+        (("name", "Channel", "ls-main", "asc"), ("films", "Films", "ls-num", "desc"),
+         ("media", "Files", "ls-num", "desc"), ("members", "Members", "ls-num", "desc"),
+         ("recent", "Latest post", "ls-num lp", "desc"), (None, "", "ls-act", "")),
+        sort, order, lambda k, d: "/channels" + _cqs(sort=k if k != "films" else None,
+                                                     order=d if d != first_dir.get(k, "desc") else None,
+                                                     offset=None))
     search = (
         '<form method="GET" action="/channels" style="display:flex;gap:8px;margin:0 0 12px">'
         + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
                   for k, v in (("show", show if show != "all" else None),
-                               ("sort", sort if sort != "films" else None)) if v)
+                               ("sort", sort if sort != "films" else None),
+                               ("order", order if order != first_dir.get(sort, "desc") else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
           'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
           '<button class="btn" type="submit">Search</button>'
@@ -5897,9 +5964,11 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
             f'{" ".join(tags)}</div>'
             f'<div class="ls-sub">{handle}{"".join(has) or "<span>no files indexed</span>"}</div></div>'
-            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
-            f'<div class="ls-num" style="width:104px"><b style="font-size:13px;font-weight:500">'
-            f'{_ago(r["last_post"]) or "–"}</b><span>latest post</span></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["films"]) if r["films"] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["media"]) if r["media"] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
+            f'<div class="ls-num lp"><b style="font-size:13px;font-weight:500">'
+            f'{_ago(r["last_post"]) or "–"}</b></div>'
             f'<div class="ls-act">{act}</div></div>')
 
     if not page:
@@ -5908,10 +5977,10 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                       "No channels yet. Join channels in Telegram, or follow some from Discover.")
                    + '</div></div>')
     else:
-        listing = (f'<div class="ls">{"".join(_row(r) for r in page)}</div>'
+        listing = (f'<div class="ls">{head}{"".join(_row(r) for r in page)}</div>'
                    + _page_nav("/channels", _cqs, page_offset, page_size, len(page), len(view)))
     body = (
-        f'{_LIST_CSS}'
+        f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
         f'<h2 class="section">Channels <span class="count">{len(view):,}'
         + (f' of {len(rows):,}' if len(view) != len(rows) else '') + '</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
@@ -5924,7 +5993,16 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
             "Its films and files are cleared from this index within a few hours. Files you saved to "
             "this machine and your favourites are kept. You can find the channel again on Discover.")
         + r""";
+function tgChGone(b, note) {
+  var row = b.closest(".ls-row");
+  b.disabled = true; b.textContent = note;
+  if (row) { row.style.transition = "opacity .5s"; row.style.opacity = "0.35";
+             setTimeout(function () { row.remove(); }, 900); }
+}
 function tgChSet(b, following) {
+  // unfollowed: it has left the list. Followed again from "being cleared": it has left that view.
+  if (!following) { tgChGone(b, "Removed"); return; }
+  if (location.search.indexOf("show=clearing") >= 0) { tgChGone(b, "Following"); return; }
   b.disabled = false;
   if (following) {
     b.className = "abtn"; b.textContent = "Unfollow"; b.title = "stop reading this channel";
@@ -5977,7 +6055,8 @@ def _profile_pills(r) -> str:
 
 @app.get("/discover", response_class=HTMLResponse)
 async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] = None,
-                        sort: str = "best", mine: int = 0, offset: int = 0, limit: int = 50):
+                        sort: str = "best", order: str = "", mine: int = 0, offset: int = 0,
+                        limit: int = 50):
     async with db_pool.acquire() as conn:
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
         if not login.session_exists() and not n_channels:
@@ -6002,7 +6081,8 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         rows = await conn.fetch(f"""
             SELECT username, title, members_count, media_count, audience,
                    language, category, distinct_contributors, verified,
-                   last_pulled_at, release_files, video_files, book_files, audio_files
+                   last_pulled_at, release_files, video_files, book_files, audio_files,
+                   last_file_at
             FROM discovered
             WHERE {' AND '.join(where)}""")
         total = await conn.fetchval("SELECT count(*) FROM discovered WHERE dismissed = FALSE")
@@ -6015,25 +6095,35 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         view = [r for r in view
                 if all(w in ((r["title"] or "") + " " + r["username"]).lower() for w in words)]
     lead = kind_col or "release_files"
+    def _dname(r):
+        return (r["title"] or r["username"]).lower()
     sorts = {
         # what the channel carries first - the reason most people install
         # tgarr - then how many installs vouch for it
-        "best": lambda r: (-(r[lead] or 0), -int(bool(r["verified"])),
-                           -(r["distinct_contributors"] or 0), -(r["members_count"] or 0)),
-        "seen": lambda r: (-(r["distinct_contributors"] or 0), -(r[lead] or 0)),
-        "members": lambda r: (-(r["members_count"] or 0),),
-        "files": lambda r: (-(r["media_count"] or 0),),
+        "best": lambda r: (r[lead] or 0, int(bool(r["verified"])),
+                           r["distinct_contributors"] or 0, r["members_count"] or 0),
+        "lead": lambda r: r[lead] or None,
+        "seen": lambda r: (r["distinct_contributors"] or 0, r[lead] or 0),
+        "members": lambda r: r["members_count"],
+        "files": lambda r: r["media_count"] or None,
+        "recent": lambda r: r["last_file_at"],
+        "name": _dname,
     }
     if sort not in sorts:
         sort = "best"
-    view = sorted(view, key=sorts[sort])
+    dfirst = {"name": "asc"}
+    if order not in ("asc", "desc"):
+        order = dfirst.get(sort, "desc")
+    view = _ls_sort(view, sorts[sort], order, _dname)
     page_size = max(10, min(limit, 200))
     page_offset = max(0, offset)
     page = view[page_offset:page_offset + page_size]
 
     def _dq(**over):
         cur = {"kind": kind or None, "audience": audience if audience != "sfw" else None,
-               "q": q, "sort": sort if sort != "best" else None, "mine": 1 if mine else None,
+               "q": q, "sort": sort if sort != "best" else None,
+               "order": order if order != dfirst.get(sort, "desc") else None,
+               "mine": 1 if mine else None,
                "limit": limit if limit != 50 else None}
         cur.update(over)
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
@@ -6048,13 +6138,16 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
            + _chip_link("SFW", "/discover" + _dq(audience=None, offset=None), audience == "sfw")
            + _chip_link("18+", "/discover" + _dq(audience="nsfw", offset=None), audience == "nsfw")
            if nsfw_on else '')
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("best match", "/discover" + _dq(sort=None, offset=None), sort == "best",
+        + '<span class="sep"></span>'
+        + _chip_link("best match", "/discover" + _dq(sort=None, order=None, offset=None), sort == "best",
                      "most of what you are looking at, then how many installs vouch for it")
-        + _chip_link("most seen", "/discover" + _dq(sort="seen", offset=None), sort == "seen",
+        + '<span class="sort-chips"><span class="lbl">Sort:</span>'
+        + _chip_link("most seen", "/discover" + _dq(sort="seen", order=None, offset=None), sort == "seen",
                      "indexed by the most tgarr installs")
-        + _chip_link("members", "/discover" + _dq(sort="members", offset=None), sort == "members")
-        + _chip_link("files", "/discover" + _dq(sort="files", offset=None), sort == "files")
+        + _chip_link("members", "/discover" + _dq(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link("files", "/discover" + _dq(sort="files", order=None, offset=None), sort == "files")
+        + _chip_link("latest file", "/discover" + _dq(sort="recent", order=None, offset=None), sort == "recent")
+        + '</span>'
         + '<span class="sep"></span>'
         + _chip_link(f'include the {len(have):,} I already have', "/discover" + _dq(mine=None if mine else 1, offset=None),
                      bool(mine)))
@@ -6063,6 +6156,7 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
                   for k, v in (("kind", kind), ("audience", audience if audience != "sfw" else None),
                                ("sort", sort if sort != "best" else None),
+                               ("order", order if order != dfirst.get(sort, "desc") else None),
                                ("mine", 1 if mine else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
           'placeholder="find a channel by name or @username…" style="flex:1;min-width:150px;max-width:420px"/>'
@@ -6097,9 +6191,13 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
             + ('<span class="tag warn">18+</span>' if r["audience"] == "nsfw" else '')
             + f'</div><div class="ls-sub"><a href="https://t.me/{html.escape(u)}" target="_blank" rel="noopener" '
             f'title="open in Telegram">@{html.escape(u)}</a>{"".join(has)}</div></div>'
-            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
-            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b>'
-            f'<span>installs</span></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r[lead]) if r[lead] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["media_count"]) if r["media_count"] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
+            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b></div>'
+            f'<div class="ls-num lp" title="when the newest file that tgarr installs have reported for this '
+            f'channel was posted"><b style="font-size:13px;font-weight:500">'
+            f'{_ago(r["last_file_at"]) or "–"}</b></div>'
             f'<div class="ls-act">{btn}</div></div>')
 
     if not rows and not total:
@@ -6115,11 +6213,19 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
                    + ('<div style="margin-top:8px;font-size:13px">“Refresh list” asks tgarr.me for it now.</div>'
                       if not rows and not (q or kind) else '') + '</div>')
     else:
-        listing = (f'<div class="ls">{"".join(_card(r) for r in page)}</div>'
+        dhead = _ls_head(
+            (("name", "Channel", "ls-main", "asc"),
+             ("lead", {"book_files": "Books", "audio_files": "Songs"}.get(lead, "Films"), "ls-num", "desc"),
+             ("files", "Files", "ls-num", "desc"), ("members", "Members", "ls-num", "desc"),
+             ("seen", "Installs", "ls-num", "desc"), ("recent", "Latest file", "ls-num lp", "desc"),
+             (None, "", "ls-act", "")),
+            sort, order, lambda k, d: "/discover" + _dq(sort=k, order=d if d != dfirst.get(k, "desc") else None,
+                                                        offset=None))
+        listing = (f'<div class="ls">{dhead}{"".join(_card(r) for r in page)}</div>'
                    + _page_nav("/discover", _dq, page_offset, page_size, len(page), len(view)))
 
     body = (
-        f'{_LIST_CSS}'
+        f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
         f'<h2 class="section">Discover <span class="count">{len(view):,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
         f'letter-spacing:0;margin-left:10px">public channels other tgarr installs index · '

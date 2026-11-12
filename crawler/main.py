@@ -266,6 +266,18 @@ _MTPROTO_BG_HALT_UNTIL: dict = {}     # method → epoch: background callers onl
 _MTPROTO_DAILY_BY: dict = {}          # method → [utc_day, {caller: count}]
 
 
+def _iso_or_none(v):
+    """An ISO-8601 time from the registry as a datetime; None for anything else."""
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        from datetime import datetime, timezone
+        d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 class DailyBudgetExhausted(RuntimeError):
     """Raised instead of making a call whose daily Telegram budget is spent."""
 
@@ -1120,6 +1132,8 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS unfollowed_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_retry_after TIMESTAMPTZ")
+        await conn.execute(
+            "ALTER TABLE discovered ADD COLUMN IF NOT EXISTS last_file_at TIMESTAMPTZ")
         # Channels marked "read to the end" by the old error handling without
         # one page ever having been read (see deep_backfill_worker): ask again.
         # A channel that really is at its end costs one more page and is marked
@@ -4757,9 +4771,11 @@ async def registry_puller() -> None:
                         """INSERT INTO discovered
                              (username, title, members_count, media_count, audience,
                               language, category, distinct_contributors, verified,
-                              release_files, video_files, book_files, audio_files)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                              release_files, video_files, book_files, audio_files,
+                              last_file_at)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                            ON CONFLICT (username) DO UPDATE SET
+                             last_file_at = COALESCE(EXCLUDED.last_file_at, discovered.last_file_at),
                              release_files = EXCLUDED.release_files,
                              video_files = EXCLUDED.video_files,
                              book_files = EXCLUDED.book_files,
@@ -4778,7 +4794,8 @@ async def registry_puller() -> None:
                         c.get("audience"), c.get("language"), c.get("category"),
                         c.get("distinct_contributors", 0), c.get("verified", False),
                         c.get("release_files"), c.get("video_files"),
-                        c.get("book_files"), c.get("audio_files"))
+                        c.get("book_files"), c.get("audio_files"),
+                        _iso_or_none(c.get("last_file_at")))
                     if is_new:
                         inserted += 1
                     else:

@@ -292,7 +292,10 @@ async def _audience_classifier():
                                 count(*) FILTER (WHERE rr.media_type = 'video') AS v,
                                 count(*) FILTER (WHERE rr.file_name ~* $1) AS rel,
                                 count(*) FILTER (WHERE rr.file_name ~* $2) AS b,
-                                count(*) FILTER (WHERE rr.media_type = 'audio') AS a
+                                count(*) FILTER (WHERE rr.media_type = 'audio') AS a,
+                                -- a post cannot be from the future: a wrong clock
+                                -- (or a liar) must not make a channel look busy
+                                LEAST(max(ch.posted_at), NOW()) AS last_file
                          FROM registry_resource_channels ch
                          JOIN registry_resources rr USING (file_unique_id)
                          WHERE NOT rr.blocked
@@ -301,6 +304,7 @@ async def _audience_classifier():
                          UPDATE registry_channels rc
                             SET release_files = st.rel, video_files = st.v,
                                 book_files = st.b, audio_files = st.a,
+                                last_file_at = st.last_file,
                                 files_stats_at = NOW()
                            FROM st WHERE rc.username = st.u
                          RETURNING 1)
@@ -1230,7 +1234,8 @@ async def get_registry(
     limit = max(1, min(limit, 20000))
     base_cols = ("username, title, members_count, media_count, audience, "
                 "language, category, distinct_contributors, verified, "
-                "last_seen_at, release_files, video_files, book_files, audio_files")
+                "last_seen_at, release_files, video_files, book_files, audio_files, "
+                "last_file_at")
     async with db_pool.acquire() as conn:
         if honeypot_ratio > 0:
             # Suspicious tier: poison the well. Compute split, fetch separately,
@@ -1261,8 +1266,9 @@ async def get_registry(
                 f"COALESCE(members_count,0) DESC LIMIT {limit}")
     def _row_json(r):
         d = dict(r)
-        if d.get("last_seen_at"):
-            d["last_seen_at"] = d["last_seen_at"].isoformat()
+        for k in ("last_seen_at", "last_file_at"):
+            if d.get(k):
+                d[k] = d[k].isoformat()
         return d
     body = {"version": VERSION,
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

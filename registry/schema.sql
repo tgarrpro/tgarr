@@ -113,3 +113,7 @@ ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS book_files INTEGER;
 ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS audio_files INTEGER;
 ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS files_stats_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_reg_release_files ON registry_channels (release_files DESC NULLS LAST);
+
+-- When the newest file installs have reported for this channel was posted:
+-- how active the channel is, as far as the federation has seen.
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS last_file_at TIMESTAMPTZ;
