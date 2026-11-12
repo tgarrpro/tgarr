@@ -399,6 +399,7 @@ async def _migrate_schema():
               last_error TEXT,
               last_error_at TIMESTAMPTZ
             );
+            ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_oldest_tg_id BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
@@ -4820,7 +4821,7 @@ async def api_workers():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT worker, last_seen, last_action, iter_count, "
-            "error_count, last_error, last_error_at "
+            "error_count, last_error, last_error_at, quiet_for_s "
             "FROM worker_status ORDER BY last_seen DESC")
         _rec_mode = (await conn.fetchval(
             "SELECT value FROM config WHERE key='dialog_reconcile_mode'") or "off").lower()
@@ -4839,6 +4840,10 @@ async def api_workers():
     for r in rows:
         seen.add(r["worker"])
         expected_max = _EXPECTED_WORKERS.get(r["worker"], 3600)
+        # the job said it would be quiet this long: silence within that
+        # (plus a margin) is what it promised, not a fault
+        if r["quiet_for_s"]:
+            expected_max = max(expected_max, int(r["quiet_for_s"] * 1.25) + 120)
         out.append({
             "worker": r["worker"],
             "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,

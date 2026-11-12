@@ -1115,6 +1115,8 @@ async def init_db() -> None:
     # here so crawler workers can query them regardless of migration order).
     async with db_pool.acquire() as conn:
         await conn.execute(
+            "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0")
+        await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_joined BOOLEAN")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ")
@@ -1196,12 +1198,20 @@ async def init_db() -> None:
     log.info("postgres pool ready")
 
 
-async def _heartbeat(worker: str, action: str = "", error: str | None = None) -> None:
+async def _heartbeat(worker: str, action: str = "", error: str | None = None,
+                     quiet_for: int = 0) -> None:
     """Write worker heartbeat into worker_status table.
     Call from inside each worker's main loop iteration.
+
+    quiet_for: the job has nothing to do and will not report again for this
+    many seconds. The System page then knows silence is expected - it used
+    to show such a job in red, as if it had died.
     """
     try:
         async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE worker_status SET quiet_for_s = $2 WHERE worker = $1 "
+                "AND quiet_for_s IS DISTINCT FROM $2", worker, int(quiet_for))
             if error:
                 await conn.execute(
                     "INSERT INTO worker_status "
@@ -4248,9 +4258,13 @@ async def subscription_poller() -> None:
                     log.info("[subscribe] @%s stale peer cache → force-resolve", uname)
                     from pyrogram.raw.functions.contacts import ResolveUsername
                     # a channel is followed because someone chose to follow it
+                    # wait=False: when today's lookups are used up this
+                    # ONE channel is skipped until tomorrow. Waiting here
+                    # parked the whole poller - every followed channel went
+                    # without its new posts for the rest of the day.
                     r = await _mtproto("resolveUsername",
                         lambda: app.invoke(ResolveUsername(username=uname.lstrip("@"))),
-                        user=True)
+                        wait=False, user=True)
                     await app.fetch_peers(r.chats + r.users)
                     chat = await _mtproto("get_chat",
                         lambda: app.get_chat(uname))
@@ -4267,6 +4281,15 @@ async def subscription_poller() -> None:
                         """UPDATE channels SET subscribe_error=$1,
                            last_polled_at=NOW() WHERE id=$2""",
                         f"FloodWait {fw.value}s", row["id"])
+                continue
+            except DailyBudgetExhausted:
+                log.info("[subscribe] @%s needs a username lookup and today's are used up "
+                         "— it is polled again tomorrow; the other channels carry on", uname)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """UPDATE channels SET subscribe_error=$1,
+                           last_polled_at=NOW() WHERE id=$2""",
+                        "waiting for tomorrow's Telegram lookup allowance", row["id"])
                 continue
             except (UsernameNotOccupied, UsernameInvalid, ChannelPrivate) as e:
                 # Permanent — channel gone / username dead / account banned.
@@ -5837,7 +5860,8 @@ async def deep_backfill_worker() -> None:
                     LIMIT 1
                 """, DEEP_BACKFILL_MIN_MEDIA, CURRENT_USER_ID)
             if not row:
-                await _heartbeat("deep_backfill_worker", "all channels deep-backfilled")
+                await _heartbeat("deep_backfill_worker", "all channels deep-backfilled",
+                                 quiet_for=3600)
                 await asyncio.sleep(3600)  # all done, idle hourly
                 continue
 
@@ -6062,7 +6086,7 @@ async def contribute_resources_worker() -> None:
                 # adaptive: empty queue → long heartbeat sleep
                 nap = _adaptive_sleep_seconds(0)
                 await _heartbeat("contribute_resources_worker",
-                                 f"queue empty; sleep {nap}s")
+                                 f"queue empty; sleep {nap}s", quiet_for=nap)
                 await asyncio.sleep(nap)
                 continue
 
