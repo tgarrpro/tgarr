@@ -1019,6 +1019,8 @@ async def init_db() -> None:
         await conn.execute(
             "ALTER TABLE releases ADD COLUMN IF NOT EXISTS part SMALLINT")
         await conn.execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS fetch_wanted_at TIMESTAMPTZ")
+        await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_rejudge ON messages (id) "
             "WHERE rel_ver IS NULL AND media_type IN ('video', 'document')")
         await conn.execute(
@@ -4909,6 +4911,33 @@ async def _ondemand_run(row) -> None:
         _ondemand_active.pop(row["id"], None)
 
 
+# Opening a film starts fetching the whole file. That is right while someone
+# is watching it and wrong the moment they are not: ten films opened and
+# closed were ten complete downloads - bandwidth, disk, and the account's
+# cross-DC allowance spent on nothing.
+#
+# The API stamps messages.fetch_wanted_at for as long as a player, a reader
+# or a browser download is asking for the file. A fetch of a big file checks
+# the stamp as it goes and stops once nobody has asked for a while; what has
+# arrived is kept, and the next request continues from there instead of
+# starting again. Songs and books are small: they simply finish.
+# (No stamp at all = an API that does not write them: behave as before.)
+ONDEMAND_WATCH_BYTES = 64 * 1024 * 1024
+ONDEMAND_IDLE_SEC = int(os.environ.get("TGARR_ONDEMAND_IDLE_SEC", "150"))
+
+
+async def _ondemand_wanted(msg_id: int) -> bool:
+    try:
+        async with db_pool.acquire() as conn:
+            v = await conn.fetchval(
+                """SELECT fetch_wanted_at IS NULL
+                          OR fetch_wanted_at > NOW() - make_interval(secs => $2)
+                   FROM messages WHERE id = $1""", msg_id, float(ONDEMAND_IDLE_SEC))
+        return v is not False
+    except Exception:
+        return True
+
+
 async def _ondemand_fetch_one(row) -> None:
     mt = row["media_type"] or "document"
     await _heartbeat("on_demand_media_downloader", f"streaming msg {row['id']} ({mt})")
@@ -4919,8 +4948,27 @@ async def _ondemand_fetch_one(row) -> None:
     safe = SAFE_NAME.sub("_", base)[:180]
     target = os.path.join(root, safe)
     rel = os.path.relpath(target, "/downloads")
+    expected = row["file_size"] or 0
+    watched = expected >= ONDEMAND_WATCH_BYTES
+    mb = 1024 * 1024
 
     try:
+        if watched and not await _ondemand_wanted(row["id"]):
+            # asked for, then left before the fetch even began
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE messages SET local_path = NULL "
+                    "WHERE id = $1 AND local_path = '__user_queued__'", row["id"])
+            log.info("[on-demand-media] id=%s: nobody is waiting for it any more — not fetched",
+                     row["id"])
+            return
+        have = os.path.getsize(target) if os.path.exists(target) else 0
+        if expected and have >= expected:
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE messages SET local_path=$1 WHERE id=$2", rel, row["id"])
+            _drop_tail_sidecar(target)
+            return                               # already here in full
+
         msg = await _mtproto_get_messages_with_auto_join(
             row["tg_chat_id"], row["tg_message_id"])
         if not msg:
@@ -4935,38 +4983,67 @@ async def _ondemand_fetch_one(row) -> None:
             await conn.execute(
                 "UPDATE messages SET local_path=$1 WHERE id=$2",
                 rel, row["id"])
-        log.info("[on-demand-media] %s id=%s → %s", mt, row["id"], rel)
+        # continue a fetch that was stopped half-way (whole megabytes only:
+        # that is the unit Telegram serves)
+        start = (have // mb) * mb if (watched and mb <= have < expected) else 0
+        log.info("[on-demand-media] %s id=%s → %s%s", mt, row["id"], rel,
+                 f" (continuing at {start // mb} MB)" if start else "")
 
-        expected = row["file_size"] or 0
-        written = 0
-        _drop_tail_sidecar(target)
-        # a FLAC's metadata is held back until it is whole, so that it can be
-        # repaired before a single byte is visible to the player
-        hold = bytearray() if target.lower().endswith(".flac") else None
-        with open(target, "wb") as f:
-            async for chunk in _stream_media_fast(msg, media):
-                if hold is not None:
-                    hold += chunk
-                    n = _flac_meta_len(hold)
-                    if n is None and len(hold) < _FLAC_META_MAX:
-                        continue
-                    if n:
-                        fixed = _flac_fix_meta(bytes(hold[:n]))
-                        if fixed != bytes(hold[:n]):
-                            log.info("[on-demand-media] id=%s: FLAC cover had no type "
-                                     "(browsers refuse such a file) — repaired", row["id"])
-                        chunk = fixed + bytes(hold[n:])
-                    else:
-                        chunk = bytes(hold)
-                    hold = None
-                f.write(chunk)
-                f.flush()
-                if not written and expected > 8 * 1024 * 1024 and mt != "audio":
-                    await _fetch_tail_sidecar(media, target, chunk, expected)
-                written += len(chunk)
-            if hold:
-                f.write(hold)
-                written += len(hold)
+        async def _fetch(start: int):
+            written, paused, checked = start, False, time.time()
+            if not start:
+                _drop_tail_sidecar(target)
+            # a FLAC's metadata is held back until it is whole, so that it can
+            # be repaired before a single byte is visible to the player
+            hold = bytearray() if (target.lower().endswith(".flac") and not start) else None
+            with open(target, "r+b" if start else "wb") as f:
+                if start:
+                    f.seek(start)
+                    f.truncate()
+                src = (_stream_file_cached(media, start=start) if start
+                       else _stream_media_fast(msg, media))
+                async for chunk in src:
+                    if hold is not None:
+                        hold += chunk
+                        n = _flac_meta_len(hold)
+                        if n is None and len(hold) < _FLAC_META_MAX:
+                            continue
+                        if n:
+                            fixed = _flac_fix_meta(bytes(hold[:n]))
+                            if fixed != bytes(hold[:n]):
+                                log.info("[on-demand-media] id=%s: FLAC cover had no type "
+                                         "(browsers refuse such a file) — repaired", row["id"])
+                            chunk = fixed + bytes(hold[n:])
+                        else:
+                            chunk = bytes(hold)
+                        hold = None
+                    f.write(chunk)
+                    f.flush()
+                    if written == 0 and expected > 8 * mb and mt != "audio":
+                        await _fetch_tail_sidecar(media, target, chunk, expected)
+                    written += len(chunk)
+                    if watched and time.time() - checked > 10:
+                        checked = time.time()
+                        if not await _ondemand_wanted(row["id"]):
+                            paused = True
+                            break
+                if hold:
+                    f.write(hold)
+                    written += len(hold)
+            return written, paused
+
+        try:
+            written, paused = await _fetch(start)
+        except _FastPathUnavailable:
+            if not start:
+                raise
+            written, paused = await _fetch(0)     # cannot continue this one: start over
+
+        if paused:
+            log.info("[on-demand-media] id=%s: nobody is watching — stopped at %d%% (%d of %d MB); "
+                     "it continues from here when someone opens it again",
+                     row["id"], written * 100 // max(expected, 1), written // mb, expected // mb)
+            return
         if not expected or written >= expected:
             _drop_tail_sidecar(target)       # the file is whole: no longer needed
 
