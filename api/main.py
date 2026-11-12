@@ -1676,6 +1676,22 @@ async def epub_asset(msg_id: int, asset_path: str):
         headers={"Cache-Control": "public, max-age=3600"})
 
 
+async def _tg_flood() -> Optional[dict]:
+    """Active Telegram wait published by the crawler, if any."""
+    try:
+        async with db_pool.acquire() as conn:
+            v = await conn.fetchval("SELECT value FROM config WHERE key='tg_flood'")
+        if not v:
+            return None
+        until_s, _, what = v.partition("|")
+        left = int(float(until_s) - time.time())
+        if left <= 0:
+            return None
+        return {"seconds_left": left, "what": what}
+    except Exception:
+        return None
+
+
 @app.get("/api/media-status/{msg_id}")
 async def media_status(msg_id: int):
     """Lightweight status for /watch page polling.
@@ -1696,7 +1712,8 @@ async def media_status(msg_id: int):
                             "my_dc": my_dc, "cross_dc": cross_dc})
     if not lp or lp == "__user_queued__":
         return JSONResponse({"status": "queued", "bytes": 0, "total": total,
-                            "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
+                            "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc,
+                            "tg_wait": await _tg_flood()})
     path = os.path.join("/downloads", lp)
     bytes_ = os.path.getsize(path) if os.path.exists(path) else 0
     if total and bytes_ >= total:
@@ -1879,8 +1896,9 @@ async function poll() {{
       }}
     }}
     if (j.status === "failed") {{
-      document.getElementById("status").textContent = "✗ download failed";
-      document.getElementById("hint").textContent = "Telegram channel may be invalid or banned";
+      document.getElementById("status").textContent = "✗ could not fetch this file";
+      document.getElementById("hint").textContent =
+        "The source message may have been deleted or the channel is no longer reachable.";
       return;
     }}
     if (j.status === "ready") {{
@@ -1900,7 +1918,16 @@ async function poll() {{
         return;
       }}
     }} else if (j.status === "queued") {{
-      document.getElementById("status").textContent = "queued — waiting for crawler…";
+      if (j.tg_wait && j.tg_wait.seconds_left > 0) {{
+        const mins = Math.max(1, Math.round(j.tg_wait.seconds_left / 60));
+        document.getElementById("status").textContent =
+          "⏸ Telegram asked us to slow down — starts by itself in about " + mins + " min";
+        document.getElementById("hint").textContent =
+          "Your request stays queued. Nothing is wrong with the file or your account; " +
+          "tgarr is waiting instead of pushing, to keep your Telegram account in good standing.";
+      }} else {{
+        document.getElementById("status").textContent = "queued — waiting for crawler…";
+      }}
     }}
   }} catch(e) {{
     document.getElementById("status").textContent = "network error — retrying…";
@@ -3149,7 +3176,7 @@ async def health():
         return JSONResponse({"status": "db_down", "error": type(e).__name__},
                             status_code=503)
     return {"status": "ok", "tgarr": TGARR_VERSION,
-            "authed": login.session_exists()}
+            "authed": login.session_exists(), "tg_wait": await _tg_flood()}
 
 
 @app.get("/")

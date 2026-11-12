@@ -241,6 +241,9 @@ _MTPROTO_CALL_LOG: dict = {}  # method → list[float] of recent call timestamps
 _MTPROTO_DAILY_MAX = {
     "join_chat":       int(os.environ.get("TGARR_JOIN_DAILY_MAX", "12")),
     "resolveUsername": int(os.environ.get("TGARR_RESOLVE_DAILY_MAX", "200")),
+    # Cross-DC authorizations (auth.ExportAuthorization). With cached media
+    # sessions a healthy day needs a handful; this is the backstop.
+    "exportAuthorization": int(os.environ.get("TGARR_EXPORT_AUTH_DAILY_MAX", "40")),
 }
 _MTPROTO_DAILY: dict = {}   # method → [utc_day:str, count:int]
 
@@ -364,7 +367,97 @@ async def _mtproto(method_name: str, coro_factory):
                 _MTPROTO_HALT_UNTIL[method_name] = until
         log.warning("[mtproto-rl] %s FloodWait %ds → halt this method only",
                     method_name, fw_val)
+        await _note_flood(method_name, until)
         raise
+
+
+async def _note_flood(what: str, until: float) -> None:
+    """Publish "Telegram asked us to wait" so the UI can say so truthfully
+    instead of showing a generic failure. Best effort."""
+    try:
+        if db_pool is None:
+            return
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('tg_flood', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                   WHERE split_part(config.value, '|', 1)::float < split_part(EXCLUDED.value, '|', 1)::float""",
+                f"{int(until)}|{what[:60]}")
+    except Exception as e:
+        log.debug("[mtproto-rl] note flood: %s", e)
+
+
+# ── cross-DC authorization: the scarce call ───────────────────────────
+# Reading a file that lives on another DC needs auth.ExportAuthorization.
+# Telegram tolerates only a few of these in a short window (a few dozen in
+# twenty minutes earns a ~30 minute FLOOD_WAIT for the whole account, during
+# which nothing off the home DC can be fetched). Every path that can cause
+# one — our cached media sessions AND Pyrogram's own downloader — must first
+# reserve it here. Reservation never waits: when the budget is spent or a
+# flood wait is active it raises FloodWait at once, callers keep the request
+# queued, and nothing is sent to Telegram.
+EXPORT_AUTH_MAX = int(os.environ.get("TGARR_EXPORT_AUTH_MAX", "4"))
+EXPORT_AUTH_WINDOW_SEC = int(os.environ.get("TGARR_EXPORT_AUTH_WINDOW_SEC", "600"))
+_export_auth_log: list = []
+
+
+async def _export_auth_reserve(dc_id: int) -> None:
+    now = time.time()
+    left = max(_media_dc_blocked_until.get(dc_id, 0),
+               _MTPROTO_HALT_UNTIL.get("exportAuthorization", 0)) - now
+    if left > 0:
+        raise FloodWait(value=int(left) + 1)
+    _export_auth_log[:] = [t for t in _export_auth_log if now - t < EXPORT_AUTH_WINDOW_SEC]
+    if len(_export_auth_log) >= EXPORT_AUTH_MAX:
+        wait = int(EXPORT_AUTH_WINDOW_SEC - (now - _export_auth_log[0])) + 1
+        log.info("[export-auth] local budget (%d per %ds) spent — holding cross-DC "
+                 "work %ds rather than asking Telegram", EXPORT_AUTH_MAX,
+                 EXPORT_AUTH_WINDOW_SEC, wait)
+        raise FloodWait(value=wait)
+    if not await _daily_budget_take("exportAuthorization"):
+        wait = int(_secs_to_utc_midnight()) + 5
+        _MTPROTO_HALT_UNTIL["exportAuthorization"] = now + wait
+        await _note_flood("daily cross-DC authorization budget", now + wait)
+        raise FloodWait(value=wait)
+    _export_auth_log.append(now)
+
+
+async def _export_auth_flooded(dc_id: int, wait: int, source: str) -> None:
+    """Telegram refused a cross-DC authorization: park all cross-DC work."""
+    until = time.time() + wait + 5
+    _media_dc_blocked_until[dc_id] = until
+    if until > _MTPROTO_HALT_UNTIL.get("exportAuthorization", 0):
+        _MTPROTO_HALT_UNTIL["exportAuthorization"] = until
+    log.warning("[export-auth] FLOOD_WAIT %ds on cross-DC authorization (%s, DC%s) — "
+                "all cross-DC fetches parked until it clears", wait, source, dc_id)
+    await _note_flood("cross-DC authorization", until)
+
+
+def _media_dc(media) -> int:
+    try:
+        return FileId.decode(media.file_id).dc_id
+    except Exception:
+        return 0
+
+
+async def _pyrogram_transfer_guard(media) -> int:
+    """Call before handing a file to Pyrogram's own download/stream. Pyrogram
+    authorizes cross-DC by itself, per file, and swallows the FloodWait (the
+    transfer just yields nothing), so the reservation has to happen here.
+    Returns the file's DC (0 = home DC / unknown, nothing reserved)."""
+    dc = _media_dc(media)
+    if dc and CURRENT_DC and dc != CURRENT_DC:
+        await _export_auth_reserve(dc)
+        return dc
+    return 0
+
+
+async def _pyrogram_transfer_empty(dc: int) -> None:
+    """A cross-DC Pyrogram transfer produced nothing. The usual cause is a
+    swallowed FLOOD_WAIT on the authorization; assume so and back off rather
+    than trying the next file."""
+    if dc:
+        await _export_auth_flooded(dc, 900, "empty Pyrogram transfer")
 
 
 async def _mtproto_wait_clearance(method_name: str = "get_chat_history"):
@@ -1608,6 +1701,7 @@ async def _process_one_download(row_payload: dict) -> None:
                 local_path = await _mtproto("download_media", _download)
             else:
                 # no usable file name on the message: let Pyrogram name it
+                await _pyrogram_transfer_guard(_media)
                 local_path = await _mtproto("download_media",
                     lambda: app.download_media(msg, file_name=f"{target_dir}/",
                                                progress=_progress))
@@ -1648,6 +1742,25 @@ async def _process_one_download(row_payload: dict) -> None:
         except Exception:
             log.exception("[worker] cancel cleanup id=%s", row["dl_id"])
         raise  # propagate so the dispatcher's sem releases properly
+    except FloodWait as fw:
+        # Telegram (or our own cross-DC budget) says wait. That is not a failed
+        # download: put it back in the queue — a 'failed' here would make the
+        # *arr blocklist a perfectly good release — and hold this dispatcher
+        # slot so we do not immediately ask again.
+        wait = int(getattr(fw, "value", 60) or 60)
+        log.warning("[worker] id=%s deferred %ds by Telegram rate limit — requeued",
+                    row["dl_id"], wait)
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE downloads
+                       SET status='pending', speed_kbps=0, error_message=$1
+                       WHERE id=$2 AND status NOT IN ('cancelled','completed')""",
+                    f"Telegram rate limit — resumes automatically in ~{max(1, wait // 60)} min",
+                    row["dl_id"])
+        except Exception:
+            log.exception("[worker] failed to requeue id=%s", row["dl_id"])
+        await asyncio.sleep(min(wait + 5, 900))
     except Exception as e:
         log.exception("[worker] failed id=%s: %s", row["dl_id"], e)
         try:
@@ -2124,6 +2237,13 @@ _THUMB_BATCH = 60
 # thumbnail is then a single upload.GetFile round-trip.
 _media_sessions: dict = {}
 _media_sessions_lock = asyncio.Lock()
+# dc_id → epoch seconds until which Telegram refuses to authorize a session on
+# that DC (FLOOD_WAIT on auth.ExportAuthorization). While set, nothing even
+# asks Telegram again: every caller gets the FloodWait immediately. This is the
+# piece the method-level limiter could never provide — the export used to
+# happen inside Pyrogram, once per file, where its FloodWait was swallowed
+# (the download just produced 0 bytes) and so never reached the limiter.
+_media_dc_blocked_until: dict = {}
 
 
 async def _media_session(dc_id: int):
@@ -2134,6 +2254,8 @@ async def _media_session(dc_id: int):
         if sess is not None:
             return sess
         my_dc = await app.storage.dc_id()
+        if dc_id != my_dc:
+            await _export_auth_reserve(dc_id)   # raises FloodWait, never waits
         test_mode = await app.storage.test_mode()
         if dc_id != my_dc:
             auth_key = await Auth(app, dc_id, test_mode).create()
@@ -2147,11 +2269,14 @@ async def _media_session(dc_id: int):
                     raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                 await sess.invoke(raw.functions.auth.ImportAuthorization(
                     id=exported.id, bytes=exported.bytes))
-        except BaseException:
+        except BaseException as e:
             try:
                 await sess.stop()
             except Exception:
                 pass
+            if isinstance(e, FloodWait):
+                await _export_auth_flooded(
+                    dc_id, int(getattr(e, "value", 60) or 60), "media session")
             raise
         _media_sessions[dc_id] = sess
         log.info("[media-session] opened DC%s (%s)", dc_id,
@@ -2289,8 +2414,13 @@ async def _stream_media_fast(msg, media):
         return
     except _FastPathUnavailable as e:
         log.info("[media-session] fast path n/a (%s) — using Pyrogram streamer", e)
+    dc = await _pyrogram_transfer_guard(media)
+    got = False
     async for part in app.stream_media(msg):
+        got = True
         yield part
+    if not got:
+        await _pyrogram_transfer_empty(dc)
 
 
 async def _fetch_small_file(media, max_bytes: int = 1024 * 1024):
@@ -2750,8 +2880,11 @@ async def _thumb_process_batch(rows) -> None:
                             f.write(data)
                     else:
                         # fast path not applicable → Pyrogram's own downloader
+                        _dc = await _pyrogram_transfer_guard(media)
                         await _mtproto("download_thumb",
                             lambda: app.download_media(media, file_name=target))
+                        if not os.path.exists(target) or os.path.getsize(target) == 0:
+                            await _pyrogram_transfer_empty(_dc)
                 if not os.path.exists(target) or os.path.getsize(target) == 0:
                     raise RuntimeError("thumbnail download returned nothing")
                 await _thumb_store(r, fname, target)
@@ -2923,11 +3056,14 @@ async def _preview_process_batch(rows) -> None:
                             blob = await _mtproto("download_preview",
                                 lambda: _fetch_file_bytes(media))
                             if not blob:
+                                _dc = await _pyrogram_transfer_guard(media)
                                 buf = await _mtproto("download_media",
                                     lambda: app.download_media(media, in_memory=True))
                                 if buf is not None:
                                     blob = (buf.getvalue() if hasattr(buf, "getvalue")
                                             else bytes(buf))
+                                if not blob:
+                                    await _pyrogram_transfer_empty(_dc)
                     except FloodWait as fw:
                         log.info("[preview] flood-wait %ss id=%s — embed fallback",
                                  getattr(fw, "value", "?"), r["id"])
