@@ -2501,6 +2501,102 @@ async def _fetch_tail_sidecar(media, target: str, head: bytes, total: int) -> No
             pass
 
 
+# Some taggers write a FLAC's embedded cover (the PICTURE block) without a
+# MIME type. Chrome's decoder then refuses the whole file - "format not
+# supported" - and the song never plays, although the audio is fine.
+# The type is filled in from the image's own signature and the same number of
+# bytes is taken out of a padding block, so the file keeps its exact size
+# (the API serves by the size Telegram reported). With no padding to take
+# from, the picture block is relabelled as padding: no cover, but it plays.
+_FLAC_META_MAX = 8 * 1024 * 1024
+
+
+def _flac_meta_len(buf) -> int | None:
+    """Length of "fLaC" + all metadata blocks if `buf` holds them whole;
+    None if more bytes are needed; 0 if this is not a FLAC stream."""
+    if len(buf) < 4:
+        return None
+    if bytes(buf[:4]) != b"fLaC":
+        return 0
+    off = 4
+    while True:
+        if off + 4 > len(buf):
+            return None
+        last = buf[off] & 0x80
+        off += 4 + int.from_bytes(buf[off + 1:off + 4], "big")
+        if off > len(buf):
+            return None
+        if last:
+            return off
+
+
+def _flac_fix_meta(meta: bytes) -> bytes:
+    """`meta` ("fLaC" + metadata blocks) with untyped covers repaired; the
+    same object if nothing needed doing. Never changes the length."""
+    blocks, off = [], 4
+    while off < len(meta):
+        ln = int.from_bytes(meta[off + 1:off + 4], "big")
+        blocks.append([meta[off] & 0x7F, meta[off + 4:off + 4 + ln]])
+        off += 4 + ln
+    changed = False
+    for b in blocks:
+        body = b[1]
+        if b[0] != 6 or len(body) < 12 or int.from_bytes(body[4:8], "big") != 0:
+            continue
+        data_at = 12 + int.from_bytes(body[8:12], "big") + 16 + 4
+        magic = body[data_at:data_at + 8]
+        mime = (b"image/jpeg" if magic[:3] == b"\xff\xd8\xff" else
+                b"image/png" if magic[:8] == b"\x89PNG\r\n\x1a\n" else
+                b"image/gif" if magic[:4] == b"GIF8" else
+                b"image/webp" if magic[:4] == b"RIFF" else b"")
+        pad = next((x for x in blocks if x[0] == 1 and len(x[1]) >= len(mime)), None)
+        if mime and pad is not None:
+            b[1] = body[:4] + len(mime).to_bytes(4, "big") + mime + body[8:]
+            pad[1] = pad[1][:len(pad[1]) - len(mime)]
+        else:
+            b[0] = 1
+        changed = True
+    if not changed:
+        return meta
+    out = bytearray(b"fLaC")
+    for i, (t, body) in enumerate(blocks):
+        out.append(t | (0x80 if i == len(blocks) - 1 else 0))
+        out += len(body).to_bytes(3, "big") + body
+    return bytes(out) if len(out) == len(meta) else meta
+
+
+def _flac_fix_file(path: str) -> bool:
+    """Repair a FLAC already on disk. True if it was changed."""
+    try:
+        with open(path, "r+b") as f:
+            buf = f.read(1024 * 1024)
+            n = _flac_meta_len(buf)
+            if n is None:
+                buf += f.read(_FLAC_META_MAX)
+                n = _flac_meta_len(buf)
+            if not n:
+                return False
+            fixed = _flac_fix_meta(buf[:n])
+            if fixed is buf[:n] or fixed == buf[:n]:
+                return False
+            f.seek(0)
+            f.write(fixed)
+            return True
+    except OSError:
+        return False
+
+
+def _flac_fix_existing() -> int:
+    n = 0
+    try:
+        for name in os.listdir(AUDIO_ROOT):
+            if name.lower().endswith(".flac") and _flac_fix_file(os.path.join(AUDIO_ROOT, name)):
+                n += 1
+    except OSError:
+        pass
+    return n
+
+
 def _drop_tail_sidecar(target: str) -> None:
     try:
         os.remove(target + ".tail")
@@ -4504,6 +4600,13 @@ async def on_demand_media_downloader() -> None:
     os.makedirs(AUDIO_ROOT, exist_ok=True)
     os.makedirs(LIBRARY_ROOT, exist_ok=True)
     os.makedirs(VIDEO_ROOT, exist_ok=True)
+    try:
+        _n = await asyncio.to_thread(_flac_fix_existing)
+        if _n:
+            log.info("[on-demand-media] repaired the cover type of %d FLAC file(s) "
+                     "already downloaded", _n)
+    except Exception as e:
+        log.warning("[on-demand-media] FLAC check: %s", e)
     while True:
         try:
             if len(_ondemand_active) >= ONDEMAND_SLOTS:
@@ -4571,13 +4674,33 @@ async def _ondemand_fetch_one(row) -> None:
         expected = row["file_size"] or 0
         written = 0
         _drop_tail_sidecar(target)
+        # a FLAC's metadata is held back until it is whole, so that it can be
+        # repaired before a single byte is visible to the player
+        hold = bytearray() if target.lower().endswith(".flac") else None
         with open(target, "wb") as f:
             async for chunk in _stream_media_fast(msg, media):
+                if hold is not None:
+                    hold += chunk
+                    n = _flac_meta_len(hold)
+                    if n is None and len(hold) < _FLAC_META_MAX:
+                        continue
+                    if n:
+                        fixed = _flac_fix_meta(bytes(hold[:n]))
+                        if fixed != bytes(hold[:n]):
+                            log.info("[on-demand-media] id=%s: FLAC cover had no type "
+                                     "(browsers refuse such a file) — repaired", row["id"])
+                        chunk = fixed + bytes(hold[n:])
+                    else:
+                        chunk = bytes(hold)
+                    hold = None
                 f.write(chunk)
                 f.flush()
                 if not written and expected > 8 * 1024 * 1024 and mt != "audio":
                     await _fetch_tail_sidecar(media, target, chunk, expected)
                 written += len(chunk)
+            if hold:
+                f.write(hold)
+                written += len(hold)
         if not expected or written >= expected:
             _drop_tail_sidecar(target)       # the file is whole: no longer needed
 
