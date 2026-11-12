@@ -2929,6 +2929,120 @@ async def media_status(msg_id: int):
                         "file_dc": file_dc, "my_dc": my_dc, "cross_dc": cross_dc})
 
 
+# ── Video player ─────────────────────────────────────────────────────
+# The browser's own <video> controls stay (they are what people know, and
+# they work on every device); around them: a view that fills the window,
+# favourite, speed, 10-second skips, picture-in-picture, "continue where I
+# stopped", and - while the file is still arriving from Telegram - how much
+# of it is here, because seeking past that point has to wait.
+_WATCH_PLAYER_CSS = """
+.vshell { width:100%; display:flex; flex-direction:column; align-items:center; }
+.vshell video { width:1200px; max-width:96vw; max-height:calc(100vh - 150px); background:#000; border-radius:8px; }
+body.wide { height:100vh; overflow:hidden; }
+body.wide main { padding:0; align-items:stretch; min-height:0; }
+body.wide .vshell { height:100%; }
+body.wide .vshell video { flex:1; min-height:0; width:100%; max-width:100%; max-height:none; border-radius:0; }
+.vbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:center; padding:10px 12px; width:100%; box-sizing:border-box; }
+.vbar button, .vbar select, .vbar a, .bar button { font:inherit; font-size:13px; color:#e2e8f0; background:#1e293b;
+  border:1px solid #334155; border-radius:8px; padding:7px 12px; cursor:pointer; text-decoration:none; line-height:1.2; }
+.vbar button:hover, .vbar a:hover, .vbar select:hover, .bar button:hover { border-color:#5eb6e5; color:#fff; }
+.vbar button.on, .bar button.on { background:#2563eb; border-color:#2563eb; color:#fff; }
+.bar button.fav.on { background:transparent; border-color:#fb7185; color:#fb7185; }
+.vbar .arr { font-size:12px; color:#94a3b8; display:flex; align-items:center; gap:8px; }
+.vbar .arr i { display:block; width:120px; height:5px; background:#1e293b; border-radius:3px; overflow:hidden; }
+.vbar .arr i b { display:block; height:100%; background:#5eb6e5; width:0; transition:width .4s; }
+.vtoast { position:fixed; left:50%; top:70px; transform:translateX(-50%); background:rgba(15,23,42,.92); border:1px solid #334155;
+  color:#e2e8f0; padding:9px 16px; border-radius:20px; font-size:13px; z-index:9; transition:opacity .5s; }
+.vtoast a { color:#5eb6e5; cursor:pointer; margin-left:10px; }
+@media (max-width:640px){ .vbar { gap:5px; padding:8px 6px } .vbar button, .vbar select, .vbar a { padding:7px 9px } }
+"""
+
+_WATCH_PLAYER_JS = r"""
+function tgFavBtn(){
+  const b = document.getElementById("favBtn"); if (!b) return;
+  b.onclick = () => fetch("/api/fav/" + MSG_ID, {method: "POST"}).then(r => r.json()).then(j => {
+    if (j.fav === undefined) return; b.classList.toggle("on", j.fav); b.title = j.fav ? "in your favourites" : "add to favourites"; });
+}
+function tgVideo(main){
+  let prefs = {}; try { prefs = JSON.parse(localStorage.getItem("tgarr.video") || "{}"); } catch (e) {}
+  if (prefs.wide === undefined) prefs.wide = true;
+  const save = () => { try { localStorage.setItem("tgarr.video", JSON.stringify(prefs)); } catch (e) {} };
+  const KEY = "tgarr.v." + MSG_ID;
+  main.innerHTML =
+    '<div class="vshell"><video id="v" controls autoplay playsinline src="/media/' + MSG_ID + '"></video>' +
+    '<div class="vbar">' +
+    '<button id="vBack" title="back 10 seconds (left arrow)">&#8630; 10s</button>' +
+    '<button id="vFwd" title="forward 10 seconds (right arrow)">10s &#8631;</button>' +
+    '<select id="vSpeed" title="playback speed (&lt; and &gt;)">' +
+      [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(x => '<option value="' + x + '">' + x + '&times;</option>').join("") + '</select>' +
+    '<button id="vWide" title="fill the window (w)">Full width</button>' +
+    '<button id="vPip" title="keep playing in a small floating window">Picture-in-picture</button>' +
+    '<button id="vFull" title="full screen (f)">Full screen</button>' +
+    '<span class="arr" id="vArr" style="display:none"><i><b id="vArrBar"></b></i><span id="vArrTxt"></span></span>' +
+    '</div></div>';
+  const v = document.getElementById("v"), $ = id => document.getElementById(id);
+  const toast = (htmlText, ms) => { const t = document.createElement("div"); t.className = "vtoast"; t.innerHTML = htmlText;
+    document.body.appendChild(t); setTimeout(() => { t.style.opacity = 0; setTimeout(() => t.remove(), 600); }, ms || 5000); return t; };
+  const fmt = s => { s = Math.floor(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+    return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
+  // wide
+  const wide = on => { prefs.wide = on; save(); document.body.classList.toggle("wide", on); $("vWide").classList.toggle("on", on); };
+  wide(prefs.wide); $("vWide").onclick = () => wide(!prefs.wide);
+  // speed + volume
+  const speed = x => { x = Math.max(0.5, Math.min(2, x)); v.playbackRate = x; v.defaultPlaybackRate = x; prefs.speed = x; save(); $("vSpeed").value = String(x); };
+  $("vSpeed").onchange = e => speed(+e.target.value);
+  if (prefs.vol !== undefined) v.volume = prefs.vol;
+  v.addEventListener("volumechange", () => { prefs.vol = v.volume; save(); });
+  v.addEventListener("loadedmetadata", () => {
+    speed(prefs.speed || 1);
+    // continue where I stopped
+    let pos = 0; try { pos = +localStorage.getItem(KEY) || 0; } catch (e) {}
+    if (pos > 30 && (!v.duration || pos < v.duration - 30)) {
+      v.currentTime = pos;
+      const t = toast("continued from " + fmt(pos) + ' <a id="vRestart">start over</a>', 8000);
+      t.querySelector("#vRestart").onclick = () => { v.currentTime = 0; t.remove(); };
+    }
+  });
+  let lastSave = 0;
+  v.addEventListener("timeupdate", () => { const now = Date.now(); if (now - lastSave < 4000) return; lastSave = now;
+    try { if (v.duration && v.currentTime > v.duration - 20) localStorage.removeItem(KEY); else localStorage.setItem(KEY, String(Math.floor(v.currentTime))); } catch (e) {} });
+  // skips, pip, full screen
+  const skip = d => { v.currentTime = Math.max(0, Math.min(v.duration || 1e9, v.currentTime + d)); };
+  $("vBack").onclick = () => skip(-10); $("vFwd").onclick = () => skip(10);
+  const full = () => { if (document.fullscreenElement) document.exitFullscreen(); else (v.requestFullscreen || v.webkitRequestFullscreen || v.webkitEnterFullscreen).call(v); };
+  $("vFull").onclick = full;
+  if (document.pictureInPictureEnabled) $("vPip").onclick = () => { if (document.pictureInPictureElement) document.exitPictureInPicture(); else v.requestPictureInPicture().catch(() => {}); };
+  else $("vPip").style.display = "none";
+  document.addEventListener("keydown", e => {
+    if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+    const k = e.key;
+    if (k === "ArrowLeft") { e.preventDefault(); skip(-10); }
+    else if (k === "ArrowRight") { e.preventDefault(); skip(10); }
+    else if (k === " " || k === "k") { if (e.target !== v) { e.preventDefault(); v.paused ? v.play() : v.pause(); } }
+    else if (k === "f") full();
+    else if (k === "w") wide(!prefs.wide);
+    else if (k === "m") v.muted = !v.muted;
+    else if (k === ">" || k === ".") speed((prefs.speed || 1) + 0.25);
+    else if (k === "<" || k === ",") speed((prefs.speed || 1) - 0.25);
+    else if (k === "ArrowUp") { e.preventDefault(); v.volume = Math.min(1, v.volume + 0.1); }
+    else if (k === "ArrowDown") { e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); }
+  });
+  // how much of the file has arrived
+  (async function arrival(){
+    try {
+      const j = await (await fetch("/api/media-status/" + MSG_ID)).json();
+      if (j.status === "downloading" && j.total) {
+        const pct = Math.min(100, j.bytes / j.total * 100);
+        $("vArr").style.display = "flex"; $("vArrBar").style.width = pct + "%";
+        $("vArrTxt").textContent = "still arriving: " + pct.toFixed(0) + "% here — skipping further ahead will wait";
+      } else if (j.status === "ready") { $("vArr").style.display = "none"; return; }
+    } catch (e) {}
+    setTimeout(arrival, 3000);
+  })();
+}
+"""
+
+
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
 async def watch_page(msg_id: int):
     """Loading-aware media viewer. Polls /api/media-status until enough bytes
@@ -2936,7 +3050,8 @@ async def watch_page(msg_id: int):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT m.local_path, m.file_name, m.file_size, m.media_type,
-                      m.mime_type, c.title AS ch_title
+                      m.mime_type, c.title AS ch_title,
+                      EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav
                FROM messages m LEFT JOIN channels c ON c.id=m.channel_id
                WHERE m.id=$1""", msg_id)
     if not row:
@@ -2975,11 +3090,13 @@ main {{ flex:1; display:flex; align-items:center; justify-content:center;
 video, audio, iframe {{ max-width:96vw; max-height:80vh; }}
 video, iframe {{ width:1200px; max-width:96vw; }}
 audio {{ width:600px; max-width:96vw; }}
+{_WATCH_PLAYER_CSS}
 </style></head><body>
 <div class="bar">
   <a href="javascript:history.back()">← back</a>
   <div class="title">{html.escape(title)}</div>
-  <a href="/media/{msg_id}" download>⬇ download raw</a>
+  <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{'in your favourites' if row["fav"] else 'add to favourites'}">♥ Favourite</button>
+  <a href="/media/{msg_id}" download>⬇ download</a>
 </div>
 <main id="main">
   <div class="loader">
@@ -2994,6 +3111,8 @@ audio {{ width:600px; max-width:96vw; }}
 const MSG_ID = {msg_id};
 const MEDIA_TYPE = {_js_str(mt)};
 const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
+{_WATCH_PLAYER_JS}
+tgFavBtn();
 let started = false;
 function fmtBytes(b) {{
   if (!b) return "0 B";
@@ -3005,7 +3124,7 @@ function renderPlayer() {{
   if (started) return; started = true;
   const main = document.getElementById("main");
   if (MEDIA_TYPE === "video") {{
-    main.innerHTML = `<video controls autoplay src="/media/${{MSG_ID}}"></video>`;
+    tgVideo(main);
     return;
   }}
   if (MEDIA_TYPE === "audio") {{
@@ -6137,7 +6256,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
 @app.get("/videos", response_class=HTMLResponse)
 async def page_videos(q: Optional[str] = None, limit: int = 120,
                       offset: int = 0, aud: str = "sfw",
-                      min_mb: int = 50, local: int = 0):
+                      min_mb: int = 50, local: int = 0, fav: int = 0):
     if not login.session_exists():
         async with db_pool.acquire() as conn:
             n = await conn.fetchval("SELECT count(*) FROM channels")
@@ -6159,6 +6278,8 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         where.append(f"COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024}")
     if local:
         where.append(_LOCAL_SQL)
+    if fav:
+        where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
 
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
@@ -6172,6 +6293,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         rows = await conn.fetch(
             f"SELECT m.id, m.file_name, m.file_size, m.caption, m.posted_at, "
             f"m.thumb_path, m.local_path, m.file_dc, "
+            f"EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id) AS fav, "
             f"c.title AS ch_title, c.username AS ch_user, c.audience, "
             f"r.id AS release_id, r.canonical_title, r.quality "
             f"FROM messages m "
@@ -6186,7 +6308,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         defaults = {"q": q,
                     "aud": aud if aud != "sfw" else None,
                     "min_mb": min_mb if min_mb != 50 else None,
-                    "local": 1 if local else None,
+                    "local": 1 if local else None, "fav": 1 if fav else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
         bits = []
@@ -6210,7 +6332,12 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         + _aud_chip("nsfw", "NSFW")
         + _aud_chip("any", "all")
         + '<span style="margin-left:6px"></span>' + _saved_chip("/videos", _qs, local)
+        + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1)}" '
+          f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
+          f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>'
         + '</div>'
+        + '<script>function tgFavCard(b,id){fetch("/api/fav/"+id,{method:"POST"}).then(r=>r.json())'
+          '.then(j=>{if(j.fav===undefined)return;b.style.color=j.fav?"#e11d48":"";b.title=j.fav?"in your favourites":"add to favourites"})}</script>'
     )
 
     def _card(r):
@@ -6243,6 +6370,9 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
             f'<div class="grab-row" style="margin-top:8px;display:flex;gap:6px">'
             f'<a class="btn" href="/watch/{r["id"]}" target="_blank">▶ watch</a>'
             f'<a class="btn ghost" href="/media/{r["id"]}" download>⬇</a>'
+            f'<button class="ghost" style="padding:6px 10px;{"color:#e11d48;" if r["fav"] else ""}" '
+            f'title="{"in your favourites" if r["fav"] else "add to favourites"}" '
+            f'onclick="tgFavCard(this,{r["id"]})">♥</button>'
             f'</div>'
             f'</div>'
         )
