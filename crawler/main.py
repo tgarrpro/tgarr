@@ -851,8 +851,9 @@ async def _poll_without_account(row) -> bool:
         # happens when one is. Reading NEW posts of a channel without a web
         # preview does need the account: let background allowance do that,
         # never the share kept for what the user asks for.
-        log.info("[web] @%s has no web preview; %d files known from tgarr.me - "
-                 "the account is asked when one is played, or when background allowance is free", uname, have)
+        log.info("[web] @%s has no web preview; %d files already listed (%d just now from tgarr.me) - "
+                 "the account is asked when one is played, or when background allowance is free",
+                 uname, have, central)
     return False
 
 

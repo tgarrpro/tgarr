@@ -961,8 +961,12 @@ async def channel_resources(request: Request):
     lets a client rehydrate its local index after a post-leave purge so grab
     / download works again without re-crawling the whole history from TG.
     """
+    # Clients send this request gzip-compressed, like the other POSTs.
+    # request.json() does not decompress: every call was answered 400 and no
+    # install ever got a channel's list back.
+    raw = await _read_body(request)
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception:
         raise HTTPException(400, "invalid json body")
     ip_hash = _ip_hash(request)
