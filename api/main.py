@@ -208,6 +208,12 @@ ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
 app.middleware("http")(_request_guard)   # defined above, next to its helpers
+# The module-level logger. It was missing: the cache cleanup removed files and
+# then died on its own log line (NameError), once, for good - and the
+# "clear everything" button answered 500 after doing its work.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+log = logging.getLogger("tgarr")
+
 db_pool: Optional[asyncpg.Pool] = None
 
 
