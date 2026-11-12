@@ -41,6 +41,82 @@ ADULT_MIN_HITS = 5
 ADULT_MIN_RATIO = 0.08
 
 
+# ── request guard: cross-site protection + optional credentials ────────
+# tgarr listens on the LAN without a login. Two things follow from that:
+#  1. Any web page open in the user's browser could make that browser send
+#     requests here (sign out, queue downloads, drive Telegram fetches). Those
+#     cross-site requests are refused. Sonarr/Radarr and scripts are not
+#     browsers and are unaffected.
+#  2. Operators who want real access control can set TGARR_API_KEY (required
+#     as apikey= by the Newznab / SABnzbd endpoints the *arrs talk to) and/or
+#     TGARR_UI_PASSWORD (HTTP Basic for the web UI and its API). Both are off
+#     unless set, so an upgrade never locks anyone out.
+_API_KEY = os.environ.get("TGARR_API_KEY", "").strip()
+_UI_PASSWORD = os.environ.get("TGARR_UI_PASSWORD", "").strip()
+_GUARD_OPEN_PATHS = ("/health", "/favicon.svg", "/favicon.ico")
+
+
+def _is_arr_path(path: str) -> bool:
+    return (path == "/api" or path.startswith("/newznab")
+            or path.startswith("/sabnzbd"))
+
+
+def _cross_site(request) -> bool:
+    """True for a request a browser is making on behalf of ANOTHER site."""
+    h = request.headers
+    sfs = (h.get("sec-fetch-site") or "").lower()
+    if sfs:
+        if sfs != "cross-site":
+            return False          # same-origin / same-site / typed-in URL
+        # a plain cross-site link click (top-level navigation, GET) is fine
+        return not (request.method == "GET"
+                    and (h.get("sec-fetch-mode") or "").lower() == "navigate")
+    origin = h.get("origin")
+    if not origin or origin == "null":
+        return False              # non-browser client
+    host = (h.get("x-forwarded-host") or h.get("host") or "").split(",")[0].strip().lower()
+    try:
+        return urllib.parse.urlsplit(origin).netloc.lower() != host
+    except Exception:
+        return True
+
+
+def _ct_equal(a: str, b: str) -> bool:
+    import hmac
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+async def _request_guard(request: Request, call_next):
+    path = request.url.path
+    if path in _GUARD_OPEN_PATHS:
+        return await call_next(request)
+    if _cross_site(request):
+        return PlainTextResponse("cross-site request refused", status_code=403)
+    if _is_arr_path(path):
+        if _API_KEY:
+            given = (request.query_params.get("apikey")
+                     or request.headers.get("x-api-key") or "")
+            if not _ct_equal(given, _API_KEY):
+                return Response(
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<error code="100" description="Incorrect user credentials"/>',
+                    media_type="application/xml", status_code=401)
+    elif _UI_PASSWORD:
+        import base64 as _b64
+        ok = False
+        auth = request.headers.get("authorization") or ""
+        if auth.lower().startswith("basic "):
+            try:
+                _user, _, pw = _b64.b64decode(auth[6:]).decode("utf-8", "replace").partition(":")
+                ok = _ct_equal(pw, _UI_PASSWORD)
+            except Exception:
+                ok = False
+        if not ok:
+            return Response("authentication required", status_code=401,
+                            headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
+    return await call_next(request)
+
+
 def _base_url(request) -> str:
     """Public base URL for links we hand to Sonarr/Radarr/browsers.
 
@@ -131,6 +207,7 @@ async def meili_search(index: str, q: str, *, limit: int = 60,
 ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
+app.middleware("http")(_request_guard)   # defined above, next to its helpers
 db_pool: Optional[asyncpg.Pool] = None
 
 
@@ -2536,6 +2613,42 @@ def _user_block() -> str:
     return '<div class="name">not signed in</div><a href="/login">sign in →</a>'
 
 
+# Phones / narrow windows: the 260px sidebar used to eat two thirds of the
+# screen. Below 820px it becomes a compact top bar with a horizontally
+# scrolling icon+label nav, and paddings / the search box shrink to fit.
+MOBILE_CSS = """
+@media (max-width: 820px) {
+  html, body { height:auto; }
+  body { flex-direction:column; font-size:15px; }
+  aside.nav { width:100%; min-width:0; flex-direction:row; align-items:center;
+              border-right:none; border-bottom:1px solid var(--border);
+              position:sticky; top:0; z-index:50; }
+  .brand { padding:8px 12px; border-bottom:none; flex-shrink:0; }
+  .brand .mark { width:26px; height:26px; }
+  .brand .logo { font-size:24px; letter-spacing:-1px; }
+  .brand .logo-row { gap:6px; }
+  .brand .ver { display:none; }
+  .navlinks { display:flex; flex:1; min-width:0; padding:0; overflow-x:auto; overflow-y:hidden;
+              -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+  .navlinks::-webkit-scrollbar { display:none; }
+  .navlink { flex-direction:column; gap:2px; padding:8px 11px; font-size:11px;
+             border-left:none; border-bottom:3px solid transparent; white-space:nowrap; }
+  .navlink.active { border-left-color:transparent; border-bottom-color:var(--accent); }
+  .navlink svg { width:20px; height:20px; }
+  aside.nav .user { display:none; }
+  main.main { min-height:0; }
+  .topbar { height:auto; padding:10px 14px; gap:10px; flex-wrap:wrap; }
+  .topbar h1 { font-size:20px; }
+  .topbar form { margin-left:0 !important; flex:1 1 100%; }
+  .topbar input.search { width:100%; padding:8px 12px; font-size:15px; }
+  .content { padding:16px 12px; overflow-y:visible; }
+  .stats { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; margin-bottom:20px; }
+  table { display:block; overflow-x:auto; max-width:100%; }
+  img, video { max-width:100%; }
+}
+"""
+
+
 def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str] = None,
             top_actions_html: Optional[str] = None) -> str:
     nav = "".join(
@@ -2564,8 +2677,9 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
 <html><head>
 <meta charset="utf-8">
 <title>{html.escape(title)} · tgarr</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-<style>{CSS}</style>
+<style>{CSS}{MOBILE_CSS}</style>
 </head><body>
 <aside class="nav">
   <div class="brand">
@@ -2942,13 +3056,24 @@ function healthDot(h) {
 async function loadWorkers() {
   const r = await fetch("/api/workers");
   const j = await r.json();
-  const rows = (j.workers || []).map(w => `
-    <tr><td>${healthDot(w.health)}<b>${w.worker}</b></td>
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  // The error counter is lifetime-cumulative. Only an error from the last 24h
+  // is shown as a problem; older ones are greyed out with their age.
+  const rows = (j.workers || []).map(w => {
+    const recent = w.last_error_at &&
+      (Date.now() - new Date(w.last_error_at).getTime()) < 86400000;
+    const errColor = recent ? "#ef4444" : "#94a3b8";
+    const errText = !w.last_error ? "" :
+      (recent ? esc(w.last_error) : `${esc(w.last_error)} · ${fmtAgo(w.last_error_at)}`);
+    return `
+    <tr><td>${healthDot(w.health)}<b>${esc(w.worker)}</b></td>
         <td>${fmtAgo(w.last_seen)}</td>
-        <td style="color:#64748b;font-size:13px">${w.last_action || "—"}</td>
+        <td style="color:#64748b;font-size:13px">${esc(w.last_action) || "—"}</td>
         <td style="text-align:right;color:#64748b">${w.iter_count.toLocaleString()}</td>
-        <td style="text-align:right;color:${w.error_count?"#ef4444":"#64748b"}">${w.error_count}</td>
-        <td style="color:#ef4444;font-size:12px">${w.last_error || ""}</td></tr>`);
+        <td style="text-align:right;color:${w.error_count ? errColor : "#64748b"}"
+            title="lifetime total">${w.error_count}</td>
+        <td style="color:${errColor};font-size:12px">${errText}</td></tr>`; });
   document.getElementById("workersTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
     <th>Worker</th><th>Last seen</th><th>Last action</th>

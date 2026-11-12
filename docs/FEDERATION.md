@@ -60,7 +60,11 @@ The submitted payload looks like:
 }
 ```
 
-Specifically **not** in the payload: your phone number, your Telegram user ID, message contents, captions, files, friends, private groups, recently-watched, watch history, anything that identifies you personally.
+**What is sent** for the public channels you index: the channel's username, title and member count, and for each indexed video / document / audio file its Telegram `file_unique_id`, file name, size, type and message id. Photos are not contributed. Nothing is sent for private groups or channels without a public username, and `@mentions` / invite links are only harvested from public channels.
+
+**Never sent**: your phone number, your Telegram user ID, message text or captions, the files themselves, your contacts, what you watch or download. Contributions are attributed to a random instance id that rotates weekly, and the registry stores a hash of the sending IP, not the IP.
+
+Opt out entirely with `TGARR_CONTRIBUTE_RESOURCES=false` and `TGARR_FEDERATION_VALIDATOR=false` on the crawler.
 
 ## Privacy guarantees
 

@@ -101,7 +101,7 @@ $EDITOR .env
 
 # 3. One-time interactive login — Telegram prompts for SMS code in the terminal,
 #    the code never appears in any config file.
-docker compose run --rm crawler python login.py
+docker compose up -d   # then open http://<your-host>:8765/login and sign in (QR or SMS)
 
 # 4. Run the full stack
 docker compose up -d
@@ -113,7 +113,7 @@ docker compose logs -f crawler
 Once running:
 
 1. **Telegram side**: from your authenticated user account, join the channels you want indexed.
-2. **Sonarr/Radarr side**: Settings → Indexers → add Newznab → URL `http://<your-host>:8765/api`.
+2. **Sonarr/Radarr side**: Settings → Indexers → add Newznab → URL `http://<your-host>:8765/newznab/` (the dashboard shows the exact address).
 3. tgarr's crawler picks up every new message; Sonarr/Radarr search against the index just like any NZB indexer.
 
 ## Platform support

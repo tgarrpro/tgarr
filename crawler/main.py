@@ -1123,7 +1123,9 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
         # === Caption-mention extraction (always; contribute gated separately) ===
         # Even text-only messages can contain @mention / invite links — those
         # are pure discovery signal independent of media payload.
-        if caption:
+        # Only from PUBLIC channels: links people share in a private group or a
+        # personal chat are not ours to forward to the registry.
+        if caption and getattr(msg.chat, "username", None):
             try:
                 mentions = _extract_mentions(caption)
                 invites = _extract_invites(caption)
@@ -5008,6 +5010,10 @@ async def contribute_resources_worker() -> None:
                       AND m.contributed_at IS NULL
                       AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
                       AND c.username IS NOT NULL AND c.username <> ''
+                      -- Photos carry no file name and are of no use to an
+                      -- index of movies / TV / books / music, yet they were
+                      -- ~63% of everything stored centrally.
+                      AND COALESCE(m.media_type, '') <> 'photo'
                     ORDER BY m.id DESC
                     LIMIT {CONTRIBUTE_RESOURCES_BATCH}
                 """)
