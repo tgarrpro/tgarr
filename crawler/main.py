@@ -1116,6 +1116,15 @@ async def init_db() -> None:
     async with db_pool.acquire() as conn:
         await conn.execute(
             "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0")
+        # Every job waits a while after a start before its first round (up to
+        # ~15 min, on purpose, so installs do not all act at once). Until then
+        # its last report is from before the restart; the System page showed
+        # those jobs as failed after every update. Say what is true instead:
+        # starting, expected back within half an hour. Jobs not heard from in
+        # a week belong to an older version and are left alone.
+        await conn.execute(
+            """UPDATE worker_status SET last_seen = NOW(), last_action = 'starting', quiet_for_s = 1800
+               WHERE last_seen > NOW() - INTERVAL '7 days'""")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_joined BOOLEAN")
         await conn.execute(
