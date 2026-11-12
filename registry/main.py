@@ -1040,10 +1040,30 @@ async def channel_resources(request: Request):
 CHANNEL_LIST_MAX = int(os.environ.get("CHANNEL_LIST_MAX", "5000"))
 
 
-async def _channel_file_list(channel: str, limit: int) -> dict:
-    """The newest files installs have reported for a public channel. Nothing
-    from a blocked channel, and no blocked file, is ever handed out."""
+# How many lists one address may fetch in a day. An install asks once per
+# channel it follows, then once a day for what is new; a few hundred covers
+# anybody. Without a ceiling one address could walk every channel in a loop
+# - the web server's 10 requests a second would let it pull tens of GB a day.
+CHANNEL_LIST_PER_IP_DAY = int(os.environ.get("CHANNEL_LIST_PER_IP_DAY", "600"))
+_chlist_day: list = ["", {}]
+
+
+def _chlist_allow(ip_hash: str) -> bool:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    if _chlist_day[0] != day:
+        _chlist_day[0], _chlist_day[1] = day, {}
+    seen = _chlist_day[1]
+    seen[ip_hash] = seen.get(ip_hash, 0) + 1
+    return seen[ip_hash] <= CHANNEL_LIST_PER_IP_DAY
+
+
+async def _channel_file_list(channel: str, limit: int, after: int = 0) -> dict:
+    """The newest files installs have reported for a public channel - only
+    those posted after message `after`, when the caller already holds the
+    rest. Nothing from a blocked channel, and no blocked file, is ever
+    handed out."""
     limit = max(1, min(int(limit), CHANNEL_LIST_MAX))
+    after = max(0, int(after or 0))
     async with db_pool.acquire() as conn:
         if await conn.fetchval(
                 "SELECT 1 FROM registry_channels WHERE lower(username) = lower($1) "
@@ -1056,9 +1076,10 @@ async def _channel_file_list(channel: str, limit: int) -> dict:
                 FROM registry_resource_channels rc
                 JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
                 WHERE rc.channel_username = $1 AND rc.msg_id IS NOT NULL AND NOT r.blocked
+                  AND rc.msg_id > $3
                 ORDER BY rc.msg_id DESC
                 LIMIT $2
-            """, channel, limit)
+            """, channel, limit, after)
     return {"status": "ok", "channel_username": channel, "count": len(rows),
             "resources": [{
                 "file_unique_id": r["file_unique_id"],
@@ -1072,7 +1093,8 @@ async def _channel_file_list(channel: str, limit: int) -> dict:
 
 
 @app.get("/api/v1/channel_resources")
-async def channel_resources_get(channel: str = Query(""), limit: int = Query(0)):
+async def channel_resources_get(request: Request, channel: str = Query(""), limit: int = Query(0),
+                                after: int = Query(0)):
     """The same list as a plain GET: no body, nothing about the caller, so
     the CDN in front of the registry can answer it. A popular channel is then
     read from the database a few times a day however many installs follow it,
@@ -1080,9 +1102,15 @@ async def channel_resources_get(channel: str = Query(""), limit: int = Query(0))
     channel = (channel or "").strip().lstrip("@")
     if not channel or not USERNAME_RX.match(channel):
         raise HTTPException(400, "invalid channel")
-    data = await _channel_file_list(channel, limit or CHANNEL_LIST_MAX)
+    if not _chlist_allow(_ip_hash(request)):
+        raise HTTPException(429, f"daily limit of {CHANNEL_LIST_PER_IP_DAY} channel lists reached",
+                            headers={"Retry-After": "3600"})
+    data = await _channel_file_list(channel, limit or CHANNEL_LIST_MAX, after)
+    # the whole list changes slowly and is the same for everybody: 6 hours.
+    # "what is newer than message N" differs per caller: one hour.
     return JSONResponse(data, headers={
-        "Cache-Control": "public, max-age=21600, stale-while-revalidate=86400"})
+        "Cache-Control": ("public, max-age=3600" if after else
+                          "public, max-age=21600, stale-while-revalidate=86400")})
 
 
 

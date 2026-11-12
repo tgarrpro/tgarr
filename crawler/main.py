@@ -811,10 +811,17 @@ async def _poll_without_account(row) -> bool:
     uname = row["username"]
     cid = row["id"]
     central = 0
+    # tgarr.me: the whole list once, then once a day only what was posted
+    # after the newest message already here
     async with db_pool.acquire() as conn:
-        pulled = await conn.fetchval("SELECT central_pulled_at FROM channels WHERE id = $1", cid)
-    if not pulled:
-        central = await _rehydrate_channel(cid, row["tg_chat_id"], uname)
+        st = await conn.fetchrow(
+            """SELECT c.central_pulled_at IS NULL AS never,
+                      c.central_pulled_at < NOW() - INTERVAL '24 hours' AS due,
+                      (SELECT max(tg_message_id) FROM messages m WHERE m.channel_id = c.id) AS newest
+               FROM channels c WHERE c.id = $1""", cid)
+    if st and (st["never"] or st["due"]):
+        central = await _rehydrate_channel(cid, row["tg_chat_id"], uname,
+                                           0 if st["never"] else int(st["newest"] or 0))
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE channels SET central_pulled_at = NOW() WHERE id = $1", cid)
     state, new, info = await _web_read(row)
@@ -6914,7 +6921,7 @@ async def _central_resolve(fuids: list) -> dict:
         return {}
 
 
-async def _central_channel_resources(username: str) -> list:
+async def _central_channel_resources(username: str, after: int = 0) -> list:
     """Fetch a channel's full resource index from central (for rehydrate)."""
     if not username:
         return []
@@ -6923,7 +6930,8 @@ async def _central_channel_resources(username: str) -> list:
     def _get():
         import urllib.parse
         url = (REGISTRY_URL + "/api/v1/channel_resources?channel="
-               + urllib.parse.quote(username.lstrip("@")))
+               + urllib.parse.quote(username.lstrip("@"))
+               + (f"&after={int(after)}" if after else ""))
         req = urllib.request.Request(url, headers={"User-Agent": TGARR_UA, "Accept-Encoding": "gzip"})
         with urllib.request.urlopen(req, timeout=60) as r:
             raw = r.read(32 * 1024 * 1024)
@@ -6938,12 +6946,12 @@ async def _central_channel_resources(username: str) -> list:
         return []
 
 
-async def _rehydrate_channel(channel_id: int, tg_chat_id: int, username: str) -> int:
+async def _rehydrate_channel(channel_id: int, tg_chat_id: int, username: str, after: int = 0) -> int:
     """Re-seed a purged channel's local index from central so grab/download
     works again. Central indexes by username, so private/no-username channels
     can't rehydrate (returns 0). file_dc is absent in central → starts NULL and
     backfills on first fetch. Returns rows restored."""
-    resources = await _central_channel_resources(username)
+    resources = await _central_channel_resources(username, after)
     if not resources:
         return 0
     from datetime import datetime as _dt
