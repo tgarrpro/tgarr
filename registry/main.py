@@ -18,6 +18,7 @@ Defense in depth:
 - distinct_contributors >= 3 → channel auto-verified (community confirmation).
 """
 import asyncio
+import gzip
 import hashlib
 import html
 import json
@@ -25,6 +26,7 @@ import logging
 import os
 import re
 import struct
+from datetime import datetime, timezone
 import time
 from typing import Optional
 
@@ -157,7 +159,6 @@ async def _startup():
 BLOOM_M_BITS = 256 * 1024 * 1024  # 32 MiB
 BLOOM_M_BYTES = BLOOM_M_BITS // 8
 BLOOM_K = 8
-BLOOM_REBUILD_INTERVAL_SEC = 300
 # Default 3 — consensus threshold. Set to 1 for solo-client demo / testing
 # (lets Bloom include single-source fuids so the client can verify the
 # skip-redundant-push path before other clients exist).
@@ -176,71 +177,123 @@ def _bloom_indices(fuid: str) -> list:
     ]
 
 
+# The filter is a SUMMARY of what the registry holds, and installs need it
+# only to avoid uploading what is already here. It used to be rebuilt every
+# five minutes with the build time inside it, so it differed every five
+# minutes and every install downloaded all of it (20 MB on the wire) again
+# and again: 99% of everything this server sent.
+#
+# Now: one summary per UTC day, of everything first seen BEFORE that day
+# began - identical for everybody all day, so "do you have a newer one?" is
+# answered with 304. And each finished day's additions are published as a
+# small list of its own (GET …/delta/<day>): an install that has yesterday's
+# summary fetches a few hundred kilobytes, not the summary again. A finished
+# day never changes, so its list can be cached for ever by anything in front
+# of the registry.
+SKETCH_DELTA_DAYS = 30                 # how far back a day's additions are served
+_central_sketch_day: str = ""          # the UTC day the current summary is for
+_delta_cache: dict = {}                # day -> gzip bytes
+
+
+def _utc_day(offset_days: int = 0) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + offset_days * 86400))
+
+
+def _fill_bloom(ids) -> bytearray:
+    b = bytearray(BLOOM_M_BYTES)
+    for fuid in ids:
+        for idx in _bloom_indices(fuid):
+            b[idx >> 3] |= (1 << (idx & 7))
+    return b
+
+
 async def _build_central_sketch():
-    """Periodic Bloom rebuild — runs forever on a background task."""
-    global _central_sketch_blob, _central_sketch_etag
+    """Build the day's summary at start and again whenever the UTC day turns."""
+    global _central_sketch_blob, _central_sketch_etag, _central_sketch_day
     while True:
-        try:
-            t0 = time.time()
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT file_unique_id FROM registry_resources "
-                    "WHERE distinct_contributors >= $1 "
-                    "  AND file_unique_id IS NOT NULL",
-                    BLOOM_DC_THRESHOLD)
-            # ~4M ids x 8 hashes is tens of seconds of pure Python. Run it in a
-            # worker thread: on the event loop it froze every request for the
-            # whole build, every 5 minutes.
-            fuids = [r["file_unique_id"] for r in rows if r["file_unique_id"]]
-            del rows
-
-            def _fill(ids):
-                b = bytearray(BLOOM_M_BYTES)
-                for fuid in ids:
-                    for idx in _bloom_indices(fuid):
-                        b[idx >> 3] |= (1 << (idx & 7))
-                return b
-
-            bits = await asyncio.to_thread(_fill, fuids)
-            n = len(fuids)
-            del fuids
-            # 20-byte header: magic(4) + m_bits(4) + k(1) + reserved(3) + n(4) + built_at(4)
-            header = struct.pack(
-                "<4sIB3xII",
-                b"BLM1", BLOOM_M_BITS, BLOOM_K, n, int(time.time()))
-            blob = bytes(header) + bytes(bits)
-            etag = hashlib.sha256(blob).hexdigest()[:32]
-            _central_sketch_blob = blob
-            _central_sketch_etag = etag
-            log.info("[bloom] rebuilt n=%d m=%d k=%d bytes=%d build_ms=%d etag=%s",
-                     n, BLOOM_M_BITS, BLOOM_K, len(blob),
-                     int((time.time()-t0)*1000), etag)
-        except Exception as e:
-            log.warning("[bloom] rebuild failed: %s", e)
-        await asyncio.sleep(BLOOM_REBUILD_INTERVAL_SEC)
+        day = _utc_day()
+        if day != _central_sketch_day:
+            try:
+                t0 = time.time()
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT file_unique_id FROM registry_resources "
+                        "WHERE distinct_contributors >= $1 AND file_unique_id IS NOT NULL "
+                        "  AND first_seen_at < $2::date",
+                        BLOOM_DC_THRESHOLD, datetime.strptime(day, "%Y-%m-%d").date())
+                # ~4M ids x 8 hashes is tens of seconds of pure Python: in a
+                # worker thread, or every request waits for the build.
+                fuids = [r["file_unique_id"] for r in rows if r["file_unique_id"]]
+                del rows
+                bits = await asyncio.to_thread(_fill_bloom, fuids)
+                n = len(fuids)
+                del fuids
+                # 20-byte header: magic(4) + m_bits(4) + k(1) + reserved(3) + n(4) + built_at(4).
+                # built_at is the START of the day, not the moment of the build:
+                # the same day gives the same bytes after a restart.
+                day_start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+                header = struct.pack("<4sIB3xII", b"BLM1", BLOOM_M_BITS, BLOOM_K, n, day_start)
+                blob = bytes(header) + bytes(bits)
+                _central_sketch_blob = blob
+                _central_sketch_etag = hashlib.sha256(blob).hexdigest()[:32]
+                _central_sketch_day = day
+                for old in [d for d in _delta_cache if d < _utc_day(-SKETCH_DELTA_DAYS - 1)]:
+                    _delta_cache.pop(old, None)
+                log.info("[bloom] summary for %s: n=%d bytes=%d build_ms=%d etag=%s",
+                         day, n, len(blob), int((time.time() - t0) * 1000), _central_sketch_etag)
+            except Exception as e:
+                log.warning("[bloom] rebuild failed: %s", e)
+                await asyncio.sleep(120)
+                continue
+        await asyncio.sleep(60)
 
 
 @app.get("/api/v1/known_resources/sketch")
 async def known_resources_sketch(request: Request):
-    """Bloom filter of consensus-met file_unique_ids. Clients fetch this and
-    skip pushing fuids that test 'present' — those already have ≥3 contributors
-    so further pushes are redundant.
-
-    ETag-based caching: client passes If-None-Match → 304 if unchanged.
-    Server rebuilds every 5 min. Filter format documented in builder above.
+    """Bloom filter of the file ids the registry held when today (UTC) began.
+    Clients skip uploading what tests 'present'. The same bytes all day:
+    If-None-Match gets 304. X-Sketch-Day names the day; additions since are
+    under /api/v1/known_resources/delta/<day>.
     """
     if not _central_sketch_blob:
         return Response("sketch not ready yet", status_code=503,
                         headers={"Retry-After": "30"})
+    head = {"ETag": f'"{_central_sketch_etag}"', "X-Sketch-Day": _central_sketch_day,
+            "Cache-Control": "public, max-age=3600"}
     inm = request.headers.get("if-none-match", "").strip('"')
     if inm == _central_sketch_etag:
-        return Response(status_code=304,
-                        headers={"ETag": f'"{_central_sketch_etag}"'})
-    return Response(
-        _central_sketch_blob,
-        media_type="application/octet-stream",
-        headers={"ETag": f'"{_central_sketch_etag}"',
-                 "Cache-Control": "public, max-age=300"})
+        return Response(status_code=304, headers=head)
+    return Response(_central_sketch_blob, media_type="application/octet-stream", headers=head)
+
+
+@app.get("/api/v1/known_resources/delta/{day}")
+async def known_resources_delta(day: str):
+    """The file ids first seen on one finished UTC day: gzip, one id per line.
+    An install holding the summary for <day> adds these and then holds the
+    summary for the day after. Never changes once the day is over."""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        raise HTTPException(400, "day must be YYYY-MM-DD")
+    if day >= _utc_day():
+        raise HTTPException(404, "that day is not over yet")
+    if day < _utc_day(-SKETCH_DELTA_DAYS):
+        raise HTTPException(410, "too old: fetch the summary instead")
+    hit = _delta_cache.get(day)
+    if hit is None:
+        try:
+            d0 = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, "day must be YYYY-MM-DD")
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT file_unique_id FROM registry_resources "
+                "WHERE first_seen_at >= $1::date AND first_seen_at < ($1::date + 1) "
+                "  AND distinct_contributors >= $2 AND file_unique_id IS NOT NULL",
+                d0, BLOOM_DC_THRESHOLD)
+        text = "\n".join(r["file_unique_id"] for r in rows).encode()
+        hit = (await asyncio.to_thread(gzip.compress, text, 6), len(rows))
+        _delta_cache[day] = hit
+    return Response(hit[0], media_type="application/gzip", headers={
+        "Cache-Control": "public, max-age=31536000, immutable", "X-Count": str(hit[1])})
 
 
 async def _audience_classifier():

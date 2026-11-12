@@ -137,3 +137,6 @@ CREATE TABLE IF NOT EXISTS registry_metrics (
     db_conns      INTEGER,
     by_path       JSONB          -- {"GET /api/v1/x": [requests, bytes_out], ...}
 );
+
+-- A day's additions to the dedup summary are read by first_seen_at.
+CREATE INDEX IF NOT EXISTS idx_rsrc_first_seen ON registry_resources (first_seen_at);

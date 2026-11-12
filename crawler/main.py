@@ -2711,59 +2711,147 @@ _BLOOM_BUILT_AT: int = 0
 _BLOOM_N: int = 0
 
 
-async def _refresh_bloom_sketch() -> None:
-    """Pull latest sketch from central. ETag-cached → 304 = no-op."""
-    global _BLOOM_BLOB, _BLOOM_M_BITS, _BLOOM_K, _BLOOM_ETAG, _BLOOM_BUILT_AT, _BLOOM_N
+# The summary is kept on disk and brought up to date once a day with that
+# day's additions only. It used to live in memory: every restart, and every
+# five-minute rebuild on the registry, meant downloading all of it again.
+BLOOM_FILE = "/app/session/known_resources.bin"
+BLOOM_REFRESH_SEC = 20 * 3600
+_BLOOM_DAY: str = ""            # the summary covers everything seen before this UTC day
+_BLOOM_CHECKED: float = 0.0
 
-    def _fetch():
-        req = urllib.request.Request(
-            f"{REGISTRY_URL}/api/v1/known_resources/sketch",
-            headers={"If-None-Match": f'"{_BLOOM_ETAG}"' if _BLOOM_ETAG else "",
-                     "Accept-Encoding": "gzip",
-                     "User-Agent": "tgarr/bloom"})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                etag = r.headers.get("etag", "").strip('"')
-                raw = r.read()
-                if r.headers.get("content-encoding", "").lower() == "gzip":
-                    raw = gzip.decompress(raw)
-                return r.status, etag, raw
-        except urllib.error.HTTPError as e:
-            if e.code == 304:
-                return 304, _BLOOM_ETAG, b""
-            return e.code, "", b""
-        except Exception as e:
-            log.warning("[bloom] fetch error: %s", e)
-            return 0, "", b""
 
-    status, etag, blob = await asyncio.to_thread(_fetch)
-    if status == 304:
-        return  # cached version still good
-    if status != 200 or len(blob) < 20:
-        log.warning("[bloom] fetch failed status=%s len=%d", status, len(blob))
-        return
-    # 20-byte header: magic(4s) + m_bits(I) + k(B) + reserved(3x) + n(I) + built_at(I)
-    if blob[:4] != b"BLM1":
-        log.warning("[bloom] bad magic: %r", blob[:4])
-        return
+def _bloom_day(offset: int = 0) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + offset * 86400))
+
+
+def _bloom_next_day(day: str) -> str:
+    from datetime import datetime as _d, timedelta as _t
+    return (_d.strptime(day, "%Y-%m-%d") + _t(days=1)).strftime("%Y-%m-%d")
+
+
+def _bloom_set(blob: bytes, day: str) -> bool:
+    """Adopt a summary as downloaded (20-byte header + bits). False if malformed."""
+    global _BLOOM_BLOB, _BLOOM_M_BITS, _BLOOM_K, _BLOOM_BUILT_AT, _BLOOM_N, _BLOOM_DAY
+    if len(blob) < 20 or blob[:4] != b"BLM1":
+        return False
     try:
-        m_bits, k, n, built_at = struct.unpack("<IB3xII", blob[4:20])
-    except struct.error as e:
-        log.warning("[bloom] header parse: %s", e)
+        import struct as _struct
+        _magic, m_bits, k, n, built_at = _struct.unpack("<4sIB3xII", blob[:20])
+    except Exception:
+        return False
+    if len(blob) != 20 + m_bits // 8 or not 1 <= k <= 32:
+        return False
+    _BLOOM_BLOB = bytearray(blob[20:])
+    _BLOOM_M_BITS, _BLOOM_K, _BLOOM_N, _BLOOM_BUILT_AT = m_bits, k, n, built_at
+    _BLOOM_DAY = day or time.strftime("%Y-%m-%d", time.gmtime(built_at))
+    return True
+
+
+def _bloom_add(fuids) -> int:
+    """Add ids to the summary held in memory. Returns how many were added."""
+    global _BLOOM_N
+    n = 0
+    for fuid in fuids:
+        if not fuid:
+            continue
+        h = hashlib.sha256(fuid.encode()).digest()
+        for i in range(_BLOOM_K):
+            idx = int.from_bytes(h[i * 4:(i + 1) * 4], "little") % _BLOOM_M_BITS
+            _BLOOM_BLOB[idx >> 3] |= (1 << (idx & 7))
+        n += 1
+    _BLOOM_N += n
+    return n
+
+
+def _bloom_save() -> None:
+    import struct as _struct
+    try:
+        tmp = BLOOM_FILE + ".part"
+        with open(tmp, "wb") as f:
+            f.write(_BLOOM_DAY.encode().ljust(16, b"\0"))
+            f.write(_struct.pack("<4sIB3xII", b"BLM1", _BLOOM_M_BITS, _BLOOM_K,
+                                 min(_BLOOM_N, 0xFFFFFFFF), _BLOOM_BUILT_AT))
+            f.write(bytes(_BLOOM_BLOB))
+        os.replace(tmp, BLOOM_FILE)
+    except OSError as e:
+        log.warning("[bloom] could not keep the summary on disk: %s", e)
+
+
+def _bloom_load() -> bool:
+    try:
+        with open(BLOOM_FILE, "rb") as f:
+            day = f.read(16).rstrip(b"\0").decode()
+            blob = f.read()
+    except OSError:
+        return False
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", day)) and _bloom_set(blob, day)
+
+
+def _bloom_http(path: str, etag: str = ""):
+    """(status, headers, body) for a GET on the registry. Blocking."""
+    req = urllib.request.Request(REGISTRY_URL + path, headers={"User-Agent": "tgarr/bloom"})
+    if etag:
+        req.add_header("If-None-Match", f'"{etag}"')
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers or {}), b""
+    except Exception as e:
+        log.warning("[bloom] %s: %s", path, e)
+        return 0, {}, b""
+
+
+async def _refresh_bloom_sketch() -> None:
+    """Have a summary no older than a day, for as few bytes as possible:
+    the copy on disk, then one small list per day missed; the whole summary
+    only for a new install or after more than a month away."""
+    global _BLOOM_ETAG, _BLOOM_CHECKED, _BLOOM_DAY
+    if _BLOOM_BLOB and time.time() - _BLOOM_CHECKED < BLOOM_REFRESH_SEC:
         return
-    expected_size = 20 + m_bits // 8
-    if len(blob) != expected_size:
-        log.warning("[bloom] size mismatch: got %d expected %d", len(blob), expected_size)
+    if not _BLOOM_BLOB and await asyncio.to_thread(_bloom_load):
+        log.info("[bloom] summary from disk: day %s, n=%d", _BLOOM_DAY, _BLOOM_N)
+    today = _bloom_day()
+    changed = False
+    if _BLOOM_BLOB:
+        day, guard = _BLOOM_DAY, 0
+        while day < today and guard < 40:
+            status, _h, body = await asyncio.to_thread(_bloom_http, f"/api/v1/known_resources/delta/{day}")
+            if status != 200:
+                break                         # too old, or a registry without daily lists: take the summary
+            try:
+                ids = gzip.decompress(body).decode().split("\n") if body else []
+            except Exception:
+                break
+            added = await asyncio.to_thread(_bloom_add, ids)
+            day = _bloom_next_day(day)
+            _BLOOM_DAY = day
+            changed = True
+            guard += 1
+            log.info("[bloom] +%d ids (%d KB): the summary now covers everything before %s",
+                     added, len(body) // 1024, day)
+        if _BLOOM_DAY >= today:
+            if changed:
+                await asyncio.to_thread(_bloom_save)
+            _BLOOM_CHECKED = time.time()
+            return
+    status, head, blob = await asyncio.to_thread(_bloom_http, "/api/v1/known_resources/sketch", _BLOOM_ETAG)
+    if status == 304:
+        _BLOOM_CHECKED = time.time()
         return
-    _BLOOM_BLOB = blob[20:]
-    _BLOOM_M_BITS = m_bits
-    _BLOOM_K = k
+    if status != 200 or not blob:
+        if status:
+            log.warning("[bloom] fetch failed status=%s len=%d", status, len(blob))
+        return
+    etag = (head.get("ETag") or head.get("etag") or "").strip('"')
+    day = head.get("X-Sketch-Day") or head.get("x-sketch-day") or ""
+    if not _bloom_set(blob, day if re.match(r"^\d{4}-\d{2}-\d{2}$", day) else ""):
+        log.warning("[bloom] the summary from the registry is malformed (%d bytes)", len(blob))
+        return
     _BLOOM_ETAG = etag
-    _BLOOM_BUILT_AT = built_at
-    _BLOOM_N = n
-    age = int(time.time() - built_at)
-    log.info("[bloom] sketch updated: n=%d m=%d k=%d size=%dKB age=%ds",
-             n, m_bits, k, len(blob)//1024, age)
+    _BLOOM_CHECKED = time.time()
+    await asyncio.to_thread(_bloom_save)
+    log.info("[bloom] summary downloaded: day %s, n=%d, %d KB", _BLOOM_DAY, _BLOOM_N, len(blob) // 1024)
 
 
 def _bloom_contains(fuid: str) -> bool:
