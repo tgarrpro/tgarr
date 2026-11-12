@@ -4674,10 +4674,24 @@ async def _session_change_watcher(boot_user_id: int):
     we self-exit and let docker's restart policy bring us back fresh.
     """
     import sqlite3
+    try:
+        boot_ino = os.stat(SESSION_PATH).st_ino
+    except OSError:
+        boot_ino = None
     await asyncio.sleep(60)  # initial settle
     while True:
         try:
             if os.path.exists(SESSION_PATH) and os.path.getsize(SESSION_PATH) > 0:
+                # /login installs a freshly authorized session by atomic
+                # rename, so a re-login (even as the SAME account) shows up as
+                # a new inode. We are still holding the old, now-unlinked file;
+                # restart to load the new auth key.
+                cur_ino = os.stat(SESSION_PATH).st_ino
+                if boot_ino is not None and cur_ino != boot_ino and _session_authed():
+                    log.warning("[session-watch] session file was replaced by a "
+                                "new login — self-exiting to load it")
+                    await asyncio.sleep(2)
+                    os._exit(0)
                 con = sqlite3.connect(f"file:{SESSION_PATH}?mode=ro",
                                       uri=True, timeout=2)
                 try:
