@@ -475,6 +475,12 @@ async def _migrate_schema():
             );
             ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS unfollowed_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS handle_known BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_preview BOOLEAN;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_cursor BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_done BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS central_pulled_at TIMESTAMPTZ;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS via_web BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_oldest_tg_id BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
@@ -5858,8 +5864,8 @@ async def api_channel_subscribe(username: str = Form(...)):
         placeholder = -abs(hash(u)) // 1000 - 1_000_000_000_000
         new_id = await conn.fetchval(
             """INSERT INTO channels (tg_chat_id, username, title,
-                                     subscribed, backfilled)
-               VALUES ($1, $2, $3, TRUE, FALSE)
+                                     subscribed, backfilled, handle_known)
+               VALUES ($1, $2, $3, TRUE, FALSE, FALSE)
                ON CONFLICT (tg_chat_id) DO NOTHING
                RETURNING id""",
             placeholder, u, f"@{u} (resolving…)")
@@ -5926,7 +5932,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                  WHERE r.category IN ('movie', 'tv') GROUP BY 1)
                SELECT c.tg_chat_id, c.username, c.title, c.backfilled, c.members_count,
                       c.audience, c.subscribed, c.is_joined, c.dead_at, c.subscribe_error,
-                      c.purged_at, c.unfollowed_at,
+                      c.purged_at, c.unfollowed_at, c.handle_known, c.web_preview,
                       COALESCE(a.msgs, 0) AS msgs, COALESCE(a.media, 0) AS media,
                       COALESCE(a.videos, 0) AS videos, COALESCE(a.songs, 0) AS songs,
                       COALESCE(a.photos, 0) AS photos, COALESCE(a.docs, 0) AS docs,
@@ -6060,6 +6066,10 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
             tags.append('<span class="tag bad" title="Telegram no longer serves this channel">gone</span>')
         elif r["is_joined"]:
             tags.append('<span class="tag ok" title="your account is a member">joined</span>')
+        elif r["subscribed"] and not r["handle_known"]:
+            tags.append('<span class="tag acc" title="read from tgarr.me and Telegram\'s public web page; '
+                        'your account is not used until you open one of its files">'
+                        + ('followed · web' if r["web_preview"] else 'followed · listed') + '</span>')
         elif r["subscribed"]:
             tags.append('<span class="tag acc" title="read without joining">followed</span>')
         elif r["unfollowed_at"]:

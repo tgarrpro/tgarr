@@ -636,15 +636,318 @@ def _dialogs(*a, **kw):
     return _mtproto_aiter("get_dialogs", app.get_dialogs(*a, **kw))
 
 
+# ═════════════════════════════════════════════════
+# HTTP first
+#
+# Following a public channel used to start with a username lookup through
+# the account. An account gets about 200 of those a day before Telegram
+# makes it wait, so following a few hundred channels - or restarting on a
+# day the allowance was spent - left channels unread until the next day.
+#
+# Almost nothing about READING a public channel needs the account:
+#   1. tgarr.me already holds the file list of every channel some install
+#      has indexed: one HTTPS request returns it, file identities included.
+#   2. Telegram's own web preview (t.me/s/<name>) shows a public channel's
+#      posts to anybody: text, file names and sizes, running times.
+# Both are tried first, for every followed channel the session holds no
+# handle for. The account is asked only
+#   * when a file is actually wanted (played, saved, grabbed): one lookup
+#     for that channel, once - after it the channel is read through the
+#     account like before, which costs no further lookups;
+#   * for a channel neither source knows (Telegram does not preview most
+#     channels that carry films, nor any group).
+# TGARR_WEB_FIRST=false restores the old behaviour.
+# ═════════════════════════════════════════════════
+WEB_FIRST = os.environ.get("TGARR_WEB_FIRST", "true").lower() != "false"
+WEB_PAGE_DELAY_SEC = float(os.environ.get("TGARR_WEB_PAGE_DELAY_SEC", "1.5"))
+WEB_PAGES_PER_POLL = int(os.environ.get("TGARR_WEB_PAGES_PER_POLL", "10"))
+WEB_BACKFILL_POSTS = int(os.environ.get("TGARR_WEB_BACKFILL_POSTS", "3000"))
+_web_lock = asyncio.Lock()
+_web_last = [0.0]
+_web_slow_until = [0.0]
+
+
+async def _web_page(username: str, before=None):
+    """One preview page, never faster than one request per WEB_PAGE_DELAY_SEC
+    for the whole install, and not at all for ten minutes after the site
+    asked us to slow down."""
+    import tme
+    if time.time() < _web_slow_until[0]:
+        return "slowdown", ""
+    async with _web_lock:
+        gap = WEB_PAGE_DELAY_SEC - (time.time() - _web_last[0])
+        if gap > 0:
+            await asyncio.sleep(gap)
+        state, body = await asyncio.to_thread(tme.fetch_page, username, before)
+        _web_last[0] = time.time()
+    if state == "slowdown":
+        _web_slow_until[0] = time.time() + 600
+    return state, body
+
+
+async def _web_ingest(channel_id: int, tg_chat_id: int, username: str, posts: list) -> int:
+    """Store what the page shows. One row per attachment (an album is several
+    messages). Rows are marked via_web: their file identity is not known yet
+    and is filled in when the account first reads the message."""
+    new = 0
+    async with db_pool.acquire() as conn:
+        for post in posts:
+            when = post.get("date")
+            if not when:
+                continue
+            text = (post.get("text") or "").replace("\x00", "")[:1024] or None
+            for it in post.get("items") or []:
+                kind = it["kind"]
+                fname = (it.get("file_name") or "").replace("\x00", "") or None
+                keep, _why = _quality_check(fname, it.get("file_size"), kind, text)
+                if not keep:
+                    continue
+                new_id = await conn.fetchval(
+                    """INSERT INTO messages
+                         (channel_id, tg_message_id, tg_chat_id, file_name, caption, file_size,
+                          media_type, posted_at, detected_lang, duration_sec, width, height,
+                          audio_duration_sec, via_web)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE)
+                       ON CONFLICT (channel_id, tg_message_id) DO NOTHING
+                       RETURNING id""",
+                    channel_id, it["id"], tg_chat_id, fname, text, it.get("file_size"), kind, when,
+                    _detect_lang(fname or ""),
+                    it.get("duration") if kind == "video" else None,
+                    it.get("width"), it.get("height"),
+                    it.get("duration") if kind == "audio" else None)
+                if not new_id:
+                    continue
+                new += 1
+                if fname:
+                    try:
+                        await maybe_create_release(conn, new_id, fname, it.get("file_size"), when,
+                                                   duration=it.get("duration"),
+                                                   width=it.get("width"), height=it.get("height"))
+                    except Exception as e:
+                        log.warning("[web] release for msg %s failed: %s", new_id, e)
+                _meili_enqueue("messages", {
+                    "id": new_id, "file_name": fname, "audio_title": None, "audio_performer": None,
+                    "audio_canonical_title": None, "detected_lang": _detect_lang(fname or "") or "unknown",
+                    "media_type": kind, "channel_username": username, "audience": "sfw",
+                    "has_local": False, "file_size": it.get("file_size") or 0,
+                    "posted_at_ts": int(when.timestamp())})
+    return new
+
+
+async def _web_read(row) -> tuple:
+    """Read a channel's web preview: the newest page, then older pages where
+    the last visit stopped. Returns (state, new_rows, info). state is 'ok',
+    'nopreview', 'slowdown' or 'error'."""
+    import tme
+    uname = row["username"]
+    state, body = await _web_page(uname)
+    if state != "ok":
+        return state, 0, {}
+    page = tme.parse_page(body)
+    info = {"title": page["title"], "members": page["members"]}
+    new = await _web_ingest(row["id"], row["tg_chat_id"], uname, page["posts"])
+    async with db_pool.acquire() as conn:
+        cur = await conn.fetchrow(
+            "SELECT web_cursor, web_done, (SELECT count(*) FROM messages m WHERE m.channel_id = c.id "
+            "AND m.via_web) AS n FROM channels c WHERE c.id = $1", row["id"])
+    cursor, done = cur["web_cursor"], cur["web_done"]
+    if cursor is None:
+        cursor = page["before"]
+    pages = 0
+    while not done and cursor and pages < WEB_PAGES_PER_POLL and (cur["n"] + new) < WEB_BACKFILL_POSTS:
+        st, body = await _web_page(uname, before=cursor)
+        if st != "ok":
+            if st == "nopreview":
+                done = True                      # walked off the top of the history
+            break
+        older = tme.parse_page(body)
+        if not older["posts"]:
+            done = True
+            break
+        new += await _web_ingest(row["id"], row["tg_chat_id"], uname, older["posts"])
+        nxt = older["before"]
+        if not nxt or nxt >= cursor:
+            done = True
+            break
+        cursor = nxt
+        pages += 1
+    if (cur["n"] + new) >= WEB_BACKFILL_POSTS:
+        done = True
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE channels SET web_cursor = $2, web_done = $3 WHERE id = $1",
+                           row["id"], cursor, bool(done))
+    return "ok", new, info
+
+
+def _web_channel_card(username: str) -> dict:
+    """Title and size of a public channel from t.me/<name> - a page that
+    exists even for channels Telegram does not preview. Blocking."""
+    import html as _h
+    import urllib.request
+    import tme
+    try:
+        req = urllib.request.Request(f"https://t.me/{username}", headers={"User-Agent": tme.UA,
+                                                                          "Accept-Language": "en"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read(512 * 1024).decode("utf-8", "replace")
+    except Exception:
+        return {}
+    out = {}
+    m = re.search(r'<meta\s+property="og:title"\s+content="([^"]*)"', body)
+    if m and m.group(1).strip() and not m.group(1).startswith("Telegram: "):
+        out["title"] = _h.unescape(m.group(1)).strip()
+    m = re.search(r'<div class="tgme_page_extra">([^<]*?)(?:subscribers?|members?)', body)
+    if m:
+        out["members"] = tme.parse_count(m.group(1).split(",")[0])
+    return out
+
+
+async def _poll_without_account(row) -> bool:
+    """Serve one followed channel from tgarr.me and the web preview.
+
+    True  = done for this round, the account was not needed.
+    False = neither source can read it: the caller goes on to the account.
+    """
+    uname = row["username"]
+    cid = row["id"]
+    central = 0
+    async with db_pool.acquire() as conn:
+        pulled = await conn.fetchval("SELECT central_pulled_at FROM channels WHERE id = $1", cid)
+    if not pulled:
+        central = await _rehydrate_channel(cid, row["tg_chat_id"], uname)
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE channels SET central_pulled_at = NOW() WHERE id = $1", cid)
+    state, new, info = await _web_read(row)
+    async with db_pool.acquire() as conn:
+        have = await conn.fetchval("SELECT count(*) FROM messages WHERE channel_id = $1", cid)
+        placeholder_title = (row["title"] or "").startswith("@") and "(resolving" in (row["title"] or "")
+        if state == "ok":
+            await conn.execute(
+                """UPDATE channels SET web_preview = TRUE, last_polled_at = NOW(), subscribe_error = NULL,
+                       backfilled = TRUE,
+                       title = CASE WHEN $2::text IS NOT NULL AND ($4 OR title IS NULL) THEN $2 ELSE title END,
+                       members_count = COALESCE($3, members_count)
+                   WHERE id = $1""", cid, info.get("title"), info.get("members"), placeholder_title)
+            log.info("[web] @%s read without the account: %d new from the web preview%s", uname, new,
+                     f", {central} from tgarr.me" if central else "")
+            return True
+        if state in ("slowdown", "error"):
+            # a hiccup of the web page is not a reason to spend a lookup
+            await conn.execute(
+                "UPDATE channels SET last_polled_at = NOW() WHERE id = $1", cid)
+            log.info("[web] @%s: preview not reachable right now (%s) - tried again next round", uname, state)
+            return True
+        # Telegram does not preview this channel
+        await conn.execute("UPDATE channels SET web_preview = FALSE WHERE id = $1", cid)
+    if placeholder_title:
+        card = await asyncio.to_thread(_web_channel_card, uname)
+        if card.get("title"):
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE channels SET title = $2, members_count = COALESCE($3, members_count) WHERE id = $1",
+                    cid, card["title"], card.get("members"))
+    if have:
+        # Its files are listed (from tgarr.me) and can be played - the lookup
+        # happens when one is. Reading NEW posts of a channel without a web
+        # preview does need the account: let background allowance do that,
+        # never the share kept for what the user asks for.
+        log.info("[web] @%s has no web preview; %d files known from tgarr.me - "
+                 "the account is asked when one is played, or when background allowance is free", uname, have)
+    return False
+
+
+async def _adopt_real_chat_id(channel_id: int, real_chat_id: int) -> int:
+    """The account has resolved a channel that so far was only known by name:
+    give the channel row (and its messages) the real chat id. If the real
+    channel is already in the table (the account is a member of it), the rows
+    read from the web move over to it. Returns the id of the surviving row."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            other = await conn.fetchval(
+                "SELECT id FROM channels WHERE tg_chat_id = $1 AND id <> $2", real_chat_id, channel_id)
+            if other:
+                await conn.execute(
+                    """UPDATE messages m SET channel_id = $2, tg_chat_id = $3
+                       WHERE m.channel_id = $1 AND NOT EXISTS (
+                           SELECT 1 FROM messages o WHERE o.channel_id = $2
+                             AND o.tg_message_id = m.tg_message_id)""", channel_id, other, real_chat_id)
+                await conn.execute("DELETE FROM channels WHERE id = $1", channel_id)
+                await conn.execute(
+                    "UPDATE channels SET subscribed = TRUE, handle_known = TRUE WHERE id = $1", other)
+                return other
+            await conn.execute(
+                "UPDATE channels SET tg_chat_id = $2, handle_known = TRUE WHERE id = $1",
+                channel_id, real_chat_id)
+            await conn.execute(
+                "UPDATE messages SET tg_chat_id = $2 WHERE channel_id = $1 AND tg_chat_id <> $2",
+                channel_id, real_chat_id)
+    return channel_id
+
+
+async def _ensure_handle(chat_id: int) -> int:
+    """A file is wanted from a channel read so far without the account: this
+    is the moment the lookup is spent (once per channel). Returns the chat id
+    to use from here on."""
+    async with db_pool.acquire() as conn:
+        ch = await conn.fetchrow(
+            "SELECT id, username FROM channels WHERE tg_chat_id = $1 AND handle_known = FALSE", chat_id)
+    if not ch or not ch["username"]:
+        return chat_id
+    uname = ch["username"]
+    chat = await _mtproto("resolveUsername", lambda: app.get_chat(uname),
+                          wait=False, user=True, username=uname)
+    await _adopt_real_chat_id(ch["id"], chat.id)
+    log.info("[web] @%s: a file was asked for - looked the channel up once, it is read through "
+             "the account from now on", uname)
+    return chat.id
+
+
+async def _fill_from_message(msg) -> None:
+    """A row that came from the web page (or from tgarr.me) meets the real
+    message: take the file's identity, exact size and data centre from it."""
+    media = msg.video or msg.document or msg.audio or msg.photo
+    if not media or not getattr(msg, "chat", None):
+        return
+    try:
+        dc = FileId.decode(media.file_id).dc_id
+    except Exception:
+        dc = None
+    kind = ("video" if msg.video else "document" if msg.document else "audio" if msg.audio else "photo")
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE messages m SET
+                   file_unique_id = COALESCE(m.file_unique_id, $3),
+                   file_name = COALESCE($4, m.file_name),
+                   file_size = COALESCE($5, m.file_size),
+                   mime_type = COALESCE($6, m.mime_type),
+                   media_type = $7,
+                   file_dc = COALESCE($8, m.file_dc),
+                   rel_ver = CASE WHEN m.via_web THEN NULL ELSE m.rel_ver END,
+                   via_web = FALSE
+               FROM channels c
+               WHERE c.id = m.channel_id AND c.tg_chat_id = $1 AND m.tg_message_id = $2
+                 AND (m.via_web OR m.file_unique_id IS NULL OR m.file_dc IS NULL)""",
+            msg.chat.id, msg.id, getattr(media, "file_unique_id", None),
+            (getattr(media, "file_name", None) or "").replace("\x00", "") or None,
+            getattr(media, "file_size", None), getattr(media, "mime_type", None), kind, dc)
+
+
 async def _mtproto_get_messages_with_auto_join(chat_id, msg_id):
     """get_messages with auto-join on CHANNEL_INVALID — for restricted channels
     where the session isn't yet a member. join_chat is itself rate-limited;
     if join also fails, propagates the original error to caller.
     """
     from pyrogram.errors import ChannelInvalid
+    chat_id = await _ensure_handle(chat_id)
     try:
-        return await _mtproto("get_messages",
-                               lambda: app.get_messages(chat_id, msg_id))
+        _m = await _mtproto("get_messages",
+                            lambda: app.get_messages(chat_id, msg_id))
+        if _m and not isinstance(_m, list):
+            try:
+                await _fill_from_message(_m)
+            except Exception as _e:
+                log.debug("[web] fill from message failed: %s", _e)
+        return _m
     except ChannelInvalid:
         # First try a refresh via get_chat_history (cheap, often fixes stale
         # access_hash). NOTE: get_chat_history is an async generator — can't
@@ -1153,6 +1456,19 @@ async def init_db() -> None:
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS unfollowed_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_retry_after TIMESTAMPTZ")
+        # HTTP first (see _poll_without_account)
+        for _ddl in (
+                "ALTER TABLE channels ADD COLUMN IF NOT EXISTS handle_known BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_preview BOOLEAN",
+                "ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_cursor BIGINT",
+                "ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_done BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE channels ADD COLUMN IF NOT EXISTS central_pulled_at TIMESTAMPTZ",
+                "ALTER TABLE messages ADD COLUMN IF NOT EXISTS via_web BOOLEAN NOT NULL DEFAULT FALSE"):
+            await conn.execute(_ddl)
+        # rows followed before this version and never resolved: known by name only
+        await conn.execute(
+            """UPDATE channels SET handle_known = FALSE
+               WHERE handle_known AND title LIKE '@%' AND title LIKE '%(resolving%'""")
         await conn.execute(
             "ALTER TABLE discovered ADD COLUMN IF NOT EXISTS last_file_at TIMESTAMPTZ")
         # Channels marked "read to the end" by the old error handling without
@@ -1789,8 +2105,20 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
                   media_type, audio_title, audio_performer, audio_duration_sec,
                   posted_at, file_dc, detected_lang, duration_sec, width, height)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-               ON CONFLICT (channel_id, tg_message_id) DO NOTHING
-               RETURNING id""",
+               ON CONFLICT (channel_id, tg_message_id) DO UPDATE SET
+                   file_unique_id = EXCLUDED.file_unique_id,
+                   file_name = COALESCE(EXCLUDED.file_name, messages.file_name),
+                   file_size = COALESCE(EXCLUDED.file_size, messages.file_size),
+                   mime_type = EXCLUDED.mime_type, media_type = EXCLUDED.media_type,
+                   file_dc = EXCLUDED.file_dc, tg_chat_id = EXCLUDED.tg_chat_id,
+                   duration_sec = COALESCE(EXCLUDED.duration_sec, messages.duration_sec),
+                   width = COALESCE(EXCLUDED.width, messages.width),
+                   height = COALESCE(EXCLUDED.height, messages.height),
+                   audio_title = EXCLUDED.audio_title, audio_performer = EXCLUDED.audio_performer,
+                   audio_duration_sec = COALESCE(EXCLUDED.audio_duration_sec, messages.audio_duration_sec),
+                   rel_ver = NULL, via_web = FALSE
+                 WHERE messages.via_web AND EXCLUDED.file_unique_id IS NOT NULL
+               RETURNING CASE WHEN xmax = 0 THEN id END""",
             ch_id, msg_id, chat_id, file_unique_id, file_name,
             (caption.replace("\x00", "")[:1024] or None), file_size, mime_type, media_type,
             audio_title, audio_performer, audio_duration_sec, msg.date,
@@ -4325,7 +4653,7 @@ async def subscription_poller() -> None:
         try:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """SELECT id, tg_chat_id, username, title, backfilled
+                    """SELECT id, tg_chat_id, username, title, backfilled, handle_known, web_preview
                        FROM channels
                        WHERE subscribed = TRUE
                          AND (account_user_id = $2 OR account_user_id IS NULL)
@@ -4341,19 +4669,37 @@ async def subscription_poller() -> None:
             uname = row["username"]
             await _heartbeat("subscription_poller", f"polling @{uname}")
             log.info("[subscribe] poll @%s (backfilled=%s)", uname, row["backfilled"])
+            # HTTP first: a channel the session holds no handle for is read
+            # from tgarr.me and the web preview; the account is not asked.
+            central_only = False
+            if WEB_FIRST and uname and not row["handle_known"]:
+                try:
+                    if await _poll_without_account(row):
+                        continue
+                    async with db_pool.acquire() as conn:
+                        central_only = bool(await conn.fetchval(
+                            "SELECT 1 FROM messages WHERE channel_id = $1 LIMIT 1", row["id"]))
+                except Exception as e:
+                    log.warning("[web] @%s: %s - falling back to the account", uname, str(e)[:160])
             try:
                 # Discriminator: title pattern '@<uname> (resolving…)' means
                 # row has placeholder chat_id from /api/channel/subscribe
                 # (the int-range trick is broken — placeholder range overlaps
                 # real TG channel ids in [-3e12, -1e12]).
-                is_placeholder = (row["title"] or "").startswith("@") and "(resolving" in (row["title"] or "")
+                is_placeholder = (not row["handle_known"]) or (
+                    (row["title"] or "").startswith("@") and "(resolving" in (row["title"] or ""))
                 try:
                     if not is_placeholder:
                         chat = await _mtproto("get_chat",
                             lambda: app.get_chat(row["tg_chat_id"]))
                     else:
-                        chat = await _mtproto("get_chat",
-                            lambda: app.get_chat(uname))
+                        # The first lookup of a followed channel, counted like
+                        # every other lookup. When its files are already listed
+                        # (from tgarr.me) nothing is waiting on it: it may only
+                        # use the background share of the allowance.
+                        chat = await _mtproto("resolveUsername",
+                            lambda: app.get_chat(uname),
+                            wait=False, user=not central_only, username=uname)
                 except (ChannelInvalid, ValueError) as e:
                     # Stale Pyrogram peer cache (access_hash bad or missing).
                     # Force fresh resolveUsername via raw API + repopulate peer
@@ -4395,7 +4741,10 @@ async def subscription_poller() -> None:
                     await conn.execute(
                         """UPDATE channels SET subscribe_error=$1,
                            last_polled_at=NOW() WHERE id=$2""",
-                        "waiting for tomorrow's Telegram lookup allowance", row["id"])
+                        # a channel whose files are already listed is not in trouble:
+                        # it only waits for spare allowance to be read live
+                        None if central_only else "waiting for tomorrow's Telegram lookup allowance",
+                        row["id"])
                 continue
             except (UsernameNotOccupied, UsernameInvalid, ChannelPrivate) as e:
                 # Permanent — channel gone / username dead / account banned.
@@ -4453,9 +4802,14 @@ async def subscription_poller() -> None:
                     else:
                         await conn.execute(
                             """UPDATE channels SET tg_chat_id=$1, title=$2,
-                               members_count=$3, last_polled_at=NOW()
+                               members_count=$3, last_polled_at=NOW(), handle_known=TRUE
                                WHERE id=$4""",
                             real_chat_id, title, members, row["id"])
+                        # rows read from the web or from tgarr.me before the
+                        # channel had a real id
+                        await conn.execute(
+                            "UPDATE messages SET tg_chat_id=$1 WHERE channel_id=$2 AND tg_chat_id<>$1",
+                            real_chat_id, row["id"])
                         row = dict(row)
                         row["tg_chat_id"] = real_chat_id
 
@@ -5944,7 +6298,7 @@ async def deep_backfill_worker() -> None:
                         -- a followed channel the poller can currently read (one
                         -- still waiting for its first lookup cannot be paged)
                         (c.subscribed = TRUE AND c.last_polled_at IS NOT NULL
-                         AND c.subscribe_error IS NULL)
+                         AND c.subscribe_error IS NULL AND c.handle_known)
                         OR
                         -- a channel the account itself is a member of
                         (c.enabled = TRUE AND c.subscribed = FALSE
