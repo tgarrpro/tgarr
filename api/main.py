@@ -5452,6 +5452,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                  WHERE r.category IN ('movie', 'tv') GROUP BY 1)
                SELECT c.tg_chat_id, c.username, c.title, c.backfilled, c.members_count,
                       c.audience, c.subscribed, c.is_joined, c.dead_at, c.subscribe_error,
+                      c.purged_at,
                       COALESCE(a.msgs, 0) AS msgs, COALESCE(a.media, 0) AS media,
                       COALESCE(a.videos, 0) AS videos, COALESCE(a.songs, 0) AS songs,
                       COALESCE(a.photos, 0) AS photos, COALESCE(a.docs, 0) AS docs,
@@ -5461,6 +5462,12 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                LEFT JOIN rel ON rel.channel_id = c.id
                WHERE COALESCE(c.audience, 'sfw') <> 'blocked_csam'""")
     rows = [r for r in rows if nsfw_on or (r["audience"] or "sfw") != "nsfw"]
+    # Does this install clean a channel out of its index once nobody follows
+    # it? (TGARR_INDEX_PURGE on the crawler; off unless switched on.) What
+    # "Unfollow" means depends on it, and the page has to say which.
+    async with db_pool.acquire() as conn:
+        purge_on = (await conn.fetchval(
+            "SELECT value FROM config WHERE key = 'index_purge'")) == "on"
 
     def _shared(r):
         return (r["members_count"] or 0) >= CONTRIB_MIN_MEMBERS and r["media"] >= CONTRIB_MIN_MEDIA
@@ -5470,6 +5477,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         "joined": lambda r: r["is_joined"],
         "subscribed": lambda r: r["subscribed"] and not r["is_joined"],
         "shared": _shared,
+        "loose": lambda r: not r["is_joined"] and not r["subscribed"] and not r["dead_at"],
         "empty": lambda r: r["media"] == 0,
         "dead": lambda r: r["dead_at"] is not None,
     }
@@ -5517,6 +5525,11 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                      show == "shared",
                      f"{CONTRIB_MIN_MEMBERS}+ members and {CONTRIB_MIN_MEDIA}+ files: listed on tgarr.me "
                      "for other people to find. Private chats and small groups never are.")
+        + (_chip_link("not followed" + _n("loose"), "/channels" + _cqs(show="loose", offset=None),
+                      show == "loose",
+                      "channels this install knows but no longer reads"
+                      + (": their files are being cleared from this index" if purge_on else ""))
+           if counts["loose"] else "")
         + _chip_link("no files" + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
         + (_chip_link("gone" + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
                       show == "dead", "channels Telegram no longer serves") if counts["dead"] else "")
@@ -5549,6 +5562,17 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
             tags.append('<span class="tag ok" title="your account is a member">joined</span>')
         elif r["subscribed"]:
             tags.append('<span class="tag acc" title="read without joining">followed</span>')
+        elif purge_on and r["purged_at"]:
+            tags.append('<span class="tag" title="not followed any more; its files have been cleared '
+                        'from this index. tgarr.me still lists it: follow it again to get them back.">'
+                        'not followed · cleared</span>')
+        elif purge_on:
+            tags.append('<span class="tag warn" title="not followed any more: its films and files are '
+                        'being cleared from this index (tgarr.me keeps the record). Follow it again '
+                        'to keep them.">not followed · being cleared</span>')
+        else:
+            tags.append('<span class="tag" title="not read any more; what was indexed stays">'
+                        'not followed</span>')
         if _shared(r):
             tags.append('<span class="tag" title="listed on tgarr.me">shared</span>')
         if (r["audience"] or "sfw") == "nsfw":
@@ -5573,6 +5597,10 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         if r["subscribed"] and not r["is_joined"]:
             act = (f'<button class="abtn" onclick="tgUnfollow(this,{r["tg_chat_id"]})" '
                    f'title="stop reading this channel">Unfollow</button>')
+        elif not r["is_joined"] and not r["dead_at"] and r["username"]:
+            act = (f'<button class="abtn pri" data-uname="{html.escape(r["username"], quote=True)}" '
+                   f'onclick="tgFollow(this)" title="read this public channel again, without joining it">'
+                   f'+ Follow</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
@@ -5598,8 +5626,16 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
         'letter-spacing:0;margin-left:10px"><a href="/discover">find more on Discover →</a></span></h2>'
         f'{search}<div class="bar-tools">{chips}</div>{listing}'
-        '<script>function tgUnfollow(b,id){if(!confirm("Stop reading this channel? What is already indexed stays."))return;'
-        'b.disabled=true;fetch("/api/channel/unsubscribe/"+id,{method:"POST"}).then(()=>location.reload())}</script>')
+        '<script>function tgUnfollow(b,id){if(!confirm(' + _js_str(
+            "Stop reading this channel?\n\nIts films and files will be CLEARED from this index once tgarr.me "
+            "holds a record of them. You can follow it again later, from here or from Discover, to get them back."
+            if purge_on else
+            "Stop reading this channel?\n\nNothing new will be indexed from it. What is already indexed stays.")
+        + '))return;'
+        'b.disabled=true;b.textContent="…";fetch("/api/channel/unsubscribe/"+id,{method:"POST"}).then(()=>location.reload())}'
+        'function tgFollow(b){b.disabled=true;b.textContent="…";fetch("/api/channel/subscribe",{method:"POST",'
+        'headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"username="+encodeURIComponent(b.dataset.uname)})'
+        '.then(()=>location.reload())}</script>')
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 

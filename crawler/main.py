@@ -6195,6 +6195,15 @@ async def index_purge_worker() -> None:
       • messages with an active/queued download are kept
       • FK-safe order in a transaction (downloads → releases → messages)
     """
+    # The API tells people what "unfollow" will do: it has to know this.
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('index_purge', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
+                "on" if INDEX_PURGE_ENABLED else "off")
+    except Exception:
+        pass
     if not INDEX_PURGE_ENABLED:
         log.info("[index-purge] TGARR_INDEX_PURGE=false — disabled")
         return
