@@ -3068,9 +3068,11 @@ async def _channel_gone(chat_id: int, username) -> "bool | None":
     None = could not tell (flood wait, missing peer, network)."""
     try:
         if username:
-            await _mtproto("resolveUsername", lambda: app.get_chat(username))
+            # never wait here: this runs inside the thumbnail and preview
+            # dispatchers, and "cannot tell right now" is a valid answer
+            await _mtproto("resolveUsername", lambda: app.get_chat(username), wait=False)
         else:
-            await _mtproto("get_chat", lambda: app.get_chat(chat_id))
+            await _mtproto("get_chat", lambda: app.get_chat(chat_id), wait=False)
         return False
     except (FloodWait, DailyBudgetExhausted):
         return None
