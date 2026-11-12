@@ -1833,7 +1833,10 @@ async def backfill_channel(chat_id: int, title: str, username: str | None = None
     log.info("[backfill] start chat_id=%s title=%s limit=%s",
              chat_id, title, BACKFILL_LIMIT)
     # Title/username gate: reject news/TV up front (see _is_noise_title).
-    noise_hit, noise_kw = _is_noise_title(title, username)
+    async with db_pool.acquire() as conn:
+        _followed = await conn.fetchval(
+            "SELECT COALESCE(subscribed, FALSE) FROM channels WHERE tg_chat_id = $1", chat_id)
+    noise_hit, noise_kw = (False, None) if _followed else _is_noise_title(title, username)
     if noise_hit:
         log.info("[backfill] chat_id=%s NOISE-TITLE kw=%r title=%s — abort",
                  chat_id, noise_kw, title)
@@ -4406,20 +4409,9 @@ async def subscription_poller() -> None:
 
             # News/TV title/username gate: reject before backfill (federation
             # value=0 — every clip is unique to one channel). See _is_noise_title.
-            noise_hit, noise_kw = _is_noise_title(title, uname)
-            if noise_hit:
-                log.info("[subscribe] @%s NOISE-TITLE kw=%r title=%s — blocked",
-                         uname, noise_kw, title)
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        """UPDATE channels
-                           SET subscribed=FALSE, enabled=FALSE,
-                               category='noise', content_category='noise',
-                               last_polled_at=NOW(),
-                               subscribe_error=$1
-                           WHERE id=$2""",
-                        f"news/TV title match: {noise_kw}", row["id"])
-                continue
+            # (No name filter here: every channel the poller handles was
+            # followed by the user. It used to be unfollowed again as "news/TV"
+            # on its first poll.)
 
             # If we resolved a real chat_id different from placeholder, replace it
             if real_chat_id != row["tg_chat_id"]:
@@ -5917,7 +5909,7 @@ async def deep_backfill_worker() -> None:
         try:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow("""
-                    SELECT c.id, c.tg_chat_id, c.username, c.title,
+                    SELECT c.id, c.tg_chat_id, c.username, c.title, c.subscribed,
                            c.content_category,
                            c.remote_documents, c.remote_photos, c.remote_videos,
                            COALESCE(c.deep_oldest_tg_id,
@@ -5968,7 +5960,14 @@ async def deep_backfill_worker() -> None:
             # Україна Новини …) slipped in and dominated the queue, the worker
             # thrashing on 100K-300K-msg channels. Disable + mark done so they
             # leave the queue for good.
-            noise_hit, noise_kw = _is_noise_title(row["title"], row["username"])
+            # The junk filters below (A: news/TV names, B: almost nothing that
+            # parses) exist for channels that are indexed without anybody
+            # having asked for them - the ones the account merely is a member
+            # of. A channel somebody FOLLOWED in tgarr is their decision; the
+            # filters used to unfollow it behind their back minutes later.
+            user_chose = bool(row["subscribed"])
+            noise_hit, noise_kw = (False, None) if user_chose else \
+                _is_noise_title(row["title"], row["username"])
             if noise_hit:
                 async with db_pool.acquire() as conn:
                     await conn.execute(
@@ -6002,7 +6001,7 @@ async def deep_backfill_worker() -> None:
             # photo+video channels (book covers + sample clips, archives) are NOT
             # gated — protects resource channels whose value is books/audio/docs
             # that don't parse into movie/TV releases.
-            if ys and ys["msgs"] >= DEEP_YIELD_MIN_MSGS \
+            if not user_chose and ys and ys["msgs"] >= DEEP_YIELD_MIN_MSGS \
                     and ys["rels"] < DEEP_YIELD_MAX_RATE * ys["msgs"] \
                     and (ys["photos"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]
                          or ys["videos"] > DEEP_YIELD_PHOTO_FRAC * ys["msgs"]):
