@@ -76,9 +76,15 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ./${{ matrix.component }}
-          platforms: linux/amd64,linux/arm64
+          # A run started by hand is a test image for one machine: build it
+          # for amd64 only. arm64 is emulated and takes most of an hour for
+          # the api image whenever its big layer is rebuilt. Releases (main,
+          # tags) and pull requests still build both.
+          platforms: ${{ github.event_name == 'workflow_dispatch' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          # test builds keep a cache of their own, so they cannot push the
+          # release build's layers out of it
+          cache-from: type=gha,scope=${{ matrix.component }}${{ github.event_name == 'workflow_dispatch' && '-test' || '' }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}${{ github.event_name == 'workflow_dispatch' && '-test' || '' }}
