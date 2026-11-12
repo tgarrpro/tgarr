@@ -678,6 +678,81 @@ async def _server():
             "forecast": [forecast(per_install, peak_factor, n) for n in (100, 1000, 10000)] if per_install else []}
 
 
+async def _webcrawl():
+    """Progress of the registry's own reader of t.me's public preview, and what
+    it has found. Slow counts are cached by the caller."""
+    if not (await _q("SELECT to_regclass('public.registry_webcrawl_days') IS NOT NULL AS ok"))[0]["ok"]:
+        return {"on": False}
+    days = await _q("""SELECT * FROM registry_webcrawl_days
+                       WHERE day > CURRENT_DATE - 30 ORDER BY day""")
+    pace = (await _q("""SELECT count(*) FILTER (WHERE health_checked_at > NOW() - INTERVAL '60 minutes') AS h1,
+                               count(*) FILTER (WHERE health_checked_at > NOW() - INTERVAL '24 hours') AS h24,
+                               max(health_checked_at) AS last_at
+                        FROM registry_channels
+                        WHERE health_checked_at > NOW() - INTERVAL '24 hours'""", timeout_s=40))[0]
+    daily = (await _q("""WITH k AS (SELECT username FROM registry_contributor_seen
+                                    UNION SELECT channel_username FROM registry_resource_channels)
+                         SELECT count(*) AS total,
+                                count(*) FILTER (WHERE c.health_checked_at > NOW() - INTERVAL '24 hours') AS done
+                         FROM registry_channels c JOIN k USING (username) WHERE NOT c.blocked""",
+                      timeout_s=120))[0]
+    cand = (await _q("""SELECT count(*) FILTER (WHERE invite_link IS NULL AND username NOT LIKE 'INVITE:%') AS names,
+                               count(*) FILTER (WHERE invite_link IS NOT NULL OR username LIKE 'INVITE:%') AS invites
+                        FROM seed_candidates
+                        WHERE validation_status IS NULL OR validation_status = 'pending'""", timeout_s=60))[0]
+    ch = (await _q("""SELECT count(*) AS total,
+                             count(*) FILTER (WHERE health_status = 'alive') AS alive,
+                             count(*) FILTER (WHERE health_status = 'no_preview') AS no_preview,
+                             count(*) FILTER (WHERE health_status = 'gone') AS gone,
+                             count(*) FILTER (WHERE health_checked_at > NOW() - INTERVAL '7 days') AS seen_7d,
+                             count(*) FILTER (WHERE health_checked_at > NOW() - INTERVAL '30 days') AS seen_30d,
+                             count(*) FILTER (WHERE gold_score >= 1000 AND health_status = 'alive') AS best,
+                             count(*) FILTER (WHERE gold_score >= 1000 AND health_status = 'alive'
+                                              AND health_checked_at > NOW() - INTERVAL '7 days') AS best_7d,
+                             min(health_checked_at) FILTER (WHERE health_status = 'alive') AS oldest_look,
+                             count(*) FILTER (WHERE health_status = 'alive' AND last_msg_at > NOW() - INTERVAL '7 days') AS post_7d,
+                             count(*) FILTER (WHERE health_status = 'alive' AND last_msg_at > NOW() - INTERVAL '30 days') AS post_30d,
+                             count(*) FILTER (WHERE health_status = 'alive' AND last_msg_at > NOW() - INTERVAL '365 days') AS post_1y,
+                             count(*) FILTER (WHERE health_status = 'alive' AND last_msg_at IS NOT NULL) AS post_known,
+                             count(*) FILTER (WHERE last_file_at > NOW() - INTERVAL '7 days') AS file_7d,
+                             count(*) FILTER (WHERE last_file_at > NOW() - INTERVAL '30 days') AS file_30d
+                      FROM registry_channels WHERE NOT blocked""", timeout_s=120))[0]
+    recent = await _q("""SELECT username, title, health_status, members_count, max_msg_id, last_msg_at,
+                                last_file_at, gold_score, health_checked_at
+                         FROM registry_channels
+                         WHERE health_checked_at > NOW() - INTERVAL '24 hours'
+                         ORDER BY health_checked_at DESC LIMIT 40""", timeout_s=40)
+    lost = await _q("""SELECT username, title, health_status, members_count, health_checked_at
+                       FROM registry_channels
+                       WHERE NOT blocked AND health_status IN ('gone', 'no_preview')
+                         AND health_checked_at > NOW() - INTERVAL '7 days'
+                         AND members_count >= 1000
+                       ORDER BY (health_status = 'gone') DESC, members_count DESC NULLS LAST LIMIT 40""",
+                    timeout_s=40)
+    active = await _q("""SELECT username, title, members_count, last_file_at, release_files, gold_score
+                         FROM registry_channels
+                         WHERE NOT blocked AND health_status = 'alive'
+                           AND last_file_at > NOW() - INTERVAL '3 days'
+                           AND health_checked_at > NOW() - INTERVAL '7 days'
+                         ORDER BY gold_score DESC NULLS LAST LIMIT 40""", timeout_s=40)
+    try:
+        import webcrawl as _w
+        limits = {"max_per_day": _w.MAX_PER_DAY, "best_score": _w.BEST_SCORE,
+                  "best_every_days": _w.BEST_EVERY_DAYS, "paused": os.path.exists(_w.OFF_FILE),
+                  "enabled": _w.ENABLED,
+                  "running": bool(_w._state["thread"] and _w._state["thread"].is_alive())}
+    except Exception:
+        limits = {}
+    return {"on": True, "days": days, "pace": pace, "daily": daily, "candidates": cand, "channels": ch,
+            "recent": recent, "lost": lost, "active": active, "limits": limits}
+
+
+@router.get("/admin/api/webcrawl")
+async def api_webcrawl(request: Request):
+    _auth(request)
+    return _json(await _cached("webcrawl", 120, _webcrawl))
+
+
 @router.get("/admin/api/server")
 async def api_server(request: Request):
     _auth(request)
@@ -726,7 +801,7 @@ svg{display:block;width:100%;height:110px}svg rect{fill:var(--acc)}svg rect:hove
 <form method="post" action="/admin/logout" style="margin:0"><button>Sign out</button></form></header>
 <nav id="nav"></nav><main id="main"><div class="mut">loading…</div></main>
 <script>
-const TABS=[["overview","Overview"],["server","Server & capacity"],["instances","Contributors"],["trends","Trends"],["channels","Channels"],["pulls","Pulls & limits"],["suspicion","Flagged"]];
+const TABS=[["overview","Overview"],["server","Server & capacity"],["webcrawl","Web reader"],["instances","Contributors"],["trends","Trends"],["channels","Channels"],["pulls","Pulls & limits"],["suspicion","Flagged"]];
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const num=n=>n==null?"–":Number(n).toLocaleString("en-US");
@@ -815,6 +890,36 @@ const V={
   const hit=p.rows.filter(r=>r.n>=p.cap).length;
   $("#main").innerHTML=`<div class="bar"><span>${p.rows.length} addresses pulled the channel list in the last 24 h. The limit is ${p.cap} a day without a key; ${hit} reached it. Addresses are stored as hashes.</span></div>`+
    table([["address",r=>`<code>${esc(r.ip_hash.slice(0,12))}</code>`],["pulls in 24 h",r=>num(r.n)+(r.n>=p.cap?' <span class="tag warn">at limit</span>':""),"r"],["last",r=>ago(r.last_at)],["key",r=>r.api_key?'<span class="tag ok">yes</span>':""]],p.rows)},
+ async webcrawl(){const w=await get("webcrawl");
+  if(!w.on){$("#main").innerHTML='<div class="mut">The web reader has not run on this registry yet.</div>';return}
+  const L=w.limits||{},t=w.days.length?w.days[w.days.length-1]:{},c=w.channels,p=w.pace;
+  const perDay=Math.round((p.h1||0)*24),state=L.paused?"paused (webcrawl.off)":L.running?"running":"not running";
+  const pctOf=(a,b)=>b?(100*a/b).toFixed(1)+"%":"–";
+  const dailyLeft=Math.max(0,w.daily.total-w.daily.done);
+  const spare=Math.max(1,perDay-w.daily.total),half=spare/2;
+  const candDays=w.candidates.names?(w.candidates.names*1.6/half):0,bestLeft=Math.max(0,c.best-c.best_7d),bestDays=bestLeft/half;
+  const tailLeft=Math.max(0,c.alive-c.seen_30d),tailDays=tailLeft/half;
+  const dd=x=>x<=0?"done":x<1?"under a day":x<60?Math.ceil(x)+" days":Math.round(x/30)+" months";
+  let h=`<div class="bar"><span>Reads Telegram's public web preview (t.me/s): no account, one page every few seconds. It keeps numbers about channels, not posts. State: <b>${state}</b> · last page ${ago(p.last_at)} · limit ${num(L.max_per_day)} pages a day.</span></div>
+   <h2>Pace</h2><div class="cards">${card(num(p.h1),"channels looked at, last hour","≈ "+num(perDay)+" a day at this pace")}${card(num(p.h24),"looked at, last 24 hours")}${card(num(t.pages),"pages asked for today")}
+   ${card(num(t.slowdowns),"times Telegram said slow down, today",t.slowdowns?"the reader pauses 5 to 30 minutes each time":"none")}${card(num(t.errors),"pages that failed today")}${card(num(t.new_names),"new names found today","queued as candidates")}</div>
+   <h2>Progress by queue</h2>`+table([["queue",r=>esc(r.q)],["what it is",r=>`<span class="mut">${esc(r.d)}</span>`],["size",r=>num(r.n),"r"],["done",r=>num(r.done),"r"],["share",r=>pctOf(r.done,r.n),"r"],["left",r=>num(r.left),"r"],["at this pace",r=>esc(r.eta),"r"]],[
+    {q:"Daily",d:"channels installs have reported, or reported files for — every day",n:w.daily.total,done:w.daily.done,left:dailyLeft,eta:dailyLeft?"today":"done for today"},
+    {q:"Candidates",d:"names never analysed (invite links cannot be read from the web: "+num(w.candidates.invites)+" wait for an install)",n:w.candidates.names+(t.candidates_done||0),done:t.candidates_done||0,left:w.candidates.names,eta:dd(candDays)},
+    {q:"Best",d:"score "+num(L.best_score)+" or more — every "+L.best_every_days+" days",n:c.best,done:c.best_7d,left:bestLeft,eta:dd(bestDays)},
+    {q:"Everything else",d:"all other unblocked channels with a preview, oldest look first (done = looked at in 30 days)",n:c.alive,done:c.seen_30d,left:tailLeft,eta:dd(tailDays)}]);
+  h+=`<h2>What the reader found (unblocked channels)</h2><div class="cards">${card(short(c.alive),"have a public preview",pctOf(c.alive,c.total)+" of "+short(c.total))}${card(short(c.no_preview),"exist, no preview","followers still counted")}${card(short(c.gone),"name no longer exists")}
+   ${card(short(c.post_7d),"posted in 7 days",pctOf(c.post_7d,c.post_known)+" of those with a known date")}${card(short(c.post_30d),"posted in 30 days",pctOf(c.post_30d,c.post_known))}${card(short(c.post_1y),"posted in a year",pctOf(c.post_1y,c.post_known))}
+   ${card(short(c.file_7d),"posted a file in 7 days")}${card(short(c.file_30d),"posted a file in 30 days")}${card(day(c.oldest_look),"oldest look still in use","among channels with a preview")}</div>`;
+  if(w.days.length>1)h+=`<h2>Per day</h2><div class="grid2">${chart("Pages asked for",w.days,"pages")}${chart("Channels with a preview",w.days,"alive")}${chart("No preview or gone",w.days.map(d=>({day:d.day,x:d.no_preview+d.gone})),"x")}${chart("Candidates analysed",w.days,"candidates_done")}${chart("New names found",w.days,"new_names")}${chart("Slow-down answers",w.days,"slowdowns")}</div>`;
+  h+=`<h2>By day</h2>`+table([["day",r=>day(r.day)],["pages",r=>num(r.pages),"r"],["daily",r=>num(r.daily_done),"r"],["best",r=>num(r.best_done),"r"],["rest",r=>num(r.tail_done),"r"],["preview",r=>num(r.alive),"r"],["no preview",r=>num(r.no_preview),"r"],["gone",r=>num(r.gone),"r"],
+    ["failed",r=>num(r.errors),"r"],["slow down",r=>num(r.slowdowns),"r"],["candidates",r=>num(r.candidates_done)+" ("+num(r.candidates_alive)+" ok)","r"],["new names",r=>num(r.new_names),"r"]],w.days.slice().reverse(),"no day recorded yet");
+  const chn=r=>`<a href="https://t.me/${esc(r.username)}" target="_blank" rel="noopener">@${esc(r.username)}</a> <span class="mut">${esc((r.title||"").slice(0,48))}</span>`;
+  const st=r=>r.health_status==="alive"?'<span class="tag ok">preview</span>':r.health_status==="gone"?'<span class="tag bad">gone</span>':'<span class="tag warn">no preview</span>';
+  h+=`<h2>Active now: posted a file in the last 3 days (best score first)</h2>`+table([["channel",chn],["followers",r=>short(r.members_count),"r"],["newest file",r=>ago(r.last_file_at),"r"],["films / episodes reported",r=>num(r.release_files),"r"],["score",r=>num(Math.round(r.gold_score||0)),"r"]],w.active,"none seen yet");
+  h+=`<h2>Lost in the last 7 days: 1,000+ followers, no preview or gone</h2>`+table([["channel",chn],["state",st],["followers",r=>short(r.members_count),"r"],["looked at",r=>ago(r.health_checked_at),"r"]],w.lost,"none");
+  h+=`<h2>Latest looks</h2>`+table([["channel",chn],["state",st],["followers",r=>short(r.members_count),"r"],["newest post",r=>day(r.last_msg_at),"r"],["newest file",r=>day(r.last_file_at),"r"],["posts",r=>num(r.max_msg_id),"r"],["score",r=>r.gold_score==null?"–":num(Math.round(r.gold_score)),"r"],["looked at",r=>ago(r.health_checked_at),"r"]],w.recent,"nothing in the last 24 hours");
+  $("#main").innerHTML=h},
  async suspicion(){const rows=await get("suspicion");
   $("#main").innerHTML=`<div class="bar"><span>Installs and addresses the registry has flagged. 100 or more is refused.</span></div>`+
    table([["who",r=>`<code>${esc(r.actor_key.slice(0,18))}</code>`],["score",r=>`<span class="tag ${r.score>=100?"bad":"warn"}">${r.score}</span>`,"r"],["why",r=>esc(r.reasons),"w"],["first",r=>day(r.first_flagged_at)],["last",r=>ago(r.last_flagged_at)]],rows,"nobody is flagged")}
