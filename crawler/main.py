@@ -4707,6 +4707,18 @@ async def subscription_poller() -> None:
                     # for subsequent polls.
                     if isinstance(e, ValueError) and "Peer id invalid" not in str(e):
                         raise
+                    # The session has lost (or never had) this channel's
+                    # handle. Before a lookup is spent on getting it back:
+                    # HTTP first, exactly as for a channel followed just now.
+                    if WEB_FIRST and uname:
+                        try:
+                            if await _poll_without_account(row):
+                                continue
+                            async with db_pool.acquire() as conn:
+                                central_only = bool(await conn.fetchval(
+                                    "SELECT 1 FROM messages WHERE channel_id = $1 LIMIT 1", row["id"]))
+                        except Exception as _we:
+                            log.warning("[web] @%s: %s - falling back to the account", uname, str(_we)[:160])
                     log.info("[subscribe] @%s stale peer cache → force-resolve", uname)
                     from pyrogram.raw.functions.contacts import ResolveUsername
                     # a channel is followed because someone chose to follow it
@@ -4716,7 +4728,7 @@ async def subscription_poller() -> None:
                     # without its new posts for the rest of the day.
                     r = await _mtproto("resolveUsername",
                         lambda: app.invoke(ResolveUsername(username=uname.lstrip("@"))),
-                        wait=False, user=True)
+                        wait=False, user=not central_only)
                     await app.fetch_peers(r.chats + r.users)
                     chat = await _mtproto("get_chat",
                         lambda: app.get_chat(uname))
