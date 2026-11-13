@@ -9212,14 +9212,16 @@ _KIDS_CSS = """<style>
 .km-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:22px;overflow:hidden}
 .km-pad{padding:16px 18px}.km-row small{color:var(--muted)}
 .km-chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
-/* channels and single files side by side where there is room */
-.km-two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 26px;align-items:start}
-.km-two > div{min-width:0}
-.km-list{height:min(62vh,640px);overflow:auto}
-.km-two h2.section{margin-top:8px}
-/* the note under each heading takes two lines at most, so the two lists start level */
-.km-two h2.section + p{min-height:2.9em}
-@media (max-width:1100px){.km-two{grid-template-columns:minmax(0,1fr)}.km-two h2.section + p{min-height:0}.km-list{height:auto;max-height:520px}}
+/* four tabs: one thing at a time, each list with the page's full width */
+.km-tabs{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid var(--border);margin:0 0 20px}
+.km-tab{appearance:none;background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;padding:10px 16px;
+  font:inherit;font-weight:600;color:var(--muted);cursor:pointer;white-space:nowrap}
+.km-tab:hover{color:var(--fg)}
+.km-tab.on{color:var(--accent);border-bottom-color:var(--accent)}
+.km-tab .c{font-weight:400;opacity:.7;margin-left:4px}
+.km-pane[hidden]{display:none}
+.km-pane > p.note{color:var(--muted);margin:0 0 12px}
+.km-list{max-height:calc(100vh - 300px);min-height:240px;overflow:auto}
 .km-in{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}
 </style>"""
 
@@ -9325,31 +9327,38 @@ async def page_kids_manage():
         f'after <input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/> minutes in one go</span>'
         '<button class="btn" onclick="mcSave()">Save</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
         '</div></div>')
-    used_box = ""
-    if usage or opened:
-        used_box = (
-            '<h2 class="section">Use</h2><p style="color:var(--muted);margin:-6px 0 12px">Kept on this machine only: time per device, '
-            'and what was opened in the Media Center.</p><div class="km-box">'
-            + "".join(f'<div class="km-row"><span class="n">📱 {html.escape(u["who"])}</span>'
-                      f'<small>today {mins(u["today"])} · last 7 days {mins(u["week"])}</small></div>' for u in usage)
-            + "".join(f'<div class="km-row"><span class="n">{html.escape(_friendly_name(o["file_name"], o["caption"]))}</span>'
-                      f'<small>{_fmt_time(o["at"])} · {html.escape(o["who"])}</small></div>' for o in opened)
-            + '</div>')
+    used_rows = (
+        "".join(f'<div class="km-row"><span class="n">📱 {html.escape(u["who"])}</span>'
+                f'<small>today {mins(u["today"])} · last 7 days {mins(u["week"])}</small></div>' for u in usage)
+        + "".join(f'<div class="km-row"><span class="n">{html.escape(_friendly_name(o["file_name"], o["caption"]))}</span>'
+                  f'<small>{_fmt_time(o["at"])} · {html.escape(o["who"])}</small></div>' for o in opened))
+    n_chan = sum(1 for c in chans if c["allowed"])
+    n_file = sum(1 for r in items if r["allowed"])
+    tabs = (("pin", "PIN &amp; time", ""), ("channels", "Channels", f"{n_chan:,} shown" if n_chan else ""),
+            ("files", "Files", f"{n_file:,} shown" if n_file else ""), ("usage", "Usage", ""))
     body = (
-        _KIDS_CSS + pin_box + time_box
-        + '<div class="km-two"><div>'
-        + '<h2 class="section">Whole channels in the Media Center</h2>'
-          '<p style="color:var(--muted);margin:-6px 0 12px">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
-        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div>'
-        + '</div><div>'
-        + '<h2 class="section">Single files</h2>'
-          '<p style="color:var(--muted);margin:-6px 0 12px">The files already saved on this machine. Tick the ones to show in the Media Center.</p>'
+        _KIDS_CSS
+        + '<div class="km-tabs" role="tablist">'
+        + "".join(f'<button type="button" class="km-tab{" on" if k == "pin" else ""}" role="tab" data-t="{k}" onclick="kmTab(\'{k}\')">'
+                  f'{lbl}{f"<span class=c>{c}</span>" if c else ""}</button>' for k, lbl, c in tabs)
+        + '</div>'
+        + f'<div class="km-pane" id="km-pin">{pin_box}{time_box}</div>'
+        + '<div class="km-pane" id="km-channels" hidden>'
+          '<p class="note">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
+        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div></div>'
+        + '<div class="km-pane" id="km-files" hidden>'
+          '<p class="note">The files already saved on this machine. Tick the ones to show in the Media Center.</p>'
         + (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">{chips}</div>'
            f'<div class="km-box km-list" id="kmItems">{item_rows}</div>' if items else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing is saved yet. Files you open in a player '
            'are kept and appear here.</div></div>')
-        + '</div></div>'
-        + used_box
+        + '</div>'
+        + '<div class="km-pane" id="km-usage" hidden>'
+          '<p class="note">Kept on this machine only: time per device, and what was opened in the Media Center.</p>'
+        + (f'<div class="km-box km-list">{used_rows}</div>' if used_rows else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing yet. Time and what was opened are listed '
+           'here once a browser without the PIN has used the Media Center.</div></div>')
+        + '</div>'
         + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
         + """<script>
 function kmAllow(kind, ref, el){
@@ -9377,6 +9386,15 @@ function kmShow(b){
   document.querySelectorAll("#kmItems .km-row").forEach(r => { r.style.display = (b.dataset.k === "all" || r.dataset.k === b.dataset.k) ? "" : "none"; });
 }
 function kmLock(){ fetch("/api/lock", {method: "POST"}).then(() => { location.href = "/mediacenter"; }); }
+// the tab is kept in the address (#files), so a reload or a link comes back to it
+function kmTab(t, quiet){
+  if (!document.getElementById("km-" + t)) t = "pin";
+  document.querySelectorAll(".km-tab").forEach(b => { b.classList.toggle("on", b.dataset.t === t); b.setAttribute("aria-selected", b.dataset.t === t); });
+  document.querySelectorAll(".km-pane").forEach(p => { p.hidden = p.id !== "km-" + t; });
+  if (!quiet) history.replaceState(null, "", "#" + t);
+}
+kmTab((location.hash || "#pin").slice(1), true);
+window.addEventListener("hashchange", () => kmTab((location.hash || "#pin").slice(1), true));
 </script>""")
     return HTMLResponse(_layout("Media Center", "/settings", body, page_title="Media Center & PIN", top_actions_html=""))
 
