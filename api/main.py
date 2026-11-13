@@ -3143,6 +3143,14 @@ body[data-theme=sepia] .pg img{mix-blend-mode:multiply}
 body[data-theme=dark] .pg{background:#1b1d22}
 body[data-theme=dark] .pg img{filter:invert(.92) hue-rotate(180deg)}
 .pg .no{position:absolute;right:8px;bottom:6px;font-size:11px;color:#94a3b8;pointer-events:none}
+/* one page at a time: each page is a slide filling the stage; turning the
+   page moves two slides sideways together */
+.stage.paged{overflow:hidden;padding:0;position:relative;touch-action:pan-y pinch-zoom}
+.slide{position:absolute;inset:0;overflow:auto;display:flex;padding:8px;will-change:transform;
+  -webkit-overflow-scrolling:touch}
+.slide .pg{margin:auto;flex:none}
+.slide.mv{transition:transform .28s cubic-bezier(.3,.1,.3,1)}
+@media (prefers-reduced-motion:reduce){.slide.mv{transition:none}}
 .pos{flex:1;min-width:0;text-align:center;font-size:13px;color:var(--mut)}
 .pos b{color:var(--fg)}
 .pos input[type=number]{width:64px;font:inherit;text-align:center;border:1px solid var(--line);border-radius:6px;
@@ -3156,6 +3164,7 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
   <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
   <div class="ttl">__TITLE__</div>
   <button id="wmBtn" title="on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.">Hide watermark</button>
+  <button id="modeBtn" title="one page at a time (pages slide sideways), or one long scroll">Pages</button>
   <button id="zOut" title="smaller (-)">A&minus;</button>
   <button id="zIn" title="larger (+)">A+</button>
   <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
@@ -3180,8 +3189,11 @@ let pages = 0, ratio = 1.414, cur = 1, els = [];
 let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.pdfreader") || "{}"); } catch (e) {}
 let book = {}; try { book = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
 let zoom = st.zoom || 1, theme = st.theme || "light";
+// "paged": one page at a time, turned sideways like a book (the default).
+// "scroll": every page in one long column.
+let mode = st.mode === "scroll" ? "scroll" : "paged";
 let clean = book.clean !== undefined ? book.clean : (st.clean !== undefined ? !!st.clean : true);
-const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean})); } catch (e) {} };
+const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean, mode})); } catch (e) {} };
 const saveBook = () => { try { localStorage.setItem(KEY, JSON.stringify({page: cur, clean})); } catch (e) {} };
 function pageW(){ return Math.round(Math.min(stage.clientWidth - 16, 980) * zoom); }
 function reqW(){ return Math.min(3200, Math.round(pageW() * Math.min(3, window.devicePixelRatio || 1))); }
@@ -3208,11 +3220,69 @@ function build(){
   }
   stage.innerHTML = ""; stage.appendChild(f); size(); refresh();
 }
+// ---- one page at a time ----
+let slide = null, moving = false; const ratios = {};
+const calm = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+function fitW(r){
+  // the whole page visible at zoom 1: as wide as the stage or as tall, whichever binds
+  const W = stage.clientWidth - 16, H = stage.clientHeight - 16;
+  return Math.round(Math.max(120, Math.min(W, H / r, 1600)) * zoom);
+}
+function pageSrc(n, w){
+  const px = Math.min(3200, Math.ceil(w * Math.min(3, window.devicePixelRatio || 1) / 100) * 100);
+  return "/pdf/" + ID + "/page/" + n + "?w=" + px + (clean ? "&clean=1" : "");
+}
+function mkSlide(n){
+  const s = document.createElement("div"); s.className = "slide"; s.dataset.n = n;
+  const el = document.createElement("div"); el.className = "pg";
+  const fit = r => { const w = fitW(r); el.style.width = w + "px"; el.style.height = Math.round(w * r) + "px"; return w; };
+  const r0 = ratios[n] || ratio, w = fit(r0);
+  const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+  img.onload = () => { if (!img.naturalWidth) return; const r = img.naturalHeight / img.naturalWidth;
+    if (Math.abs(r - r0) > 0.01) { ratios[n] = r; fit(r); } };
+  img.src = pageSrc(n, w);
+  const no = document.createElement("span"); no.className = "no"; no.textContent = n;
+  el.appendChild(img); el.appendChild(no); s.appendChild(el);
+  return s;
+}
+function settle(){
+  // a turn still in flight: finish it at once, so that quick presses never queue up
+  stage.querySelectorAll(".slide").forEach(x => { if (x !== slide) x.remove(); });
+  if (slide) { slide.classList.remove("mv"); slide.style.transform = ""; }
+  moving = false;
+}
+function show(n, dir){
+  n = Math.max(1, Math.min(pages, n | 0));
+  if (moving) settle();
+  const old = slide, s = mkSlide(n);
+  slide = s; cur = n; ui(); saveBook();
+  [n + 1, n - 1].forEach(k => { if (k >= 1 && k <= pages) { const i = new Image(); i.src = pageSrc(k, fitW(ratios[k] || ratio)); } });
+  if (!old || !dir || calm) { stage.querySelectorAll(".slide,.msg").forEach(x => x.remove()); stage.appendChild(s); return; }
+  // dir +1: the new page comes in from the right and pushes the old one out
+  // to the left; -1 the other way round
+  moving = true;
+  s.style.transform = "translateX(" + (dir * 100) + "%)";
+  stage.appendChild(s); s.getBoundingClientRect();
+  s.classList.add("mv"); old.classList.add("mv");
+  s.style.transform = "translateX(0)"; old.style.transform = "translateX(" + (-dir * 100) + "%)";
+  const done = () => { if (slide === s && moving) settle(); };
+  s.addEventListener("transitionend", done, {once: true}); setTimeout(done, 450);
+}
+function setMode(m){
+  mode = m === "scroll" ? "scroll" : "paged";
+  stage.classList.toggle("paged", mode === "paged");
+  stage.innerHTML = ""; els = []; slide = null; moving = false;
+  if (mode === "paged") show(cur, 0); else { build(); go(cur); }
+  ui();
+}
 function go(n, smooth){
-  n = Math.max(1, Math.min(pages, n | 0)); if (!els[n - 1]) return;
+  n = Math.max(1, Math.min(pages, n | 0));
+  if (mode === "paged") { if (n !== cur || !slide) show(n, smooth ? Math.sign(n - cur) : 0); return; }
+  if (!els[n - 1]) return;
   stage.scrollTo({top: els[n - 1].offsetTop - 8, behavior: smooth ? "smooth" : "auto"});
 }
 function track(){
+  if (mode !== "scroll" || !els.length) return;
   const mid = stage.scrollTop + stage.clientHeight * 0.35; let lo = 0, hi = els.length - 1, k = 0;
   while (lo <= hi) { const m = (lo + hi) >> 1; if (els[m].offsetTop <= mid) { k = m; lo = m + 1; } else hi = m - 1; }
   if (k + 1 !== cur) { cur = k + 1; ui(); saveBook(); }
@@ -3221,22 +3291,44 @@ function ui(){
   if (document.activeElement !== $("pno")) $("pno").value = cur;
   $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur >= pages;
   $("wmBtn").classList.toggle("on", clean); document.body.dataset.theme = theme;
+  $("modeBtn").textContent = mode === "paged" ? "Pages" : "Scroll";
 }
 let tt = null; stage.addEventListener("scroll", () => { clearTimeout(tt); tt = setTimeout(track, 60); }, {passive: true});
 $("prev").onclick = () => go(cur - 1, true); $("next").onclick = () => go(cur + 1, true);
 $("pno").addEventListener("change", e => go(+e.target.value));
 $("slider").addEventListener("input", e => { $("pno").value = e.target.value; });
 $("slider").addEventListener("change", e => go(+e.target.value));
-function rezoom(z){ const keep = cur; zoom = Math.max(0.5, Math.min(2.5, z)); saveSt(); size(); refresh(); go(keep); }
+function redraw(){ const keep = cur; if (mode === "paged") show(keep, 0); else { size(); refresh(); go(keep); } }
+function rezoom(z){ zoom = Math.max(0.5, Math.min(2.5, z)); saveSt(); redraw(); }
+$("modeBtn").onclick = () => { setMode(mode === "paged" ? "scroll" : "paged"); saveSt(); };
+// a swipe turns the page (one finger, clearly sideways)
+let sx = null, sy = 0;
+stage.addEventListener("touchstart", e => { sx = e.touches.length === 1 ? e.touches[0].clientX : null; sy = e.touches[0].clientY; }, {passive: true});
+stage.addEventListener("touchend", e => {
+  if (mode !== "paged" || sx === null) return;
+  const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy; sx = null;
+  if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.5) go(cur + (dx < 0 ? 1 : -1), true);
+}, {passive: true});
+// the wheel scrolls inside a page that is taller than the window; at its
+// edge (or when it fits) it turns the page
+let wheelAt = 0;
+stage.addEventListener("wheel", e => {
+  if (mode !== "paged" || !slide || e.ctrlKey) return;
+  const d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  const top = slide.scrollTop <= 0, bottom = slide.scrollTop + slide.clientHeight >= slide.scrollHeight - 1;
+  if (!((d > 0 && bottom) || (d < 0 && top))) return;
+  e.preventDefault();
+  if (Math.abs(d) > 6 && Date.now() - wheelAt > 420) { wheelAt = Date.now(); go(cur + (d > 0 ? 1 : -1), true); }
+}, {passive: false});
 $("zIn").onclick = () => rezoom(zoom * 1.2); $("zOut").onclick = () => rezoom(zoom / 1.2);
 $("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); ui(); };
-$("wmBtn").onclick = () => { clean = !clean; saveSt(); saveBook(); ui(); refresh(); };
-window.addEventListener("resize", () => { const keep = cur; size(); refresh(); go(keep); });
+$("wmBtn").onclick = () => { clean = !clean; saveSt(); saveBook(); ui(); if (mode === "paged") show(cur, 0); else refresh(); };
+window.addEventListener("resize", redraw);
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" && e.target.type === "number") return;
   const k = e.key;
-  if (k === "ArrowRight" || k === "PageDown") { e.preventDefault(); go(cur + 1, true); }
-  else if (k === "ArrowLeft" || k === "PageUp") { e.preventDefault(); go(cur - 1, true); }
+  if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur + 1, true); }
+  else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur - 1, true); }
   else if (k === "Home") go(1); else if (k === "End") go(pages);
   else if (k === "+" || k === "=") rezoom(zoom * 1.2); else if (k === "-") rezoom(zoom / 1.2);
 });
@@ -3254,10 +3346,9 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
   if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
   pages = j.pages; ratio = j.ratio || 1.414;
   $("ptotal").textContent = pages; $("slider").max = pages; $("pno").max = pages;
-  build();
   const h = parseInt((location.hash || "").slice(1), 10);
   cur = (h >= 1 && h <= pages) ? h : Math.min(pages, book.page || 1);
-  go(cur); ui();
+  setMode(mode);
 }).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
 })();
 </script>
