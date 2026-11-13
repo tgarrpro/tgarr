@@ -26,6 +26,8 @@ from fastapi import FastAPI, Form, Header, Query, Response, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 import login  # local module
+import access  # local module
+import contextvars
 
 
 # ── adult (NSFW) classification ────────────────────────────────────────
@@ -125,6 +127,80 @@ def _pub_m(alias: str = "m") -> str:
         f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL)")
 
 
+# ════════════════════════════════════════════════════════════════════
+# Access PIN and the kids' list
+#
+# Whoever opened this address used to see everything the owner sees: the
+# followed channels, the private photos, the settings. With a PIN set
+# (config 'access_pin'), a browser that has not entered it is LOCKED: it gets
+# the kids' pages and the items the owner put on the kids' list - nothing
+# else. This is decided here, for every request, not by hiding links.
+# ════════════════════════════════════════════════════════════════════
+_LOCKED = contextvars.ContextVar("tgarr_locked", default=False)
+_ACCESS = {"at": 0.0, "pin": None, "secret": None}
+_GUESSES = access.Guesses()
+_KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
+_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw'
+               AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
+                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+_LOCKED_OPEN = ("/kids", "/unlock", "/api/unlock")
+
+
+async def _access_cfg(fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if (fresh or now - _ACCESS["at"] > 3) and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT key, value FROM config WHERE key IN ('access_pin', 'access_secret')")
+            d = {r["key"]: r["value"] for r in rows}
+            _ACCESS.update(at=now, pin=d.get("access_pin") or None, secret=d.get("access_secret") or None)
+        except Exception:
+            pass                       # e.g. the very first start, before the tables exist
+    return _ACCESS
+
+
+async def _is_locked(request: Request) -> bool:
+    cfg = await _access_cfg()
+    if not cfg["pin"]:
+        return False                   # no PIN set: as before, everything is open
+    return not access.token_ok(cfg["secret"], request.cookies.get(access.COOKIE))
+
+
+async def _kid_ok(key, sql: str, arg) -> bool:
+    hit = _KID_OK.get(key)
+    if hit and time.monotonic() - hit[1] < 30:
+        return hit[0]
+    ok = False
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            ok = bool(await conn.fetchval(sql, arg))
+    if len(_KID_OK) > 20000:
+        _KID_OK.clear()
+    _KID_OK[key] = (ok, time.monotonic())
+    return ok
+
+
+async def _locked_block(request: Request):
+    """What a locked browser may not have. None = let it through."""
+    path = request.url.path
+    if path in _LOCKED_OPEN or path in _GUARD_OPEN_PATHS:
+        return None
+    if request.method in ("GET", "HEAD"):
+        m = _PRIVATE_ID_RX.match(path)
+        if m and await _kid_ok(int(m.group(1)), f"""
+                SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.id = $1 AND {_KID_SQL}""", int(m.group(1))):
+            return None
+        if path.startswith("/thumbs/") and await _kid_ok(path, f"""
+                SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.thumb_path = $1 AND {_KID_SQL} LIMIT 1""", path[len("/thumbs/"):]):
+            return None
+        if "text/html" in (request.headers.get("accept") or "") and not path.startswith("/api/"):
+            return RedirectResponse("/kids", status_code=303)
+    return JSONResponse({"status": "locked", "message": "enter the PIN to do this"}, status_code=403)
+
+
 async def _signed_out_block(request: Request):
     if _signed_in():
         return None
@@ -184,6 +260,12 @@ async def _request_guard(request: Request, call_next):
         if not ok:
             return Response("authentication required", status_code=401,
                             headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
+    locked = await _is_locked(request)
+    _LOCKED.set(locked)
+    if locked:
+        blocked = await _locked_block(request)
+        if blocked is not None:
+            return blocked
     blocked = await _signed_out_block(request)
     if blocked is not None:
         return blocked
@@ -714,6 +796,15 @@ async def _migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_alias_canon ON series_aliases (canonical_title);
             -- Which series have been asked about (other-language names by
             -- TVDB number), so each is asked once, not every hour.
+            -- What a browser that has not entered the PIN may see: whole
+            -- channels (kind 'channel', ref = channels.id) and single items
+            -- (kind 'message', ref = messages.id).
+            CREATE TABLE IF NOT EXISTS kids_allow (
+              kind TEXT NOT NULL,
+              ref BIGINT NOT NULL,
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (kind, ref)
+            );
             CREATE TABLE IF NOT EXISTS series_alias_lookups (
               tvdb_id BIGINT PRIMARY KEY,
               looked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -5237,6 +5328,7 @@ def _user_block() -> str:
         '<div class="ub-menu" id="tgUserMenu" hidden>'
         '<a href="/settings">Settings</a>'
         '<a href="/system">System status</a>'
+        '<a href="/kids/manage">Kids mode &amp; PIN</a>'
         + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
            if uname else '')
         + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
@@ -5296,10 +5388,13 @@ MOBILE_CSS = """
 
 def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str] = None,
             top_actions_html: Optional[str] = None) -> str:
+    locked = _LOCKED.get()
     nav = "".join(
         f'<a href="{path}" class="navlink{" active" if path == active else ""}">'
         f'{_icon(svg)}<span>{name}</span></a>'
-        for path, name, svg in NAV_ITEMS
+        # a locked browser is shown the kids' pages and nothing else
+        for path, name, svg in ([("/kids", "Kids", "M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z")]
+                                if locked else NAV_ITEMS)
     )
     if top_actions_html is None:
         cfg = {
@@ -5335,7 +5430,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
     <div class="ver">v{TGARR_VERSION}</div>
   </div>
   <div class="navlinks">{nav}</div>
-  <div class="user">{_user_block()}</div>
+  <div class="user">{'<a class="ub-in" href="/unlock">🔒 Enter PIN</a>' if locked else _user_block()}</div>
 </aside>
 <main class="main">
   <header class="topbar">
@@ -6930,6 +7025,307 @@ async def api_registry_pull_now():
 # ════════════════════════════════════════════════════════════════════
 # Page: Gallery (Telegram-shared photos)
 # ════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+# Kids' pages, the PIN, the kids' list
+# ════════════════════════════════════════════════════════════════════
+_UNLOCK_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr - PIN</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
+  display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;max-width:360px;width:100%;padding:28px;text-align:center;
+  box-shadow:0 10px 30px rgba(15,23,42,.08)}
+h1{margin:0 0 6px;font-size:22px}p{color:#64748b;font-size:14px;line-height:1.5;margin:6px 0 18px}
+input[type=password]{width:100%;box-sizing:border-box;padding:14px;font-size:26px;letter-spacing:8px;text-align:center;
+  border:1px solid #cbd5e1;border-radius:10px}
+input[type=password]:focus{outline:2px solid #0ea5e9;border-color:#0ea5e9}
+label{display:flex;gap:8px;align-items:center;justify-content:center;font-size:13px;color:#475569;margin:14px 0 4px}
+button{margin-top:12px;width:100%;padding:12px;font:inherit;font-size:15px;font-weight:600;color:#fff;background:#0ea5e9;
+  border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.6}
+#err{color:#b91c1c;font-size:14px;min-height:20px;margin-top:10px}a{color:#0284c7;font-size:13px}
+</style></head><body><div class="card">
+<h1>Enter the PIN</h1><p>This tgarr shows only the kids' list until its PIN is entered.</p>
+<form id="f" autocomplete="off">
+<input type="password" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="12" autofocus aria-label="PIN"/>
+<label><input type="checkbox" id="rem"/> keep this browser unlocked for 30 days</label>
+<button id="b" type="submit">Unlock</button><div id="err"></div></form>
+<a href="/kids">&larr; back to the kids' pages</a></div>
+<script>
+document.getElementById("f").addEventListener("submit", async function (e) {
+  e.preventDefault();
+  const b = document.getElementById("b"), err = document.getElementById("err");
+  b.disabled = true; err.textContent = "";
+  try {
+    const r = await fetch("/api/unlock", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({pin: document.getElementById("pin").value, remember: document.getElementById("rem").checked})});
+    const j = await r.json();
+    if (j.status === "ok") { location.href = "/"; return; }
+    err.textContent = j.message || "That is not the PIN.";
+  } catch (x) { err.textContent = "Could not reach tgarr."; }
+  document.getElementById("pin").value = ""; b.disabled = false; document.getElementById("pin").focus();
+});
+</script></body></html>"""
+
+
+@app.get("/unlock", response_class=HTMLResponse)
+async def page_unlock(request: Request):
+    if not await _is_locked(request):
+        return RedirectResponse("/")
+    return HTMLResponse(_UNLOCK_HTML)
+
+
+def _unlock_cookie(resp, secret: str, remember: bool):
+    seconds = access.REMEMBER_SECONDS if remember else access.UNLOCK_SECONDS
+    resp.set_cookie(access.COOKIE, access.make_token(secret, seconds), max_age=seconds,
+                    httponly=True, samesite="lax", path="/")
+    return resp
+
+
+@app.post("/api/unlock")
+async def api_unlock(request: Request):
+    cfg = await _access_cfg(fresh=True)
+    if not cfg["pin"]:
+        return {"status": "ok"}
+    who = request.client.host if request.client else "?"
+    wait = _GUESSES.wait(who)
+    if wait:
+        return JSONResponse({"status": "wait", "message": f"Too many wrong tries. Try again in {max(1, wait // 60)} min."},
+                            status_code=429)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not access.check_pin(str(body.get("pin") or ""), cfg["pin"]):
+        earned = _GUESSES.wrong(who)
+        return JSONResponse({"status": "wrong", "message": "That is not the PIN." + (
+            f" Too many wrong tries - wait {earned // 60} min." if earned else "")}, status_code=403)
+    _GUESSES.right(who)
+    return _unlock_cookie(JSONResponse({"status": "ok"}), cfg["secret"], bool(body.get("remember")))
+
+
+@app.post("/api/lock")
+async def api_lock():
+    resp = JSONResponse({"status": "ok"})
+    resp.delete_cookie(access.COOKIE, path="/")
+    return resp
+
+
+@app.post("/api/kids/pin")
+async def api_kids_pin(request: Request):
+    """Set, change or remove the PIN. A locked browser never reaches this (the
+    guard refuses it); changing or removing an existing PIN needs the old one."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    new, cur = str(body.get("pin") or ""), str(body.get("current") or "")
+    cfg = await _access_cfg(fresh=True)
+    if cfg["pin"] and not access.check_pin(cur, cfg["pin"]):
+        return JSONResponse({"status": "error", "message": "The current PIN is not right."}, status_code=403)
+    async with db_pool.acquire() as conn:
+        if not new:
+            await conn.execute("DELETE FROM config WHERE key = 'access_pin'")
+            await _access_cfg(fresh=True)
+            return {"status": "ok", "pin": False}
+        if not access.valid_pin(new):
+            return JSONResponse({"status": "error", "message": "A PIN is 4 to 12 digits."}, status_code=400)
+        secret = cfg["secret"] or access.new_secret()
+        for k, v in (("access_pin", access.hash_pin(new)), ("access_secret", secret)):
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    await _access_cfg(fresh=True)
+    # the browser that set the PIN stays unlocked
+    return _unlock_cookie(JSONResponse({"status": "ok", "pin": True}), secret, False)
+
+
+@app.post("/api/kids/allow")
+async def api_kids_allow(request: Request):
+    try:
+        body = await request.json()
+        kind, ref, on = str(body.get("kind")), int(body.get("ref")), bool(body.get("on"))
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    if kind not in ("channel", "message"):
+        return JSONResponse({"status": "error", "message": "bad kind"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        if on:
+            await conn.execute(
+                "INSERT INTO kids_allow (kind, ref) VALUES ($1, $2) ON CONFLICT DO NOTHING", kind, ref)
+        else:
+            await conn.execute("DELETE FROM kids_allow WHERE kind = $1 AND ref = $2", kind, ref)
+    _KID_OK.clear()
+    return {"status": "ok", "on": on}
+
+
+_KID_KINDS = {
+    "video": ("🎬 Videos", "m.media_type = 'video'"),
+    "audio": ("🎵 Music", "m.media_type = 'audio'"),
+    "book": ("📚 Books", r"m.file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz)$'"),
+    "photo": ("🖼 Photos", "m.media_type = 'photo'"),
+}
+_KIDS_CSS = """<style>
+.kd-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.kd-tab{padding:9px 16px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--fg);
+  text-decoration:none;font-weight:600;font-size:15px}
+.kd-tab.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.kd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px}
+.kd-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;text-decoration:none;
+  color:var(--fg);display:flex;flex-direction:column}
+.kd-card:hover{border-color:var(--accent)}
+.kd-pic{aspect-ratio:16/10;background:#e2e8f0 center/cover no-repeat;display:flex;align-items:center;justify-content:center;font-size:40px}
+.kd-card.book .kd-pic{aspect-ratio:3/4}
+.kd-name{padding:10px 12px;font-size:14px;line-height:1.35;word-break:break-word}
+.kd-empty{padding:50px 20px;text-align:center;color:var(--muted)}
+.km-row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.km-row:last-child{border-bottom:none}.km-row span.n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.km-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:22px;overflow:hidden}
+.km-pad{padding:16px 18px}.km-row small{color:var(--muted)}
+.km-in{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}
+</style>"""
+
+
+@app.get("/kids", response_class=HTMLResponse)
+async def page_kids(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
+    kind = kind if kind in _KID_KINDS else "video"
+    offset = max(0, int(offset))
+    where, params = [_KID_SQL, _KID_KINDS[kind][1]], []
+    for w in (q or "").split()[:6]:
+        params.append(f"%{w}%")
+        where.append(f"COALESCE(m.file_name, m.caption, '') ILIKE ${len(params)}")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT m.id, m.file_name, m.caption, m.media_type,
+                   (m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__') AS saved
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where)}
+            ORDER BY saved DESC, m.posted_at DESC NULLS LAST LIMIT 61 OFFSET {offset}""", *params)
+        counts = {k: await conn.fetchval(f"""
+            SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {_KID_SQL} AND {v[1]}""") for k, v in _KID_KINDS.items()}
+    more, rows = len(rows) > 60, rows[:60]
+    tabs = "".join(
+        f'<a class="kd-tab{" on" if k == kind else ""}" href="/kids?kind={k}">{v[0]} '
+        f'<span style="opacity:.7">{counts[k]:,}</span></a>' for k, v in _KID_KINDS.items())
+    cards = []
+    for r in rows:
+        name = (r["file_name"] or (r["caption"] or "").strip().split("\n")[0] or "untitled")[:90]
+        if kind == "book":
+            pic, href, icon = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", ""
+        elif kind == "audio":
+            pic, href, icon = "", f"/watch/{r['id']}", "🎵"
+        elif kind == "photo":
+            pic, href, icon = f"/api/thumb/{r['id']}", f"/api/photo-preview/{r['id']}", ""
+        else:
+            pic, href, icon = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", ""
+        style = f' style="background-image:url({pic})"' if pic else ""
+        cards.append(f'<a class="kd-card {kind}" href="{href}"><div class="kd-pic"{style}>{icon}</div>'
+                     f'<div class="kd-name">{html.escape(name)}</div></a>')
+    grid = (f'<div class="kd-grid">{"".join(cards)}</div>' if cards else
+            '<div class="kd-empty">Nothing here yet. A grown-up can add things to the kids\' list.</div>')
+    nav = ""
+    if offset or more:
+        qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
+        nav = ('<div style="display:flex;gap:10px;justify-content:center;margin-top:20px">'
+               + (f'<a class="btn ghost" href="/kids?{qs}&offset={max(0, offset - 60)}">&larr; Back</a>' if offset else "")
+               + (f'<a class="btn ghost" href="/kids?{qs}&offset={offset + 60}">More &rarr;</a>' if more else "")
+               + "</div>")
+    search = (f'<form method="GET" action="/kids" style="display:flex;gap:8px;margin-bottom:16px">'
+              f'<input type="hidden" name="kind" value="{kind}"/>'
+              f'<input class="km-in" type="text" name="q" value="{html.escape(q or "", quote=True)}" '
+              f'placeholder="find…" style="flex:1;max-width:360px"/><button class="btn" type="submit">Search</button></form>')
+    return HTMLResponse(_layout("Kids", "/kids", _KIDS_CSS + f'<div class="kd-tabs">{tabs}</div>{search}{grid}{nav}',
+                                top_actions_html=""))
+
+
+@app.get("/kids/manage", response_class=HTMLResponse)
+async def page_kids_manage(q: Optional[str] = None):
+    cfg = await _access_cfg(fresh=True)
+    async with db_pool.acquire() as conn:
+        chans = await conn.fetch("""
+            SELECT c.id, c.title, c.username, COALESCE(c.audience, 'sfw') AS audience,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = c.id) AS n,
+                   EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'channel' AND k.ref = c.id) AS allowed
+            FROM channels c
+            WHERE EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id)
+            ORDER BY allowed DESC, n DESC LIMIT 400""")
+        allowed_items = await conn.fetch("""
+            SELECT m.id, m.file_name, m.media_type FROM kids_allow k JOIN messages m ON m.id = k.ref
+            WHERE k.kind = 'message' ORDER BY k.added_at DESC LIMIT 200""")
+        found = []
+        if q and q.strip():
+            ps = [f"%{w}%" for w in q.split()[:6]]
+            found = await conn.fetch(f"""
+                SELECT m.id, m.file_name, m.media_type, c.title,
+                       EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'message' AND k.ref = m.id) AS allowed
+                FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.file_name IS NOT NULL AND COALESCE(c.audience, 'sfw') = 'sfw'
+                  AND {' AND '.join(f'm.file_name ILIKE ${i + 1}' for i in range(len(ps)))}
+                ORDER BY (m.local_path IS NOT NULL) DESC, m.posted_at DESC NULLS LAST LIMIT 60""", *ps)
+
+    def box(kind, ref, on, dis=""):
+        return (f'<input type="checkbox" {"checked" if on else ""} {dis} '
+                f'onchange="kmAllow(\'{kind}\',{ref},this)"/>')
+    pin_box = (
+        '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">PIN</h3>'
+        + ('<p style="color:var(--muted);margin:0 0 12px">A PIN is set. Any browser that has not entered it sees only '
+           'the kids\' list below. This browser is unlocked.</p>' if cfg["pin"] else
+           '<p style="color:var(--muted);margin:0 0 12px"><b style="color:#b45309">No PIN is set:</b> anybody who opens '
+           'this address sees everything you see. Set a PIN and other browsers get only the kids\' list.</p>')
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        + ('<input class="km-in" id="kmCur" type="password" inputmode="numeric" maxlength="12" placeholder="current PIN" style="width:140px"/>'
+           if cfg["pin"] else "")
+        + '<input class="km-in" id="kmNew" type="password" inputmode="numeric" maxlength="12" '
+          f'placeholder="{"new PIN" if cfg["pin"] else "PIN, 4 to 12 digits"}" style="width:170px"/>'
+        + f'<button class="btn" onclick="kmPin(false)">{"Change PIN" if cfg["pin"] else "Set PIN"}</button>'
+        + ('<button class="btn ghost" onclick="kmPin(true)">Remove PIN</button>'
+           '<button class="btn ghost" onclick="kmLock()">Lock this browser now</button>' if cfg["pin"] else "")
+        + '<span id="kmMsg" style="color:var(--muted);font-size:13px"></span></div></div></div>')
+    chan_rows = "".join(
+        f'<label class="km-row">{box("channel", c["id"], c["allowed"], "disabled" if c["audience"] != "sfw" else "")}'
+        f'<span class="n">{html.escape(c["title"] or c["username"] or "chat")}'
+        + (f' <small>@{html.escape(c["username"])}</small>' if c["username"] else ' <small>🔒 private</small>')
+        + (' <small>· 18+, never shown to kids</small>' if c["audience"] != "sfw" else "")
+        + f'</span><small>{c["n"]:,} items</small></label>' for c in chans)
+    ico = {"video": "🎬", "audio": "🎵", "photo": "🖼"}
+    item_rows = "".join(
+        f'<label class="km-row">{box("message", r["id"], True)}<span class="n">{ico.get(r["media_type"], "📄")} '
+        f'{html.escape(r["file_name"] or "item " + str(r["id"]))}</span></label>' for r in allowed_items)
+    found_rows = "".join(
+        f'<label class="km-row">{box("message", r["id"], r["allowed"])}<span class="n">{ico.get(r["media_type"], "📄")} '
+        f'{html.escape(r["file_name"])} <small>{html.escape(r["title"] or "")}</small></span></label>' for r in found)
+    body = (
+        _KIDS_CSS + pin_box
+        + '<h2 class="section">Whole channels on the kids\' list</h2>'
+          '<p style="color:var(--muted);margin:-6px 0 12px">Everything in a ticked channel is shown to kids, now and as it grows.</p>'
+        + f'<div class="km-box" style="max-height:420px;overflow:auto">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div>'
+        + '<h2 class="section">Single items</h2>'
+        + f'<form method="GET" action="/kids/manage" style="display:flex;gap:8px;margin-bottom:12px">'
+          f'<input class="km-in" type="text" name="q" value="{html.escape(q or "", quote=True)}" placeholder="find a file by name…" style="flex:1;max-width:420px"/>'
+          '<button class="btn" type="submit">Search</button></form>'
+        + (f'<div class="km-box">{found_rows}</div>' if found else
+           ('<div class="km-box"><div class="km-pad" style="color:var(--muted)">nothing found</div></div>' if q else ""))
+        + (f'<p style="color:var(--muted);margin:14px 0 8px">On the list now ({len(allowed_items)}):</p>'
+           f'<div class="km-box">{item_rows}</div>' if allowed_items else "")
+        + '<p><a class="btn ghost" href="/kids">See the kids\' pages &rarr;</a></p>'
+        + """<script>
+function kmAllow(kind, ref, el){
+  fetch("/api/kids/allow", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({kind: kind, ref: ref, on: el.checked})}).then(r => r.json())
+    .then(j => { if (j.status !== "ok") el.checked = !el.checked; }).catch(() => { el.checked = !el.checked; });
+}
+function kmPin(remove){
+  const cur = document.getElementById("kmCur"), nw = document.getElementById("kmNew"), msg = document.getElementById("kmMsg");
+  if (remove && !confirm("Remove the PIN? Anybody who opens this address will see everything again.")) return;
+  fetch("/api/kids/pin", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({pin: remove ? "" : nw.value, current: cur ? cur.value : ""})}).then(r => r.json())
+    .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "that did not work"; });
+}
+function kmLock(){ fetch("/api/lock", {method: "POST"}).then(() => { location.href = "/kids"; }); }
+</script>""")
+    return HTMLResponse(_layout("Kids mode", "/settings", body, page_title="Kids mode & PIN", top_actions_html=""))
+
+
 # A private chat: no public @name and small (see the crawler's
 # PRIVATE_CHAT_SQL). A group of thousands that merely has no public name is
 # not "my private chats".
