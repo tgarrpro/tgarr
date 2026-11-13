@@ -2813,7 +2813,10 @@ function load(n, f){
   n = Math.max(0, Math.min((titles.length || 1) - 1, n));
   ch = n; pendingFrac = f || 0; busy = true;
   $("msg").style.display = "flex"; $("msg").textContent = "loading…";
-  fr.src = "/epub/" + ID + "/ch/" + n;
+  // replace, not assign: setting src made every chapter a step in the tab's
+  // history, so "Library" (one step back) only went back one chapter
+  const url = "/epub/" + ID + "/ch/" + n;
+  try { fr.contentWindow.location.replace(url); } catch (e) { fr.src = url; }
 }
 function go(d){
   if (busy || !doc) return;
@@ -2889,8 +2892,19 @@ setTimeout(hideTip, 7000);
 // "back": players open in a new tab, where there is no page to go back to.
 // Go back if there is one; otherwise close the tab (the list is still open
 // behind it); if the browser will not close it, go to the list.
+// A link followed inside the book still adds a step, so count the steps
+// from where the reader opened and go back over all of them at once.
+let startLen = history.length;
+try {
+  const k = "tgarr.start." + ID, s = +sessionStorage.getItem(k);
+  const nav = (performance.getEntriesByType("navigation")[0] || {}).type;
+  if (nav === "reload" && s && s <= history.length) startLen = s;
+  else sessionStorage.setItem(k, startLen);
+} catch (e) {}
 function tgBack(fallback){
-  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) {
+    history.go(-(1 + Math.max(0, history.length - startLen))); return;
+  }
   window.close();
   setTimeout(function(){ location.href = fallback; }, 200);
 }
