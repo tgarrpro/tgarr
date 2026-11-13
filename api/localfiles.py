@@ -97,3 +97,20 @@ def unique_id(rel: str) -> str:
 
 def title(root: str) -> str:
     return "My files" if root == MINE else root
+
+
+def orphans(files, known, sidecars) -> list:
+    """Of the saved files found on the disk, those nothing in the index points at.
+    `files`: paths relative to the downloads folder; `known`: every local_path the index
+    holds; `sidecars`: endings of the files kept beside a saved one ('.cover.jpg', ...).
+    A file is spoken for when it is known itself, or is the sidecar of a known one -
+    'book.epub.cover.jpg' beside 'book.epub', and 'film.tail' beside 'film'."""
+    known = set(known)
+    out = []
+    for f in files:
+        if f in known:
+            continue
+        if any(suf and f.endswith(suf) and f[:-len(suf)] in known for suf in sidecars):
+            continue
+        out.append(f)
+    return out

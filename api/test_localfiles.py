@@ -41,4 +41,16 @@ ok(L.is_local(L.chat_id("mine")) and not L.is_local(-1001234567890) and not L.is
 ok(L.unique_id("mine/a.jpg") == L.unique_id("mine/a.jpg") != L.unique_id("mine/b.jpg"), "one id per file")
 ok(L.title("mine") == "My files", "the name people see")
 
+# files on the disk that nothing points at
+_side = ("", ".tail", ".pdf", ".cover.jpg", ".queue", ".pdf.inprogress.pdf")
+_known = {"library/book.epub", "video/film.mkv", "library/paper.pdf", "library/notes.docx"}
+_disk = ["library/book.epub", "library/book.epub.cover.jpg", "video/film.mkv", "video/film.mkv.tail", "library/paper.pdf",
+         "library/notes.docx", "library/notes.docx.pdf", "library/notes.docx.pdf.inprogress.pdf",
+         "video/item-4204108", "video/old.mp4", "library/gone.epub", "library/gone.epub.cover.jpg", "audio/song.flac.queue"]
+ok(L.orphans(_disk, _known, _side) == ["video/item-4204108", "video/old.mp4", "library/gone.epub", "library/gone.epub.cover.jpg", "audio/song.flac.queue"],
+   "what the index knows, and what lies beside it, is spoken for; the rest is not")
+ok(L.orphans(_disk, set(), _side) == _disk and L.orphans([], _known, _side) == [], "an empty index speaks for nothing; an empty disk has nothing")
+ok(L.orphans(["library/a.pdf"], {"library/a"}, _side) == [] and L.orphans(["library/a.pdf"], {"library/b"}, _side) == ["library/a.pdf"],
+   "a converted copy belongs to its original, and to no other")
+
 print(f"ok - {n} checks")

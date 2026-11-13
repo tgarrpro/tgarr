@@ -1778,7 +1778,61 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
             await conn.execute(
                 "UPDATE messages SET local_path = NULL, local_accessed_at = NULL "
                 "WHERE local_path = ANY($1::text[])", gone)
-    return len(doomed), freed
+    n_orphan, freed_orphan = await _cache_orphan_sweep(180 if clear_all else 3600)
+    return len(doomed) + n_orphan, freed + freed_orphan
+
+
+def _cache_listing() -> list:
+    """Every saved file on the disk: (path relative to /downloads, bytes, mtime)."""
+    out = []
+    for pre in _CACHE_PREFIXES:
+        top = os.path.join("/downloads", pre.rstrip("/"))
+        for root, _dirs, names in os.walk(top):
+            for nm in names:
+                full = os.path.join(root, nm)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                out.append((os.path.relpath(full, "/downloads").replace(os.sep, "/"), st.st_size, st.st_mtime))
+    return out
+
+
+async def _cache_orphan_sweep(min_age_s: int) -> tuple:
+    """Remove saved files that nothing in the index points at. A file is saved under its
+    row's local_path; when the row goes - its channel removed, the index purged, a chat
+    re-read under new ids - the file stayed, counted by nobody: the Dashboard said
+    nothing was saved while the disk held gigabytes. Files of chats kept for a
+    signed-out account are spoken for. A file changed in the last `min_age_s` seconds is
+    left alone (it may be arriving)."""
+    import time as _time
+    try:
+        async with db_pool.acquire() as conn:
+            known = {r[0] for r in await conn.fetch(
+                "SELECT DISTINCT local_path FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'")}
+            if await conn.fetchval("SELECT to_regclass('held_messages') IS NOT NULL"):
+                known |= {r[0] for r in await conn.fetch(
+                    "SELECT DISTINCT local_path FROM held_messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'")}
+    except Exception as e:
+        log.warning("[cache] not looking for leftover files: %s", e)      # without the whole list, remove nothing
+        return 0, 0
+    listing = await asyncio.to_thread(_cache_listing)
+    now = _time.time()
+    size_of = {p: (sz, mt) for p, sz, mt in listing}
+    n = freed = 0
+    for p in localfiles.orphans([x[0] for x in listing], known, _CACHE_SIDECARS):
+        sz, mt = size_of[p]
+        if now - mt < min_age_s or ".." in p or not p.startswith(_CACHE_PREFIXES):
+            continue
+        try:
+            await asyncio.to_thread(os.unlink, os.path.join("/downloads", p))
+        except OSError:
+            continue
+        n += 1
+        freed += sz
+    if n:
+        log.info("[cache] removed %d leftover file(s) the index no longer points at, freed %s", n, _fmt_size(freed))
+    return n, freed
 
 
 async def _cache_gc_worker():
