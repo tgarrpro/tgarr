@@ -7186,6 +7186,10 @@ def _friendly_name(file_name, caption) -> str:
     t = re.sub(r"[@#][\w.]+", " ", t)                      # @channel, #tag
     t = re.sub(r"[\[【(（][^\]】)）]{0,40}[\]】)）]", " ", t)    # [group], 【广告】, (2019) goes too - the year is noise here
     t = t.replace("_", " ").replace(".", " ")
+    # what streaming sites glue onto a title: "…-免费在线观看-酷播", "… 高清免费在线观看 XX影视网"
+    t = re.sub(r"[\s\-–—|]*(?:高清|超清)?(?:免费)?在线观看.*$", " ", t)
+    t = re.sub(r"\S*(?:影视网|电影网|资源网|影院|酷播)\S*", " ", t)
+    t = re.sub(r"(?:HD)?(?:中字|国语|粤语|双语)?(?:高清|超清|正片)+", " ", t, flags=re.I)
     t = _MC_JUNK_RX.sub(" ", t)
     t = re.sub(r"\s*-\s*[A-Za-z0-9]{2,12}\s*$", " ", t)    # -GROUP at the end
     t = re.sub(r"\s{2,}", " ", t).strip(" -–—_·|")
@@ -7246,8 +7250,8 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
   display:flex;align-items:center;justify-content:center;font-size:20px;color:var(--c);box-shadow:0 3px 10px rgba(0,0,0,.25)}
 .saved{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.94);color:#157f3d;font-size:11.5px;font-weight:700;
   padding:3px 9px;border-radius:999px}
-.name{padding:11px 14px 14px;font-size:15.5px;font-weight:700;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;
-  -webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.name{padding:11px 14px 14px;font-size:15.5px;font-weight:700;line-height:1.3;word-break:break-word}
+.name span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .photo .name{display:none}
 .empty{margin:30px clamp(16px,4vw,44px);padding:46px 20px;text-align:center;background:var(--card);border-radius:var(--r);
   color:var(--soft);font-size:17px;box-shadow:var(--shadow)}
@@ -7300,7 +7304,7 @@ __MORE__
       var name = document.createElement("div"); name.textContent = x.name;
       h += '<a class="card ' + x.kind + '" style="--c:' + x.c + '" href="' + x.href + '"><div class="pic">' + (x.icon || "") +
            (x.pic ? '<img loading="lazy" src="' + x.pic + '" alt="" onerror="this.remove()"/>' : "") +
-           '<span class="play">▶</span></div><div class="name">' + name.innerHTML + '</div></a>';
+           '<span class="play">▶</span></div><div class="name"><span>' + name.innerHTML + '</span></div></a>';
     });
     document.getElementById("recent").innerHTML = h + "</div>";
   }
@@ -7373,7 +7377,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
             f'<div class="pic">{ic}{img}'
             + ('<span class="saved">ready</span>' if r["saved"] and kind != "photo" else "")
             + ('' if kind == "photo" else '<span class="play">▶</span>')
-            + f'</div><div class="name">{html.escape(name)}</div></a>')
+            + f'</div><div class="name"><span>{html.escape(name)}</span></div></a>')
     if cards:
         grid = f'<div class="grid {kind}">{"".join(cards)}</div>'
     elif q:
