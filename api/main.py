@@ -29,6 +29,7 @@ import login  # local module
 import access  # local module
 import screentime  # local module
 import export  # local module
+import localfiles  # local module
 import contextvars
 
 
@@ -136,14 +137,14 @@ def _me_id():
 
 def _pub(alias: str = "c") -> str:
     """SQL to append to a WHERE: public channels only, when nobody is signed in."""
-    return "" if _signed_in() else f" AND {alias}.username IS NOT NULL"
+    return "" if _signed_in() else f" AND ({alias}.username IS NOT NULL OR {alias}.local_root IS NOT NULL)"
 
 
 def _pub_m(alias: str = "m") -> str:
     """The same for a query on messages that may not join channels at all (a
     page's count and facet queries reuse its filter without the join)."""
     return "" if _signed_in() else (
-        f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL)")
+        f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL OR local_root IS NOT NULL)")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -286,7 +287,7 @@ async def _signed_out_block(request: Request):
         # the PIN and the kids' list belong to this install, not to the
         # Telegram account: they work whether or not anybody is signed in
         if path.startswith("/api/") and not path.startswith(
-                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/")):
+                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/")):
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -297,7 +298,7 @@ async def _signed_out_block(request: Request):
         if ok is None:
             async with db_pool.acquire() as conn:
                 ok = bool(await conn.fetchval(
-                    """SELECT c.username IS NOT NULL FROM messages m
+                    """SELECT c.username IS NOT NULL OR c.local_root IS NOT NULL FROM messages m
                        JOIN channels c ON c.id = m.channel_id WHERE m.id = $1""", mid))
             if len(_PUBLIC_MSG) > 20000:
                 _PUBLIC_MSG.clear()
@@ -565,6 +566,7 @@ async def _startup():
     asyncio.create_task(_usenet_scan_worker())
     asyncio.create_task(_private_keep_worker())
     asyncio.create_task(_export_worker())
+    asyncio.create_task(_local_scan_worker())
     asyncio.create_task(_cache_gc_worker())
     asyncio.create_task(_update_check_worker())
 
@@ -773,6 +775,8 @@ async def _migrate_schema():
             -- to this channel. Crawler workers filter by current account so an
             -- account switch doesn't try to access channels it can't reach.
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS account_user_id BIGINT;
+            -- the household's own files (uploads, folders): which source this "chat" stands for
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS local_root TEXT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS is_joined BOOLEAN NOT NULL DEFAULT FALSE;
             CREATE INDEX IF NOT EXISTS idx_channels_account ON channels (account_user_id);
             -- NULL account_user_id = "not yet claimed by an account"; the crawler
@@ -1311,6 +1315,9 @@ async def lazy_thumb(msg_id: int):
     if tp in ("__failed__", "__deleted__"):
         return Response(_TINY_TRANSPARENT_GIF, status_code=410,
                        media_type="image/gif")
+    own = await _local_picture(msg_id, "thumb_path", THUMBS_DIR, 320)
+    if own is not None:
+        return own
     async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE messages SET thumb_path = $$__user_queued__$$ "
@@ -1368,6 +1375,9 @@ async def lazy_preview(msg_id: int):
         # retrying so slideshow can advance without waiting.
         return Response(_TINY_TRANSPARENT_GIF, status_code=410,
                        media_type="image/gif")
+    own = await _local_picture(msg_id, "preview_path", PREVIEWS_DIR, 1280)
+    if own is not None:
+        return own
     # Queue preview fetch (worker picks up __user_queued__)
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -2204,7 +2214,7 @@ async def fetch_remove_many(request: Request):
             """UPDATE messages m SET local_path = NULL, local_accessed_at = NULL,
                       fetch_wanted_at = 'epoch'
                FROM (SELECT id, local_path FROM messages WHERE id = ANY($1::bigint[])) o
-               WHERE m.id = o.id RETURNING o.local_path""", ids)
+               WHERE m.id = o.id AND m.tg_chat_id > $2 RETURNING o.local_path""", ids, localfiles.LOCAL_CHAT_MAX)
     n = 0
     for r in rows:
         lp = r["local_path"]
@@ -2246,7 +2256,7 @@ async def fetch_cancel(msg_id: int):
     async with db_pool.acquire() as conn:
         lp = await conn.fetchval(
             """UPDATE messages SET fetch_wanted_at = 'epoch'
-               WHERE id = $1 RETURNING local_path""", msg_id)
+               WHERE id = $1 AND tg_chat_id > $2 RETURNING local_path""", msg_id, localfiles.LOCAL_CHAT_MAX)
         if lp is None:
             return {"ok": True}
         await conn.execute(
@@ -4864,7 +4874,7 @@ async def hold_private_channel_data(uid) -> dict:
                 if uid is None:
                     v = await conn.fetchval("SELECT value FROM config WHERE key = 'last_account_id'")
                     uid = int(v) if v and v.lstrip("-").isdigit() else None
-                ids = [r["id"] for r in await conn.fetch("SELECT id FROM channels WHERE username IS NULL")]
+                ids = [r["id"] for r in await conn.fetch("SELECT id FROM channels WHERE username IS NULL AND local_root IS NULL")]
                 n = await _hold_channels(conn, cols, ids, uid)
         _PUBLIC_MSG.clear()
     if n:
@@ -4896,7 +4906,8 @@ async def _private_reconcile() -> None:
                     if last is not None and last != uid:
                         # chats nobody is marked on were the previous account's
                         await conn.execute(
-                            "UPDATE channels SET account_user_id = $1 WHERE username IS NULL AND account_user_id IS NULL",
+                            "UPDATE channels SET account_user_id = $1 WHERE username IS NULL AND account_user_id IS NULL "
+                            "AND local_root IS NULL",
                             last)
                     others = [r["id"] for r in await conn.fetch(
                         """SELECT id FROM channels WHERE username IS NULL
@@ -5207,7 +5218,7 @@ async def export_download(job_id: int):
             path = os.path.join("/downloads", it["local_path"])
             try:
                 # inside the download folder, and complete (not one still arriving)
-                if not os.path.realpath(path).startswith("/downloads/"):
+                if not os.path.normpath(path).startswith("/downloads/"):
                     continue
                 if it["file_size"] and os.path.getsize(path) < it["file_size"]:
                     continue
@@ -5300,6 +5311,362 @@ async def page_exports():
         + ('setTimeout(function(){if(document.activeElement.tagName!=="SELECT")location.reload()},6000);' if busy else '')
         + '</script>')
     return HTMLResponse(_layout("Download many at once", "/downloads", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# The household's own files (see localfiles.py): uploads, and folders from
+# a NAS / USB disk / cloud drive read where they are. Each source is one
+# "chat" with a made-up id, so every player and the Media Center treat
+# these files like any other. They belong to this install, not to a
+# Telegram account: signing out neither hides nor moves them.
+# ════════════════════════════════════════════════════════════════════
+_SCAN = {"running": False, "at": 0.0, "msg": "not read yet"}
+EXTERNAL_DIR = "/downloads/" + localfiles.EXTERNAL
+_FILE_COLS = ["channel_id", "tg_chat_id", "tg_message_id", "file_unique_id", "file_name", "file_size",
+              "mime_type", "media_type", "posted_at", "local_path"]
+
+
+async def _local_channel(conn, root: str) -> tuple:
+    cid = localfiles.chat_id(root)
+    ch = await conn.fetchval(
+        """INSERT INTO channels (tg_chat_id, username, title, category, audience, local_root,
+                                 is_joined, subscribed, members_count)
+           VALUES ($1, NULL, $2, 'personal', 'sfw', $3, FALSE, FALSE, 0)
+           ON CONFLICT (tg_chat_id) DO UPDATE SET local_root = EXCLUDED.local_root, category = 'personal'
+           RETURNING id""", cid, localfiles.title(root), root)
+    return ch, cid
+
+
+async def _local_add(conn, root: str, files: list) -> int:
+    """files: (path below /downloads, size, time changed) - known to be new."""
+    import datetime as _dt
+    ch, cid = await _local_channel(conn, root)
+    nxt = (await conn.fetchval(
+        "SELECT COALESCE(max(tg_message_id), 0) FROM messages WHERE channel_id = $1", ch)) + 1
+    rows = []
+    for rel, size, mtime in files:
+        kind, mime = localfiles.classify(rel) or ("document", "application/octet-stream")
+        rows.append((ch, cid, nxt, localfiles.unique_id(rel), os.path.basename(rel), size, mime, kind,
+                     _dt.datetime.fromtimestamp(mtime, _dt.timezone.utc), rel))
+        nxt += 1
+    await conn.copy_records_to_table("messages", records=rows, columns=_FILE_COLS)
+    return len(rows)
+
+
+async def _local_forget(conn, ch: int, paths: list) -> None:
+    ids = [r["id"] for r in await conn.fetch(
+        "SELECT id FROM messages WHERE channel_id = $1 AND local_path = ANY($2::text[])", ch, paths)]
+    if ids:
+        await conn.execute("DELETE FROM downloads WHERE release_id IN "
+                           "(SELECT id FROM releases WHERE primary_msg_id = ANY($1::bigint[]))", ids)
+        await conn.execute("DELETE FROM releases WHERE primary_msg_id = ANY($1::bigint[])", ids)
+        await conn.execute("DELETE FROM messages WHERE id = ANY($1::bigint[])", ids)
+
+
+def _local_picture_make(src: str, dst: str, px: int) -> None:
+    from PIL import Image, ImageOps
+    with Image.open(src) as im:
+        im = ImageOps.exif_transpose(im)
+        im.thumbnail((px, px))
+        im.convert("RGB").save(dst, "JPEG", quality=82)
+
+
+async def _local_picture(msg_id: int, col: str, folder: str, px: int):
+    """A small picture of one of the household's own photos, made from the
+    file itself. None = this is not one of ours (ask Telegram as usual)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path, media_type, tg_chat_id FROM messages WHERE id = $1", msg_id)
+    if not row or not localfiles.is_local(row["tg_chat_id"]):
+        return None
+    nothing = Response(_TINY_TRANSPARENT_GIF, status_code=410, media_type="image/gif")
+    if row["media_type"] != "photo" or not _is_local(row["local_path"]):
+        return nothing
+    name = f"local-{msg_id}-{px}.jpg"
+    dst = os.path.join(folder, name)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        await asyncio.to_thread(_local_picture_make, os.path.join("/downloads", row["local_path"]), dst, px)
+    except Exception:
+        return nothing               # a format that cannot be read here (HEIC, a broken file)
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"UPDATE messages SET {col} = $2 WHERE id = $1", msg_id, name)
+    return FileResponse(dst, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.put("/api/files/upload")
+async def api_files_upload(request: Request, name: str = ""):
+    """One file, sent as the body of the request and written straight to its
+    place - no second copy on the way, whatever its size."""
+    import shutil
+    fname = localfiles.safe_name(name)
+    what = localfiles.classify(fname)
+    if what is None:
+        return JSONResponse({"status": "error", "message": "this kind of file is not taken"}, status_code=400)
+    size = int(request.headers.get("content-length") or 0)
+    try:
+        os.makedirs("/downloads/" + localfiles.MINE, exist_ok=True)
+        if size and size > shutil.disk_usage("/downloads").free - (1 << 30):
+            return JSONResponse({"status": "error", "message": "not enough room left on the disk"}, status_code=507)
+    except OSError:
+        pass
+    folder = f"/downloads/{localfiles.MINE}/{what[0]}"
+    os.makedirs(folder, exist_ok=True)
+    fname = localfiles.free_name(lambda n: os.path.exists(os.path.join(folder, n)), fname)
+    tmp = os.path.join(folder, "." + fname + ".part")
+    written = 0
+    try:
+        f = await asyncio.to_thread(open, tmp, "wb")
+        try:
+            async for chunk in request.stream():
+                if chunk:
+                    await asyncio.to_thread(f.write, chunk)
+                    written += len(chunk)
+        finally:
+            f.close()
+        if not written or (size and written != size):
+            raise ValueError("the file did not arrive whole")
+        os.replace(tmp, os.path.join(folder, fname))
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return JSONResponse({"status": "error", "message": str(e)[:120] or "not uploaded"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await _local_add(conn, localfiles.MINE, [(f"{localfiles.MINE}/{what[0]}/{fname}", written, int(time.time()))])
+    return {"status": "ok", "name": fname, "size": written}
+
+
+@app.post("/api/files/delete")
+async def api_files_delete(request: Request):
+    """Uploaded files only: a folder from elsewhere is never changed."""
+    try:
+        ids = [int(x) for x in (await request.json()).get("ids", [])][:2000]
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT m.id, m.channel_id, m.local_path FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE m.id = ANY($1::bigint[]) AND c.local_root = $2""", ids, localfiles.MINE)
+        for r in rows:
+            path = os.path.normpath(os.path.join("/downloads", r["local_path"] or ""))
+            if path.startswith(f"/downloads/{localfiles.MINE}/"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        if rows:
+            await _local_forget(conn, rows[0]["channel_id"], [r["local_path"] for r in rows])
+    return {"status": "ok", "removed": len(rows)}
+
+
+def _external_names() -> list:
+    try:
+        return sorted(d for d in os.listdir(EXTERNAL_DIR)
+                      if not d.startswith(".") and os.path.isdir(os.path.join(EXTERNAL_DIR, d)))
+    except OSError:
+        return []
+
+
+async def _local_scan() -> None:
+    """Read the folders from elsewhere: list what is new, forget what went away."""
+    if _SCAN["running"]:
+        return
+    _SCAN["running"] = True
+    added = removed = 0
+    try:
+        names = await asyncio.to_thread(_external_names)
+        for name in names:
+            root = f"{localfiles.EXTERNAL}/{name}"
+            found = await asyncio.to_thread(
+                lambda b=os.path.join(EXTERNAL_DIR, name): {p_: (s_, m_) for p_, s_, m_ in localfiles.walk(b)})
+            async with db_pool.acquire() as conn:
+                ch, _cid = await _local_channel(conn, root)
+                known = {r["local_path"][len(root) + 1:]: r["file_size"] for r in await conn.fetch(
+                    "SELECT local_path, file_size FROM messages WHERE channel_id = $1 AND local_path IS NOT NULL", ch)}
+                if not found and known:
+                    continue        # a share that is not connected right now looks empty: keep its list
+                new, gone, changed = localfiles.diff({k: v[0] for k, v in found.items()}, known)
+                if gone or changed:
+                    await _local_forget(conn, ch, [root + "/" + x for x in gone + changed])
+                if new or changed:
+                    await _local_add(conn, root, [(root + "/" + x, found[x][0], found[x][1]) for x in new + changed])
+                added += len(new)
+                removed += len(gone)
+        _SCAN["msg"] = (f"{len(names)} folder(s) read: {added:,} new, {removed:,} gone" if names
+                        else "no folders connected")
+    except Exception as e:
+        _SCAN["msg"] = f"could not be read: {str(e)[:120]}"
+        logging.getLogger("tgarr").warning("[files] reading folders: %s", e)
+    finally:
+        _SCAN["running"] = False
+        _SCAN["at"] = time.time()
+
+
+async def _local_scan_worker():
+    await asyncio.sleep(90)
+    while True:
+        await _local_scan()
+        await asyncio.sleep(6 * 3600)
+
+
+@app.post("/api/files/scan")
+async def api_files_scan():
+    if not _SCAN["running"]:
+        asyncio.create_task(_local_scan())
+    return {"status": "ok"}
+
+
+@app.post("/api/files/forget")
+async def api_files_forget(request: Request):
+    """Take a folder that is no longer connected off the list (its files are not touched)."""
+    try:
+        root = str((await request.json()).get("root") or "")
+    except Exception:
+        root = ""
+    if not root.startswith(localfiles.EXTERNAL + "/"):
+        return JSONResponse({"status": "error"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        ch = await conn.fetchval("SELECT id FROM channels WHERE local_root = $1", root)
+        if ch:
+            msgs = "SELECT id FROM messages WHERE channel_id = $1"
+            await conn.execute(f"DELETE FROM downloads WHERE release_id IN "
+                               f"(SELECT id FROM releases WHERE primary_msg_id IN ({msgs}))", ch)
+            await conn.execute(f"DELETE FROM releases WHERE primary_msg_id IN ({msgs})", ch)
+            await conn.execute("DELETE FROM channels WHERE id = $1", ch)
+    return {"status": "ok"}
+
+
+_FILES_JS = (
+    '<script>var fq=[],fBusy=false,fDone=0,fTotal=0,fBad=0;'
+    'function fAdd(l){for(var i=0;i<l.length;i++){fq.push(l[i]);fTotal++}fNext()}'
+    'function fErr(t){fBad++;var d=document.createElement("div");d.textContent=t;document.getElementById("fErr").appendChild(d)}'
+    'function fNext(){if(fBusy)return;var f=fq.shift(),s=document.getElementById("fState"),b=document.getElementById("fBar");'
+    'if(!f){if(fTotal){s.textContent=fDone+" of "+fTotal+" uploaded";if(!fBad)setTimeout(function(){location.reload()},900)}return}'
+    'fBusy=true;document.getElementById("fProg").style.display="block";var x=new XMLHttpRequest();'
+    'x.open("PUT","/api/files/upload?name="+encodeURIComponent(f.name));'
+    'x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(100*e.loaded/e.total);b.style.width=p+"%";'
+    's.textContent=(fDone+1)+" of "+fTotal+": "+f.name+" "+p+"%"}};'
+    'x.onload=function(){fBusy=false;if(x.status===200){fDone++}else{var m="";try{m=JSON.parse(x.responseText).message}catch(e){}'
+    'fErr(f.name+": "+(m||"not uploaded"))}fNext()};'
+    'x.onerror=function(){fBusy=false;fErr(f.name+": the connection was lost");fNext()};x.send(f)}'
+    'function fDel(){var ids=[];document.querySelectorAll(".f-ck:checked").forEach(function(c){ids.push(+c.value)});'
+    'if(!ids.length||!confirm("Delete "+ids.length+" uploaded file(s) from this machine for good?"))return;'
+    'fetch("/api/files/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:ids})})'
+    '.then(function(){location.reload()})}'
+    'function fScan(){fetch("/api/files/scan",{method:"POST"}).then(function(){setTimeout(function(){location.reload()},2500)})}'
+    'function fForget(r){if(!confirm("Take this folder off the list? Its files are not touched."))return;'
+    'fetch("/api/files/forget",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({root:r})})'
+    '.then(function(){location.reload()})}'
+    'var dz=document.getElementById("fDrop");if(dz){'
+    'dz.addEventListener("dragover",function(e){e.preventDefault();dz.classList.add("over")});'
+    'dz.addEventListener("dragleave",function(){dz.classList.remove("over")});'
+    'dz.addEventListener("drop",function(e){e.preventDefault();dz.classList.remove("over");fAdd(e.dataTransfer.files)})}'
+    '</script>')
+_FILE_ICON = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
+
+
+def _file_href(r) -> str:
+    e = localfiles.ext(r["file_name"] or "")
+    if r["media_type"] == "video":
+        return f'/watch/{r["id"]}'
+    if e == "pdf":
+        return f'/pdf/{r["id"]}'
+    if e == "epub":
+        return f'/epub/{r["id"]}'
+    return f'/media/{r["id"]}'
+
+
+@app.get("/files", response_class=HTMLResponse)
+async def page_files(offset: int = 0):
+    offset = max(0, int(offset))
+    async with db_pool.acquire() as conn:
+        mine = await conn.fetch(
+            """SELECT m.id, m.file_name, m.file_size, m.media_type, m.indexed_at
+               FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE c.local_root = $1 ORDER BY m.id DESC LIMIT 200 OFFSET $2""", localfiles.MINE, offset)
+        tot = await conn.fetchrow(
+            """SELECT count(*) AS n, COALESCE(sum(m.file_size), 0) AS b
+               FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.local_root = $1""", localfiles.MINE)
+        folders = {r["local_root"]: r for r in await conn.fetch(
+            """SELECT c.local_root, count(m.id) AS n, COALESCE(sum(m.file_size), 0) AS b
+               FROM channels c LEFT JOIN messages m ON m.channel_id = c.id
+               WHERE c.local_root LIKE $1 GROUP BY c.local_root""", localfiles.EXTERNAL + "/%")}
+    here = await asyncio.to_thread(_external_names)
+    rows = "".join(
+        '<label class="dl-item" style="cursor:pointer">'
+        f'<input type="checkbox" class="f-ck" value="{r["id"]}" style="margin-right:4px"/>'
+        f'<div class="icon">{_FILE_ICON.get(r["media_type"], "📄")}</div><div class="info">'
+        f'<div class="name"><a href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a></div>'
+        f'<div class="meta">{export.human(r["file_size"])} · added {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
+        '</div></label>' for r in mine)
+    fl = []
+    for name in sorted(set(here) | {k.split("/", 1)[1] for k in folders}):
+        root = f"{localfiles.EXTERNAL}/{name}"
+        st = folders.get(root)
+        on = name in here
+        fl.append(
+            '<div class="dl-item"><div class="icon">📁</div><div class="info">'
+            f'<div class="name">{html.escape(name)}</div><div class="meta">'
+            + (f'{st["n"]:,} files · {export.human(st["b"]) or "0 MB"}' if st else 'not read yet')
+            + ('' if on else ' · <span style="color:var(--warn,#b45309)">not connected right now</span>')
+            + '</div></div><div class="right">'
+            + ('' if on else f'<button type="button" class="btn ghost" data-r="{html.escape(root, quote=True)}" '
+                             'onclick="fForget(this.dataset.r)">Take off the list</button>')
+            + '</div></div>')
+    scan = ("reading the folders now…" if _SCAN["running"] else html.escape(_SCAN["msg"])
+            + (time.strftime(" · %Y-%m-%d %H:%M UTC", time.gmtime(_SCAN["at"])) if _SCAN["at"] else ""))
+    pager = ""
+    if offset or len(mine) == 200:
+        pager = ('<div style="display:flex;gap:10px;margin:14px 0">'
+                 + (f'<a class="btn ghost" href="/files?offset={max(0, offset - 200)}">← newer</a>' if offset else '')
+                 + (f'<a class="btn ghost" href="/files?offset={offset + 200}">older →</a>' if len(mine) == 200 else '')
+                 + '</div>')
+    body = (
+        '<style>.f-drop{border:2px dashed var(--border);border-radius:14px;padding:26px 18px;text-align:center;'
+        'background:var(--surface);margin-bottom:10px}.f-drop.over{border-color:var(--accent);background:rgba(94,182,229,.10)}'
+        '.f-drop .btn{margin:8px 4px 0}.f-how{background:var(--surface);border:1px solid var(--border);border-radius:12px;'
+        'padding:12px 16px;margin:10px 0 22px;font-size:13.5px}.f-how code{background:rgba(127,127,127,.14);padding:1px 5px;'
+        'border-radius:4px}.f-how pre{overflow:auto;background:rgba(127,127,127,.10);padding:10px;border-radius:8px}</style>'
+        '<p style="color:var(--muted);margin-top:0">Your own films, music, photos and books, played and read here like '
+        'everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.</p>'
+        '<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">Drop files here</div>'
+        '<div style="color:var(--muted);font-size:13px;margin-top:4px">or choose them - as many as you like, of any size</div>'
+        '<label class="btn">Choose files<input type="file" multiple style="display:none" onchange="fAdd(this.files)"/></label>'
+        '<label class="btn ghost">Choose a whole folder<input type="file" webkitdirectory multiple style="display:none" '
+        'onchange="fAdd(this.files)"/></label>'
+        '<div id="fProg" style="display:none;margin-top:14px"><div style="height:8px;border-radius:4px;background:var(--border);'
+        'overflow:hidden"><div id="fBar" style="height:100%;width:0;background:var(--accent)"></div></div>'
+        '<div id="fState" style="font-size:13px;color:var(--muted);margin-top:6px"></div></div>'
+        '<div id="fErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>'
+        f'<h2 class="section">Uploaded <span class="count">{tot["n"]:,}</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
+        f'margin-left:10px">{export.human(tot["b"]) or "0 MB"}'
+        + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
+        + ('<div class="dl-list">' + rows + '</div>' + pager if mine else
+           '<div class="empty-state"><div class="icon">📂</div><div>Nothing uploaded yet.</div></div>')
+        + f'<h2 class="section" style="margin-top:28px">Folders from elsewhere <span class="count">{len(fl)}</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
+        f'margin-left:10px">{scan} · <a href="#" onclick="fScan();return false">read them again now</a></span></h2>'
+        + ('<div class="dl-list">' + "".join(fl) + '</div>' if fl else '')
+        + '<details class="f-how"' + ('' if fl else ' open') + '><summary style="cursor:pointer;font-weight:600">'
+        'How to connect a NAS share, a USB disk or a cloud drive</summary>'
+        '<p>tgarr reads such folders where they are - nothing is copied and nothing in them is changed. Two steps, '
+        'on the machine that runs tgarr:</p>'
+        '<p><b>1. Make the folder available on that machine.</b> A USB disk: plug it in. A NAS share (SMB or NFS): mount it, '
+        'for example at <code>/mnt/nas</code>. Google Drive, OneDrive, Dropbox: mount it with '
+        '<code>rclone mount</code>, for example at <code>/mnt/gdrive</code>.</p>'
+        '<p><b>2. Hand it to tgarr.</b> In <code>docker-compose.yml</code>, under <code>volumes:</code> of the '
+        '<code>api</code> service, add one line per folder, then run <code>docker compose up -d</code>:</p>'
+        '<pre>      - /mnt/nas/films:/downloads/external/films:ro\n'
+        '      - /media/usb/photos:/downloads/external/photos:ro\n'
+        '      - /mnt/gdrive:/downloads/external/gdrive:ro</pre>'
+        '<p style="margin-bottom:0">The name after <code>external/</code> is what the folder is called here. '
+        '<code>:ro</code> means tgarr can read it and nothing else. Folders are read again every six hours, '
+        'or at once with the link above.</p></details>'
+        + _FILES_JS)
+    return HTMLResponse(_layout("My files", "/files", body))
 
 
 @app.post("/api/photo/{msg_id}/delete")
@@ -5843,6 +6210,7 @@ NAV_ITEMS = [
     ("/music",     "Music",     "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"),
     ("/library",   "Library",   "M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 18H6V4h7v6l2-1 2 1V4h1v16z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
+    ("/files",     "My files",  "M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"),
     # /system page still accessible by URL, just hidden from nav (admin only).
     ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
     ("/settings",  "Settings",  "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94 0 .31.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"),
@@ -8800,7 +9168,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     _in = _signed_in()
     if not _in:
         private = 0                       # no account, no private chats
-        where.append("c.username IS NOT NULL")
+        where.append("(c.username IS NOT NULL OR c.local_root IS NOT NULL)")
     if private:
         where.append(_PRIVATE_CHAT)
     if q:
@@ -10195,7 +10563,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         sort = "best"
     where = ["1=1"]
     if not _signed_in():
-        where.append("c.username IS NOT NULL")
+        where.append("(c.username IS NOT NULL OR c.local_root IS NOT NULL)")
     params = []
     if q:
         for w in q.split():

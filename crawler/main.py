@@ -1861,6 +1861,7 @@ async def release_judge_worker():
                        FROM (SELECT * FROM messages
                              WHERE rel_ver IS NULL AND media_type IN ('video', 'document')
                                AND indexed_at < NOW() - INTERVAL '2 minutes'
+                               AND tg_chat_id > -8000000000000000   -- not the household's own files
                              ORDER BY id LIMIT $1) m
                        LEFT JOIN releases r ON r.primary_msg_id = m.id
                        ORDER BY m.id""", RELEASE_JUDGE_BATCH)

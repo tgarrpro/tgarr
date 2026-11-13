@@ -115,6 +115,9 @@ services:
     volumes:
       - ./_data/session:/app/session
       - ${TGARR_DOWNLOADS:-./_data/downloads}:/downloads
+      # Your own folders (a NAS share, a USB disk, a cloud drive mounted on this
+      # machine), read where they are - one line each; see "My files" in tgarr:
+      # - /mnt/nas/films:/downloads/external/films:ro
     ports:
       - "${TGARR_PORT:-8765}:8088"
     networks:
