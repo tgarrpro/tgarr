@@ -263,7 +263,9 @@ async def _request_guard(request: Request, call_next):
         if not ok:
             return Response("authentication required", status_code=401,
                             headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
-    locked = await _is_locked(request)
+    # Sonarr, Radarr and the like come with their own key (checked above) and
+    # carry no browser cookie: the PIN is not for them
+    locked = (not _is_arr_path(path)) and await _is_locked(request)
     _LOCKED.set(locked)
     if locked:
         blocked = await _locked_block(request)
