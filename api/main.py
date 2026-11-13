@@ -581,7 +581,6 @@ async def _startup():
     asyncio.create_task(_usenet_scan_worker())
     asyncio.create_task(_private_keep_worker())
     asyncio.create_task(_export_worker())
-    asyncio.create_task(_local_scan_worker())
     asyncio.create_task(_cache_gc_worker())
     asyncio.create_task(_update_check_worker())
 
@@ -5335,14 +5334,11 @@ async def page_exports():
 
 
 # ════════════════════════════════════════════════════════════════════
-# The household's own files (see localfiles.py): uploads, and folders from
-# a NAS / USB disk / cloud drive read where they are. Each source is one
-# "chat" with a made-up id, so every player and the Media Center treat
-# these files like any other. They belong to this install, not to a
+# The household's own files (see localfiles.py): uploaded through the
+# browser. They are one "chat" with a made-up id, so every player and the
+# Media Center treat these files like any other. They belong to this install, not to a
 # Telegram account: signing out neither hides nor moves them.
 # ════════════════════════════════════════════════════════════════════
-_SCAN = {"running": False, "at": 0.0, "msg": "not read yet"}
-EXTERNAL_DIR = "/downloads/" + localfiles.EXTERNAL
 _FILE_COLS = ["channel_id", "tg_chat_id", "tg_message_id", "file_unique_id", "file_name", "file_size",
               "mime_type", "media_type", "posted_at", "local_path"]
 
@@ -5482,83 +5478,6 @@ async def api_files_delete(request: Request):
     return {"status": "ok", "removed": len(rows)}
 
 
-def _external_names() -> list:
-    try:
-        return sorted(d for d in os.listdir(EXTERNAL_DIR)
-                      if not d.startswith(".") and os.path.isdir(os.path.join(EXTERNAL_DIR, d)))
-    except OSError:
-        return []
-
-
-async def _local_scan() -> None:
-    """Read the folders from elsewhere: list what is new, forget what went away."""
-    if _SCAN["running"]:
-        return
-    _SCAN["running"] = True
-    added = removed = 0
-    try:
-        names = await asyncio.to_thread(_external_names)
-        for name in names:
-            root = f"{localfiles.EXTERNAL}/{name}"
-            found = await asyncio.to_thread(
-                lambda b=os.path.join(EXTERNAL_DIR, name): {p_: (s_, m_) for p_, s_, m_ in localfiles.walk(b)})
-            async with db_pool.acquire() as conn:
-                ch, _cid = await _local_channel(conn, root)
-                known = {r["local_path"][len(root) + 1:]: r["file_size"] for r in await conn.fetch(
-                    "SELECT local_path, file_size FROM messages WHERE channel_id = $1 AND local_path IS NOT NULL", ch)}
-                if not found and known:
-                    continue        # a share that is not connected right now looks empty: keep its list
-                new, gone, changed = localfiles.diff({k: v[0] for k, v in found.items()}, known)
-                if gone or changed:
-                    await _local_forget(conn, ch, [root + "/" + x for x in gone + changed])
-                if new or changed:
-                    await _local_add(conn, root, [(root + "/" + x, found[x][0], found[x][1]) for x in new + changed])
-                added += len(new)
-                removed += len(gone)
-        _SCAN["msg"] = (f"{len(names)} folder(s) read: {added:,} new, {removed:,} gone" if names
-                        else "no folders connected")
-    except Exception as e:
-        _SCAN["msg"] = f"could not be read: {str(e)[:120]}"
-        logging.getLogger("tgarr").warning("[files] reading folders: %s", e)
-    finally:
-        _SCAN["running"] = False
-        _SCAN["at"] = time.time()
-
-
-async def _local_scan_worker():
-    await asyncio.sleep(90)
-    while True:
-        await _local_scan()
-        await asyncio.sleep(6 * 3600)
-
-
-@app.post("/api/files/scan")
-async def api_files_scan():
-    if not _SCAN["running"]:
-        asyncio.create_task(_local_scan())
-    return {"status": "ok"}
-
-
-@app.post("/api/files/forget")
-async def api_files_forget(request: Request):
-    """Take a folder that is no longer connected off the list (its files are not touched)."""
-    try:
-        root = str((await request.json()).get("root") or "")
-    except Exception:
-        root = ""
-    if not root.startswith(localfiles.EXTERNAL + "/"):
-        return JSONResponse({"status": "error"}, status_code=400)
-    async with db_pool.acquire() as conn:
-        ch = await conn.fetchval("SELECT id FROM channels WHERE local_root = $1", root)
-        if ch:
-            msgs = "SELECT id FROM messages WHERE channel_id = $1"
-            await conn.execute(f"DELETE FROM downloads WHERE release_id IN "
-                               f"(SELECT id FROM releases WHERE primary_msg_id IN ({msgs}))", ch)
-            await conn.execute(f"DELETE FROM releases WHERE primary_msg_id IN ({msgs})", ch)
-            await conn.execute("DELETE FROM channels WHERE id = $1", ch)
-    return {"status": "ok"}
-
-
 _FILES_JS = (
     '<script>var fq=[],fBusy=false,fDone=0,fTotal=0,fBad=0;'
     'function fAdd(l){for(var i=0;i<l.length;i++){fq.push(l[i]);fTotal++}fNext()}'
@@ -5575,10 +5494,6 @@ _FILES_JS = (
     'function fDel(){var ids=[];document.querySelectorAll(".f-ck:checked").forEach(function(c){ids.push(+c.value)});'
     'if(!ids.length||!confirm("Delete "+ids.length+" uploaded file(s) from this machine for good?"))return;'
     'fetch("/api/files/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:ids})})'
-    '.then(function(){location.reload()})}'
-    'function fScan(){fetch("/api/files/scan",{method:"POST"}).then(function(){setTimeout(function(){location.reload()},2500)})}'
-    'function fForget(r){if(!confirm("Take this folder off the list? Its files are not touched."))return;'
-    'fetch("/api/files/forget",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({root:r})})'
     '.then(function(){location.reload()})}'
     'var dz=document.getElementById("fDrop");if(dz){'
     'dz.addEventListener("dragover",function(e){e.preventDefault();dz.classList.add("over")});'
@@ -5610,11 +5525,6 @@ async def page_files(offset: int = 0):
         tot = await conn.fetchrow(
             """SELECT count(*) AS n, COALESCE(sum(m.file_size), 0) AS b
                FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.local_root = $1""", localfiles.MINE)
-        folders = {r["local_root"]: r for r in await conn.fetch(
-            """SELECT c.local_root, count(m.id) AS n, COALESCE(sum(m.file_size), 0) AS b
-               FROM channels c LEFT JOIN messages m ON m.channel_id = c.id
-               WHERE c.local_root LIKE $1 GROUP BY c.local_root""", localfiles.EXTERNAL + "/%")}
-    here = await asyncio.to_thread(_external_names)
     rows = "".join(
         '<label class="dl-item" style="cursor:pointer">'
         f'<input type="checkbox" class="f-ck" value="{r["id"]}" style="margin-right:4px"/>'
@@ -5622,22 +5532,6 @@ async def page_files(offset: int = 0):
         f'<div class="name"><a href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a></div>'
         f'<div class="meta">{export.human(r["file_size"])} · added {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
         '</div></label>' for r in mine)
-    fl = []
-    for name in sorted(set(here) | {k.split("/", 1)[1] for k in folders}):
-        root = f"{localfiles.EXTERNAL}/{name}"
-        st = folders.get(root)
-        on = name in here
-        fl.append(
-            '<div class="dl-item"><div class="icon">📁</div><div class="info">'
-            f'<div class="name">{html.escape(name)}</div><div class="meta">'
-            + (f'{st["n"]:,} files · {export.human(st["b"]) or "0 MB"}' if st else 'not read yet')
-            + ('' if on else ' · <span style="color:var(--warn,#b45309)">not connected right now</span>')
-            + '</div></div><div class="right">'
-            + ('' if on else f'<button type="button" class="btn ghost" data-r="{html.escape(root, quote=True)}" '
-                             'onclick="fForget(this.dataset.r)">Take off the list</button>')
-            + '</div></div>')
-    scan = ("reading the folders now…" if _SCAN["running"] else html.escape(_SCAN["msg"])
-            + (time.strftime(" · %Y-%m-%d %H:%M UTC", time.gmtime(_SCAN["at"])) if _SCAN["at"] else ""))
     pager = ""
     if offset or len(mine) == 200:
         pager = ('<div style="display:flex;gap:10px;margin:14px 0">'
@@ -5647,9 +5541,7 @@ async def page_files(offset: int = 0):
     body = (
         '<style>.f-drop{border:2px dashed var(--border);border-radius:14px;padding:26px 18px;text-align:center;'
         'background:var(--surface);margin-bottom:10px}.f-drop.over{border-color:var(--accent);background:rgba(94,182,229,.10)}'
-        '.f-drop .btn{margin:8px 4px 0}.f-how{background:var(--surface);border:1px solid var(--border);border-radius:12px;'
-        'padding:12px 16px;margin:10px 0 22px;font-size:13.5px}.f-how code{background:rgba(127,127,127,.14);padding:1px 5px;'
-        'border-radius:4px}.f-how pre{overflow:auto;background:rgba(127,127,127,.10);padding:10px;border-radius:8px}</style>'
+        '.f-drop .btn{margin:8px 4px 0}</style>'
         '<p style="color:var(--muted);margin-top:0">Your own films, music, photos and books, played and read here like '
         'everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.</p>'
         '<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">Drop files here</div>'
@@ -5667,25 +5559,6 @@ async def page_files(offset: int = 0):
         + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
         + ('<div class="dl-list">' + rows + '</div>' + pager if mine else
            '<div class="empty-state"><div class="icon">📂</div><div>Nothing uploaded yet.</div></div>')
-        + f'<h2 class="section" style="margin-top:28px">Folders from elsewhere <span class="count">{len(fl)}</span>'
-        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
-        f'margin-left:10px">{scan} · <a href="#" onclick="fScan();return false">read them again now</a></span></h2>'
-        + ('<div class="dl-list">' + "".join(fl) + '</div>' if fl else '')
-        + '<details class="f-how"' + ('' if fl else ' open') + '><summary style="cursor:pointer;font-weight:600">'
-        'How to connect a NAS share, a USB disk or a cloud drive</summary>'
-        '<p>tgarr reads such folders where they are - nothing is copied and nothing in them is changed. Two steps, '
-        'on the machine that runs tgarr:</p>'
-        '<p><b>1. Make the folder available on that machine.</b> A USB disk: plug it in. A NAS share (SMB or NFS): mount it, '
-        'for example at <code>/mnt/nas</code>. Google Drive, OneDrive, Dropbox: mount it with '
-        '<code>rclone mount</code>, for example at <code>/mnt/gdrive</code>.</p>'
-        '<p><b>2. Hand it to tgarr.</b> In <code>docker-compose.yml</code>, under <code>volumes:</code> of the '
-        '<code>api</code> service, add one line per folder, then run <code>docker compose up -d</code>:</p>'
-        '<pre>      - /mnt/nas/films:/downloads/external/films:ro\n'
-        '      - /media/usb/photos:/downloads/external/photos:ro\n'
-        '      - /mnt/gdrive:/downloads/external/gdrive:ro</pre>'
-        '<p style="margin-bottom:0">The name after <code>external/</code> is what the folder is called here. '
-        '<code>:ro</code> means tgarr can read it and nothing else. Folders are read again every six hours, '
-        'or at once with the link above.</p></details>'
         + _FILES_JS)
     return HTMLResponse(_layout("My files", "/files", body))
 
