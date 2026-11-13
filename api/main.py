@@ -3058,6 +3058,48 @@ def _pdf_render(path: str, n: int, width: int, clean: bool):
         return buf.getvalue(), "image/png"
 
 
+_CJK_CH = "\u2e80-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef"
+_PDF_JOIN_CJK_RX = re.compile(f"([{_CJK_CH}])[ \\t]*\\n[ \\t]*(?=[{_CJK_CH}])")
+_PDF_HYPHEN_RX = re.compile(r"([A-Za-z])-\n([a-z])")
+
+
+def _pdf_text_clean(raw: str) -> str:
+    """A page's text as it should be spoken: lines of one paragraph joined
+    (Chinese without a space, a word hyphenated across lines made whole),
+    paragraphs kept apart, page-break marks and stray spaces removed."""
+    t = (raw or "").replace("\f", "\n").replace("\r", "")
+    t = _PDF_HYPHEN_RX.sub(r"\1\2", t)
+    t = _PDF_JOIN_CJK_RX.sub(r"\1", t)
+    paras = [re.sub(r"[ \t]*\n[ \t]*", " ", p).strip() for p in re.split(r"\n[ \t]*\n+", t)]
+    return "\n".join(re.sub(r"[ \t]{2,}", " ", p) for p in paras if p)[:20000]
+
+
+def _pdf_text(path: str, n: int) -> str:
+    import subprocess
+    r = subprocess.run(["pdftotext", "-f", str(n), "-l", str(n), "-enc", "UTF-8", path, "-"],
+                       capture_output=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError("could not read this page's text")
+    return _pdf_text_clean(r.stdout.decode("utf-8", "replace"))
+
+
+@app.get("/pdf/{msg_id}/text/{n}")
+async def pdf_text(msg_id: int, n: int):
+    """The words on one page (for reading aloud). Empty for a scanned page:
+    that is a picture of text, and there are no words in the file."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    path = _pdf_source(row)
+    if not path:
+        return JSONResponse({"error": "not downloaded yet"}, status_code=404)
+    try:
+        text = await asyncio.to_thread(_pdf_text, path, max(1, int(n)))
+    except Exception as e:
+        return JSONResponse({"error": str(e), "text": ""}, status_code=422)
+    return JSONResponse({"page": n, "text": text},
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+
 @app.get("/pdf/{msg_id}/info")
 async def pdf_info(msg_id: int):
     async with db_pool.acquire() as conn:
@@ -3148,7 +3190,10 @@ body[data-theme=dark] .pg img{filter:invert(.92) hue-rotate(180deg)}
 .stage.paged{overflow:hidden;padding:0;position:relative;touch-action:pan-y pinch-zoom}
 .slide{position:absolute;inset:0;overflow:auto;display:flex;padding:8px;will-change:transform;
   -webkit-overflow-scrolling:touch}
-.slide .pg{margin:auto;flex:none}
+.slide .pair{margin:auto;display:flex;gap:10px;flex:none;align-items:flex-start}
+.slide .pg{margin:0;flex:none}
+.toast{position:fixed;left:50%;bottom:76px;transform:translateX(-50%);background:rgba(15,23,42,.9);color:#fff;
+  font-size:13px;padding:8px 14px;border-radius:8px;z-index:20;max-width:86vw;text-align:center;pointer-events:none}
 .slide.mv{transition:transform .28s cubic-bezier(.3,.1,.3,1)}
 @media (prefers-reduced-motion:reduce){.slide.mv{transition:none}}
 .pos{flex:1;min-width:0;text-align:center;font-size:13px;color:var(--mut)}
@@ -3164,7 +3209,11 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
   <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
   <div class="ttl">__TITLE__</div>
   <button id="wmBtn" title="on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.">Hide watermark</button>
+  <button id="readBtn" title="read this book aloud from the current page, turning pages as it goes (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
   <button id="modeBtn" title="one page at a time (pages slide sideways), or one long scroll">Pages</button>
+  <button id="fitBtn" title="how a page fills the window: the whole page, its width, or its height">Fit page</button>
+  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
+  <button id="fsBtn" class="hide-s" title="full screen (F)">&#9974;</button>
   <button id="zOut" title="smaller (-)">A&minus;</button>
   <button id="zIn" title="larger (+)">A+</button>
   <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
@@ -3192,8 +3241,10 @@ let zoom = st.zoom || 1, theme = st.theme || "light";
 // "paged": one page at a time, turned sideways like a book (the default).
 // "scroll": every page in one long column.
 let mode = st.mode === "scroll" ? "scroll" : "paged";
+let fit = ["page", "width", "height"].includes(st.fit) ? st.fit : "page";   // paged mode only
+let two = !!st.two;                                                           // two pages side by side
 let clean = book.clean !== undefined ? book.clean : (st.clean !== undefined ? !!st.clean : true);
-const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean, mode})); } catch (e) {} };
+const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean, mode, fit, two})); } catch (e) {} };
 const saveBook = () => { try { localStorage.setItem(KEY, JSON.stringify({page: cur, clean})); } catch (e) {} };
 function pageW(){ return Math.round(Math.min(stage.clientWidth - 16, 980) * zoom); }
 function reqW(){ return Math.min(3200, Math.round(pageW() * Math.min(3, window.devicePixelRatio || 1))); }
@@ -3223,17 +3274,29 @@ function build(){
 // ---- one page at a time ----
 let slide = null, moving = false; const ratios = {};
 const calm = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+// two pages only where there is room for them
+const spread = () => two && mode === "paged" && stage.clientWidth >= 760;
+const step = () => spread() ? 2 : 1;
+const left = n => spread() ? n - ((n - 1) % 2) : n;       // the page a spread starts on
 function fitW(r){
-  // the whole page visible at zoom 1: as wide as the stage or as tall, whichever binds
-  const W = stage.clientWidth - 16, H = stage.clientHeight - 16;
-  return Math.round(Math.max(120, Math.min(W, H / r, 1600)) * zoom);
+  // at zoom 1: the whole page ("page"), as wide as the window ("width"), or as tall ("height")
+  const W = (stage.clientWidth - 16 - (spread() ? 10 : 0)) / (spread() ? 2 : 1), H = stage.clientHeight - 16;
+  const w = fit === "width" ? Math.min(W, 2400) : fit === "height" ? H / r : Math.min(W, H / r, 1600);
+  return Math.round(Math.max(120, w) * zoom);
 }
 function pageSrc(n, w){
   const px = Math.min(3200, Math.ceil(w * Math.min(3, window.devicePixelRatio || 1) / 100) * 100);
   return "/pdf/" + ID + "/page/" + n + "?w=" + px + (clean ? "&clean=1" : "");
 }
-function mkSlide(n){
-  const s = document.createElement("div"); s.className = "slide"; s.dataset.n = n;
+function mkSlide(first){
+  const s = document.createElement("div"); s.className = "slide"; s.dataset.n = first;
+  const pair = document.createElement("div"); pair.className = "pair";
+  pair.appendChild(mkPage(first));
+  if (spread() && first + 1 <= pages) pair.appendChild(mkPage(first + 1));
+  s.appendChild(pair);
+  return s;
+}
+function mkPage(n){
   const el = document.createElement("div"); el.className = "pg";
   const fit = r => { const w = fitW(r); el.style.width = w + "px"; el.style.height = Math.round(w * r) + "px"; return w; };
   const r0 = ratios[n] || ratio, w = fit(r0);
@@ -3242,8 +3305,8 @@ function mkSlide(n){
     if (Math.abs(r - r0) > 0.01) { ratios[n] = r; fit(r); } };
   img.src = pageSrc(n, w);
   const no = document.createElement("span"); no.className = "no"; no.textContent = n;
-  el.appendChild(img); el.appendChild(no); s.appendChild(el);
-  return s;
+  el.appendChild(img); el.appendChild(no);
+  return el;
 }
 function settle(){
   // a turn still in flight: finish it at once, so that quick presses never queue up
@@ -3252,11 +3315,11 @@ function settle(){
   moving = false;
 }
 function show(n, dir){
-  n = Math.max(1, Math.min(pages, n | 0));
+  n = left(Math.max(1, Math.min(pages, n | 0)));
   if (moving) settle();
   const old = slide, s = mkSlide(n);
-  slide = s; cur = n; ui(); saveBook();
-  [n + 1, n - 1].forEach(k => { if (k >= 1 && k <= pages) { const i = new Image(); i.src = pageSrc(k, fitW(ratios[k] || ratio)); } });
+  slide = s; cur = n; ui(); saveBook(); turned();
+  [n + step(), n + step() + 1, n - 1, n - 2].forEach(k => { if (k >= 1 && k <= pages) { const i = new Image(); i.src = pageSrc(k, fitW(ratios[k] || ratio)); } });
   if (!old || !dir || calm) { stage.querySelectorAll(".slide,.msg").forEach(x => x.remove()); stage.appendChild(s); return; }
   // dir +1: the new page comes in from the right and pushes the old one out
   // to the left; -1 the other way round
@@ -3277,7 +3340,7 @@ function setMode(m){
 }
 function go(n, smooth){
   n = Math.max(1, Math.min(pages, n | 0));
-  if (mode === "paged") { if (n !== cur || !slide) show(n, smooth ? Math.sign(n - cur) : 0); return; }
+  if (mode === "paged") { n = left(n); if (n !== cur || !slide) show(n, smooth ? Math.sign(n - cur) : 0); return; }
   if (!els[n - 1]) return;
   stage.scrollTo({top: els[n - 1].offsetTop - 8, behavior: smooth ? "smooth" : "auto"});
 }
@@ -3289,25 +3352,97 @@ function track(){
 }
 function ui(){
   if (document.activeElement !== $("pno")) $("pno").value = cur;
-  $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur >= pages;
+  $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur + step() > pages;
+  $("fitBtn").textContent = "Fit " + fit; $("fitBtn").disabled = mode !== "paged";
+  $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
+  $("readBtn").classList.toggle("on", reading);
   $("wmBtn").classList.toggle("on", clean); document.body.dataset.theme = theme;
   $("modeBtn").textContent = mode === "paged" ? "Pages" : "Scroll";
 }
 let tt = null; stage.addEventListener("scroll", () => { clearTimeout(tt); tt = setTimeout(track, 60); }, {passive: true});
-$("prev").onclick = () => go(cur - 1, true); $("next").onclick = () => go(cur + 1, true);
+$("prev").onclick = () => go(cur - step(), true); $("next").onclick = () => go(cur + step(), true);
 $("pno").addEventListener("change", e => go(+e.target.value));
 $("slider").addEventListener("input", e => { $("pno").value = e.target.value; });
 $("slider").addEventListener("change", e => go(+e.target.value));
 function redraw(){ const keep = cur; if (mode === "paged") show(keep, 0); else { size(); refresh(); go(keep); } }
 function rezoom(z){ zoom = Math.max(0.5, Math.min(2.5, z)); saveSt(); redraw(); }
 $("modeBtn").onclick = () => { setMode(mode === "paged" ? "scroll" : "paged"); saveSt(); };
+$("fitBtn").onclick = () => { fit = fit === "page" ? "width" : fit === "width" ? "height" : "page"; saveSt(); redraw(); ui(); };
+$("twoBtn").onclick = () => { two = !two; saveSt(); redraw(); ui(); };
+const fullscreen = () => { if (document.fullscreenElement) document.exitFullscreen(); else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen(); };
+$("fsBtn").onclick = fullscreen;
+function toast(text, ms){
+  let t = $("toast"); if (!t) { t = document.createElement("div"); t.id = "toast"; t.className = "toast"; document.body.appendChild(t); }
+  t.textContent = text; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, ms || 4000);
+}
+// ---- read aloud: the browser's own voices (Edge has Microsoft's natural ones) ----
+const synth = window.speechSynthesis;
+let reading = false, readN = 0, readRun = 0, blanks = 0, byReader = false;
+function voiceFor(text){
+  const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length, kana = (text.match(/[\u3040-\u30ff]/g) || []).length,
+        hangul = (text.match(/[\uac00-\ud7af]/g) || []).length;
+  const lang = kana > 10 ? "ja" : hangul > 10 ? "ko" : cjk > text.length * 0.15 ? "zh" : (navigator.language || "en").slice(0, 2);
+  const vs = synth.getVoices().filter(v => v.lang && v.lang.toLowerCase().startsWith(lang));
+  const score = v => (/natural|neural/i.test(v.name) ? 8 : 0) + (/online/i.test(v.name) ? 4 : 0) + (/microsoft|google/i.test(v.name) ? 2 : 0)
+    + (lang === "zh" && /zh[-_]cn|hans/i.test(v.lang) ? 1 : 0);
+  return {voice: vs.sort((a, b) => score(b) - score(a))[0] || null, lang: lang === "zh" ? "zh-CN" : lang};
+}
+function chunks(text){
+  // sentences, packed into pieces of about 200 characters: some voices stop on long passages
+  const out = []; let buf = "";
+  (text.match(/[^.!?。！？；;\n]+[.!?。！？；;\n]*/g) || [text]).forEach(s => {
+    if (buf && (buf + s).length > 200) { out.push(buf); buf = ""; }
+    buf += s;
+    while (buf.length > 260) { out.push(buf.slice(0, 240)); buf = buf.slice(240); }
+  });
+  if (buf.trim()) out.push(buf);
+  return out.map(x => x.trim()).filter(Boolean);
+}
+function stopRead(why){
+  reading = false; readRun++; if (synth) synth.cancel(); ui(); if (why) toast(why, 6000);
+}
+async function readFrom(n){
+  const run = ++readRun; readN = n; if (synth) synth.cancel();
+  let j = {}; try { j = await fetch("/pdf/" + ID + "/text/" + n).then(r => r.json()); } catch (e) {}
+  if (!reading || run !== readRun) return;
+  const text = (j.text || "").trim();
+  const nextPage = () => {
+    if (!reading || run !== readRun) return;
+    if (n >= pages) { stopRead("the end of the book"); return; }
+    byReader = true; go(n + 1, true); byReader = false; readFrom(n + 1);
+  };
+  if (!text) {
+    if (++blanks >= 3) { stopRead("no words to read on these pages - a scanned book holds pictures of text"); return; }
+    nextPage(); return;
+  }
+  blanks = 0;
+  const parts = chunks(text), v = voiceFor(text);
+  parts.forEach((part, i) => {
+    const u = new SpeechSynthesisUtterance(part);
+    if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
+    if (i === parts.length - 1) u.onend = nextPage;
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    synth.speak(u);
+  });
+}
+function turned(){
+  // the reader turned the page itself: nothing to do. A person did: read on from there.
+  if (reading && !byReader) readFrom(cur);
+}
+$("readBtn").onclick = () => {
+  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (reading) { stopRead(); return; }
+  reading = true; blanks = 0; ui(); readFrom(cur);
+};
+if (!synth) $("readBtn").style.display = "none";
+else { synth.getVoices(); window.addEventListener("beforeunload", () => synth.cancel()); }
 // a swipe turns the page (one finger, clearly sideways)
 let sx = null, sy = 0;
 stage.addEventListener("touchstart", e => { sx = e.touches.length === 1 ? e.touches[0].clientX : null; sy = e.touches[0].clientY; }, {passive: true});
 stage.addEventListener("touchend", e => {
   if (mode !== "paged" || sx === null) return;
   const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy; sx = null;
-  if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.5) go(cur + (dx < 0 ? 1 : -1), true);
+  if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.5) go(cur + (dx < 0 ? step() : -step()), true);
 }, {passive: true});
 // the wheel scrolls inside a page that is taller than the window; at its
 // edge (or when it fits) it turns the page
@@ -3318,7 +3453,7 @@ stage.addEventListener("wheel", e => {
   const top = slide.scrollTop <= 0, bottom = slide.scrollTop + slide.clientHeight >= slide.scrollHeight - 1;
   if (!((d > 0 && bottom) || (d < 0 && top))) return;
   e.preventDefault();
-  if (Math.abs(d) > 6 && Date.now() - wheelAt > 420) { wheelAt = Date.now(); go(cur + (d > 0 ? 1 : -1), true); }
+  if (Math.abs(d) > 6 && Date.now() - wheelAt > 420) { wheelAt = Date.now(); go(cur + (d > 0 ? step() : -step()), true); }
 }, {passive: false});
 $("zIn").onclick = () => rezoom(zoom * 1.2); $("zOut").onclick = () => rezoom(zoom / 1.2);
 $("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); ui(); };
@@ -3327,8 +3462,11 @@ window.addEventListener("resize", redraw);
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" && e.target.type === "number") return;
   const k = e.key;
-  if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur + 1, true); }
-  else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur - 1, true); }
+  if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur + step(), true); }
+  else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur - step(), true); }
+  else if (k === "f" || k === "F") fullscreen();
+  else if (k === "r" || k === "R") $("readBtn").click();
+  else if (k === "2") $("twoBtn").click();
   else if (k === "Home") go(1); else if (k === "End") go(pages);
   else if (k === "+" || k === "=") rezoom(zoom * 1.2); else if (k === "-") rezoom(zoom / 1.2);
 });

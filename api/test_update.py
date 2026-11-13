@@ -108,6 +108,15 @@ ok(L(0, 0) == "off", "unknown disk")
 ok(main._fmt_uptime(12 * 86400 + 21 * 3600) == "12 d 21 h" and main._fmt_uptime(3 * 3600 + 120) == "3 h 2 min",
    "uptime wording")
 
+# ---- a PDF page's text, as it should be read aloud ------------------------
+ok(main._pdf_text_clean("第一行文字\n第二行文字\n\n新的一段\f") == "第一行文字第二行文字\n新的一段",
+   "Chinese lines of one paragraph are joined without a space; paragraphs stay apart")
+ok(main._pdf_text_clean("The quick brown\nfox jumps over the la-\nzy dog.\n\nNext paragraph.") ==
+   "The quick brown fox jumps over the lazy dog.\nNext paragraph.",
+   "English lines are joined with a space and a hyphenated word is made whole")
+ok(main._pdf_text_clean("  \n \f ") == "" and main._pdf_text_clean(None) == "", "a page without words reads as nothing")
+ok(len(main._pdf_text_clean("字" * 50000)) == 20000, "one page's text is capped")
+
 # ---- other-language names of a series -----------------------------------
 import metadata as _md  # noqa: E402
 
