@@ -40,4 +40,12 @@ for name, text in (("crawler", src), ("sign-in", login)):
 ok("client.storage.server_address(opt.ip_address)" in login and "client.storage.port(opt.port)" in login,
    "the sign-in stores the new data centre's address with the session")
 
+# The start-up backfill walks the account's dialogs. ingest_message keeps only
+# messages of chats that have a row marked joined or followed, so the walk
+# must make that row first - or it reads every chat and keeps nothing.
+walk = src[src.index("async for dialog in _dialogs():"):]
+walk = walk[:walk.index("await backfill_channel(chat_id, title, dialog.chat.username)")]
+ok("INSERT INTO channels (tg_chat_id, title, is_joined)" in walk and "is_joined = TRUE" in walk,
+   "the start-up backfill registers a dialog as joined before reading it")
+
 print(f"ok - {n} checks")

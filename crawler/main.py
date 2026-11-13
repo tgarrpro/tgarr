@@ -2289,6 +2289,27 @@ async def backfill_all() -> None:
         if chat_id in backfilled:
             log.info("[backfill] skip already-done chat_id=%s title=%s", chat_id, title)
             continue
+        # A dialog is a chat the account is in. Make sure it has a row that
+        # says so before reading it: ingest_message only keeps messages of
+        # chats it knows as joined or followed, so without the row every
+        # message of the backfill was dropped. That is what happened to all
+        # private groups after signing out (their rows are removed) and in
+        # again - they were read and nothing was kept. A public channel
+        # already followed by name (read from the web, not yet matched to
+        # its Telegram id) keeps its own row and is left to the poller.
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO channels (tg_chat_id, title, is_joined)
+                       SELECT $1, $2, TRUE
+                       WHERE $3::text IS NULL OR NOT EXISTS (
+                             SELECT 1 FROM channels WHERE lower(username) = lower($3::text))
+                       ON CONFLICT (tg_chat_id) DO UPDATE
+                         SET is_joined = TRUE,
+                             title = COALESCE(NULLIF(EXCLUDED.title, ''), channels.title)""",
+                    chat_id, title, dialog.chat.username or None)
+        except Exception as e:
+            log.warning("[backfill] could not register chat_id=%s: %s", chat_id, e)
         try:
             await backfill_channel(chat_id, title, dialog.chat.username)
         except Exception as e:
