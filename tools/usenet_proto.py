@@ -17,7 +17,7 @@ import sqlite3
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "crawler"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api"))
 import usenet as U  # noqa: E402
 
 DB = os.environ.get("USENET_DB", "usenet_cards.db")

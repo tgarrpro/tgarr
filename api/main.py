@@ -209,7 +209,7 @@ async def _signed_out_block(request: Request):
         # the PIN and the kids' list belong to this install, not to the
         # Telegram account: they work whether or not anybody is signed in
         if path.startswith("/api/") and not path.startswith(
-                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/")):
+                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/")):
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -310,6 +310,7 @@ def _js_str(v) -> str:
             .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 import metadata as md  # local module
+import usenet  # local module
 
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
@@ -480,6 +481,7 @@ async def _startup():
     asyncio.create_task(_stats_snapshot_worker())
     asyncio.create_task(_ebook_queue_restore())
     asyncio.create_task(_arr_alias_sync_worker())
+    asyncio.create_task(_usenet_scan_worker())
     asyncio.create_task(_cache_gc_worker())
     asyncio.create_task(_update_check_worker())
 
@@ -804,6 +806,20 @@ async def _migrate_schema():
             -- What a browser that has not entered the PIN may see: whole
             -- channels (kind 'channel', ref = channels.id) and single items
             -- (kind 'message', ref = messages.id).
+            -- Usenet: one small card per named release (the NZB is rebuilt
+            -- when asked for), and how far each newsgroup has been read.
+            CREATE TABLE IF NOT EXISTS usenet_cards (
+              id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, size BIGINT, grp TEXT NOT NULL,
+              poster TEXT, posted_from BIGINT, posted_to BIGINT, files INT, files_expected INT,
+              segments INT, segments_expected INT, complete BOOLEAN, first_message_id TEXT, key TEXT,
+              art_lo BIGINT, art_hi BIGINT, alive REAL, added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_usenet_cards_posted ON usenet_cards (posted_from DESC);
+            CREATE TABLE IF NOT EXISTS usenet_progress (
+              grp TEXT PRIMARY KEY, first_article BIGINT, last_article BIGINT, next_article BIGINT,
+              headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
+              enabled BOOLEAN NOT NULL DEFAULT TRUE, note TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             CREATE TABLE IF NOT EXISTS kids_allow (
               kind TEXT NOT NULL,
               ref BIGINT NOT NULL,
@@ -7031,6 +7047,391 @@ async def api_registry_pull_now():
 # Page: Gallery (Telegram-shared photos)
 # ════════════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════════════
+# Usenet - a second source, for people who have a Usenet account
+#
+# Off until an account is entered in Settings and the server answers. Then:
+#   * a slow scanner reads newsgroup headers and keeps one small card per
+#     named video / audio / e-book / photo release (usenet.py);
+#   * /newznab/usenet/api offers those cards to Sonarr and Radarr;
+#   * a grab is answered with the release's NZB, built at that moment by
+#     reading its stretch of headers again. tgarr does not download from
+#     Usenet: the *arr hands the NZB to its own downloader (SABnzbd, NZBGet).
+# In the *arr this is a second indexer entry, because an indexer is tied to
+# one download client: "tgarr" goes to tgarr itself (Telegram), "tgarr
+# Usenet" to the Usenet downloader.
+# ════════════════════════════════════════════════════════════════════
+_USENET = {"at": 0.0, "cfg": {}, "ok": None, "msg": "not tried yet", "checked": 0.0}
+_USENET_KEYS = ("usenet_enabled", "usenet_host", "usenet_port", "usenet_ssl", "usenet_user", "usenet_pass",
+                "usenet_per_day")
+USENET_GROUPS = ("alt.binaries.teevee", "alt.binaries.hdtv.x264", "alt.binaries.x264", "alt.binaries.multimedia",
+                 "alt.binaries.tv", "alt.binaries.movies", "alt.binaries.sounds.lossless", "alt.binaries.ebook",
+                 "alt.binaries.e-book.technical")
+USENET_BLOCK = 200_000               # headers read in one go
+USENET_SETTLE = 30_000               # a release is taken as finished this many articles behind the reader
+USENET_START = "2009-01-01"          # where a group is first read from: old posts carry readable names
+
+
+async def _usenet_cfg(fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if (fresh or now - _USENET["at"] > 5) and db_pool is not None:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, value FROM config WHERE key = ANY($1::text[])", list(_USENET_KEYS))
+        d = {r["key"][7:]: r["value"] for r in rows}
+        _USENET.update(at=now, cfg={
+            "enabled": d.get("enabled") == "1", "host": (d.get("host") or "").strip(),
+            "port": int(d.get("port") or 563), "ssl": d.get("ssl", "1") != "0",
+            "user": d.get("user") or "", "pass": d.get("pass") or "",
+            "per_day": max(0, int(d.get("per_day") or 2_000_000))})
+    return _USENET["cfg"]
+
+
+def _usenet_connect(cfg: dict):
+    return usenet.NNTP(cfg["host"], cfg["port"], cfg["user"] or None, cfg["pass"] or None, use_ssl=cfg["ssl"])
+
+
+def _usenet_try(cfg: dict) -> str:
+    """'' when the server lets us in and answers, otherwise why not (never the account's name)."""
+    try:
+        nn = _usenet_connect(cfg)
+    except usenet.NNTPError as e:
+        return str(e)
+    except Exception as e:
+        return f"could not connect: {type(e).__name__}"
+    try:
+        nn.group("alt.binaries.teevee")
+        return ""
+    except Exception as e:
+        return f"connected, but the server did not open a group: {e}"
+    finally:
+        nn.quit()
+
+
+async def _usenet_ready(recheck: bool = False) -> bool:
+    """Switched on, an account entered, and the server answered when last asked
+    (asked again at most every ten minutes)."""
+    cfg = await _usenet_cfg()
+    if not (cfg.get("enabled") and cfg.get("host")):
+        return False
+    if recheck or _USENET["ok"] is None or time.monotonic() - _USENET["checked"] > 600:
+        msg = await asyncio.to_thread(_usenet_try, cfg)
+        _USENET.update(ok=not msg, msg=msg or "working", checked=time.monotonic())
+    return bool(_USENET["ok"])
+
+
+def _usenet_scan_block(cfg: dict, grp: str, start, asm, count: int):
+    """Read `count` headers of a group from article `start` (None: from
+    USENET_START), feed them to the group's assembler, and return the cards of
+    the releases that are finished. Runs in a thread."""
+    import calendar
+    import random
+    nn = _usenet_connect(cfg)
+    try:
+        _n, first, last = nn.group(grp)
+        if start is None or start < first:
+            start = usenet.article_at(nn, first, last, calendar.timegm(time.strptime(USENET_START, "%Y-%m-%d")))
+        b0, lo, end = nn.bytes_in, start, min(last, start + count - 1)
+        while lo <= end:
+            for row in nn.over(lo, min(end, lo + 19999)):
+                asm.add(*row)
+            lo += 20000
+        cursor, cards = end + 1, []
+        for k, r in list(asm.rel.items()):
+            if r["art_hi"] >= cursor - USENET_SETTLE and cursor <= last:
+                continue                              # may still be arriving
+            del asm.rel[k]
+            c = usenet.card(r)
+            if not c:
+                continue
+            ids = [m for f in r["files"].values() for m, _s in f["parts"].values()]
+            sample = random.sample(ids, min(4, len(ids)))
+            c["alive"] = round(sum(1 for m in sample if nn.stat(m)) / max(1, len(sample)), 2)
+            cards.append(c)
+        resume = min([r["art_lo"] for r in asm.rel.values()] + [cursor])
+        return cards, cursor, max(resume, cursor - USENET_BLOCK), end - start + 1, nn.bytes_in - b0, first, last
+    finally:
+        nn.quit()
+
+
+async def _usenet_scan_worker():
+    """Reads a block of one group, then the next group, staying under the
+    day's allowance of headers (their download is the cost: about 350 bytes
+    each). Only while Usenet is switched on and the server answers."""
+    await asyncio.sleep(90)
+    logu = logging.getLogger("tgarr.usenet")
+    asms, cursors, turn = {}, {}, 0
+    while True:
+        try:
+            if not await _usenet_ready():
+                await asyncio.sleep(300)
+                continue
+            cfg = await _usenet_cfg()
+            day = time.strftime("%Y-%m-%d", time.gmtime())
+            async with db_pool.acquire() as conn:
+                used = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_today'") or ""
+                rows = await conn.fetch("SELECT grp, next_article, enabled FROM usenet_progress")
+            used_n = int(used.split(":")[1]) if used.startswith(day + ":") else 0
+            room = cfg["per_day"] - used_n
+            if room < 20000:
+                await asyncio.sleep(900)
+                continue
+            known = {r["grp"]: r for r in rows}
+            groups = [g for g in USENET_GROUPS if g not in known or known[g]["enabled"]]
+            if not groups:
+                await asyncio.sleep(900)
+                continue
+            grp = groups[turn % len(groups)]
+            turn += 1
+            start = cursors.get(grp, known[grp]["next_article"] if grp in known else None)
+            asm = asms.setdefault(grp, usenet.Assembler(grp))
+            try:
+                cards, cursor, resume, n, nbytes, first, last = await asyncio.to_thread(
+                    _usenet_scan_block, cfg, grp, start, asm, min(USENET_BLOCK, room))
+            except Exception as e:
+                logu.warning("[usenet] %s: %s", grp, str(e)[:120])
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO usenet_progress (grp, note) VALUES ($1, $2)
+                           ON CONFLICT (grp) DO UPDATE SET note = $2, updated_at = NOW()""", grp, str(e)[:200])
+                await asyncio.sleep(120)
+                continue
+            cursors[grp] = cursor
+            async with db_pool.acquire() as conn:
+                await _usenet_store(conn, cards)
+                await conn.execute(
+                    """INSERT INTO usenet_progress (grp, first_article, last_article, next_article, headers, cards, bytes, note)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+                       ON CONFLICT (grp) DO UPDATE SET first_article = $2, last_article = $3, next_article = $4,
+                           headers = usenet_progress.headers + $5, cards = usenet_progress.cards + $6,
+                           bytes = usenet_progress.bytes + $7, note = NULL, updated_at = NOW()""",
+                    grp, first, last, resume, n, len(cards), nbytes)
+                await conn.execute(
+                    """INSERT INTO config (key, value) VALUES ('usenet_today', $1)
+                       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", f"{day}:{used_n + n}")
+            logu.info("[usenet] %s: %s headers, %s cards, %.0f MB", grp, f"{n:,}", len(cards), nbytes / 1e6)
+            await asyncio.sleep(20 if cursor <= last else 600)
+        except Exception as e:
+            logu.warning("[usenet] scanner: %s: %s", type(e).__name__, str(e)[:160])
+            await asyncio.sleep(300)
+
+
+_USENET_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "posted_to", "files", "files_expected",
+                "segments", "segments_expected", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive")
+
+
+async def _usenet_store(conn, cards: list) -> None:
+    for c in cards:
+        row = dict(c)
+        row["grp"] = row.pop("group", row.get("grp"))
+        await conn.execute(
+            f"""INSERT INTO usenet_cards ({", ".join(_USENET_COLS)})
+                VALUES ({", ".join(f"${i + 1}" for i in range(len(_USENET_COLS)))})
+                ON CONFLICT (id) DO UPDATE SET size = EXCLUDED.size, files = EXCLUDED.files,
+                    segments = EXCLUDED.segments, segments_expected = EXCLUDED.segments_expected,
+                    complete = EXCLUDED.complete, art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo),
+                    art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi), alive = EXCLUDED.alive,
+                    posted_to = EXCLUDED.posted_to""",
+            *[bool(row.get(k)) if k == "complete" else row.get(k) for k in _USENET_COLS])
+
+
+def _usenet_nzb(cfg: dict, c) -> str:
+    """The NZB of one card, from the headers as they are on the server now. Runs in a thread."""
+    nn = _usenet_connect(cfg)
+    try:
+        nn.group(c["grp"])
+        asm = usenet.Assembler(c["grp"])
+        lo, hi = c["art_lo"] - 2000, c["art_hi"] + 2000
+        while lo <= hi:
+            for r in nn.over(lo, min(hi, lo + 19999)):
+                if usenet.poster_hash(r[2]) == c["poster"]:
+                    p = usenet.parse_subject(r[1])
+                    if p and usenet.release_key(p) == c["key"]:
+                        asm.add(*r)
+            lo += 20000
+        rels = asm.releases()
+        return usenet.build_nzb(rels[0]) if rels else ""
+    finally:
+        nn.quit()
+
+
+_USENET_EP_RX = re.compile(r"S(\d{1,2})E(\d{1,3})", re.I)
+
+
+def _usenet_item_xml(c, base_url: str, apikey: str) -> str:
+    link = html.escape(f"{base_url}/newznab/usenet/api?t=get&id=un-{c['id']}&apikey={apikey}", quote=True)
+    name, hd = c["name"], bool(re.search(r"\b(720|1080|2160)[pi]\b", c["name"], re.I))
+    ep = _USENET_EP_RX.search(name)
+    if c["kind"] == "video":
+        cat = ("5040" if hd else "5030") if ep or re.search(r"\b\d{4}[. ]\d{2}[. ]\d{2}\b", name) else ("2040" if hd else "2030")
+    else:
+        cat = {"audio": "3010", "ebook": "7020"}.get(c["kind"], "8000")
+    when = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(c["posted_from"] or 0))
+    attrs = f'      <newznab:attr name="category" value="{cat}"/>\n      <newznab:attr name="size" value="{c["size"] or 0}"/>\n'
+    if ep and cat.startswith("5"):
+        attrs += (f'      <newznab:attr name="season" value="{int(ep.group(1))}"/>\n'
+                  f'      <newznab:attr name="episode" value="{int(ep.group(2))}"/>\n')
+    attrs += f'      <newznab:attr name="group" value="{html.escape(c["grp"])}"/>\n'
+    return (f"    <item>\n      <title>{html.escape(name)}</title>\n"
+            f"      <guid isPermaLink=\"false\">un-{c['id']}</guid>\n      <link>{link}</link>\n"
+            f"      <pubDate>{when}</pubDate>\n      <category>{cat}</category>\n      <size>{c['size'] or 0}</size>\n"
+            f"      <description>Usenet, {html.escape(c['grp'])}</description>\n"
+            f"      <enclosure url=\"{link}\" length=\"{c['size'] or 0}\" type=\"application/x-nzb\"/>\n{attrs}    </item>")
+
+
+@app.get("/newznab/usenet/api", response_class=PlainTextResponse)
+@app.get("/newznab/usenet", response_class=PlainTextResponse)
+async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional[str] = Query(None),
+                         season: Optional[int] = None, ep: Optional[int] = None, cat: Optional[str] = None,
+                         limit: int = 100, offset: int = 0, apikey: Optional[str] = "tgarr",
+                         id: Optional[str] = None):
+    base_url = _base_url(request)
+    if t == "caps":
+        return Response(CAPS_XML, media_type="application/xml")
+    if t not in ("search", "tvsearch", "movie", "get"):
+        return _newznab_error(202, f"No such function ({t})")
+    # Nothing is offered unless Usenet is switched on and the server answers:
+    # a result that cannot be turned into an NZB is worse than no result.
+    if not await _usenet_ready():
+        if t == "get":
+            return _newznab_error(300, "Usenet is switched off or the news server is not answering", 503)
+        return Response(_feed_envelope("", "usenet (off)", base_url), media_type="application/xml")
+    if t == "get":
+        if not id or not re.fullmatch(r"un-[0-9a-f]{20}", id):
+            return _newznab_error(300, "No such item", 404)
+        async with db_pool.acquire() as conn:
+            c = await conn.fetchrow("SELECT * FROM usenet_cards WHERE id = $1", id[3:])
+        if not c:
+            return _newznab_error(300, "No such item", 404)
+        try:
+            text = await asyncio.to_thread(_usenet_nzb, await _usenet_cfg(), c)
+        except Exception as e:
+            _USENET.update(ok=None)                          # look at the server again before the next answer
+            return _newznab_error(300, f"The news server did not give the headers: {str(e)[:80]}", 503)
+        if not text:
+            return _newznab_error(300, "This release is no longer on the news server", 404)
+        safe = "".join(ch if ord(ch) < 128 and ch not in '"\\' else "_" for ch in c["name"])[:150]
+        return Response(text, media_type="application/x-nzb",
+                        headers={"Content-Disposition": f'attachment; filename="{safe}.nzb"'})
+    where, params = ["alive >= 0.5"], []
+    for w in re.split(r"[\s.]+", q or "")[:8]:
+        if w:
+            params.append("%" + w.replace("%", "").replace("_", r"\_") + "%")
+            where.append(f"name ILIKE ${len(params)}")
+    if t == "tvsearch":
+        where.append(r"kind = 'video' AND name ~* 'S\d{1,2}E\d{1,3}|\d{4}[. ]\d{2}[. ]\d{2}'")
+        if season is not None and ep is not None:
+            params.append(rf"S0*{int(season)}E0*{int(ep)}(?!\d)")
+            where.append(f"name ~* ${len(params)}")
+        elif season is not None:
+            params.append(rf"S0*{int(season)}(E\d|\M)")
+            where.append(f"name ~* ${len(params)}")
+    elif t == "movie":
+        where.append(r"kind = 'video' AND name !~* 'S\d{1,2}E\d{1,3}'")
+    else:
+        where.append("kind IN ('video', 'audio', 'ebook')")
+    lim = max(1, min(int(limit), 200))
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT *, count(*) OVER() AS _total FROM usenet_cards WHERE {' AND '.join(where)}
+                ORDER BY complete DESC, posted_from DESC NULLS LAST LIMIT {lim} OFFSET {max(0, int(offset))}""", *params)
+    items = "\n".join(_usenet_item_xml(r, base_url, apikey or "tgarr") for r in rows)
+    return Response(_feed_envelope(items, f"usenet t={t} q={q or ''}", base_url, offset=max(0, int(offset)),
+                                   total=rows[0]["_total"] if rows else 0), media_type="application/xml")
+
+
+@app.post("/api/usenet/settings")
+async def api_usenet_settings(request: Request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    vals = {"usenet_enabled": "1" if b.get("enabled") else "0", "usenet_host": str(b.get("host") or "").strip()[:200],
+            "usenet_port": str(int(b.get("port") or 563)), "usenet_ssl": "1" if b.get("ssl", True) else "0",
+            "usenet_user": str(b.get("user") or "")[:200],
+            "usenet_per_day": str(max(0, min(int(b.get("per_day") or 2_000_000), 200_000_000)))}
+    if b.get("password"):                                  # left empty = keep the one already kept
+        vals["usenet_pass"] = str(b["password"])[:300]
+    async with db_pool.acquire() as conn:
+        for k, v in vals.items():
+            await conn.execute("""INSERT INTO config (key, value) VALUES ($1, $2)
+                                  ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    await _usenet_cfg(fresh=True)
+    _USENET.update(ok=None)
+    ready = await _usenet_ready(recheck=True)
+    return {"status": "ok", "working": ready, "message": _USENET["msg"] if vals["usenet_enabled"] == "1" else "switched off"}
+
+
+@app.get("/settings/usenet", response_class=HTMLResponse)
+async def page_settings_usenet(request: Request):
+    cfg = await _usenet_cfg(fresh=True)
+    ready = await _usenet_ready() if cfg.get("enabled") and cfg.get("host") else False
+    async with db_pool.acquire() as conn:
+        kinds = await conn.fetch("""SELECT kind, count(*) AS n, COALESCE(sum(size), 0) AS b,
+                                           count(*) FILTER (WHERE alive >= 0.99) AS there
+                                    FROM usenet_cards GROUP BY 1 ORDER BY 2 DESC""")
+        prog = await conn.fetch("SELECT * FROM usenet_progress ORDER BY grp")
+        today = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_today'") or ""
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    used = int(today.split(":")[1]) if today.startswith(day + ":") else 0
+    state = ('<span class="pill ok">working</span>' if ready else
+             '<span class="pill muted">switched off</span>' if not cfg.get("enabled") else
+             f'<span class="pill bad">not working</span> <span style="color:var(--muted)">{html.escape(_USENET["msg"])}</span>')
+    base = _base_url(request)
+    cards_html = "".join(
+        f'<div class="card"><div class="n">{r["n"]:,}</div><div class="l">{html.escape(r["kind"])}</div>'
+        f'<div class="s">{(_fmt_size(r["b"]) or "0")} · {r["there"]:,} fully there</div></div>' for r in kinds)
+    prog_html = "".join(
+        f'<tr><td>{html.escape(r["grp"])}</td><td class="num">{(r["headers"] or 0):,}</td><td class="num">{(r["cards"] or 0):,}</td>'
+        f'<td class="num">{(_fmt_size(r["bytes"] or 0) or "0")}</td>'
+        f'<td class="num">{(100 * ((r["next_article"] or 0) - (r["first_article"] or 0)) // max(1, (r["last_article"] or 1) - (r["first_article"] or 0))) if r["next_article"] else 0}%</td>'
+        f'<td>{html.escape(r["note"] or "")}</td></tr>' for r in prog)
+    body = f"""<style>.un-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
+.un-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0}}
+.un-grid label{{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--muted)}}
+.un-grid input{{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
+.un-stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}}
+.un-stats .card{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px}}
+.un-stats .n{{font-size:24px;font-weight:700}}.un-stats .l{{color:var(--muted)}}.un-stats .s{{color:var(--muted);font-size:12px;margin-top:4px}}
+.un-t{{width:100%;border-collapse:collapse}}.un-t td,.un-t th{{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left;font-size:14px}}
+.un-t .num{{text-align:right;white-space:nowrap}}</style>
+<div class="un-box"><h3 style="margin:0 0 6px">Usenet account {state}</h3>
+<p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
+card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
+tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet).</p>
+<div class="un-grid">
+<label>News server<input id="unHost" value="{html.escape(cfg.get("host") or "", quote=True)}" placeholder="news.example.com"/></label>
+<label>Port<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
+<label>User name<input id="unUser" value="{html.escape(cfg.get("user") or "", quote=True)}" autocomplete="off"/></label>
+<label>Password<input id="unPass" type="password" placeholder="{"kept - leave empty to keep it" if cfg.get("pass") else ""}" autocomplete="new-password"/></label>
+<label>Headers read per day (about 350 bytes each)<input id="unDay" type="number" step="100000" value="{cfg.get("per_day", 2000000)}"/></label>
+</div>
+<label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
+<label style="display:flex;gap:8px;align-items:center;margin:6px 0 14px"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""}/> <b>Use Usenet</b></label>
+<button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span></div>
+<h2 class="section">Found so far</h2>
+<div class="un-stats">{cards_html or '<div class="card"><div class="l">nothing yet</div></div>'}
+<div class="card"><div class="n">{used:,}</div><div class="l">headers read today</div><div class="s">of {cfg.get("per_day", 0):,} allowed</div></div></div>
+<div class="un-box" style="padding:6px 10px"><table class="un-t"><thead><tr><th>newsgroup</th><th class="num">headers read</th><th class="num">cards</th>
+<th class="num">downloaded</th><th class="num">through the group</th><th></th></tr></thead><tbody>{prog_html or '<tr><td colspan="6" style="color:var(--muted)">not started</td></tr>'}</tbody></table></div>
+<h2 class="section">In Sonarr and Radarr</h2>
+<div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
+<p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
+Download client: <b>SABnzbd</b> (or NZBGet) - not "tgarr". An indexer goes to one download client, which is why Usenet needs its own entry.</p></div>
+<script>
+function unSave(){{
+  const m = document.getElementById("unMsg"); m.textContent = "testing…";
+  fetch("/api/usenet/settings", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{
+    enabled: document.getElementById("unOn").checked, host: document.getElementById("unHost").value,
+    port: +document.getElementById("unPort").value, ssl: document.getElementById("unSsl").checked,
+    user: document.getElementById("unUser").value, password: document.getElementById("unPass").value,
+    per_day: +document.getElementById("unDay").value}})}}).then(r => r.json())
+    .then(j => {{ m.textContent = j.working ? "saved - the server answers" : "saved - " + (j.message || "not working"); setTimeout(() => location.reload(), 1200); }})
+    .catch(() => {{ m.textContent = "could not save"; }});
+}}
+</script>"""
+    return HTMLResponse(_layout("Usenet", "/settings", body, page_title="Usenet", top_actions_html=""))
+
+
+# ════════════════════════════════════════════════════════════════════
 # Kids' pages, the PIN, the kids' list
 # ════════════════════════════════════════════════════════════════════
 _UNLOCK_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
@@ -9976,6 +10377,17 @@ async def page_settings(request: Request):
   </div>
 </div>
 
+<h2 class="section">Other sources</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">📰</div>
+    <div class="info">
+      <div class="name">Usenet</div>
+      <div class="meta">With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.</div>
+    </div>
+    <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
+  </div>
+</div>
 <h2 class="section">Metadata sources</h2>
 <div class="dl-list">
   <div class="dl-item">
