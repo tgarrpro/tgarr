@@ -7530,7 +7530,7 @@ button{margin-top:12px;width:100%;padding:12px;font:inherit;font-size:15px;font-
   border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.6}
 #err{color:#b91c1c;font-size:14px;min-height:20px;margin-top:10px}a{color:#0284c7;font-size:13px}
 </style></head><body><div class="card">
-<h1>Enter the PIN</h1><p>For grown-ups: enter the PIN to open all of tgarr.</p>
+<h1>Enter the PIN</h1><p>Enter the PIN to open all of tgarr.</p>
 <form id="f" autocomplete="off">
 <input type="password" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="12" autofocus aria-label="PIN"/>
 <label><input type="checkbox" id="rem"/> keep this browser unlocked for 30 days</label>
@@ -7659,7 +7659,7 @@ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:c
 .big{font-size:96px;line-height:1}h1{font-size:34px;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
 a{display:inline-block;margin-top:34px;font-size:13px;color:inherit;opacity:.55}
 </style></head><body><div><div class="big">__ICON__</div><h1>__TITLE__</h1><p>__TEXT__</p>
-<a href="/unlock">🔒 Grown-ups</a></div>
+<a href="/unlock">🔒 Enter PIN</a></div>
 <script>
 // look again every half minute: when it is time, go back in
 setInterval(function(){ fetch("/api/mc/ping").then(function(r){ return r.json(); })
@@ -7799,9 +7799,9 @@ a{color:inherit;text-decoration:none}
 .logo .wm b{font-weight:900;color:var(--ink)}
 .logo .mc{font-size:21px;font-weight:700;color:var(--soft);padding-left:12px;margin-left:4px;border-left:2px solid var(--line);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.grown{font-size:13px;color:var(--soft);padding:9px 14px;border-radius:999px;border:1.5px solid var(--line);
+.pill{font-size:13px;color:var(--soft);padding:9px 14px;border-radius:999px;border:1.5px solid var(--line);
   background:var(--card);white-space:nowrap}
-.grown:hover{border-color:var(--accent);color:var(--ink)}
+.pill:hover{border-color:var(--accent);color:var(--ink)}
 .cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);
   padding:14px clamp(16px,4vw,44px) 4px}
 .cat{background:var(--card);border-radius:var(--r);padding:clamp(14px,2.4vw,24px) 10px;text-align:center;
@@ -7856,7 +7856,7 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
   <a class="logo" href="/mediacenter" aria-label="tgarr Media Center">
     <svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
     <span class="wm">tg<b>arr</b></span><span class="mc">Media Center</span></a>
-  __GROWN__
+  __TOPRIGHT__
 </div>
 <nav class="cats">__CATS__</nav>
 <form class="find" method="GET" action="/mediacenter">
@@ -7972,7 +7972,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
     elif q:
         grid = '<div class="empty"><i>🔎</i>Nothing found. Try another word?</div>'
     else:
-        grid = ('<div class="empty"><i>🌱</i>Nothing here yet.<br/>A grown-up can add things to the Media Center.</div>')
+        grid = ('<div class="empty"><i>🌱</i>Nothing here yet.<br/>Things show up here once they are added to the Media Center.</div>')
     qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
     nav = ""
     if offset or more:
@@ -7980,12 +7980,12 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
                + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← Back</a>' if offset else "")
                + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">More →</a>' if more else "")
                + "</div>")
-    grown = ('<a class="grown" href="/unlock" title="for grown-ups">🔒 Grown-ups</a>' if locked else
-             ('<a class="grown" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
-             + '<a class="grown" href="/mediacenter/manage">⚙ Choose what is shown</a>'
-             '<a class="grown" href="/">← Back to tgarr</a>')
+    top_right = ('<a class="pill" href="/unlock" title="open all of tgarr">🔒 Enter PIN</a>' if locked else
+             ('<a class="pill" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
+             + '<a class="pill" href="/mediacenter/manage">⚙ Choose what is shown</a>'
+             '<a class="pill" href="/">← Back to tgarr</a>')
     heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
-    page = (_MEDIACENTER_HTML.replace("__COLOR__", colour).replace("__GROWN__", grown).replace("__CATS__", cats)
+    page = (_MEDIACENTER_HTML.replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
             .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
             .replace("__GRID__", grid).replace("__MORE__", nav))
