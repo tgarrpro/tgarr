@@ -8160,10 +8160,10 @@ async def _usenet_cfg(fresh: bool = False) -> dict:
             "port": int(d.get("port") or 563), "ssl": d.get("ssl", "1") != "0",
             "user": d.get("user") or "", "pass": d.get("pass") or "",
             "per_day": max(0, int(d.get("per_day") or 2_000_000)),
-            # taking part in the shared index (off unless switched on). One connection, as for
-            # everything else an install does: the index is built by many installs each doing a
-            # little, and the account's other connections stay free for downloading
-            "index": d.get("index") == "1", "conns": max(1, min(int(d.get("conns") or 1), 20))})
+            # taking part in the shared index (off unless switched on). "conns" is the most this
+            # install is willing to use; the registry says how many it may (one for an ordinary
+            # install), and the smaller of the two is used
+            "index": d.get("index") == "1", "conns": max(1, min(int(d.get("conns") or 12), 20))})
     return _USENET["cfg"]
 
 
@@ -8520,7 +8520,11 @@ def _usenet_index_window(cfg: dict, w: dict) -> dict:
     sparse = tuple(w["read"]) if w.get("read") else None
     sk = usenet_scan.Sketch(w["grp"])
     got = []
-    st = usenet_scan.read_window(cfg, w["grp"], lo, max(lo, hi), read=sparse, connections=cfg.get("conns", 1), on_rows=got.append)
+    # how many connections: never more than the registry allows this install (one, unless it
+    # is told otherwise), and never more than is set here
+    allowed = max(1, min(int(w.get("connections") or 1), 20))
+    st = usenet_scan.read_window(cfg, w["grp"], lo, max(lo, hi), read=sparse,
+                                 connections=max(1, min(cfg.get("conns", 1), allowed)), on_rows=got.append)
     for rows in got:
         sk.add_rows(rows)
     cards = sk.cards(detail=0 if sparse else 1, min_size=100_000_000 if sparse else 0)
