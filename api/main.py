@@ -2958,6 +2958,9 @@ function collect(){
 // the pages a paragraph starts and ends on: one that runs over a page break
 // has a piece in each column
 function pagesOf(el){
+  // measured against where the page will rest: a sideways slide still in
+  // flight gives positions that do not add up, so finish it first
+  if (Math.abs(doc.body.scrollLeft - page * W) > 1) doc.body.scrollLeft = page * W;
   const at = x => Math.max(0, Math.min(pages - 1, Math.floor((x + doc.body.scrollLeft + 2) / W)));
   const rs = el.getClientRects();
   if (!rs.length) { const p = at(el.getBoundingClientRect().left); return [p, p]; }
