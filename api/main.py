@@ -206,7 +206,10 @@ async def _signed_out_block(request: Request):
         return None
     path = request.url.path
     if request.method not in ("GET", "HEAD", "OPTIONS"):
-        if path.startswith("/api/") and not path.startswith("/api/login"):
+        # the PIN and the kids' list belong to this install, not to the
+        # Telegram account: they work whether or not anybody is signed in
+        if path.startswith("/api/") and not path.startswith(
+                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/")):
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
