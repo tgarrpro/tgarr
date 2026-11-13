@@ -7364,35 +7364,15 @@ async def api_usenet_settings(request: Request):
 async def page_settings_usenet(request: Request):
     cfg = await _usenet_cfg(fresh=True)
     ready = await _usenet_ready() if cfg.get("enabled") and cfg.get("host") else False
-    async with db_pool.acquire() as conn:
-        kinds = await conn.fetch("""SELECT kind, count(*) AS n, COALESCE(sum(size), 0) AS b,
-                                           count(*) FILTER (WHERE alive >= 0.99) AS there
-                                    FROM usenet_cards GROUP BY 1 ORDER BY 2 DESC""")
-        prog = await conn.fetch("SELECT * FROM usenet_progress ORDER BY grp")
-        today = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_today'") or ""
-    day = time.strftime("%Y-%m-%d", time.gmtime())
-    used = int(today.split(":")[1]) if today.startswith(day + ":") else 0
     state = ('<span class="pill ok">working</span>' if ready else
              '<span class="pill muted">switched off</span>' if not cfg.get("enabled") else
              f'<span class="pill bad">not working</span> <span style="color:var(--muted)">{html.escape(_USENET["msg"])}</span>')
     base = _base_url(request)
-    cards_html = "".join(
-        f'<div class="card"><div class="n">{r["n"]:,}</div><div class="l">{html.escape(r["kind"])}</div>'
-        f'<div class="s">{(_fmt_size(r["b"]) or "0")} · {r["there"]:,} fully there</div></div>' for r in kinds)
-    prog_html = "".join(
-        f'<tr><td>{html.escape(r["grp"])}</td><td class="num">{(r["headers"] or 0):,}</td><td class="num">{(r["cards"] or 0):,}</td>'
-        f'<td class="num">{(_fmt_size(r["bytes"] or 0) or "0")}</td>'
-        f'<td class="num">{(100 * ((r["next_article"] or 0) - (r["first_article"] or 0)) // max(1, (r["last_article"] or 1) - (r["first_article"] or 0))) if r["next_article"] else 0}%</td>'
-        f'<td>{html.escape(r["note"] or "")}</td></tr>' for r in prog)
     body = f"""<style>.un-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
 .un-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0}}
 .un-grid label{{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--muted)}}
 .un-grid input{{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
-.un-stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}}
-.un-stats .card{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px}}
-.un-stats .n{{font-size:24px;font-weight:700}}.un-stats .l{{color:var(--muted)}}.un-stats .s{{color:var(--muted);font-size:12px;margin-top:4px}}
-.un-t{{width:100%;border-collapse:collapse}}.un-t td,.un-t th{{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left;font-size:14px}}
-.un-t .num{{text-align:right;white-space:nowrap}}</style>
+</style>
 <div class="un-box"><h3 style="margin:0 0 6px">Usenet account {state}</h3>
 <p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
 card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
@@ -7402,16 +7382,11 @@ tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet 
 <label>Port<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
 <label>User name<input id="unUser" value="{html.escape(cfg.get("user") or "", quote=True)}" autocomplete="off"/></label>
 <label>Password<input id="unPass" type="password" placeholder="{"kept - leave empty to keep it" if cfg.get("pass") else ""}" autocomplete="new-password"/></label>
-<label>Headers read per day (about 350 bytes each)<input id="unDay" type="number" step="100000" value="{cfg.get("per_day", 2000000)}"/></label>
+<label>Data it may use per day, in MB<input id="unDay" type="number" step="100" min="0" value="{round(cfg.get("per_day", 2000000) * 350 / 1e6)}"/></label>
 </div>
 <label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
 <label style="display:flex;gap:8px;align-items:center;margin:6px 0 14px"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""}/> <b>Use Usenet</b></label>
 <button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span></div>
-<h2 class="section">Found so far</h2>
-<div class="un-stats">{cards_html or '<div class="card"><div class="l">nothing yet</div></div>'}
-<div class="card"><div class="n">{used:,}</div><div class="l">headers read today</div><div class="s">of {cfg.get("per_day", 0):,} allowed</div></div></div>
-<div class="un-box" style="padding:6px 10px"><table class="un-t"><thead><tr><th>newsgroup</th><th class="num">headers read</th><th class="num">cards</th>
-<th class="num">downloaded</th><th class="num">through the group</th><th></th></tr></thead><tbody>{prog_html or '<tr><td colspan="6" style="color:var(--muted)">not started</td></tr>'}</tbody></table></div>
 <h2 class="section">In Sonarr and Radarr</h2>
 <div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
 <p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
@@ -7423,7 +7398,7 @@ function unSave(){{
     enabled: document.getElementById("unOn").checked, host: document.getElementById("unHost").value,
     port: +document.getElementById("unPort").value, ssl: document.getElementById("unSsl").checked,
     user: document.getElementById("unUser").value, password: document.getElementById("unPass").value,
-    per_day: +document.getElementById("unDay").value}})}}).then(r => r.json())
+    per_day: Math.round(+document.getElementById("unDay").value * 1e6 / 350)}})}}).then(r => r.json())
     .then(j => {{ m.textContent = j.working ? "saved - the server answers" : "saved - " + (j.message || "not working"); setTimeout(() => location.reload(), 1200); }})
     .catch(() => {{ m.textContent = "could not save"; }});
 }}
