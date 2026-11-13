@@ -143,7 +143,7 @@ _KID_OK: dict = {}                     # message id / thumb file -> (allowed, ch
 _KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw'
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
                     OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
-_LOCKED_OPEN = ("/kids", "/unlock", "/api/unlock")
+_LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock")
 
 
 async def _access_cfg(fresh: bool = False) -> dict:
@@ -197,7 +197,7 @@ async def _locked_block(request: Request):
                 WHERE m.thumb_path = $1 AND {_KID_SQL} LIMIT 1""", path[len("/thumbs/"):]):
             return None
         if "text/html" in (request.headers.get("accept") or "") and not path.startswith("/api/"):
-            return RedirectResponse("/kids", status_code=303)
+            return RedirectResponse("/mediacenter", status_code=303)
     return JSONResponse({"status": "locked", "message": "enter the PIN to do this"}, status_code=403)
 
 
@@ -5333,7 +5333,7 @@ def _user_block() -> str:
         '<div class="ub-menu" id="tgUserMenu" hidden>'
         '<a href="/settings">Settings</a>'
         '<a href="/system">System status</a>'
-        '<a href="/kids/manage">Kids mode &amp; PIN</a>'
+        '<a href="/mediacenter/manage">Media Center &amp; PIN</a>'
         + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
            if uname else '')
         + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
@@ -5398,7 +5398,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
         f'<a href="{path}" class="navlink{" active" if path == active else ""}">'
         f'{_icon(svg)}<span>{name}</span></a>'
         # a locked browser is shown the kids' pages and nothing else
-        for path, name, svg in ([("/kids", "Kids", "M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z")]
+        for path, name, svg in ([("/mediacenter", "Media Center", "M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z")]
                                 if locked else NAV_ITEMS)
     )
     if top_actions_html is None:
@@ -7049,12 +7049,12 @@ button{margin-top:12px;width:100%;padding:12px;font:inherit;font-size:15px;font-
   border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.6}
 #err{color:#b91c1c;font-size:14px;min-height:20px;margin-top:10px}a{color:#0284c7;font-size:13px}
 </style></head><body><div class="card">
-<h1>Enter the PIN</h1><p>This tgarr shows only the kids' list until its PIN is entered.</p>
+<h1>Enter the PIN</h1><p>For grown-ups: enter the PIN to open all of tgarr.</p>
 <form id="f" autocomplete="off">
 <input type="password" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="12" autofocus aria-label="PIN"/>
 <label><input type="checkbox" id="rem"/> keep this browser unlocked for 30 days</label>
 <button id="b" type="submit">Unlock</button><div id="err"></div></form>
-<a href="/kids">&larr; back to the kids' pages</a></div>
+<a href="/mediacenter">&larr; back to the Media Center</a></div>
 <script>
 document.getElementById("f").addEventListener("submit", async function (e) {
   e.preventDefault();
@@ -7163,25 +7163,242 @@ async def api_kids_allow(request: Request):
     return {"status": "ok", "on": on}
 
 
-_KID_KINDS = {
-    "video": ("🎬 Videos", "m.media_type = 'video'"),
-    "audio": ("🎵 Music", "m.media_type = 'audio'"),
-    "book": ("📚 Books", r"m.file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz)$'"),
-    "photo": ("🖼 Photos", "m.media_type = 'photo'"),
+_MC_KINDS = {
+    # key: (label, icon, colour, SQL)
+    "video": ("Watch", "🎬", "#f97066", "m.media_type = 'video'"),
+    "audio": ("Listen", "🎧", "#12b5a6", "m.media_type = 'audio'"),
+    "book": ("Read", "📖", "#f5a524", r"m.file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz)$'"),
+    "photo": ("Photos", "🖼️", "#8b6cf6", "m.media_type = 'photo'"),
 }
+_MC_JUNK_RX = re.compile(
+    r"\b(2160p|1080p|720p|480p|4k|uhd|hdr\d*|dv|x26[45]|h\.?26[45]|hevc|avc|web-?dl|webrip|bluray|blu-ray|bdrip|"
+    r"hdtv|dvdrip|remux|aac\d?(\.\d)?|ddp?\d?(\.\d)?|atmos|dts(-hd)?|flac|mp3|10bit|8bit|repack|proper|"
+    r"高码率?|高清|超清|蓝光|国语|粤语|中字|双语|内封|简繁|英字)\b", re.I)
+
+
+def _friendly_name(file_name, caption) -> str:
+    """A title a person would say aloud, from a file name: no extension, no
+    dots and underscores, no technical tags, no '@channel' advert."""
+    t = (file_name or "").strip()
+    if not t:
+        t = (caption or "").strip().split("\n")[0]
+    t = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", t)
+    t = re.sub(r"[@#][\w.]+", " ", t)                      # @channel, #tag
+    t = re.sub(r"[\[【(（][^\]】)）]{0,40}[\]】)）]", " ", t)    # [group], 【广告】, (2019) goes too - the year is noise here
+    t = t.replace("_", " ").replace(".", " ")
+    t = _MC_JUNK_RX.sub(" ", t)
+    t = re.sub(r"\s*-\s*[A-Za-z0-9]{2,12}\s*$", " ", t)    # -GROUP at the end
+    t = re.sub(r"\s{2,}", " ", t).strip(" -–—_·|")
+    return (t or (file_name or "untitled"))[:80]
+
+
+_MEDIACENTER_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>Media Center</title>
+<link rel="icon" href="/favicon.svg"/>
+<style>
+:root{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--accent:__COLOR__;
+  --shadow:0 6px 18px rgba(64,40,10,.10);--r:22px}
+@media (prefers-color-scheme:dark){:root{--bg:#191624;--card:#262234;--ink:#f3eefc;--soft:#a79fbd;--line:#342f45;
+  --shadow:0 6px 18px rgba(0,0,0,.35)}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+a{color:inherit;text-decoration:none}
+.top{display:flex;align-items:center;gap:14px;padding:18px clamp(16px,4vw,44px) 6px}
+.logo{font-size:26px;font-weight:800;letter-spacing:-.5px;display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+.logo i{font-style:normal;font-size:30px}
+.grown{font-size:13px;color:var(--soft);padding:9px 14px;border-radius:999px;border:1.5px solid var(--line);
+  background:var(--card);white-space:nowrap}
+.grown:hover{border-color:var(--accent);color:var(--ink)}
+.cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);
+  padding:14px clamp(16px,4vw,44px) 4px}
+.cat{background:var(--card);border-radius:var(--r);padding:clamp(14px,2.4vw,24px) 10px;text-align:center;
+  box-shadow:var(--shadow);border:3px solid transparent;transition:transform .15s, border-color .15s}
+.cat:hover{transform:translateY(-3px)}
+.cat .ic{font-size:clamp(34px,6vw,56px);line-height:1.1;display:block}
+.cat b{display:block;font-size:clamp(15px,2.2vw,21px);margin-top:6px}
+.cat small{color:var(--soft);font-size:13px}
+.cat.on{border-color:var(--c);background:color-mix(in srgb, var(--c) 12%, var(--card))}
+.find{padding:16px clamp(16px,4vw,44px) 0;display:flex;gap:10px}
+.find input{flex:1;max-width:520px;font:inherit;font-size:18px;padding:13px 20px;border-radius:999px;
+  border:2px solid var(--line);background:var(--card);color:var(--ink);outline:none}
+.find input:focus{border-color:var(--accent)}
+.find button{font:inherit;font-size:17px;font-weight:700;padding:0 24px;border-radius:999px;border:0;
+  background:var(--accent);color:#fff;cursor:pointer}
+h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items:center;gap:8px}
+.row{display:flex;gap:14px;overflow-x:auto;padding:2px clamp(16px,4vw,44px) 10px;scrollbar-width:none}
+.row::-webkit-scrollbar{display:none}
+.row .card{flex:0 0 clamp(170px,22vw,240px)}
+.grid{display:grid;gap:clamp(12px,2vw,22px);padding:0 clamp(16px,4vw,44px);
+  grid-template-columns:repeat(auto-fill,minmax(clamp(150px,20vw,230px),1fr))}
+.grid.book{grid-template-columns:repeat(auto-fill,minmax(clamp(120px,15vw,170px),1fr))}
+.grid.photo{grid-template-columns:repeat(auto-fill,minmax(clamp(110px,14vw,170px),1fr));gap:8px}
+.card{background:var(--card);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);display:flex;
+  flex-direction:column;transition:transform .15s, box-shadow .15s;position:relative}
+.card:hover,.card:focus-visible{transform:translateY(-4px) scale(1.015);box-shadow:0 12px 26px rgba(64,40,10,.18);outline:none}
+.pic{aspect-ratio:16/10;background:linear-gradient(135deg,color-mix(in srgb,var(--c) 55%,#fff),var(--c));
+  display:flex;align-items:center;justify-content:center;font-size:54px;position:relative;overflow:hidden}
+.pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.book .pic{aspect-ratio:3/4}.photo .pic{aspect-ratio:1/1}.audio .pic{aspect-ratio:1/1}
+.play{position:absolute;right:10px;bottom:10px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.94);
+  display:flex;align-items:center;justify-content:center;font-size:20px;color:var(--c);box-shadow:0 3px 10px rgba(0,0,0,.25)}
+.saved{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.94);color:#157f3d;font-size:11.5px;font-weight:700;
+  padding:3px 9px;border-radius:999px}
+.name{padding:11px 14px 14px;font-size:15.5px;font-weight:700;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.photo .name{display:none}
+.empty{margin:30px clamp(16px,4vw,44px);padding:46px 20px;text-align:center;background:var(--card);border-radius:var(--r);
+  color:var(--soft);font-size:17px;box-shadow:var(--shadow)}
+.empty i{display:block;font-size:54px;font-style:normal;margin-bottom:10px}
+.more{display:flex;gap:12px;justify-content:center;padding:26px 16px 50px}
+.more a{font-size:17px;font-weight:700;padding:13px 28px;border-radius:999px;background:var(--card);box-shadow:var(--shadow)}
+.more a.go{background:var(--accent);color:#fff}
+.lb{position:fixed;inset:0;background:rgba(10,8,18,.93);display:none;align-items:center;justify-content:center;z-index:9}
+.lb.on{display:flex}.lb img{max-width:96vw;max-height:92vh;border-radius:12px}
+.lb button{position:fixed;top:14px;right:16px;width:50px;height:50px;border-radius:50%;border:0;font-size:24px;cursor:pointer}
+.lb .nv{top:50%;transform:translateY(-50%)}.lb .pv{left:14px;right:auto}.lb .nx{right:14px}
+@media (max-width:560px){.cats{grid-template-columns:repeat(4,1fr);gap:8px}.cat small{display:none}.logo{font-size:22px}}
+</style></head>
+<body>
+<div class="top">
+  <a class="logo" href="/mediacenter"><i>🌈</i><span>Media Center</span></a>
+  __GROWN__
+</div>
+<nav class="cats">__CATS__</nav>
+<form class="find" method="GET" action="/mediacenter">
+  <input type="hidden" name="kind" value="__KIND__"/>
+  <input type="search" name="q" value="__Q__" placeholder="What are you looking for?" aria-label="search"/>
+  <button type="submit">Find</button>
+</form>
+<div id="recent"></div>
+<h2>__HEADING__</h2>
+__GRID__
+__MORE__
+<div class="lb" id="lb"><button id="lbX" aria-label="close">✕</button>
+  <button class="nv pv" id="lbP" aria-label="previous">‹</button><img id="lbI" alt=""/>
+  <button class="nv nx" id="lbN" aria-label="next">›</button></div>
+<script>
+(function(){
+  var KEY = "tgarr.mc.recent";
+  function load(){ try { return JSON.parse(localStorage.getItem(KEY) || "[]"); } catch (e) { return []; } }
+  // remember what was opened in this browser, to offer it again
+  document.querySelectorAll("a.card[data-id]").forEach(function(a){
+    a.addEventListener("click", function(){
+      if (a.dataset.kind === "photo") return;
+      var r = load().filter(function(x){ return x.id !== a.dataset.id; });
+      r.unshift({id: a.dataset.id, kind: a.dataset.kind, name: a.dataset.name, href: a.getAttribute("href"),
+                 pic: a.dataset.pic || "", c: a.dataset.c, icon: a.dataset.icon});
+      try { localStorage.setItem(KEY, JSON.stringify(r.slice(0, 12))); } catch (e) {}
+    });
+  });
+  var rec = load();
+  if (rec.length && !"__Q__" && !__OFFSET__) {
+    var h = '<h2>⭐ Carry on</h2><div class="row">';
+    rec.forEach(function(x){
+      var name = document.createElement("div"); name.textContent = x.name;
+      h += '<a class="card ' + x.kind + '" style="--c:' + x.c + '" href="' + x.href + '"><div class="pic">' + (x.icon || "") +
+           (x.pic ? '<img loading="lazy" src="' + x.pic + '" alt="" onerror="this.remove()"/>' : "") +
+           '<span class="play">▶</span></div><div class="name">' + name.innerHTML + '</div></a>';
+    });
+    document.getElementById("recent").innerHTML = h + "</div>";
+  }
+  // photos open large, with next and previous
+  var ph = Array.prototype.slice.call(document.querySelectorAll("a.card.photo")), at = 0;
+  var lb = document.getElementById("lb"), im = document.getElementById("lbI");
+  function show(i){ at = (i + ph.length) % ph.length; im.src = ph[at].getAttribute("href"); lb.classList.add("on"); }
+  ph.forEach(function(a, i){ a.addEventListener("click", function(e){ e.preventDefault(); show(i); }); });
+  document.getElementById("lbX").onclick = function(){ lb.classList.remove("on"); im.src = ""; };
+  document.getElementById("lbP").onclick = function(){ show(at - 1); };
+  document.getElementById("lbN").onclick = function(){ show(at + 1); };
+  lb.addEventListener("click", function(e){ if (e.target === lb) document.getElementById("lbX").onclick(); });
+  document.addEventListener("keydown", function(e){
+    if (!lb.classList.contains("on")) return;
+    if (e.key === "Escape") document.getElementById("lbX").onclick();
+    else if (e.key === "ArrowRight") show(at + 1); else if (e.key === "ArrowLeft") show(at - 1);
+  });
+})();
+</script>
+</body></html>"""
+
+
+@app.get("/kids")
+async def page_kids_old():
+    return RedirectResponse("/mediacenter", status_code=308)
+
+
+@app.get("/mediacenter", response_class=HTMLResponse)
+async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
+    """What a locked browser gets: the items on the Media Center list, as a
+    page of its own - large pictures, four big choices, nothing to configure."""
+    kind = kind if kind in _MC_KINDS else "video"
+    offset, per = max(0, int(offset)), 48
+    label, icon, colour, cond = _MC_KINDS[kind]
+    where, params = [_KID_SQL, cond], []
+    for w in (q or "").split()[:6]:
+        params.append(f"%{w}%")
+        where.append(f"COALESCE(m.file_name, m.caption, '') ILIKE ${len(params)}")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT m.id, m.file_name, m.caption,
+                   (m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__') AS saved
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where)}
+            ORDER BY saved DESC, m.posted_at DESC NULLS LAST LIMIT {per + 1} OFFSET {offset}""", *params)
+        counts = {k: await conn.fetchval(f"""
+            SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {_KID_SQL} AND {v[3]}""") for k, v in _MC_KINDS.items()}
+    more, rows = len(rows) > per, rows[:per]
+    locked = _LOCKED.get()
+    cats = "".join(
+        f'<a class="cat{" on" if k == kind else ""}" style="--c:{v[2]}" href="/mediacenter?kind={k}">'
+        f'<span class="ic">{v[1]}</span><b>{v[0]}</b><small>{counts[k]:,}</small></a>'
+        for k, v in _MC_KINDS.items())
+    cards = []
+    for r in rows:
+        name = _friendly_name(r["file_name"], r["caption"])
+        if kind == "book":
+            pic, href, ic = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", "📖"
+        elif kind == "audio":
+            pic, href, ic = "", f"/watch/{r['id']}", "🎵"
+        elif kind == "photo":
+            pic, href, ic = f"/api/thumb/{r['id']}", f"/api/photo-preview/{r['id']}", ""
+        else:
+            pic, href, ic = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", "🎬"
+        img = f'<img loading="lazy" src="{pic}" alt="" onerror="this.remove()"/>' if pic else ""
+        cards.append(
+            f'<a class="card {kind}" style="--c:{colour}" href="{href}" data-id="{r["id"]}" data-kind="{kind}" '
+            f'data-name="{html.escape(name, quote=True)}" data-pic="{pic}" data-c="{colour}" data-icon="{ic}">'
+            f'<div class="pic">{ic}{img}'
+            + ('<span class="saved">ready</span>' if r["saved"] and kind != "photo" else "")
+            + ('' if kind == "photo" else '<span class="play">▶</span>')
+            + f'</div><div class="name">{html.escape(name)}</div></a>')
+    if cards:
+        grid = f'<div class="grid {kind}">{"".join(cards)}</div>'
+    elif q:
+        grid = '<div class="empty"><i>🔎</i>Nothing found. Try another word?</div>'
+    else:
+        grid = ('<div class="empty"><i>🌱</i>Nothing here yet.<br/>A grown-up can add things to the Media Center.</div>')
+    qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
+    nav = ""
+    if offset or more:
+        nav = ('<div class="more">'
+               + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← Back</a>' if offset else "")
+               + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">More →</a>' if more else "")
+               + "</div>")
+    grown = ('<a class="grown" href="/unlock" title="for grown-ups">🔒 Grown-ups</a>' if locked else
+             '<a class="grown" href="/mediacenter/manage">⚙ Choose what is shown</a>'
+             '<a class="grown" href="/">← Back to tgarr</a>')
+    heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
+    page = (_MEDIACENTER_HTML.replace("__COLOR__", colour).replace("__GROWN__", grown).replace("__CATS__", cats)
+            .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
+            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
+            .replace("__GRID__", grid).replace("__MORE__", nav))
+    return HTMLResponse(page)
+
+
 _KIDS_CSS = """<style>
-.kd-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-.kd-tab{padding:9px 16px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--fg);
-  text-decoration:none;font-weight:600;font-size:15px}
-.kd-tab.on{background:var(--accent);color:#fff;border-color:var(--accent)}
-.kd-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px}
-.kd-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;text-decoration:none;
-  color:var(--fg);display:flex;flex-direction:column}
-.kd-card:hover{border-color:var(--accent)}
-.kd-pic{aspect-ratio:16/10;background:#e2e8f0 center/cover no-repeat;display:flex;align-items:center;justify-content:center;font-size:40px}
-.kd-card.book .kd-pic{aspect-ratio:3/4}
-.kd-name{padding:10px 12px;font-size:14px;line-height:1.35;word-break:break-word}
-.kd-empty{padding:50px 20px;text-align:center;color:var(--muted)}
 .km-row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--border)}
 .km-row:last-child{border-bottom:none}.km-row span.n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .km-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:22px;overflow:hidden}
@@ -7190,60 +7407,7 @@ _KIDS_CSS = """<style>
 </style>"""
 
 
-@app.get("/kids", response_class=HTMLResponse)
-async def page_kids(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
-    kind = kind if kind in _KID_KINDS else "video"
-    offset = max(0, int(offset))
-    where, params = [_KID_SQL, _KID_KINDS[kind][1]], []
-    for w in (q or "").split()[:6]:
-        params.append(f"%{w}%")
-        where.append(f"COALESCE(m.file_name, m.caption, '') ILIKE ${len(params)}")
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(f"""
-            SELECT m.id, m.file_name, m.caption, m.media_type,
-                   (m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__') AS saved
-            FROM messages m JOIN channels c ON c.id = m.channel_id
-            WHERE {' AND '.join(where)}
-            ORDER BY saved DESC, m.posted_at DESC NULLS LAST LIMIT 61 OFFSET {offset}""", *params)
-        counts = {k: await conn.fetchval(f"""
-            SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
-            WHERE {_KID_SQL} AND {v[1]}""") for k, v in _KID_KINDS.items()}
-    more, rows = len(rows) > 60, rows[:60]
-    tabs = "".join(
-        f'<a class="kd-tab{" on" if k == kind else ""}" href="/kids?kind={k}">{v[0]} '
-        f'<span style="opacity:.7">{counts[k]:,}</span></a>' for k, v in _KID_KINDS.items())
-    cards = []
-    for r in rows:
-        name = (r["file_name"] or (r["caption"] or "").strip().split("\n")[0] or "untitled")[:90]
-        if kind == "book":
-            pic, href, icon = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", ""
-        elif kind == "audio":
-            pic, href, icon = "", f"/watch/{r['id']}", "🎵"
-        elif kind == "photo":
-            pic, href, icon = f"/api/thumb/{r['id']}", f"/api/photo-preview/{r['id']}", ""
-        else:
-            pic, href, icon = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", ""
-        style = f' style="background-image:url({pic})"' if pic else ""
-        cards.append(f'<a class="kd-card {kind}" href="{href}"><div class="kd-pic"{style}>{icon}</div>'
-                     f'<div class="kd-name">{html.escape(name)}</div></a>')
-    grid = (f'<div class="kd-grid">{"".join(cards)}</div>' if cards else
-            '<div class="kd-empty">Nothing here yet. A grown-up can add things to the kids\' list.</div>')
-    nav = ""
-    if offset or more:
-        qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
-        nav = ('<div style="display:flex;gap:10px;justify-content:center;margin-top:20px">'
-               + (f'<a class="btn ghost" href="/kids?{qs}&offset={max(0, offset - 60)}">&larr; Back</a>' if offset else "")
-               + (f'<a class="btn ghost" href="/kids?{qs}&offset={offset + 60}">More &rarr;</a>' if more else "")
-               + "</div>")
-    search = (f'<form method="GET" action="/kids" style="display:flex;gap:8px;margin-bottom:16px">'
-              f'<input type="hidden" name="kind" value="{kind}"/>'
-              f'<input class="km-in" type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-              f'placeholder="find…" style="flex:1;max-width:360px"/><button class="btn" type="submit">Search</button></form>')
-    return HTMLResponse(_layout("Kids", "/kids", _KIDS_CSS + f'<div class="kd-tabs">{tabs}</div>{search}{grid}{nav}',
-                                top_actions_html=""))
-
-
-@app.get("/kids/manage", response_class=HTMLResponse)
+@app.get("/mediacenter/manage", response_class=HTMLResponse)
 async def page_kids_manage(q: Optional[str] = None):
     cfg = await _access_cfg(fresh=True)
     async with db_pool.acquire() as conn:
@@ -7274,9 +7438,9 @@ async def page_kids_manage(q: Optional[str] = None):
     pin_box = (
         '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">PIN</h3>'
         + ('<p style="color:var(--muted);margin:0 0 12px">A PIN is set. Any browser that has not entered it sees only '
-           'the kids\' list below. This browser is unlocked.</p>' if cfg["pin"] else
+           'the Media Center with what is ticked below. This browser is unlocked.</p>' if cfg["pin"] else
            '<p style="color:var(--muted);margin:0 0 12px"><b style="color:#b45309">No PIN is set:</b> anybody who opens '
-           'this address sees everything you see. Set a PIN and other browsers get only the kids\' list.</p>')
+           'this address sees everything you see. Set a PIN and other browsers get only the Media Center.</p>')
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
         + ('<input class="km-in" id="kmCur" type="password" inputmode="numeric" maxlength="12" placeholder="current PIN" style="width:140px"/>'
            if cfg["pin"] else "")
@@ -7290,7 +7454,7 @@ async def page_kids_manage(q: Optional[str] = None):
         f'<label class="km-row">{box("channel", c["id"], c["allowed"], "disabled" if c["audience"] != "sfw" else "")}'
         f'<span class="n">{html.escape(c["title"] or c["username"] or "chat")}'
         + (f' <small>@{html.escape(c["username"])}</small>' if c["username"] else ' <small>🔒 private</small>')
-        + (' <small>· 18+, never shown to kids</small>' if c["audience"] != "sfw" else "")
+        + (' <small>· 18+, never shown there</small>' if c["audience"] != "sfw" else "")
         + f'</span><small>{c["n"]:,} items</small></label>' for c in chans)
     ico = {"video": "🎬", "audio": "🎵", "photo": "🖼"}
     item_rows = "".join(
@@ -7301,18 +7465,18 @@ async def page_kids_manage(q: Optional[str] = None):
         f'{html.escape(r["file_name"])} <small>{html.escape(r["title"] or "")}</small></span></label>' for r in found)
     body = (
         _KIDS_CSS + pin_box
-        + '<h2 class="section">Whole channels on the kids\' list</h2>'
-          '<p style="color:var(--muted);margin:-6px 0 12px">Everything in a ticked channel is shown to kids, now and as it grows.</p>'
+        + '<h2 class="section">Whole channels in the Media Center</h2>'
+          '<p style="color:var(--muted);margin:-6px 0 12px">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
         + f'<div class="km-box" style="max-height:420px;overflow:auto">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div>'
         + '<h2 class="section">Single items</h2>'
-        + f'<form method="GET" action="/kids/manage" style="display:flex;gap:8px;margin-bottom:12px">'
+        + f'<form method="GET" action="/mediacenter/manage" style="display:flex;gap:8px;margin-bottom:12px">'
           f'<input class="km-in" type="text" name="q" value="{html.escape(q or "", quote=True)}" placeholder="find a file by name…" style="flex:1;max-width:420px"/>'
           '<button class="btn" type="submit">Search</button></form>'
         + (f'<div class="km-box">{found_rows}</div>' if found else
            ('<div class="km-box"><div class="km-pad" style="color:var(--muted)">nothing found</div></div>' if q else ""))
         + (f'<p style="color:var(--muted);margin:14px 0 8px">On the list now ({len(allowed_items)}):</p>'
            f'<div class="km-box">{item_rows}</div>' if allowed_items else "")
-        + '<p><a class="btn ghost" href="/kids">See the kids\' pages &rarr;</a></p>'
+        + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
         + """<script>
 function kmAllow(kind, ref, el){
   fetch("/api/kids/allow", {method: "POST", headers: {"Content-Type": "application/json"},
@@ -7326,9 +7490,9 @@ function kmPin(remove){
     body: JSON.stringify({pin: remove ? "" : nw.value, current: cur ? cur.value : ""})}).then(r => r.json())
     .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "that did not work"; });
 }
-function kmLock(){ fetch("/api/lock", {method: "POST"}).then(() => { location.href = "/kids"; }); }
+function kmLock(){ fetch("/api/lock", {method: "POST"}).then(() => { location.href = "/mediacenter"; }); }
 </script>""")
-    return HTMLResponse(_layout("Kids mode", "/settings", body, page_title="Kids mode & PIN", top_actions_html=""))
+    return HTMLResponse(_layout("Media Center", "/settings", body, page_title="Media Center & PIN", top_actions_html=""))
 
 
 # A private chat: no public @name and small (see the crawler's
