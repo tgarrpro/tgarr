@@ -6821,11 +6821,16 @@ async def api_deep_backfill_progress():
             -- (done + unfollowed) and purged ones drop off the list — the
             -- moat is the contributed resource data, not the channel row.
             WHERE purged_at IS NULL
+              -- public channels only: a private chat is read and kept whole
+              -- whatever happens, and its name has no business on a status page
+              AND username IS NOT NULL AND local_root IS NULL
               AND (subscribed = TRUE OR is_joined = TRUE
                    OR (COALESCE(enabled, TRUE) = TRUE
                        AND COALESCE(deep_backfilled, FALSE) = FALSE))
             ORDER BY deep_backfilled ASC, COALESCE(remote_msgs, 0) DESC
         """)
+        private_count = await conn.fetchval(
+            "SELECT count(*) FROM channels WHERE username IS NULL AND local_root IS NULL AND COALESCE(is_joined, FALSE)")
         released_count = await conn.fetchval("""
             SELECT count(*) FROM channels
             WHERE purged_at IS NULL
@@ -6867,6 +6872,7 @@ async def api_deep_backfill_progress():
          "pct_documents": pct(r["local_documents"], r["remote_documents"])}
         for r in rows],
         "released_count": released_count or 0,
+        "private_count": private_count or 0,
         "purged_count": purged_count or 0}
 
 
@@ -7022,7 +7028,8 @@ async function loadDeepBackfill() {
     <th style="text-align:right">Videos</th>
     <th style="text-align:right">Audio</th>
     <th style="text-align:right">Docs</th>
-    <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+    <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    + (j.private_count ? `<div style="font-size:12.5px;color:#64748b;margin-top:8px">Your ${j.private_count} private chat${j.private_count == 1 ? " is" : "s are"} read and kept whole; they are not listed here.</div>` : "");
 }
 loadWorkers(); loadDeepBackfill();
 setInterval(loadWorkers, 30000);
@@ -7487,10 +7494,16 @@ async def api_channel_subscribe(username: str = Form(...)):
 
 @app.post("/api/channel/unsubscribe/{tg_chat_id}")
 async def api_channel_unsubscribe(tg_chat_id: int):
+    """Stop reading a public channel and let its index be cleared.
+    Also for a channel that is not followed at all: tgarr joins some channels
+    by itself, reads them and leaves again, and such a channel stayed in the
+    list for good - not followed, not joined, with a "+ Follow" button and no
+    way to take it off. Never a chat the account is in, never a private one."""
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """UPDATE channels SET subscribed=FALSE, unfollowed_at=NOW()
-               WHERE tg_chat_id=$1 AND subscribed=TRUE""", tg_chat_id)
+            """UPDATE channels SET subscribed = FALSE, unfollowed_at = COALESCE(unfollowed_at, NOW())
+               WHERE tg_chat_id = $1 AND username IS NOT NULL AND local_root IS NULL
+                 AND (subscribed = TRUE OR COALESCE(is_joined, FALSE) = FALSE)""", tg_chat_id)
     return {"status": "ok"}
 
 
@@ -7731,6 +7744,10 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         elif not r["is_joined"] and not r["dead_at"] and r["username"]:
             act = (f'<button class="abtn pri" {_ids} onclick="tgFollow(this)" '
                    f'title="read this public channel again, without joining it">+ Follow</button>')
+            if not r["unfollowed_at"]:
+                # not followed, not joined, and nobody ever unfollowed it: it can be taken off the list
+                act += (f' <button class="abtn" {_ids} onclick="tgRemove(this)" '
+                        f'title="take this channel and its index off this tgarr">Remove</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
@@ -7795,6 +7812,14 @@ function tgUnfollow(b) {
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChSet(b, false); })
     .catch(function (e) { tgChFail(b, "Unfollow", e.message); });
+}
+function tgRemove(b) {
+  if (!confirm("Remove this channel from tgarr?\n\nIts films and files leave the index within a few hours. "
+               + "Files you saved and favourites stay. It can be followed again from Discover.")) return;
+  b.disabled = true; b.textContent = "…";
+  fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChGone(b, "Removed"); })
+    .catch(function (e) { tgChFail(b, "Remove", e.message); });
 }
 function tgFollow(b) {
   b.disabled = true; b.textContent = "…";
