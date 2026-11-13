@@ -104,4 +104,20 @@ ok(U.decode(b"=?UTF-8?B?5Lit5paH?= title") == "中文 title" or "中文" in U.de
 ok(U.decode(b"caf\xe9") == "café", "Latin-1 when it is not UTF-8")
 ok(U.when("Tue, 01 Mar 2011 10:00:00 +0000") == 1298973600 and U.when("nonsense") is None, "dates")
 
+# "no articles selected" is an empty answer
+class _NN(U.NNTP):
+    def __init__(self, code):
+        self.code = code
+
+    def cmd(self, line):
+        return self.code, "x"
+
+
+ok(_NN(420).over(1, 50) == [] and _NN(423).over(1, 50) == [], "a range with nothing in it is an empty list, by either number the server uses")
+try:
+    _NN(480).over(1, 50)
+    ok(False, "any other refusal must still be an error")
+except U.NNTPError:
+    ok(True, "any other refusal is still an error")
+
 print(f"ok - {n} checks")

@@ -95,7 +95,7 @@ class NNTP:
         if code in (400, 500, 501, 502) and verb == "OVER":
             self._over = "XOVER"
             code, _text = self.cmd(f"XOVER {lo}-{hi}")
-        if code == 423:
+        if code in (420, 423):            # "no article with that number" / "no articles selected": nothing there
             return []
         if code != 224:
             raise NNTPError(f"OVER {code} {_text[:80]}")

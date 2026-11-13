@@ -8707,7 +8707,9 @@ async def _usenet_index_worker():
     logu = logging.getLogger("tgarr")
     await asyncio.sleep(40)
     tidied = 0.0
+    failed = {}                                    # window id -> when reading it last failed
     while True:
+        w = None
         try:
             if time.time() - tidied > 3600:            # at start, and every hour: whatever way cards came in
                 tidied = time.time()
@@ -8726,6 +8728,10 @@ async def _usenet_index_worker():
                 continue
             uuid_ = await _instance_uuid()
             wins = await asyncio.to_thread(usenet_client.lease, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], None, 0)
+            # A window that could not be read is left alone for six hours. The registry gives
+            # back what an install still holds, so without this one bad window was handed out
+            # again every ten minutes and nothing else was ever read.
+            wins = [x for x in wins if time.time() - failed.get(x["id"], 0) > 6 * 3600]
             if not wins:
                 _UN_INDEX["state"] = "nothing to do right now"
                 await asyncio.sleep(1800)
@@ -8755,7 +8761,13 @@ async def _usenet_index_worker():
         except Exception as e:
             _UN_INDEX["state"] = f"waiting after a problem: {type(e).__name__}: {str(e)[:120]}"
             logu.warning("[usenet-index] %s: %s", type(e).__name__, str(e)[:200])
-            await asyncio.sleep(600)
+            if w is not None:
+                if len(failed) > 500:
+                    failed.clear()
+                failed[w["id"]] = time.time()
+                await asyncio.sleep(60)            # this window is set aside: on to the next one
+            else:
+                await asyncio.sleep(600)           # the registry or the settings: wait
 
 
 async def _usenet_from_registry(q: str) -> int:
