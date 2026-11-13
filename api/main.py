@@ -7984,6 +7984,14 @@ _KIDS_CSS = """<style>
 .km-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:22px;overflow:hidden}
 .km-pad{padding:16px 18px}.km-row small{color:var(--muted)}
 .km-chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+/* channels and single files side by side where there is room */
+.km-two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 26px;align-items:start}
+.km-two > div{min-width:0}
+.km-list{height:min(62vh,640px);overflow:auto}
+.km-two h2.section{margin-top:8px}
+/* the note under each heading takes two lines at most, so the two lists start level */
+.km-two h2.section + p{min-height:2.9em}
+@media (max-width:1100px){.km-two{grid-template-columns:minmax(0,1fr)}.km-two h2.section + p{min-height:0}.km-list{height:auto;max-height:520px}}
 .km-in{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}
 </style>"""
 
@@ -8101,15 +8109,18 @@ async def page_kids_manage():
             + '</div>')
     body = (
         _KIDS_CSS + pin_box + time_box
+        + '<div class="km-two"><div>'
         + '<h2 class="section">Whole channels in the Media Center</h2>'
           '<p style="color:var(--muted);margin:-6px 0 12px">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
-        + f'<div class="km-box" style="max-height:420px;overflow:auto">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div>'
+        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div>'
+        + '</div><div>'
         + '<h2 class="section">Single files</h2>'
           '<p style="color:var(--muted);margin:-6px 0 12px">The files already saved on this machine. Tick the ones to show in the Media Center.</p>'
         + (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">{chips}</div>'
-           f'<div class="km-box" id="kmItems" style="max-height:560px;overflow:auto">{item_rows}</div>' if items else
+           f'<div class="km-box km-list" id="kmItems">{item_rows}</div>' if items else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing is saved yet. Files you open in a player '
            'are kept and appear here.</div></div>')
+        + '</div></div>'
         + used_box
         + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
         + """<script>
