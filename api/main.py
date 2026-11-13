@@ -2755,6 +2755,7 @@ button.on{background:var(--acc,#2563eb);color:#fff;border-color:var(--acc,#2563e
   <button id="tocBtn" title="table of contents">&#9776;<span class="hide-s"> Contents</span></button>
   <div class="ttl" id="ttl">__TITLE__</div>
   <button id="readBtn" title="read aloud from here; the page follows the voice (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
+  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
   <button id="fsDown" title="smaller text">A&minus;</button>
   <button id="fsUp" title="larger text">A+</button>
   <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
@@ -2789,9 +2790,18 @@ const $ = id => document.getElementById(id);
 const fr = $("bk");
 let titles = [], ch = 0, page = 0, pages = 1, W = 0, doc = null, pendingFrac = 0, busy = false;
 let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.reader") || "{}"); } catch (e) {}
-let fs = st.fs || 18, theme = st.theme || "light", mode = st.mode || "paged";
+let fs = st.fs || 18, theme = st.theme || "light", mode = st.mode || "paged", two = !!st.two;
+const calm = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+// two pages only where there is room for them
+const spread = () => two && mode === "paged" && W >= 900;
+// turning a page: the text slides sideways, the new page coming in as the old one leaves
+function slide(){
+  const x = page * W;
+  if (calm) { doc.body.scrollLeft = x; return; }
+  try { doc.body.scrollTo({left: x, behavior: "smooth"}); } catch (e) { doc.body.scrollLeft = x; }
+}
 const THEMES = {light: ["#ffffff", "#1f2937"], sepia: ["#f6efdc", "#433422"], dark: ["#15181d", "#c9d1d9"]};
-function saveSt(){ try { localStorage.setItem("tgarr.reader", JSON.stringify({fs, theme, mode})); } catch (e) {} }
+function saveSt(){ try { localStorage.setItem("tgarr.reader", JSON.stringify({fs, theme, mode, two})); } catch (e) {} }
 function frac(){
   if (mode === "paged") return pages > 1 ? page / (pages - 1) : 0;
   const se = doc && doc.scrollingElement; if (!se) return 0;
@@ -2803,9 +2813,14 @@ function css(){
   let s = "html{background:" + c[0] + "}body{background:" + c[0] + ";color:" + c[1] + ";font-size:" + fs + "px}" +
           ".tg-reading{background:rgba(250,204,21," + (theme === "dark" ? ".22" : ".32") + ");border-radius:3px}";
   if (mode === "paged") {
-    const col = Math.min(W - 44, 860), P = Math.max(22, Math.round((W - col) / 2));
+    // one screen = one column with a margin P either side; or two columns
+    // with the same 2P between them as between screens, so a screen is
+    // always exactly W wide whichever it is
+    const col = Math.min(W - 44, 860);
+    const P = spread() ? Math.max(24, Math.round(W * 0.035)) : Math.max(22, Math.round((W - col) / 2));
+    const cw = spread() ? Math.floor((W - 4 * P) / 2) : W - 2 * P;
     s += "html{height:100%;overflow:hidden}" +
-         "body{margin:0;height:100vh;box-sizing:border-box;padding:26px " + P + "px;column-width:" + (W - 2 * P) +
+         "body{margin:0;height:100vh;box-sizing:border-box;padding:26px " + P + "px;column-width:" + cw +
          "px;column-gap:" + (2 * P) + "px;column-fill:auto;overflow:hidden}" +
          "img,svg{max-height:calc(100vh - 90px);width:auto;max-width:100%;break-inside:avoid}" +
          "h1,h2,h3,h4{break-after:avoid}";
@@ -2822,6 +2837,7 @@ function layout(keep){
   el.textContent = css();
   document.body.dataset.theme = theme; document.body.dataset.mode = mode;
   $("modeLbl").textContent = mode === "paged" ? "Scroll" : "Pages";
+  $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
   if (mode === "paged") {
     pages = Math.max(1, Math.round(doc.body.scrollWidth / W));
     page = Math.min(pages - 1, Math.max(0, Math.round(keep * (pages - 1))));
@@ -2859,7 +2875,7 @@ function go(d){
   if (busy || !doc) return;
   hideTip(); userMoved();
   if (mode === "paged") {
-    if (page + d >= 0 && page + d < pages) { page += d; doc.body.scrollLeft = page * W; ui(); return; }
+    if (page + d >= 0 && page + d < pages) { page += d; slide(); ui(); return; }
   } else {
     const se = doc.scrollingElement, max = se.scrollHeight - se.clientHeight, step = se.clientHeight * 0.9;
     if ((d > 0 && se.scrollTop < max - 2) || (d < 0 && se.scrollTop > 2)) { se.scrollTop += d * step; setTimeout(ui, 60); return; }
@@ -2876,6 +2892,7 @@ function onKey(e){
   else if (k === "End") { e.preventDefault(); userMoved(); load(titles.length - 1, 1); }
   else if (k === "Escape") toc(false);
   else if ((k === "r" || k === "R") && !e.ctrlKey && !e.metaKey) $("readBtn").click();
+  else if (k === "2") $("twoBtn").click();
 }
 let wheelAt = 0;
 function onWheel(e){
@@ -2926,6 +2943,7 @@ $("fsUp").onclick = () => { fs = Math.min(30, fs + 2); saveSt(); layout(frac());
 $("fsDown").onclick = () => { fs = Math.max(12, fs - 2); saveSt(); layout(frac()); };
 $("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); layout(frac()); };
 $("modeBtn").onclick = () => { const f = frac(); mode = mode === "paged" ? "scroll" : "paged"; saveSt(); layout(f); };
+$("twoBtn").onclick = () => { const f = frac(); two = !two; saveSt(); layout(f); };
 $("slider").addEventListener("change", e => { userMoved(); load(+e.target.value, 0); });
 // ---- read aloud: paragraph by paragraph, the page following the voice ----
 __SPEECH_JS__
@@ -2937,11 +2955,20 @@ function collect(){
     (el.textContent || "").trim() && !Array.from(el.querySelectorAll(BLOCKS)).some(k => (k.textContent || "").trim()));
   return all.length ? all : ((doc.body.textContent || "").trim() ? [doc.body] : []);
 }
-function pageOf(el){ return Math.max(0, Math.floor((el.getBoundingClientRect().left + doc.body.scrollLeft + 2) / W)); }
+// the pages a paragraph starts and ends on: one that runs over a page break
+// has a piece in each column
+function pagesOf(el){
+  const at = x => Math.max(0, Math.min(pages - 1, Math.floor((x + doc.body.scrollLeft + 2) / W)));
+  const rs = el.getClientRects();
+  if (!rs.length) { const p = at(el.getBoundingClientRect().left); return [p, p]; }
+  return [at(rs[0].left), at(rs[rs.length - 1].left)];
+}
+function turnTo(p){ if (p !== page) { page = p; slide(); ui(); } }
 function firstInView(){
   for (let i = 0; i < blocks.length; i++) {
-    const r = blocks[i].getBoundingClientRect();
-    if (mode === "paged" ? pageOf(blocks[i]) >= page : r.bottom > 40) return i;
+    // on this page or after it - a paragraph that began on the page before
+    // and ends on this one counts
+    if (mode === "paged" ? pagesOf(blocks[i])[1] >= page : blocks[i].getBoundingClientRect().bottom > 40) return i;
   }
   return blocks.length;
 }
@@ -2959,13 +2986,22 @@ function readBlock(i){
   }
   const el = blocks[i], text = (el.textContent || "").replace(/\s+/g, " ").trim();
   if (el !== doc.body) el.classList.add("tg-reading");
-  if (mode === "paged") { const p = Math.min(pages - 1, pageOf(el)); if (p !== page) { page = p; doc.body.scrollLeft = page * W; ui(); } }
+  // show the paragraph - unless part of it is already on screen (do not pull
+  // the page back to where it began)
+  const span = mode === "paged" && el !== doc.body ? pagesOf(el) : null;
+  if (span) { if (page < span[0] || page > span[1]) turnTo(span[0]); }
   else if (el !== doc.body) el.scrollIntoView({block: "center", behavior: "smooth"});
   const parts = chunks(text), v = voiceFor(text);
   if (!parts.length) { readBlock(i + 1); return; }
   parts.forEach((part, k) => {
     const u = new SpeechSynthesisUtterance(part);
     if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
+    // a paragraph that runs over the page: turn when the voice gets that far
+    if (span && span[1] > span[0]) u.onstart = () => {
+      if (!reading || run !== readRun) return;
+      const want = span[0] + Math.min(span[1] - span[0], Math.floor(k / parts.length * (span[1] - span[0] + 1)));
+      if (want > page) turnTo(want);
+    };
     if (k === parts.length - 1) u.onend = () => { if (reading && run === readRun) readBlock(i + 1); };
     u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
     synth.speak(u);
@@ -2978,7 +3014,7 @@ function readFromView(){
   readBlock(Math.min(firstInView(), blocks.length - 1));
 }
 // a person turned the page or jumped: read on from what is now in view
-function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 320); }
+function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 450); }
 $("readBtn").onclick = () => {
   if (!synth) { toast("this browser cannot read aloud"); return; }
   if (reading) { stopRead(); return; }
