@@ -11,6 +11,7 @@ via MTProto → drops file in /downloads/tgarr/<release>/ → Sonarr's CDH impor
 """
 import asyncio
 import html
+import io
 import json as _json
 import logging
 import os
@@ -5406,13 +5407,29 @@ async def _local_picture(msg_id: int, col: str, folder: str, px: int):
     if not row or not localfiles.is_local(row["tg_chat_id"]):
         return None
     nothing = Response(_TINY_TRANSPARENT_GIF, status_code=410, media_type="image/gif")
-    if row["media_type"] != "photo" or not _is_local(row["local_path"]):
+    if not _is_local(row["local_path"]):
         return nothing
+    src = os.path.join("/downloads", row["local_path"])
+    if row["media_type"] == "photo":
+        pic = src                                    # a photo: the file itself
+    else:
+        # a film: the frame the browser took while it was uploading it (kept
+        # beside the file); a book: its cover, taken out of it the first time
+        pic = src + ".cover.jpg"
+        if not os.path.exists(pic) and row["media_type"] == "document":
+            e = localfiles.ext(src)
+            if e == "pdf" or e in _EBOOK_CONVERTIBLE:
+                try:
+                    await _ebook_cover(src, pic)
+                except Exception:
+                    pass
+        if not os.path.exists(pic):
+            return nothing
     name = f"local-{msg_id}-{px}.jpg"
     dst = os.path.join(folder, name)
     try:
         os.makedirs(folder, exist_ok=True)
-        await asyncio.to_thread(_local_picture_make, os.path.join("/downloads", row["local_path"]), dst, px)
+        await asyncio.to_thread(_local_picture_make, pic, dst, px)
     except Exception:
         return nothing               # a format that cannot be read here (HEIC, a broken file)
     async with db_pool.acquire() as conn:
@@ -5459,9 +5476,42 @@ async def api_files_upload(request: Request, name: str = ""):
         except OSError:
             pass
         return JSONResponse({"status": "error", "message": str(e)[:120] or "not uploaded"}, status_code=400)
+    rel = f"{localfiles.MINE}/{what[0]}/{fname}"
     async with db_pool.acquire() as conn:
-        await _local_add(conn, localfiles.MINE, [(f"{localfiles.MINE}/{what[0]}/{fname}", written, int(time.time()))])
-    return {"status": "ok", "name": fname, "size": written}
+        await _local_add(conn, localfiles.MINE, [(rel, written, int(time.time()))])
+        mid = await conn.fetchval("SELECT id FROM messages WHERE local_path = $1 ORDER BY id DESC LIMIT 1", rel)
+    return {"status": "ok", "name": fname, "size": written, "id": mid, "kind": what[0]}
+
+
+@app.put("/api/files/thumb/{msg_id}")
+async def api_files_thumb(msg_id: int, request: Request):
+    """The picture for an uploaded film: one frame, taken by the browser that
+    is uploading it (it has the film and can play it; this machine has no
+    video tools). Kept beside the file, so it lasts as long as the film does."""
+    if int(request.headers.get("content-length") or 0) > 800_000:
+        return JSONResponse({"status": "error"}, status_code=413)
+    body = await request.body()
+    async with db_pool.acquire() as conn:
+        lp = await conn.fetchval(
+            """SELECT m.local_path FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE m.id = $1 AND c.local_root = $2""", msg_id, localfiles.MINE)
+    if not body or not _is_local(lp):
+        return JSONResponse({"status": "error"}, status_code=404)
+    cover = os.path.join("/downloads", lp) + ".cover.jpg"
+
+    def _make():
+        from PIL import Image
+        with Image.open(io.BytesIO(body)) as im:      # whatever arrives is redrawn, never stored as sent
+            im.load()
+            im.thumbnail((640, 640))
+            im.convert("RGB").save(cover, "JPEG", quality=82)
+    try:
+        await asyncio.to_thread(_make)
+    except Exception:
+        return JSONResponse({"status": "error", "message": "not a picture"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE messages SET thumb_path = NULL, preview_path = NULL WHERE id = $1", msg_id)
+    return {"status": "ok"}
 
 
 @app.post("/api/files/delete")
@@ -5489,16 +5539,26 @@ async def api_files_delete(request: Request):
 
 
 _FILES_JS = (
-    '<script>var fq=[],fBusy=false,fDone=0,fTotal=0,fBad=0;'
+    '<script>var fq=[],fBusy=false,fDone=0,fTotal=0,fBad=0,fPend=0;'
+    'function fThumb(f,id){try{var v=document.createElement("video"),u=URL.createObjectURL(f),over=false;fPend++;'
+    'function end(){if(over)return;over=true;fPend--;URL.revokeObjectURL(u)}'
+    'v.muted=true;v.preload="metadata";v.src=u;'
+    'v.onloadedmetadata=function(){v.currentTime=Math.min((v.duration||10)*0.1,30)};'
+    'v.onseeked=function(){try{var w=480,h=Math.round(w*v.videoHeight/v.videoWidth)||270,c=document.createElement("canvas");'
+    'c.width=w;c.height=h;c.getContext("2d").drawImage(v,0,0,w,h);'
+    'c.toBlob(function(b){if(!b){end();return}fetch("/api/files/thumb/"+id,{method:"PUT",body:b}).then(end,end)},"image/jpeg",0.8)}'
+    'catch(e){end()}};v.onerror=end;setTimeout(end,15000)}catch(e){}}'
     'function fAdd(l){for(var i=0;i<l.length;i++){fq.push(l[i]);fTotal++}fNext()}'
     'function fErr(t){fBad++;var d=document.createElement("div");d.textContent=t;document.getElementById("fErr").appendChild(d)}'
     'function fNext(){if(fBusy)return;var f=fq.shift(),s=document.getElementById("fState"),b=document.getElementById("fBar");'
-    'if(!f){if(fTotal){s.textContent=fDone+" of "+fTotal+" uploaded";if(!fBad)setTimeout(function(){location.reload()},900)}return}'
+    'if(!f){if(fTotal){s.textContent=fDone+" of "+fTotal+" uploaded";if(!fBad){var t0=Date.now(),iv=setInterval(function(){'
+    'if(fPend<=0||Date.now()-t0>20000){clearInterval(iv);location.reload()}},400)}}return}'
     'fBusy=true;document.getElementById("fProg").style.display="block";var x=new XMLHttpRequest();'
     'x.open("PUT","/api/files/upload?name="+encodeURIComponent(f.name));'
     'x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(100*e.loaded/e.total);b.style.width=p+"%";'
     's.textContent=(fDone+1)+" of "+fTotal+": "+f.name+" "+p+"%"}};'
-    'x.onload=function(){fBusy=false;if(x.status===200){fDone++}else{var m="";try{m=JSON.parse(x.responseText).message}catch(e){}'
+    'x.onload=function(){fBusy=false;if(x.status===200){fDone++;var r={};try{r=JSON.parse(x.responseText)}catch(e){}'
+    'if(r.id&&r.kind==="video")fThumb(f,r.id)}else{var m="";try{m=JSON.parse(x.responseText).message}catch(e){}'
     'fErr(f.name+": "+(m||"not uploaded"))}fNext()};'
     'x.onerror=function(){fBusy=false;fErr(f.name+": the connection was lost");fNext()};x.send(f)}'
     'function fDel(){var ids=[];document.querySelectorAll(".f-ck:checked").forEach(function(c){ids.push(+c.value)});'
@@ -5511,6 +5571,7 @@ _FILES_JS = (
     'dz.addEventListener("drop",function(e){e.preventDefault();dz.classList.remove("over");fAdd(e.dataTransfer.files)})}'
     '</script>')
 _FILE_ICON = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
+FILES_PAGE = 100
 _FILE_TABS = {"": "All", "video": "🎬 Videos", "audio": "🎵 Music", "photo": "🖼 Photos", "document": "📄 Documents"}
 
 
@@ -5526,40 +5587,48 @@ def _file_href(r) -> str:
 
 
 @app.get("/files", response_class=HTMLResponse)
-async def page_files(offset: int = 0, kind: str = ""):
+async def page_files(offset: int = 0, kind: str = "", q: str = ""):
     offset = max(0, int(offset))
     kind = kind if kind in _FILE_TABS else ""
+    q = (q or "").strip()[:100]
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     async with db_pool.acquire() as conn:
         mine = await conn.fetch(
             """SELECT m.id, m.file_name, m.file_size, m.media_type, m.indexed_at
                FROM messages m JOIN channels c ON c.id = m.channel_id
-               WHERE c.local_root = $1 AND ($3 = '' OR m.media_type = $3)
-               ORDER BY m.id DESC LIMIT 200 OFFSET $2""", localfiles.MINE, offset, kind)
+               WHERE c.local_root = $1 AND ($3 = '' OR m.media_type = $3) AND m.file_name ILIKE $4
+               ORDER BY m.id DESC LIMIT $5 OFFSET $2""", localfiles.MINE, offset, kind, like, FILES_PAGE)
         per = {r["media_type"]: r for r in await conn.fetch(
             """SELECT m.media_type, count(*) AS n, COALESCE(sum(m.file_size), 0) AS b
                FROM messages m JOIN channels c ON c.id = m.channel_id
-               WHERE c.local_root = $1 GROUP BY m.media_type""", localfiles.MINE)}
+               WHERE c.local_root = $1 AND m.file_name ILIKE $2 GROUP BY m.media_type""", localfiles.MINE, like)}
     everything = {"n": sum(r["n"] for r in per.values()), "b": sum(r["b"] for r in per.values())}
     tot = per.get(kind, {"n": 0, "b": 0}) if kind else everything
+    def _fqs(**over):
+        cur = {"kind": kind or None, "q": q or None, "offset": offset or None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
     # one tab per kind: an upload goes to its tab by itself, by what the file is
     tabs = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px">' + "".join(
         _chip_link(f'{label} <span style="opacity:.6">{(per.get(k, {"n": 0})["n"] if k else everything["n"]):,}</span>',
-                   "/files" + (f"?kind={k}" if k else ""), k == kind)
+                   "/files" + _fqs(kind=k or None, offset=None), k == kind)
         for k, label in _FILE_TABS.items()) + '</div>'
-    kq = f"kind={kind}&" if kind else ""
+    find = ('<form method="get" action="/files" style="display:flex;gap:8px;margin:0 0 12px">'
+            + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else '')
+            + f'<input type="text" name="q" value="{html.escape(q, quote=True)}" placeholder="find an uploaded file by name…" '
+              'style="flex:1;max-width:420px"/><button class="btn" type="submit">Find</button>'
+            + (f'<a class="btn ghost" href="/files{_fqs(q=None, offset=None)}">clear</a>' if q else '') + '</form>')
     rows = "".join(
         '<label class="dl-item" style="cursor:pointer">'
         f'<input type="checkbox" class="f-ck" value="{r["id"]}" style="margin-right:4px"/>'
-        f'<div class="icon">{_FILE_ICON.get(r["media_type"], "📄")}</div><div class="info">'
+        f'<div class="icon" style="position:relative;overflow:hidden">{_FILE_ICON.get(r["media_type"], "📄")}'
+        f'<img src="/api/thumb/{r["id"]}" loading="lazy" alt="" onerror="this.remove()" '
+        'style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:6px"/></div><div class="info">'
         f'<div class="name"><a href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a></div>'
         f'<div class="meta">{export.human(r["file_size"])} · added {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
         '</div></label>' for r in mine)
-    pager = ""
-    if offset or len(mine) == 200:
-        pager = ('<div style="display:flex;gap:10px;margin:14px 0">'
-                 + (f'<a class="btn ghost" href="/files?{kq}offset={max(0, offset - 200)}">← newer</a>' if offset else '')
-                 + (f'<a class="btn ghost" href="/files?{kq}offset={offset + 200}">older →</a>' if len(mine) == 200 else '')
-                 + '</div>')
+    pager = _page_nav("/files", _fqs, offset, FILES_PAGE, len(mine), tot["n"])
     body = (
         '<style>.f-drop{border:2px dashed var(--border);border-radius:14px;padding:26px 18px;text-align:center;'
         'background:var(--surface);margin-bottom:10px}.f-drop.over{border-color:var(--accent);background:rgba(94,182,229,.10)}'
@@ -5579,10 +5648,11 @@ async def page_files(offset: int = 0, kind: str = ""):
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
         f'margin-left:10px">{export.human(tot["b"]) or "0 MB"}'
         + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
-        + (tabs if everything["n"] else '')
+        + (find + tabs if (everything["n"] or q) else '')
         + ('<div class="dl-list">' + rows + '</div>' + pager if mine else
            '<div class="empty-state"><div class="icon">📂</div><div>'
-           + ('Nothing of this kind uploaded yet.' if kind else 'Nothing uploaded yet.') + '</div></div>')
+           + ('Nothing found by that name.' if q else 'Nothing of this kind uploaded yet.' if kind
+              else 'Nothing uploaded yet.') + '</div></div>')
         + _FILES_JS)
     return HTMLResponse(_layout("My files", "/files", body))
 
