@@ -46,7 +46,7 @@ Public-tracker users have their IP logged by tens of thousands of peers. US ISPs
                       │ MTProto · HTTPS to Telegram
                       ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  tgarr-crawler   (Pyrogram, async)                               │
+│  tgarr-crawler   (Kurigram, async)                               │
 │    Listens for new messages + back-fills history                 │
 │    Parses filename + caption → release metadata                  │
 └─────────────────────┬────────────────────────────────────────────┘
@@ -136,9 +136,9 @@ Container images are multi-arch (`linux/amd64`, `linux/arm64`) — every modern 
 
 | Component | Purpose | Stack |
 |---|---|---|
-| `crawler/` | MTProto channel listener — ingests messages to Postgres | Python · Pyrogram · asyncpg |
+| `crawler/` | MTProto channel listener — ingests messages to Postgres | Python · Kurigram · asyncpg |
 | `api/` | Newznab-compatible HTTP API — Sonarr/Radarr query target | Python · FastAPI |
-| `worker/` | Download executor — pulls files from Telegram, delivers to *arr | Python · Pyrogram |
+| `worker/` | Download executor — pulls files from Telegram, delivers to *arr | Python · Kurigram |
 | `ui/` | Web admin — channel management, stats, manual search | React · Vite |
 | `api/schema.sql` | PostgreSQL base schema (applied by the api on start) | SQL |
 

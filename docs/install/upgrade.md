@@ -93,3 +93,23 @@ docker compose -f docker-compose.dev.yml up -d --build
 Set `TGARR_UPDATE_CHECK=false` in `.env`. tgarr then no longer asks
 tgarr.me which version is current. (The question sends nothing about your
 install.)
+
+## Going back to 0.5.6 after 0.5.7
+
+0.5.7 changes the library that talks to Telegram, and the first start
+upgrades the saved sign-in (`tgarr.session`) to that library's format. 0.5.6
+cannot read the upgraded file. Before upgrading it, 0.5.7 keeps a copy of the
+old one beside it as `tgarr.session.pre-0.5.7.bak`.
+
+To go back without signing in again:
+
+```bash
+docker compose stop crawler api
+cd _data/session            # or wherever your session folder is
+cp tgarr.session tgarr.session.0.5.7
+cp tgarr.session.pre-0.5.7.bak tgarr.session
+```
+
+Then set `TGARR_TAG=0.5.6` in `.env` and run `docker compose up -d`. Without
+the copy, 0.5.6 will simply ask you to sign in to Telegram again; nothing
+else is lost.

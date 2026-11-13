@@ -7464,6 +7464,44 @@ async def _session_change_watcher(boot_user_id: int):
         await asyncio.sleep(30)
 
 
+SESSION_FILE = "/app/session/tgarr.session"
+SESSION_BACKUP = SESSION_FILE + ".pre-0.5.7.bak"
+
+
+def session_needs_backup(path: str) -> bool:
+    """Is this a session file in the format tgarr used up to 0.5.6 (Pyrogram,
+    schema 3 or older)? Kurigram rewrites such a file in place when it opens
+    it, and 0.5.6 cannot read the result."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT number FROM version").fetchone()
+        finally:
+            con.close()
+        return bool(row) and int(row[0]) <= 3
+    except Exception:
+        return False
+
+
+def _session_backup_before_upgrade() -> None:
+    """Keep a copy of the old-format session before it is upgraded, so that
+    going back to 0.5.6 does not mean signing in again: stop the containers,
+    put this copy back as tgarr.session, pin TGARR_TAG=0.5.6. Made once."""
+    import shutil
+    try:
+        if os.path.exists(SESSION_BACKUP) or not os.path.exists(SESSION_FILE):
+            return
+        if not session_needs_backup(SESSION_FILE):
+            return
+        shutil.copy2(SESSION_FILE, SESSION_BACKUP)
+        os.chmod(SESSION_BACKUP, 0o600)
+        log.info("[session] the session is in the pre-0.5.7 format; a copy is kept as %s "
+                 "(needed only to go back to 0.5.6)", os.path.basename(SESSION_BACKUP))
+    except Exception as e:
+        log.warning("[session] could not keep a copy of the old session: %s", e)
+
+
 def _session_carry_usernames() -> None:
     """After the switch from Pyrogram to Kurigram: keep the @usernames the
     session already knew.
@@ -7542,6 +7580,7 @@ async def main() -> None:
     # would normally crash main() before any watcher fires. Catch the same
     # auth-revoke errors here to write the marker + clean exit.
     try:
+        _session_backup_before_upgrade()
         await app.start()
         _session_carry_usernames()
         app.add_handler(RawUpdateHandler(on_raw_update))
