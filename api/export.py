@@ -14,7 +14,7 @@ _EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image
         "video/mp4": ".mp4", "video/x-matroska": ".mkv", "video/quicktime": ".mov", "video/webm": ".webm",
         "audio/mpeg": ".mp3", "audio/flac": ".flac", "audio/ogg": ".ogg", "audio/mp4": ".m4a",
         "application/pdf": ".pdf", "application/epub+zip": ".epub", "application/zip": ".zip"}
-KINDS = ("photo", "video", "audio", "document", "all")
+KINDS = ("photo", "video", "audio", "document", "book", "all")
 
 
 def safe_name(name, fallback="file") -> str:

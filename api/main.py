@@ -1970,9 +1970,14 @@ def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> 
 def _saved_chip(path: str, qs, local: int) -> str:
     style = ("background:rgba(16,185,129,0.15);color:#059669;border-color:#10b981;"
              if local else "")
-    return (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
+    chip = (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
             f'style="{style}padding:5px 12px;font-size:12px" '
             f'title="only what is already downloaded">● saved</a>')
+    # with "saved" chosen: everything of this kind that is on this machine, as one zip, at once
+    kind = {"/music": "audio", "/library": "book", "/videos": "video"}.get(path)
+    if local and kind and _signed_in():
+        chip += _export_btn({"scope": "saved", "kind": kind}, "⬇ Download all")
+    return chip
 
 
 @app.post("/api/fav/{msg_id}")
@@ -5070,9 +5075,10 @@ _EXPORT_KIND_SQL = {
     "video": "m.media_type = 'video'",
     "audio": "m.media_type = 'audio'",
     "document": "m.media_type = 'document'",
+    "book": "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'",
     "all": "(m.file_unique_id IS NOT NULL OR m.file_name IS NOT NULL)",
 }
-_EXPORT_KIND_NAME = {"photo": "photos", "video": "videos", "audio": "music", "document": "documents", "all": "all files"}
+_EXPORT_KIND_NAME = {"photo": "photos", "video": "videos", "audio": "music", "document": "documents", "book": "books", "all": "all files"}
 _HERE = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
 _EXPORT_JS = (
     '<script>if(!window.tgExport){window.tgExport=function(o){'
@@ -5085,7 +5091,7 @@ _EXPORT_JS = (
     'if(j.to_fetch){m+=" "+j.to_fetch+" of them are not on this machine yet"+(j.fetch_size?" ("+j.fetch_size+")":"")+'
     '": they are fetched from Telegram first, which takes a while."}'
     'if(!confirm(m+" Go on?"))return;'
-    'ask(o).then(function(k){if(k.status==="ok"){location.href="/exports"}else{alert(k.message||"That did not work.")}})'
+    'ask(o).then(function(k){if(k.status==="ok"){location.href=k.ready?"/export/"+k.id+"/download":"/exports"}else{alert(k.message||"That did not work.")}})'
     '})}}</script>')
 
 
@@ -5153,7 +5159,7 @@ async def api_export(request: Request):
             """INSERT INTO exports (title, owner, msg_ids, status, done_at)
                VALUES ($1, $2, $3::bigint[], $4, CASE WHEN $4 = 'ready' THEN NOW() END) RETURNING id""",
             title[:200], _me_id(), [r["id"] for r in rows], "fetching" if fetch else "ready")
-    return {"status": "ok", "id": jid}
+    return {"status": "ok", "id": jid, "ready": not fetch}
 
 
 async def _export_state(conn, ids: list) -> dict:
