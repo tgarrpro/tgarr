@@ -417,20 +417,23 @@ async def _qr_poll_loop():
                 # DC auth_key triggers AUTH_TOKEN_EXPIRED on ImportLoginToken.
                 from pyrogram.session import Auth, Session
                 try:
+                    # Kurigram connects to an address it is given (Pyrogram
+                    # had the data centres' addresses built in): ask for the
+                    # new one while still connected to the old, and store it
+                    # with the session - connect() refuses a session that
+                    # holds no server address.
+                    opt = await client.get_dc_option(
+                        r.dc_id, ipv6=bool(getattr(client, "ipv6", False)))
+                    test_mode = await client.storage.test_mode()
                     await client.session.stop()
                     await client.storage.dc_id(r.dc_id)
+                    await client.storage.server_address(opt.ip_address)
+                    await client.storage.port(opt.port)
                     new_auth_key = await Auth(
-                        client,
-                        await client.storage.dc_id(),
-                        await client.storage.test_mode(),
-                    ).create()
+                        client, r.dc_id, opt.ip_address, opt.port, test_mode).create()
                     await client.storage.auth_key(new_auth_key)
                     client.session = Session(
-                        client,
-                        await client.storage.dc_id(),
-                        await client.storage.auth_key(),
-                        await client.storage.test_mode(),
-                    )
+                        client, r.dc_id, opt.ip_address, opt.port, new_auth_key, test_mode)
                     await client.session.start()
                     r2 = await client.invoke(ImportLoginToken(token=r.token))
                     if isinstance(r2, LoginTokenSuccess):
