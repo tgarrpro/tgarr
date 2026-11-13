@@ -146,7 +146,7 @@ _KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw'
                     OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
 _LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock")
 # open even when the Media Center itself is closed for the moment (time rules)
-_LOCKED_ALWAYS = ("/unlock", "/api/unlock", "/mediacenter/rest", "/api/mc/ping", "/mc/ping.js")
+_LOCKED_ALWAYS = ("/unlock", "/api/unlock", "/lock", "/mediacenter/rest", "/api/mc/ping", "/mc/ping.js")
 _MC = {"at": 0.0, "rules": screentime.clean(None)}
 _DEVICES = screentime.Devices()
 _MC_SEEN: dict = {}                    # (device, item) -> when it was last noted in the record of use
