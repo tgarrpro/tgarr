@@ -397,6 +397,7 @@ import metadata as md  # local module
 import usenet  # local module
 import usenet_scan  # local module
 import usenet_client  # local module
+import usenet_rules  # local module
 
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
@@ -925,6 +926,8 @@ async def _migrate_schema():
             -- detail 0 = seen in a sparse pass, size estimated
             ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS sketch BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS detail SMALLINT NOT NULL DEFAULT 1;
+            -- 'nsfw' for adult material (usenet_rules): left out of the feed unless adult content is switched on
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'sfw';
             CREATE TABLE IF NOT EXISTS usenet_progress (
               grp TEXT PRIMARY KEY, first_article BIGINT, last_article BIGINT, next_article BIGINT,
               headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
@@ -8478,7 +8481,7 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
             return _newznab_error(300, "No such item", 404)
         async with db_pool.acquire() as conn:
             c = await conn.fetchrow("SELECT * FROM usenet_cards WHERE id = $1", id[3:])
-        if not c:
+        if not c or usenet_rules.forbidden({"name": c["name"], "groups": [c["grp"]], "audience": c["audience"]}):
             return _newznab_error(300, "No such item", 404)
         try:
             if c["sketch"]:
@@ -8535,12 +8538,15 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
         where.append(r"kind = 'video' AND name !~* 'S\d{1,2}E\d{1,3}'")
     else:
         where.append("kind IN ('video', 'audio', 'ebook')")
+    if not await _is_nsfw_enabled():
+        where.append("audience <> 'nsfw'")             # adult material only where it is switched on
     lim = max(1, min(int(limit), 200))
     await _usenet_from_registry(q or "")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             f"""SELECT *, count(*) OVER() AS _total FROM usenet_cards WHERE {' AND '.join(where)}
                 ORDER BY complete DESC, posted_from DESC NULLS LAST LIMIT {lim} OFFSET {max(0, int(offset))}""", *params)
+    rows = [r for r in rows if not usenet_rules.forbidden({"name": r["name"], "groups": [r["grp"]], "audience": r["audience"]})]
     items = "\n".join(_usenet_item_xml(r, base_url, apikey or "tgarr") for r in rows)
     return Response(_feed_envelope(items, f"usenet t={t} q={q or ''}", base_url, offset=max(0, int(offset)),
                                    total=rows[0]["_total"] if rows else 0), media_type="application/xml")
@@ -8560,7 +8566,25 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
 # ════════════════════════════════════════════════════════════════════
 _UN_INDEX = {"state": "off", "window": None, "at": 0.0, "last": None, "asked": {}}
 _UN_SKETCH_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "posted_to", "files", "files_expected",
-                   "segments", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive", "sketch", "detail")
+                   "segments", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive", "sketch", "detail", "audience")
+
+
+async def _usenet_tidy() -> dict:
+    """The cards kept here brought into line with usenet_rules as they are now: adult ones
+    labelled, those that are never kept deleted. At start and after cards are taken in -
+    whatever way they came (this install's own reading, the older scanner, the registry)."""
+    R = usenet_rules
+    async with db_pool.acquire() as conn:
+        labelled = await conn.execute(
+            "UPDATE usenet_cards SET audience = 'nsfw' WHERE audience <> 'nsfw' AND (name ~* $1 OR grp ~* $2)",
+            R.ADULT_NAME_SQL, R.ADULT_GROUP_SQL)
+        gone = await conn.execute(
+            """DELETE FROM usenet_cards WHERE name ~* $1 OR grp ~* $2 OR (audience = 'nsfw' AND name ~* $3)""",
+            R.FORBIDDEN_SQL, R.GROUP_FORBIDDEN_SQL, R.MINOR_SQL)
+    out = {"labelled_adult": int(labelled.split()[-1]), "deleted": int(gone.split()[-1])}
+    if out["labelled_adult"] or out["deleted"]:
+        logging.getLogger("tgarr").info("[usenet] cards put in line with the rules: %s", out)
+    return out
 
 
 async def _instance_uuid() -> str:
@@ -8582,12 +8606,17 @@ async def _usenet_keep(cards: list) -> int:
     """Sketched cards into this install's own table, in one go."""
     rows = []
     for c in cards:
-        if CSAM_RX.search(c["name"]) or not c.get("art_lo"):
+        grp = c.get("grp") or c["groups"][0]
+        judged = {"name": c["name"], "inner_name": c.get("inner_name"), "groups": list(c.get("groups") or ()) + [grp],
+                  "audience": c.get("audience")}
+        # wherever the card came from - this install's reading or the registry - it is judged here
+        if CSAM_RX.search(c["name"]) or usenet_rules.forbidden(judged) or not c.get("art_lo"):
             continue
-        rows.append((_usenet_card_id(c["poster"], c["key"]), c["name"][:300], c["kind"], c.get("size"), c.get("grp") or c["groups"][0],
+        rows.append((_usenet_card_id(c["poster"], c["key"]), c["name"][:300], c["kind"], c.get("size"), grp,
                      c["poster"], c.get("posted_from"), c.get("posted_to"), c.get("files"), c.get("files_expected"),
                      c.get("segments"), c.get("complete"), c["first_message_id"], c["key"], c["art_lo"], c["art_hi"], 1.0, True,
-                     0 if c.get("detail") == 0 else 1))
+                     0 if c.get("detail") == 0 else 1,
+                     "nsfw" if (c.get("audience") == "nsfw" or usenet_rules.adult(judged)) else "sfw"))
     if not rows:
         return 0
     cols = ", ".join(_UN_SKETCH_COLS)
@@ -8601,7 +8630,8 @@ async def _usenet_keep(cards: list) -> int:
                       art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo), art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi),
                       -- what was read in full is not put back to an estimate
                       size = CASE WHEN usenet_cards.detail > EXCLUDED.detail THEN usenet_cards.size ELSE EXCLUDED.size END,
-                      detail = GREATEST(usenet_cards.detail, EXCLUDED.detail), alive = 1.0, sketch = TRUE""")
+                      detail = GREATEST(usenet_cards.detail, EXCLUDED.detail), alive = 1.0, sketch = TRUE,
+                      audience = CASE WHEN EXCLUDED.audience = 'nsfw' THEN 'nsfw' ELSE usenet_cards.audience END""")
     return len(rows)
 
 
@@ -8662,8 +8692,15 @@ def _usenet_index_window(cfg: dict, w: dict) -> dict:
 async def _usenet_index_worker():
     logu = logging.getLogger("tgarr")
     await asyncio.sleep(40)
+    tidied = 0.0
     while True:
         try:
+            if time.time() - tidied > 3600:            # at start, and every hour: whatever way cards came in
+                tidied = time.time()
+                try:
+                    await _usenet_tidy()
+                except Exception as e:
+                    logu.warning("[usenet] tidy: %s", e)
             cfg = await _usenet_cfg(fresh=True)
             if not (cfg.get("index") and cfg.get("enabled") and cfg.get("host")):
                 _UN_INDEX["state"] = "off"
@@ -8680,6 +8717,12 @@ async def _usenet_index_worker():
                 await asyncio.sleep(1800)
                 continue
             w = wins[0]
+            if usenet_rules.group_never(w["grp"]):
+                # tgarr.me does not hand such a group out; should one arrive all the same,
+                # it is not read (the lease runs out)
+                _UN_INDEX["state"] = "was handed a group that is not read; waiting"
+                await asyncio.sleep(3600)
+                continue
             _UN_INDEX.update(state="reading", window=w, at=time.time())
             logu.info("[usenet-index] window %s: %s %s, %s", w["id"], w["grp"],
                       time.strftime("%Y-%m-%d", time.gmtime(w["t_from"])), w["mode"])

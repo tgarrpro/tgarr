@@ -22,6 +22,7 @@ import zlib
 
 import usenet as U
 import usenet_judge as J
+import usenet_rules as R
 
 
 # ───────────────────────── asking the server ─────────────────────────
@@ -470,12 +471,17 @@ class Sketch:
                 continue
             whole = all(v[1] >= v[0] for v in r["files"].values()) and (not r["files_expected"] or len(r["files"]) >= r["files_expected"])
             listed = self.items_of(r) if (detail and self.items) else []
+            groups = sorted(r["groups"] | {self.grp})
+            judged = {"name": r["name"], "groups": groups, "items": listed}
+            if R.forbidden(judged):
+                self.count["never kept"] += 1      # not sent, not stored: see usenet_rules
+                continue
             out.append({
                 "name": r["name"][:300], "kind": r["kind"], "size": size, "files": len(r["files"]), "files_expected": r["files_expected"],
                 "segments": r["seen"] if detail else None, "complete": bool(whole) if detail else None,
                 "posted_from": r["t0"], "posted_to": r["t1"], "poster": r["poster"], "key": r["key"][:300],
-                "groups": sorted(r["groups"] | {self.grp}), "first_message_id": r["mid"], "art_lo": r["lo"], "art_hi": r["hi"],
-                "detail": detail})
+                "groups": groups, "first_message_id": r["mid"], "art_lo": r["lo"], "art_hi": r["hi"],
+                "audience": "nsfw" if R.adult(judged) else "sfw", "detail": detail})
             if listed:
                 out[-1]["items"] = listed
         return out

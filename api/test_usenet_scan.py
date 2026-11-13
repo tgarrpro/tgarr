@@ -363,4 +363,53 @@ try:
 except ZeroDivisionError:
     ok(True, "a failure while judging comes out at close, and no reader was left waiting")
 
+# ---- what is never kept and what is adult: judged here before anything is sent or stored ------
+import usenet_rules as R
+
+
+def _c(name, groups, **k):
+    return dict({"name": name, "inner_name": None, "groups": groups, "items": [], "audience": "sfw"}, **k)
+
+
+for _card, _forb, _adult, _why in (
+    (_c("Some.Film.2010.1080p.BluRay.x264-GRP", ["alt.binaries.movies"]), False, False, "an ordinary film"),
+    (_c("Lolita.1962.1080p.BluRay.x264-GRP", ["alt.binaries.movies"]), False, False, "Kubrick's film, in a film group"),
+    (_c("Coffret Melissa Lauren.Vicieuses Lolitas.French", ["alt.binaries.french.xxx"]), True, True, "the same word in an adult group"),
+    (_c("Private.Gold.123.XXX.DVDRip", ["alt.binaries.erotica"]), False, True, "an adult film: kept, labelled"),
+    (_c("pthc collection", ["alt.binaries.multimedia"]), True, False, "a term for it, in any group"),
+    (_c("holiday pictures", ["alt.binaries.pictures.erotica.pre-teen"]), True, True, "a group named for it"),
+    (_c("Some.Adult.Film.XXX", ["alt.binaries.erotica", "alt.binaries.erotica.teens"]), False, True, "an adult film cross-posted to a group that is not read"),
+    (_c("cute 14yo XXX", ["alt.binaries.erotica"]), True, True, "an age under eighteen in an adult setting"),
+    (_c("My.14.Years.Old.Son.Plays.Piano", ["alt.binaries.sounds.mp3"]), False, False, "the same age where nothing is adult"),
+    (_c("Cory in the House - 1x12", ["alt.binaries.tv.disney-channel", "alt.binaries.multimedia.teen-idols"]), False, False, "a Disney series cross-posted to a group that is not read"),
+    (_c("Two and a Half Men - 6x17 - The 'Ocu' or the 'Pado'", ["alt.binaries.hdtv"]), False, False, "an episode title"),
+    (_c("Analysis of Sussex County Records", ["alt.binaries.e-book"]), False, False, "'anal' and 'sex' inside other words"),
+    (_c("Album", ["alt.binaries.sounds.mp3"], items=[{"name": "01 - preteen xxx.jpg"}]), True, False, "a listed file's name counts"),
+):
+    ok(R.forbidden(_card) == _forb and R.adult(_card) == _adult, f"{_why}: never kept {R.forbidden(_card)}, adult {R.adult(_card)}")
+ok(R.group_never("alt.binaries.erotica.teen") and R.group_never("alt.binaries.multimedia.teen-idols") and not R.group_never("alt.binaries.erotica")
+   and not R.group_never("alt.binaries.movies.kids"), "the groups that are not read")
+ok(R.forbidden({"name": "x", "groups": ["alt.binaries.tv"], "audience": None}) is False and R.forbidden({"name": "pthc", "groups": None}) is True, "cards with things missing are judged all the same")
+
+
+def _post(arts, start, subject_of, n, poster=POSTER):
+    for k in range(n):
+        arts[start + k] = (subject_of(k), poster, "Mon, 04 Jan 2010 10:00:00 +0000", f"<r{start + k}@test>", 700_000)
+
+
+_arts = {}
+_post(_arts, 1, lambda k: f'Private.Gold.123.XXX.DVDRip.XviD-GRP [01/40] - "private.gold.123.xxx.part01.rar" yEnc ({k + 1}/200)', 200)
+_post(_arts, 1000, lambda k: f'Some.Film.2010.1080p.BluRay.x264-GRP [01/40] - "some.film.2010.part01.rar" yEnc ({k + 1}/200)', 200)
+_post(_arts, 2000, lambda k: f'pthc.collection.2009.DVDRip.XviD [01/40] - "collection.2009.part01.rar" yEnc ({k + 1}/200)', 200)
+sk = S.Sketch("alt.binaries.multimedia")
+sk.add_rows([(k,) + v + ((),) for k, v in _arts.items()])
+_cards = {c["name"][:12]: c for c in sk.cards(detail=0)}
+ok(len(_cards) == 2 and sk.count["never kept"] == 1, f"of three releases read, the one that is never kept makes no card: {sorted(_cards)}")
+ok(_cards["Private.Gold"]["audience"] == "nsfw" and _cards["Some.Film.20"]["audience"] == "sfw", "and the adult one is sent labelled adult")
+sk2 = S.Sketch("alt.binaries.pictures.erotica.pre-teen")
+sk2.add_rows([(k,) + v + ((),) for k, v in _arts.items() if 1000 <= k < 2000])
+ok(sk2.cards(detail=0) == [], "nothing read in a group named for it makes a card, whatever it is called")
+# the registry's copy of the rules and this one must be the same text
+ok("FORBIDDEN_SQL" in dir(R) and R.FORBIDDEN_RX.pattern == R.FORBIDDEN_SQL and R.MINOR_RX.pattern == R.MINOR_SQL, "the patterns Postgres is given are the ones Python uses")
+
 print(f"ok - {n} checks")

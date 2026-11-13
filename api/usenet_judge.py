@@ -16,8 +16,10 @@ import re
 
 import usenet as U
 
+# (not .xxx: "Some.Title.123.XXX.DVDRip" is how adult releases are named, and reading "123.XXX" as a site
+# took the rest of the name with it - the release lost its name and its kind)
 RX_TAG = re.compile(
-    r"[\[<({:.\s>-]*\b(?:https?://)?(?:www\.)?[a-z0-9][a-z0-9-]{1,30}\.(?:com|net|org|info|eu|nl|de|ag|tk|to|xxx|biz|cc|me|ws|in|us|co)\b[^\s\]>)}]*[\]>)}:.\s<-]*",
+    r"[\[<({:.\s>-]*\b(?:https?://)?(?:www\.)?[a-z0-9][a-z0-9-]{1,30}\.(?:com|net|org|info|eu|nl|de|ag|tk|to|biz|cc|me|ws|in|us|co)\b[^\s\]>)}]*[\]>)}:.\s<-]*",
     re.I)
 RX_BOARD = re.compile(
     r"(?:powered|sponsore?d|presented|brought to you)\s+by\b[^\[\"]{0,40}|partner of\b[^\[\"]{0,40}|\bpost(?:ed)?\s+op\b[^\[\"]{0,40}|"
