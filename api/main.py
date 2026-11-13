@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 
 import login  # local module
 import access  # local module
+import screentime  # local module
 import contextvars
 
 
@@ -144,6 +145,40 @@ _KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw'
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
                     OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
 _LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock")
+# open even when the Media Center itself is closed for the moment (time rules)
+_LOCKED_ALWAYS = ("/unlock", "/api/unlock", "/mediacenter/rest", "/api/mc/ping", "/mc/ping.js")
+_MC = {"at": 0.0, "rules": screentime.clean(None)}
+_DEVICES = screentime.Devices()
+_MC_SEEN: dict = {}                    # (device, item) -> when it was last noted in the record of use
+
+
+async def _mc_rules(fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if (fresh or now - _MC["at"] > 5) and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                raw = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_rules'")
+            _MC.update(at=now, rules=screentime.clean(_json.loads(raw) if raw else None))
+        except Exception:
+            pass
+    return _MC["rules"]
+
+
+def _mc_who(request: Request) -> str:
+    return request.client.host if request.client else "?"
+
+
+async def _mc_device(who: str, rules: dict) -> None:
+    """A device seen for the first time since the start: pick up what it had
+    already used today, so that a restart does not hand the day back."""
+    day = screentime.local(time.time(), rules.get("tz", 0))[0]
+    if who in _DEVICES.by and _DEVICES.by[who]["day"] == day:
+        return
+    used = 0
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            used = await conn.fetchval("SELECT seconds FROM mc_usage WHERE day = $1 AND who = $2", day, who) or 0
+    _DEVICES.get(who, day)["used"] = int(used)
 
 
 async def _access_cfg(fresh: bool = False) -> dict:
@@ -184,10 +219,34 @@ async def _kid_ok(key, sql: str, arg) -> bool:
 async def _locked_block(request: Request):
     """What a locked browser may not have. None = let it through."""
     path = request.url.path
-    if path in _LOCKED_OPEN or path in _GUARD_OPEN_PATHS:
+    if path in _LOCKED_ALWAYS or path in _GUARD_OPEN_PATHS:
+        return None
+    # Opening hours, minutes a day, breaks. Decided here as well as in the
+    # page, so that closing time cannot be got round by typing an address.
+    rules = await _mc_rules()
+    if rules["on"]:
+        who = _mc_who(request)
+        await _mc_device(who, rules)
+        if not _DEVICES.check(who, rules, time.time())["ok"]:
+            if request.method in ("GET", "HEAD") and "text/html" in (request.headers.get("accept") or ""):
+                return RedirectResponse("/mediacenter/rest", status_code=303)
+            return JSONResponse({"status": "rest", "message": "the Media Center is closed for now"}, status_code=403)
+    if path in _LOCKED_OPEN:
         return None
     if request.method in ("GET", "HEAD"):
         m = _PRIVATE_ID_RX.match(path)
+        if m and path.startswith("/watch/") and db_pool is not None:
+            # the record of use: which item, on which device, when (once per ten minutes)
+            k, now = (_mc_who(request), int(m.group(1))), time.time()
+            if now - _MC_SEEN.get(k, 0) > 600:
+                if len(_MC_SEEN) > 5000:
+                    _MC_SEEN.clear()
+                _MC_SEEN[k] = now
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute("INSERT INTO mc_log (who, msg_id) VALUES ($1, $2)", k[0], k[1])
+                except Exception:
+                    pass
         if m and await _kid_ok(int(m.group(1)), f"""
                 SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
                 WHERE m.id = $1 AND {_KID_SQL}""", int(m.group(1))):
@@ -820,6 +879,15 @@ async def _migrate_schema():
               headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
               enabled BOOLEAN NOT NULL DEFAULT TRUE, note TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            -- Media Center: seconds used per device per day (day = days since
+            -- 1970 in the owner's time zone), and which items were opened.
+            CREATE TABLE IF NOT EXISTS mc_usage (
+              day INT NOT NULL, who TEXT NOT NULL, seconds INT NOT NULL DEFAULT 0, PRIMARY KEY (day, who)
+            );
+            CREATE TABLE IF NOT EXISTS mc_log (
+              at TIMESTAMPTZ NOT NULL DEFAULT NOW(), who TEXT NOT NULL, msg_id BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mc_log_at ON mc_log (at DESC);
             CREATE TABLE IF NOT EXISTS kids_allow (
               kind TEXT NOT NULL,
               ref BIGINT NOT NULL,
@@ -3187,6 +3255,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
 }).catch(() => { $("msg").textContent = "✗ could not open this book"; });
 })();
 </script>
+<script src="/mc/ping.js" defer></script>
 </body></html>"""
 
 
@@ -3723,6 +3792,7 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
 }).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
 })();
 </script>
+<script src="/mc/ping.js" defer></script>
 </body></html>"""
 
 
@@ -4318,6 +4388,7 @@ async function poll() {{
 }}
 poll();
 </script>
+<script src="/mc/ping.js" defer></script>
 </body></html>"""
     return HTMLResponse(body)
 
@@ -7521,6 +7592,97 @@ async def api_lock():
     return resp
 
 
+_MC_PING_JS = """(function(){
+  // tells the server "still here" while the page is in front or something is playing;
+  // the server counts the time and says when it is time to stop
+  function busy(){
+    if (document.visibilityState === "visible") return true;
+    var m = document.querySelectorAll("video,audio");
+    for (var i = 0; i < m.length; i++) if (!m[i].paused && !m[i].ended) return true;
+    return false;
+  }
+  function ping(){
+    if (!busy()) return;
+    fetch("/api/mc/ping", {credentials: "same-origin"}).then(function(r){ return r.json(); })
+      .then(function(j){ if (j && j.ok === false && location.pathname !== "/mediacenter/rest") location.href = "/mediacenter/rest"; })
+      .catch(function(){});
+  }
+  ping(); setInterval(ping, __EVERY__000); document.addEventListener("visibilitychange", ping);
+})();""".replace("__EVERY__", str(screentime.PING_SECONDS))
+
+
+@app.get("/mc/ping.js")
+async def mc_ping_js():
+    return Response(_MC_PING_JS, media_type="application/javascript", headers={"Cache-Control": "public, max-age=300"})
+
+
+@app.get("/api/mc/ping")
+async def api_mc_ping(request: Request):
+    """"Still here" from a page. A browser that has entered the PIN (or an
+    install with no PIN) is not counted and never told to stop."""
+    if not await _is_locked(request):
+        return {"ok": True, "free": True}
+    rules = await _mc_rules()
+    who, now = _mc_who(request), time.time()
+    await _mc_device(who, rules)
+    v = _DEVICES.ping(who, rules, now)
+    d = _DEVICES.by[who]
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO mc_usage (day, who, seconds) VALUES ($1, $2, $3)
+                                  ON CONFLICT (day, who) DO UPDATE SET seconds = GREATEST(mc_usage.seconds, $3)""",
+                               d["day"], who, d["used"])
+    except Exception:
+        pass
+    return v
+
+
+_MC_REST_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr Media Center</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;
+  background:#fff8ef;color:#2b2140;font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC",system-ui,sans-serif;text-align:center}
+@media (prefers-color-scheme:dark){body{background:#191624;color:#f3eefc}}
+.big{font-size:96px;line-height:1}h1{font-size:34px;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
+a{display:inline-block;margin-top:34px;font-size:13px;color:inherit;opacity:.55}
+</style></head><body><div><div class="big">__ICON__</div><h1>__TITLE__</h1><p>__TEXT__</p>
+<a href="/unlock">🔒 Grown-ups</a></div>
+<script>
+// look again every half minute: when it is time, go back in
+setInterval(function(){ fetch("/api/mc/ping").then(function(r){ return r.json(); })
+  .then(function(j){ if (j && j.ok) location.href = "/mediacenter"; }).catch(function(){}); }, 30000);
+</script></body></html>"""
+
+
+@app.get("/mediacenter/rest", response_class=HTMLResponse)
+async def page_mc_rest(request: Request):
+    rules = await _mc_rules()
+    who = _mc_who(request)
+    await _mc_device(who, rules)
+    v = _DEVICES.check(who, rules, time.time())
+    if v["ok"] or not await _is_locked(request):
+        return RedirectResponse("/mediacenter", status_code=303)
+    icon, title, text = {
+        "hours": ("🌙", "The Media Center is closed now", f"It opens again at {v['until']}."),
+        "day": ("🌟", "That is all for today", "Well done. See you tomorrow!"),
+        "rest": ("🤸", "Time for a break", f"Stretch, drink some water, look far away. Back at {v['until']}."),
+    }.get(v["why"], ("🌙", "The Media Center is closed now", ""))
+    return HTMLResponse(_MC_REST_HTML.replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
+
+
+@app.post("/api/kids/rules")
+async def api_kids_rules(request: Request):
+    try:
+        rules = screentime.clean(await request.json())
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('mc_rules', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", _json.dumps(rules))
+    await _mc_rules(fresh=True)
+    return {"status": "ok", "rules": rules}
+
+
 @app.post("/api/kids/pin")
 async def api_kids_pin(request: Request):
     """Set, change or remove the PIN. A locked browser never reaches this (the
@@ -7737,6 +7899,7 @@ __MORE__
   });
 })();
 </script>
+<script src="/mc/ping.js" defer></script>
 </body></html>"""
 
 
@@ -7828,7 +7991,15 @@ _KIDS_CSS = """<style>
 @app.get("/mediacenter/manage", response_class=HTMLResponse)
 async def page_kids_manage():
     cfg = await _access_cfg(fresh=True)
+    rules = await _mc_rules(fresh=True)
+    today = screentime.local(time.time(), rules.get("tz", 0))[0]
     async with db_pool.acquire() as conn:
+        usage = await conn.fetch(
+            """SELECT who, sum(seconds) FILTER (WHERE day = $1) AS today, sum(seconds) AS week
+               FROM mc_usage WHERE day > $1 - 7 GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 12""", today)
+        opened = await conn.fetch(
+            """SELECT l.at, l.who, m.file_name, m.caption FROM mc_log l JOIN messages m ON m.id = l.msg_id
+               ORDER BY l.at DESC LIMIT 30""")
         chans = await conn.fetch("""
             SELECT c.id, c.title, c.username, COALESCE(c.audience, 'sfw') AS audience,
                    (SELECT count(*) FROM messages m WHERE m.channel_id = c.id) AS n,
@@ -7897,8 +8068,39 @@ async def page_kids_manage():
         f'<span style="opacity:.6">{n:,}</span></button>'
         for k, lbl, n in (("all", "All", len(items)), ("video", "🎬 Videos", n_kind["video"]),
                           ("audio", "🎵 Music", n_kind["audio"]), ("book", "📄 Books", n_kind["book"])))
+    def mins(x):
+        x = int(x or 0)
+        return f"{x // 3600} h {x % 3600 // 60:02d} min" if x >= 3600 else f"{x // 60} min"
+    time_box = (
+        '<div class="km-box"><div class="km-pad">'
+        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><h3 style="margin:0;flex:1">Time</h3>'
+        f'<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="mcOn" {"checked" if rules["on"] else ""}/> <b>use time rules</b></label></div>'
+        '<p style="color:var(--muted);margin:0 0 12px">For browsers that have not entered the PIN. Counted per device, '
+        'only while a page is in front or something is playing.</p>'
+        '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
+        '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
+        + "".join(
+            f'<b>{lbl}</b><input class="km-in" type="time" id="mc_{k}_from" value="{rules[k]["from"]}"/>'
+            f'<input class="km-in" type="time" id="mc_{k}_to" value="{rules[k]["to"]}"/>'
+            f'<input class="km-in" type="number" min="0" max="1440" id="mc_{k}_limit" value="{rules[k]["limit"]}"/>'
+            for k, lbl in (("wd", "Monday to Friday"), ("we", "Saturday, Sunday")))
+        + '</div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px">'
+        f'<span>A break of <input class="km-in" type="number" min="0" max="240" id="mcRest" value="{rules["rest"]}" style="width:74px"/> minutes '
+        f'after <input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/> minutes in one go</span>'
+        '<button class="btn" onclick="mcSave()">Save</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
+        '</div></div>')
+    used_box = ""
+    if usage or opened:
+        used_box = (
+            '<h2 class="section">Use</h2><p style="color:var(--muted);margin:-6px 0 12px">Kept on this machine only: time per device, '
+            'and what was opened in the Media Center.</p><div class="km-box">'
+            + "".join(f'<div class="km-row"><span class="n">📱 {html.escape(u["who"])}</span>'
+                      f'<small>today {mins(u["today"])} · last 7 days {mins(u["week"])}</small></div>' for u in usage)
+            + "".join(f'<div class="km-row"><span class="n">{html.escape(_friendly_name(o["file_name"], o["caption"]))}</span>'
+                      f'<small>{_fmt_time(o["at"])} · {html.escape(o["who"])}</small></div>' for o in opened)
+            + '</div>')
     body = (
-        _KIDS_CSS + pin_box
+        _KIDS_CSS + pin_box + time_box
         + '<h2 class="section">Whole channels in the Media Center</h2>'
           '<p style="color:var(--muted);margin:-6px 0 12px">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
         + f'<div class="km-box" style="max-height:420px;overflow:auto">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div>'
@@ -7908,6 +8110,7 @@ async def page_kids_manage():
            f'<div class="km-box" id="kmItems" style="max-height:560px;overflow:auto">{item_rows}</div>' if items else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing is saved yet. Files you open in a player '
            'are kept and appear here.</div></div>')
+        + used_box
         + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
         + """<script>
 function kmAllow(kind, ref, el){
@@ -7921,6 +8124,14 @@ function kmPin(remove){
   fetch("/api/kids/pin", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({pin: remove ? "" : nw.value, current: cur ? cur.value : ""})}).then(r => r.json())
     .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "that did not work"; });
+}
+function mcSave(){
+  const g = id => document.getElementById(id), msg = g("mcMsg");
+  const part = k => ({from: g("mc_" + k + "_from").value, to: g("mc_" + k + "_to").value, limit: +g("mc_" + k + "_limit").value});
+  fetch("/api/kids/rules", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({
+    on: g("mcOn").checked, wd: part("wd"), we: part("we"), session: +g("mcSession").value, rest: +g("mcRest").value,
+    tz: -new Date().getTimezoneOffset()})}).then(r => r.json())
+    .then(j => { msg.textContent = j.status === "ok" ? "saved" : (j.message || "that did not work"); });
 }
 function kmShow(b){
   document.querySelectorAll(".km-chip").forEach(x => x.classList.toggle("on", x === b));
