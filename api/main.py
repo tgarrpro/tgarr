@@ -6933,6 +6933,52 @@ async def api_deep_backfill_progress():
         "purged_count": purged_count or 0}
 
 
+async def _usenet_system_html() -> str:
+    """The Usenet side, for the System page: is the news server answering, what the index
+    reading is on, what it last brought, what is kept here. Nothing when Usenet is not set up."""
+    import datetime as _dt
+    cfg = await _usenet_cfg()
+    if not cfg.get("host"):
+        return ""
+    h3 = 'style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em"'
+    if not cfg.get("enabled"):
+        return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
+                '<div style="color:var(--muted)">Switched off. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
+    ready = await _usenet_ready()
+    async with db_pool.acquire() as conn:
+        kept = await conn.fetchrow(
+            """SELECT count(*) AS n, count(*) FILTER (WHERE audience = 'nsfw') AS adult,
+                      count(*) FILTER (WHERE detail = 1) AS exact FROM usenet_cards""")
+        level = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_nzb_conns'")
+    day = lambda t: time.strftime("%Y-%m-%d", time.gmtime(t))
+    w, last, state = _UN_INDEX.get("window"), _UN_INDEX.get("last"), _UN_INDEX.get("state") or ""
+    if state == "reading" and w:
+        now = (f'reading <b>{html.escape(w["grp"])}</b>, {day(w["t_from"])} to {day(w["t_to"])} '
+               f'({html.escape(str(w["mode"]))}, {int(w.get("connections") or 1)} connection{"" if int(w.get("connections") or 1) == 1 else "s"} allowed)')
+    else:
+        now = html.escape(state)
+    rows = [("News server", ('<span class="pill ok">answering</span> ' if ready else
+                             f'<span class="pill bad">not answering</span> {html.escape(_USENET.get("msg") or "")} ')
+             + html.escape(cfg["host"])),
+            ("Index reading", now or "starting")]
+    if last:
+        st = last.get("stats") or {}
+        rows.append(("Last window",
+                     f'<b>{html.escape(str(last.get("grp")))}</b> ({html.escape(str(last.get("mode")))}) · {int(st.get("headers") or 0):,} headers in '
+                     f'{int(st.get("seconds") or 0):,} s, {(st.get("bytes") or 0) / 1e6:.1f} MB · {int(last.get("cards") or 0):,} cards found, '
+                     f'{int(last.get("accepted") or 0):,} taken by tgarr.me'
+                     + (f' · {int(st["unread"]):,} stretches unread' if st.get("unread") else "")
+                     + f' · {_ago(_dt.datetime.fromtimestamp(last["at"], _dt.timezone.utc))}'))
+    rows.append(("Cards kept here", f'{kept["n"]:,} ({kept["exact"]:,} read in full' + (f', {kept["adult"]:,} adult' if kept["adult"] else "") + ')'))
+    rows.append(("Connections for an NZB", f'{usenet_scan.next_connections(level, {})} next time - as many as the provider gives'))
+    body = "".join(f'<tr><td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;color:#64748b;white-space:nowrap;width:1%">{k}</td>'
+                   f'<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0">{v}</td></tr>' for k, v in rows)
+    return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
+            f'<table style="width:100%;border-collapse:collapse;font-size:14px">{body}</table>'
+            '<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr reads headers only and makes NZBs; the downloading is '
+            'your downloader\'s. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
+
+
 @app.get("/system", response_class=HTMLResponse)
 async def page_system():
     if not login.session_exists():
@@ -6994,6 +7040,7 @@ async def page_system():
     body = """
 <h2 class="section">System</h2>
 __ALLOWANCES__
+__USENET__
 <section style="margin-bottom:28px">
   <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Workers</h3>
   <div id="workersTable">loading...</div>
@@ -7100,6 +7147,11 @@ setInterval(loadDeepBackfill, 60000);
 </style>
 """
     body = body.replace("__ALLOWANCES__", allowances_html)
+    try:
+        body = body.replace("__USENET__", await _usenet_system_html())
+    except Exception as e:
+        log.warning("[system] usenet section: %s", e)
+        body = body.replace("__USENET__", "")
     return HTMLResponse(_layout("System", "/system", body))
 
 
