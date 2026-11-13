@@ -4763,7 +4763,7 @@ async def _held_prepare(conn) -> dict:
     return cols
 
 
-def _q(names, prefix="") -> str:
+def _colnames(names, prefix="") -> str:
     return ", ".join(f'{prefix}"{n}"' for n in names)
 
 
@@ -4780,13 +4780,13 @@ async def _hold_channels(conn, cols: dict, ids: list, owner) -> int:
     # replaced: its kept history stays, the new messages join it.
     c = cols["channels"]
     await conn.execute(
-        f"""INSERT INTO held_channels ({_q(c)}, held_at) SELECT {_q(c)}, NOW() FROM channels ch
+        f"""INSERT INTO held_channels ({_colnames(c)}, held_at) SELECT {_colnames(c)}, NOW() FROM channels ch
             WHERE ch.id = ANY($1::bigint[])
               AND NOT EXISTS (SELECT 1 FROM held_channels hc WHERE hc.tg_chat_id = ch.tg_chat_id)""", ids)
     c = cols["messages"]
     sel = ", ".join("hc.id" if n == "channel_id" else f'm."{n}"' for n in c)
     await conn.execute(
-        f"""INSERT INTO held_messages ({_q(c)})
+        f"""INSERT INTO held_messages ({_colnames(c)})
             SELECT {sel} FROM messages m
             JOIN channels ch ON ch.id = m.channel_id
             JOIN held_channels hc ON hc.tg_chat_id = ch.tg_chat_id
@@ -4795,10 +4795,10 @@ async def _hold_channels(conn, cols: dict, ids: list, owner) -> int:
                               WHERE o.channel_id = hc.id AND o.tg_message_id = m.tg_message_id)""", ids)
     c = cols["releases"]
     await conn.execute(
-        f"INSERT INTO held_releases ({_q(c)}) SELECT {_q(c)} FROM releases WHERE primary_msg_id IN ({msgs})", ids)
+        f"INSERT INTO held_releases ({_colnames(c)}) SELECT {_colnames(c)} FROM releases WHERE primary_msg_id IN ({msgs})", ids)
     c = cols["favorites"]
     await conn.execute(
-        f"INSERT INTO held_favorites ({_q(c)}) SELECT {_q(c)} FROM favorites WHERE msg_id IN ({msgs})", ids)
+        f"INSERT INTO held_favorites ({_colnames(c)}) SELECT {_colnames(c)} FROM favorites WHERE msg_id IN ({msgs})", ids)
     # and out of the live tables (downloads -> releases -> channels; messages
     # and favourites follow their channel)
     rels = f"SELECT id FROM releases WHERE primary_msg_id IN ({msgs})"
@@ -4820,25 +4820,25 @@ async def _restore_channels(conn, cols: dict, uid: int) -> list:
     # (the crawler may already have listed a chat again in the seconds since
     # signing in: then that row stays and the kept messages join it)
     await conn.execute(
-        f"""INSERT INTO channels ({_q(c)}) SELECT {_q(c)} FROM held_channels
+        f"""INSERT INTO channels ({_colnames(c)}) SELECT {_colnames(c)} FROM held_channels
             WHERE id = ANY($1::bigint[]) ON CONFLICT DO NOTHING""", ids)
     c = cols["messages"]
     sel = ", ".join("c.id" if n == "channel_id" else f'h."{n}"' for n in c)
     await conn.execute(
-        f"""INSERT INTO messages ({_q(c)})
+        f"""INSERT INTO messages ({_colnames(c)})
             SELECT {sel} FROM held_messages h
             JOIN held_channels hc ON hc.id = h.channel_id
             JOIN channels c ON c.tg_chat_id = hc.tg_chat_id
             WHERE hc.id = ANY($1::bigint[]) ON CONFLICT DO NOTHING""", ids)
     c = cols["releases"]
     await conn.execute(
-        f"""INSERT INTO releases ({_q(c)}) SELECT {_q(c)} FROM held_releases h
+        f"""INSERT INTO releases ({_colnames(c)}) SELECT {_colnames(c)} FROM held_releases h
             WHERE h.primary_msg_id IN (SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[]))
               AND h.primary_msg_id IN (SELECT id FROM messages)
             ON CONFLICT DO NOTHING""", ids)
     c = cols["favorites"]
     await conn.execute(
-        f"""INSERT INTO favorites ({_q(c)}) SELECT {_q(c)} FROM held_favorites h
+        f"""INSERT INTO favorites ({_colnames(c)}) SELECT {_colnames(c)} FROM held_favorites h
             WHERE h.msg_id IN (SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[]))
               AND h.msg_id IN (SELECT id FROM messages)
             ON CONFLICT DO NOTHING""", ids)
