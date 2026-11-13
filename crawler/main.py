@@ -89,7 +89,7 @@ BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 # Single source for the version this crawler reports to the registry.
-TGARR_VERSION = "0.5.7"
+TGARR_VERSION = "0.5.8"
 TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
@@ -140,56 +140,11 @@ _REVOKED_FIRED = False
 
 
 async def wipe_private_channel_data() -> dict:
-    """Drop all channels with no public username (= private/invite-only) and
-    everything that depends on them — messages, releases, downloads, and the
-    auto_grab_log/Meili docs that follow. Returns counts for logging.
-
-    Rationale: private channels are reachable only via MTProto from the
-    account that joined them. Once that account is logged out / revoked,
-    the local rows are dead pointers (no client can fetch them). Central
-    federation already has the resources, so on next login the client can
-    pull a fresh snapshot.
-
-    Public channels (username IS NOT NULL) are kept — any new account can
-    re-join and re-index them, and the cached browse data stays useful in
-    read-only mode while logged out.
-    """
-    async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            target_ids = [r["id"] for r in await conn.fetch(
-                "SELECT id FROM channels WHERE username IS NULL")]
-            if not target_ids:
-                return {"channels": 0, "messages": 0, "releases": 0}
-            msg_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE channel_id = ANY($1::int[])",
-                target_ids)
-            rel_target_q = """
-                SELECT r.id FROM releases r
-                JOIN messages m ON m.id = r.primary_msg_id
-                WHERE m.channel_id = ANY($1::int[])"""
-            # Order matters — bottom-up so FK constraints don't fire:
-            # downloads → releases → monitored_movies-nullify → releases →
-            # (channels cascade messages, auto_grab_log cascades from releases).
-            await conn.execute(
-                f"DELETE FROM downloads WHERE release_id IN ({rel_target_q})",
-                target_ids)
-            await conn.execute(
-                f"UPDATE monitored_movies SET grabbed_release_id = NULL "
-                f"WHERE grabbed_release_id IN ({rel_target_q})",
-                target_ids)
-            rel_count = int((await conn.execute(
-                f"""DELETE FROM releases WHERE primary_msg_id IN (
-                       SELECT id FROM messages
-                       WHERE channel_id = ANY($1::int[]))""",
-                target_ids)).split()[-1])
-            await conn.execute(
-                "DELETE FROM channels WHERE id = ANY($1::int[])", target_ids)
-    log.warning("[wipe-private] removed %d channels + %d messages + %d releases",
-                len(target_ids), msg_count, rel_count)
-    # Meili will reconcile on next sync pass — its docs reference the now-gone
-    # message/release ids, those become stale until meili_sync_worker prunes.
-    return {"channels": len(target_ids), "messages": msg_count,
-            "releases": rel_count}
+    """The session is gone (signed out elsewhere, or revoked). This used to
+    delete the account's private chats; they are kept now. The api moves
+    them into its keeping tables (see _private_keep_worker there) and gives
+    them back when the same account signs in again - nothing to do here."""
+    return {"kept": "by the api"}
 
 
 async def _mark_revoked(reason: str) -> None:
@@ -206,7 +161,7 @@ async def _mark_revoked(reason: str) -> None:
     try:
         if db_pool is not None:
             counts = await wipe_private_channel_data()
-            log.warning("[revoked] wiped private slice: %s", counts)
+            log.warning("[revoked] private chats are kept for the account: %s", counts)
     except Exception as e:
         log.exception("[revoked] wipe failed (continuing): %s", e)
     try:
@@ -628,6 +583,25 @@ async def _mtproto_wait_clearance(method_name: str = "get_chat_history"):
         return
 
 
+# History comes a page (100 messages) per request, and a generator asks for
+# the next page the moment the last message of the previous one is taken.
+# Reading several chats at start-up was therefore dozens of requests back to
+# back, which Telegram answers with "wait 11-26 seconds". The gap is kept
+# here, for every reader at once (start-up backfill, following a channel,
+# the deep backfill): no two history requests closer than this, whoever asks.
+HISTORY_GAP_SEC = float(os.environ.get("TGARR_HISTORY_GAP_SEC", "2"))
+HISTORY_PAGE = 100
+_HIST_SLOT = [0.0]
+
+
+async def _hist_gap() -> None:
+    now = time.monotonic()
+    slot = max(now, _HIST_SLOT[0] + HISTORY_GAP_SEC)
+    _HIST_SLOT[0] = slot                 # taken before sleeping: two readers never share a slot
+    if slot > now:
+        await asyncio.sleep(slot - now)
+
+
 async def _mtproto_aiter(method_name: str, agen):
     """Drive a Pyrogram async generator (get_chat_history / get_dialogs) under
     the same FloodWait discipline as _mtproto(): wait out an existing halt
@@ -637,9 +611,16 @@ async def _mtproto_aiter(method_name: str, agen):
     generic error and the caller moved straight on to hit the next channel.
     """
     await _mtproto_wait_clearance(method_name)
+    paced = method_name == "get_chat_history"
+    seen = 0
     try:
+        if paced:
+            await _hist_gap()
         async for item in agen:
             yield item
+            seen += 1
+            if paced and seen % HISTORY_PAGE == 0:
+                await _hist_gap()        # the next item costs a request
     except _REVOKED_AUTH_ERRORS as e:
         await _mark_revoked(type(e).__name__)
         raise
@@ -1165,6 +1146,15 @@ _MIN_SIZES = {
 }
 
 
+# A private chat: no public @name and small. Telegram's ordinary groups hold
+# at most 200 people; a "group" of thousands that simply has no public name
+# (search-bot groups, advert groups) is not somebody's private chat. What is
+# in a private chat is the person's own - family photos, short clips, notes -
+# and none of the rules written to keep public-channel junk out of the index
+# apply to it: no size floors, no advert keywords, no noise verdict, no sweep.
+PRIVATE_CHAT_SQL = "username IS NULL AND COALESCE(members_count, 0) < 200"
+
+
 def _quality_check(file_name: str | None, file_size: int | None,
                    media_type: str | None, caption: str | None) -> tuple[bool, str | None]:
     """Multi-signal quality gate. Returns (keep?, reject_reason_if_drop).
@@ -1485,6 +1475,38 @@ async def init_db() -> None:
         log.warning("[boot] the API has not reported the database ready after 3 min — going on")
     # Crawl-and-release columns (also created by api _migrate_schema; ensure
     # here so crawler workers can query them regardless of migration order).
+    # 0.5.8, once: private chats are kept whole. Until now the rules meant for
+    # public-channel junk applied to them too - small photos and short clips
+    # were dropped or swept, and a chatty group could be judged "noise" and
+    # left unread. Lift the verdict and read each of them again. And remove
+    # what a large no-name group judged noise had kept sending in.
+    try:
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT 1 FROM config WHERE key = 'private_kept_whole_0_5_8'"):
+                r = await conn.execute(
+                    f"""UPDATE channels
+                           SET backfilled = FALSE, enabled = TRUE,
+                               category = NULLIF(category, 'noise'),
+                               content_category = CASE WHEN content_category = 'noise' THEN 'mixed'
+                                                       ELSE content_category END
+                         WHERE {PRIVATE_CHAT_SQL} AND COALESCE(is_joined, FALSE)""")
+                d = await conn.execute(
+                    f"""DELETE FROM messages
+                         WHERE channel_id IN (
+                               SELECT id FROM channels
+                               WHERE username IS NULL AND NOT ({PRIVATE_CHAT_SQL})
+                                 AND (COALESCE(category, '') = 'noise' OR COALESCE(content_category, '') = 'noise')
+                                 AND NOT COALESCE(subscribed, FALSE))
+                           AND COALESCE(local_path, '') = ''
+                           AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)""")
+                await conn.execute(
+                    "INSERT INTO config (key, value) VALUES ('private_kept_whole_0_5_8', 'done') "
+                    "ON CONFLICT (key) DO NOTHING")
+                log.info("[private] kept whole from now on: %s to be read again, %s from large no-name noise groups",
+                         r, d)
+    except Exception as e:
+        log.warning("[private] one-time re-read not scheduled: %s", e)
+
     async with db_pool.acquire() as conn:
         await conn.execute(
             "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0")
@@ -1673,7 +1695,7 @@ async def _heartbeat(worker: str, action: str = "", error: str | None = None,
 # Pure database work: no Telegram calls, nothing is downloaded, nothing is
 # auto-grabbed. A release someone has downloaded or grabbed is never removed.
 # ════════════════════════════════════════════════════════
-RELEASE_JUDGE_VER = 1            # bump when the rules change: everything is re-judged
+RELEASE_JUDGE_VER = 2            # bump when the rules change: everything is re-judged
 RELEASE_JUDGE_BATCH = 300
 CONTEXT_WINDOW = 12              # messages back from a file to look for its poster
 
@@ -1839,9 +1861,32 @@ async def _judge_message(conn, m, gone: list) -> str:
     return "created"
 
 
+async def _drop_releases_of_songs() -> int:
+    """Take out releases whose file is audio (made before that was checked when a file
+    is first read). One with a grab, a download or a watch-list entry on it is left."""
+    async with db_pool.acquire() as conn:
+        gone = [r["id"] for r in await conn.fetch(
+            """DELETE FROM releases r USING messages m
+               WHERE m.id = r.primary_msg_id
+                 AND (m.media_type = 'audio' OR m.mime_type ILIKE 'audio/%')
+                 AND COALESCE(r.grab_count, 0) = 0
+                 AND NOT EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = r.id)
+                 AND NOT EXISTS (SELECT 1 FROM monitored_movies mm WHERE mm.grabbed_release_id = r.id)
+               RETURNING r.id""")]
+    if gone:
+        for i in range(0, len(gone), 1000):
+            await _meili_delete("releases", gone[i:i + 1000])
+        log.info("[judge] %d release(s) that were songs, not films, taken out", len(gone))
+    return len(gone)
+
+
 async def release_judge_worker():
     await asyncio.sleep(90)
     log.info("[judge] release re-judgement started (rules v%d)", RELEASE_JUDGE_VER)
+    try:
+        await _drop_releases_of_songs()
+    except Exception as e:
+        log.warning("[judge] taking out song releases: %s", e)
     totals: dict = {}
     while True:
         try:
@@ -1865,6 +1910,7 @@ async def release_judge_worker():
                        FROM (SELECT * FROM messages
                              WHERE rel_ver IS NULL AND media_type IN ('video', 'document')
                                AND indexed_at < NOW() - INTERVAL '2 minutes'
+                               AND tg_chat_id > -100000000000000000   -- not the household's own files
                              ORDER BY id LIMIT $1) m
                        LEFT JOIN releases r ON r.primary_msg_id = m.id
                        ORDER BY m.id""", RELEASE_JUDGE_BATCH)
@@ -1910,6 +1956,12 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
     """Parse the file name and insert a release row if it qualifies. The
     decision (see parser.decide_release) also weighs the running time and
     frame size Telegram reported, when it did."""
+    # Only video can be a film or an episode. The re-judgement has this rule, but it
+    # never looks at audio - so a DJ set called "Something.2026" (audio/mpeg, 300 MB)
+    # was filed as a film when it was first read and stayed one.
+    kind = await conn.fetchrow("SELECT media_type, mime_type FROM messages WHERE id = $1", msg_row_id)
+    if kind is not None and not is_video_file(file_name, kind["mime_type"], kind["media_type"]):
+        return None
     parsed = parse_filename(file_name or "")
     verdict = decide_release(parsed, file_size=file_size, duration=duration,
                              width=width, height=height,
@@ -2005,15 +2057,24 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
     chat_id = msg.chat.id
     msg_id = msg.id
 
-    if not live:
-        async with db_pool.acquire() as conn:
-            allowed = await conn.fetchval(
-                """SELECT 1 FROM channels
-                   WHERE tg_chat_id=$1
-                     AND (is_joined=TRUE OR subscribed=TRUE)""",
-                chat_id)
-        if not allowed:
-            return False
+    async with db_pool.acquire() as conn:
+        st = await conn.fetchrow(
+            f"""SELECT (is_joined = TRUE OR subscribed = TRUE) AS known,
+                       COALESCE(subscribed, FALSE) AS followed,
+                       (COALESCE(category, '') = 'noise'
+                        OR COALESCE(content_category, '') = 'noise') AS noise,
+                       ({PRIVATE_CHAT_SQL}) AS private
+                FROM channels WHERE tg_chat_id = $1""", chat_id)
+    if not live and not (st and st["known"]):
+        return False
+    # a chat not seen before arrives live: private until its size is known
+    is_private = bool(st["private"]) if st else not getattr(msg.chat, "username", None)
+    # A chat judged to be noise is not indexed - not its history, and not what
+    # it posts from now on (a notice re-posted every few minutes by a
+    # 17,000-member group used to keep arriving). Followed channels and
+    # private chats are never treated as noise.
+    if st and st["noise"] and not st["followed"] and not is_private:
+        return False
 
     file_name = None
     file_size = None
@@ -2125,7 +2186,8 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
         if media is None:
             return False
         # QUALITY GATE: ad-keyword / micro-size junk rejected before persist.
-        keep, reason = _quality_check(file_name, file_size, media_type, caption)
+        keep, reason = (True, None) if is_private else _quality_check(
+            file_name, file_size, media_type, caption)
         if not keep:
             return False
         # Caption = the human-written description of the resource (title,
@@ -2220,7 +2282,8 @@ async def backfill_channel(chat_id: int, title: str, username: str | None = None
     # Title/username gate: reject news/TV up front (see _is_noise_title).
     async with db_pool.acquire() as conn:
         _followed = await conn.fetchval(
-            "SELECT COALESCE(subscribed, FALSE) FROM channels WHERE tg_chat_id = $1", chat_id)
+            f"""SELECT COALESCE(subscribed, FALSE) OR ({PRIVATE_CHAT_SQL})
+                FROM channels WHERE tg_chat_id = $1""", chat_id)
     noise_hit, noise_kw = (False, None) if _followed else _is_noise_title(title, username)
     if noise_hit:
         log.info("[backfill] chat_id=%s NOISE-TITLE kw=%r title=%s — abort",
@@ -2245,7 +2308,7 @@ async def backfill_channel(chat_id: int, title: str, username: str | None = None
             if count % 200 == 0:
                 log.info("[backfill] chat_id=%s progress=%s media=%s",
                          chat_id, count, media_count)
-            if count == NOISE_SAMPLE_AT:
+            if count == NOISE_SAMPLE_AT and not _followed:
                 pct = media_count * 100 // count
                 if pct < NOISE_THRESHOLD_PCT:
                     log.info("[backfill] NOISE chat_id=%s title=%s "
@@ -6115,11 +6178,12 @@ async def decay_eviction_worker() -> None:
                     # Don't delete rows that user has grabbed (local_path set)
                     # — those are local cache the user is using.
                     result = await conn.execute(
-                        """DELETE FROM messages
+                        f"""DELETE FROM messages
                            WHERE channel_id IN (
                              SELECT id FROM channels WHERE content_category = $1
                            )
                            AND posted_at < NOW() - ($2 || ' days')::INTERVAL
+                           AND channel_id NOT IN (SELECT id FROM channels WHERE {PRIVATE_CHAT_SQL})
                            AND COALESCE(local_path, '') = ''
                            AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)""",
                         category, str(cutoff_days))
@@ -6145,6 +6209,7 @@ async def decay_eviction_worker() -> None:
                         OR COALESCE(caption, '') ~* $1
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """, r'(\bcrypto\b|\bnft\b|\busdt\b|赌博|博彩|casino|gamble|gambling|'
                      r'投资理财|做单|赚钱|月入|代理|代充|代购|刷单|'
@@ -6162,6 +6227,7 @@ async def decay_eviction_worker() -> None:
                         OR COALESCE(caption, '') ~* $1
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """, r'(qrcode|qr[\s_]*code|二维码|'
                      r'微信号|wechat[\s_]*id|加微信|加[\s_]*wx|'
@@ -6186,6 +6252,7 @@ async def decay_eviction_worker() -> None:
                         -- mid/large (>=5k): 10KB (baseline, matches ingest gate)
                         (COALESCE(c.members_count, 0) >= 5000 AND m.file_size < 10000)
                       )
+                      AND NOT (c.username IS NULL AND COALESCE(c.members_count, 0) < 200)
                       AND COALESCE(m.local_path, '') = ''
                       AND m.id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
@@ -6200,6 +6267,7 @@ async def decay_eviction_worker() -> None:
                       (media_type='document' AND file_size < 10000)
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
                 micro_n = (int(r2b.split()[-1]) if r2b.startswith("DELETE") else 0) + photo_n
@@ -6216,6 +6284,7 @@ async def decay_eviction_worker() -> None:
                         HAVING count(DISTINCT channel_id) > 10
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
                 spam_n = int(r3.split()[-1]) if r3.startswith("DELETE") else 0
@@ -6884,7 +6953,9 @@ async def contribute_resources_worker() -> None:
 # list, marked cleared. Private chats and KwickPOS* are never touched.
 # Nothing is sent to tgarr.me about the unfollow, and nothing is removed there.
 # ═════════════════════════════════════════════════
-UNFOLLOW_REPORT_GRACE_HOURS = int(os.environ.get("TGARR_UNFOLLOW_REPORT_GRACE_HOURS", "6"))
+# (one hour: long enough for a report that is already on its way, short enough that
+     # "remove" does not look as if nothing had happened; it was six)
+UNFOLLOW_REPORT_GRACE_HOURS = int(os.environ.get("TGARR_UNFOLLOW_REPORT_GRACE_HOURS", "1"))
 
 _UNFOLLOW_PICK_SQL = """
     SELECT c.id, c.username, c.title FROM channels c

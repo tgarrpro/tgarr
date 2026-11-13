@@ -10,7 +10,9 @@ Sonarr grab → SAB `addurl` → row in `downloads` table → crawler's worker f
 via MTProto → drops file in /downloads/tgarr/<release>/ → Sonarr's CDH imports.
 """
 import asyncio
+import hashlib
 import html
+import io
 import json as _json
 import logging
 import os
@@ -26,6 +28,11 @@ from fastapi import FastAPI, Form, Header, Query, Response, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 import login  # local module
+import access  # local module
+import screentime  # local module
+import export  # local module
+import localfiles  # local module
+import contextvars
 
 
 # ── adult (NSFW) classification ────────────────────────────────────────
@@ -113,16 +120,165 @@ def _signed_in() -> bool:
     return _SIGNED_IN[1]
 
 
+_ME_ID = [0.0, None]
+
+
+def _me_id():
+    """The Telegram id of the account signed in here, or None."""
+    if not _signed_in():
+        return None
+    now = time.monotonic()
+    if now - _ME_ID[0] > 1.0:
+        try:
+            _ME_ID[1] = login.session_user_id()
+        except Exception:
+            _ME_ID[1] = None
+        _ME_ID[0] = now
+    return _ME_ID[1]
+
+
 def _pub(alias: str = "c") -> str:
     """SQL to append to a WHERE: public channels only, when nobody is signed in."""
-    return "" if _signed_in() else f" AND {alias}.username IS NOT NULL"
+    return "" if _signed_in() else f" AND ({alias}.username IS NOT NULL OR {alias}.local_root IS NOT NULL)"
 
 
 def _pub_m(alias: str = "m") -> str:
     """The same for a query on messages that may not join channels at all (a
     page's count and facet queries reuse its filter without the join)."""
     return "" if _signed_in() else (
-        f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL)")
+        f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL OR local_root IS NOT NULL)")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Access PIN and the kids' list
+#
+# Whoever opened this address used to see everything the owner sees: the
+# followed channels, the private photos, the settings. With a PIN set
+# (config 'access_pin'), a browser that has not entered it is LOCKED: it gets
+# the kids' pages and the items the owner put on the kids' list - nothing
+# else. This is decided here, for every request, not by hiding links.
+# ════════════════════════════════════════════════════════════════════
+_LOCKED = contextvars.ContextVar("tgarr_locked", default=False)
+_ACCESS = {"at": 0.0, "pin": None, "secret": None}
+_GUESSES = access.Guesses()
+_KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
+_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw'
+               AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
+                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+_LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock")
+# open even when the Media Center itself is closed for the moment (time rules)
+_LOCKED_ALWAYS = ("/unlock", "/api/unlock", "/lock", "/mediacenter/rest", "/api/mc/ping", "/mc/ping.js")
+_MC = {"at": 0.0, "rules": screentime.clean(None)}
+_DEVICES = screentime.Devices()
+_MC_SEEN: dict = {}                    # (device, item) -> when it was last noted in the record of use
+
+
+async def _mc_rules(fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if (fresh or now - _MC["at"] > 5) and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                raw = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_rules'")
+            _MC.update(at=now, rules=screentime.clean(_json.loads(raw) if raw else None))
+        except Exception:
+            pass
+    return _MC["rules"]
+
+
+def _mc_who(request: Request) -> str:
+    return request.client.host if request.client else "?"
+
+
+async def _mc_device(who: str, rules: dict) -> None:
+    """A device seen for the first time since the start: pick up what it had
+    already used today, so that a restart does not hand the day back."""
+    day = screentime.local(time.time(), rules.get("tz", 0))[0]
+    if who in _DEVICES.by and _DEVICES.by[who]["day"] == day:
+        return
+    used = 0
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            used = await conn.fetchval("SELECT seconds FROM mc_usage WHERE day = $1 AND who = $2", day, who) or 0
+    _DEVICES.get(who, day)["used"] = int(used)
+
+
+async def _access_cfg(fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if (fresh or now - _ACCESS["at"] > 3) and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT key, value FROM config WHERE key IN ('access_pin', 'access_secret')")
+            d = {r["key"]: r["value"] for r in rows}
+            _ACCESS.update(at=now, pin=d.get("access_pin") or None, secret=d.get("access_secret") or None)
+        except Exception:
+            pass                       # e.g. the very first start, before the tables exist
+    return _ACCESS
+
+
+async def _is_locked(request: Request) -> bool:
+    cfg = await _access_cfg()
+    if not cfg["pin"]:
+        return False                   # no PIN set: as before, everything is open
+    return not access.token_ok(cfg["secret"], request.cookies.get(access.COOKIE))
+
+
+async def _kid_ok(key, sql: str, arg) -> bool:
+    hit = _KID_OK.get(key)
+    if hit and time.monotonic() - hit[1] < 30:
+        return hit[0]
+    ok = False
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            ok = bool(await conn.fetchval(sql, arg))
+    if len(_KID_OK) > 20000:
+        _KID_OK.clear()
+    _KID_OK[key] = (ok, time.monotonic())
+    return ok
+
+
+async def _locked_block(request: Request):
+    """What a locked browser may not have. None = let it through."""
+    path = request.url.path
+    if path in _LOCKED_ALWAYS or path in _GUARD_OPEN_PATHS:
+        return None
+    # Opening hours, minutes a day, breaks. Decided here as well as in the
+    # page, so that closing time cannot be got round by typing an address.
+    rules = await _mc_rules()
+    if rules["on"]:
+        who = _mc_who(request)
+        await _mc_device(who, rules)
+        if not _DEVICES.check(who, rules, time.time())["ok"]:
+            if request.method in ("GET", "HEAD") and "text/html" in (request.headers.get("accept") or ""):
+                return RedirectResponse("/mediacenter/rest", status_code=303)
+            return JSONResponse({"status": "rest", "message": "the Media Center is closed for now"}, status_code=403)
+    if path in _LOCKED_OPEN:
+        return None
+    if request.method in ("GET", "HEAD"):
+        m = _PRIVATE_ID_RX.match(path)
+        if m and path.startswith("/watch/") and db_pool is not None:
+            # the record of use: which item, on which device, when (once per ten minutes)
+            k, now = (_mc_who(request), int(m.group(1))), time.time()
+            if now - _MC_SEEN.get(k, 0) > 600:
+                if len(_MC_SEEN) > 5000:
+                    _MC_SEEN.clear()
+                _MC_SEEN[k] = now
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute("INSERT INTO mc_log (who, msg_id) VALUES ($1, $2)", k[0], k[1])
+                except Exception:
+                    pass
+        if m and await _kid_ok(int(m.group(1)), f"""
+                SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.id = $1 AND {_KID_SQL}""", int(m.group(1))):
+            return None
+        if path.startswith("/thumbs/") and await _kid_ok(path, f"""
+                SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.thumb_path = $1 AND {_KID_SQL} LIMIT 1""", path[len("/thumbs/"):]):
+            return None
+        if "text/html" in (request.headers.get("accept") or "") and not path.startswith("/api/"):
+            return RedirectResponse("/mediacenter", status_code=303)
+    return JSONResponse({"status": "locked", "message": "enter the PIN to do this"}, status_code=403)
 
 
 async def _signed_out_block(request: Request):
@@ -130,7 +286,10 @@ async def _signed_out_block(request: Request):
         return None
     path = request.url.path
     if request.method not in ("GET", "HEAD", "OPTIONS"):
-        if path.startswith("/api/") and not path.startswith("/api/login"):
+        # the PIN and the kids' list belong to this install, not to the
+        # Telegram account: they work whether or not anybody is signed in
+        if path.startswith("/api/") and not path.startswith(
+                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/")):
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -141,7 +300,7 @@ async def _signed_out_block(request: Request):
         if ok is None:
             async with db_pool.acquire() as conn:
                 ok = bool(await conn.fetchval(
-                    """SELECT c.username IS NOT NULL FROM messages m
+                    """SELECT c.username IS NOT NULL OR c.local_root IS NOT NULL FROM messages m
                        JOIN channels c ON c.id = m.channel_id WHERE m.id = $1""", mid))
             if len(_PUBLIC_MSG) > 20000:
                 _PUBLIC_MSG.clear()
@@ -158,6 +317,10 @@ def _ct_equal(a: str, b: str) -> bool:
 
 async def _request_guard(request: Request, call_next):
     path = request.url.path
+    # a different account than a moment ago: put the other one's private
+    # chats into keeping (and take this one's out) before anything is shown
+    if db_pool is not None and _me_id() != _PRIVATE_FOR[0]:
+        await _private_reconcile()
     if path in _GUARD_OPEN_PATHS:
         return await call_next(request)
     if _cross_site(request):
@@ -184,6 +347,14 @@ async def _request_guard(request: Request, call_next):
         if not ok:
             return Response("authentication required", status_code=401,
                             headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
+    # Sonarr, Radarr and the like come with their own key (checked above) and
+    # carry no browser cookie: the PIN is not for them
+    locked = (not _is_arr_path(path)) and await _is_locked(request)
+    _LOCKED.set(locked)
+    if locked:
+        blocked = await _locked_block(request)
+        if blocked is not None:
+            return blocked
     blocked = await _signed_out_block(request)
     if blocked is not None:
         return blocked
@@ -223,11 +394,15 @@ def _js_str(v) -> str:
             .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 import metadata as md  # local module
+import usenet  # local module
+import usenet_scan  # local module
+import usenet_client  # local module
+import usenet_rules  # local module
 
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.7"
+TGARR_VERSION = "0.5.8"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -281,6 +456,21 @@ ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
 app.middleware("http")(_request_guard)   # defined above, next to its helpers
+
+
+async def _safe_headers(request: Request, call_next):
+    """Three headers every answer carries: a file is what its type says (no
+    guessing a script out of an upload), these pages are not shown inside
+    another site's frame (no invisible-button tricks), and the address of a
+    page here is not passed on to sites it links to."""
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    return resp
+
+
+app.middleware("http")(_safe_headers)
 # The module-level logger. It was missing: the cache cleanup removed files and
 # then died on its own log line (NameError), once, for good - and the
 # "clear everything" button answered 500 after doing its work.
@@ -393,6 +583,10 @@ async def _startup():
     asyncio.create_task(_stats_snapshot_worker())
     asyncio.create_task(_ebook_queue_restore())
     asyncio.create_task(_arr_alias_sync_worker())
+    asyncio.create_task(_usenet_scan_worker())
+    asyncio.create_task(_usenet_index_worker())
+    asyncio.create_task(_private_keep_worker())
+    asyncio.create_task(_export_worker())
     asyncio.create_task(_cache_gc_worker())
     asyncio.create_task(_update_check_worker())
 
@@ -601,6 +795,8 @@ async def _migrate_schema():
             -- to this channel. Crawler workers filter by current account so an
             -- account switch doesn't try to access channels it can't reach.
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS account_user_id BIGINT;
+            -- the household's own files (uploads, folders): which source this "chat" stands for
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS local_root TEXT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS is_joined BOOLEAN NOT NULL DEFAULT FALSE;
             CREATE INDEX IF NOT EXISTS idx_channels_account ON channels (account_user_id);
             -- NULL account_user_id = "not yet claimed by an account"; the crawler
@@ -714,6 +910,53 @@ async def _migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_alias_canon ON series_aliases (canonical_title);
             -- Which series have been asked about (other-language names by
             -- TVDB number), so each is asked once, not every hour.
+            -- What a browser that has not entered the PIN may see: whole
+            -- channels (kind 'channel', ref = channels.id) and single items
+            -- (kind 'message', ref = messages.id).
+            -- Usenet: one small card per named release (the NZB is rebuilt
+            -- when asked for), and how far each newsgroup has been read.
+            CREATE TABLE IF NOT EXISTS usenet_cards (
+              id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, size BIGINT, grp TEXT NOT NULL,
+              poster TEXT, posted_from BIGINT, posted_to BIGINT, files INT, files_expected INT,
+              segments INT, segments_expected INT, complete BOOLEAN, first_message_id TEXT, key TEXT,
+              art_lo BIGINT, art_hi BIGINT, alive REAL, added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_usenet_cards_posted ON usenet_cards (posted_from DESC);
+            -- cards made by the index scanner (or taken from the registry): found again by their own key;
+            -- detail 0 = seen in a sparse pass, size estimated
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS sketch BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS detail SMALLINT NOT NULL DEFAULT 1;
+            -- 'nsfw' for adult material (usenet_rules): left out of the feed unless adult content is switched on
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'sfw';
+            CREATE TABLE IF NOT EXISTS usenet_progress (
+              grp TEXT PRIMARY KEY, first_article BIGINT, last_article BIGINT, next_article BIGINT,
+              headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
+              enabled BOOLEAN NOT NULL DEFAULT TRUE, note TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            -- Media Center: seconds used per device per day (day = days since
+            -- 1970 in the owner's time zone), and which items were opened.
+            CREATE TABLE IF NOT EXISTS mc_usage (
+              day INT NOT NULL, who TEXT NOT NULL, seconds INT NOT NULL DEFAULT 0, PRIMARY KEY (day, who)
+            );
+            CREATE TABLE IF NOT EXISTS mc_log (
+              at TIMESTAMPTZ NOT NULL DEFAULT NOW(), who TEXT NOT NULL, msg_id BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mc_log_at ON mc_log (at DESC);
+            CREATE TABLE IF NOT EXISTS kids_allow (
+              kind TEXT NOT NULL,
+              ref BIGINT NOT NULL,
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (kind, ref)
+            );
+            CREATE TABLE IF NOT EXISTS exports (
+              id BIGSERIAL PRIMARY KEY,
+              title TEXT NOT NULL,
+              owner BIGINT,
+              msg_ids BIGINT[] NOT NULL,
+              status TEXT NOT NULL DEFAULT 'fetching',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              done_at TIMESTAMPTZ
+            );
             CREATE TABLE IF NOT EXISTS series_alias_lookups (
               tvdb_id BIGINT PRIMARY KEY,
               looked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1098,6 +1341,9 @@ async def lazy_thumb(msg_id: int):
     if tp in ("__failed__", "__deleted__"):
         return Response(_TINY_TRANSPARENT_GIF, status_code=410,
                        media_type="image/gif")
+    own = await _local_picture(msg_id, "thumb_path", THUMBS_DIR, 320)
+    if own is not None:
+        return own
     async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE messages SET thumb_path = $$__user_queued__$$ "
@@ -1155,6 +1401,9 @@ async def lazy_preview(msg_id: int):
         # retrying so slideshow can advance without waiting.
         return Response(_TINY_TRANSPARENT_GIF, status_code=410,
                        media_type="image/gif")
+    own = await _local_picture(msg_id, "preview_path", PREVIEWS_DIR, 1280)
+    if own is not None:
+        return own
     # Queue preview fetch (worker picks up __user_queued__)
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -1532,7 +1781,61 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
             await conn.execute(
                 "UPDATE messages SET local_path = NULL, local_accessed_at = NULL "
                 "WHERE local_path = ANY($1::text[])", gone)
-    return len(doomed), freed
+    n_orphan, freed_orphan = await _cache_orphan_sweep(180 if clear_all else 3600)
+    return len(doomed) + n_orphan, freed + freed_orphan
+
+
+def _cache_listing() -> list:
+    """Every saved file on the disk: (path relative to /downloads, bytes, mtime)."""
+    out = []
+    for pre in _CACHE_PREFIXES:
+        top = os.path.join("/downloads", pre.rstrip("/"))
+        for root, _dirs, names in os.walk(top):
+            for nm in names:
+                full = os.path.join(root, nm)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                out.append((os.path.relpath(full, "/downloads").replace(os.sep, "/"), st.st_size, st.st_mtime))
+    return out
+
+
+async def _cache_orphan_sweep(min_age_s: int) -> tuple:
+    """Remove saved files that nothing in the index points at. A file is saved under its
+    row's local_path; when the row goes - its channel removed, the index purged, a chat
+    re-read under new ids - the file stayed, counted by nobody: the Dashboard said
+    nothing was saved while the disk held gigabytes. Files of chats kept for a
+    signed-out account are spoken for. A file changed in the last `min_age_s` seconds is
+    left alone (it may be arriving)."""
+    import time as _time
+    try:
+        async with db_pool.acquire() as conn:
+            known = {r[0] for r in await conn.fetch(
+                "SELECT DISTINCT local_path FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'")}
+            if await conn.fetchval("SELECT to_regclass('held_messages') IS NOT NULL"):
+                known |= {r[0] for r in await conn.fetch(
+                    "SELECT DISTINCT local_path FROM held_messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'")}
+    except Exception as e:
+        log.warning("[cache] not looking for leftover files: %s", e)      # without the whole list, remove nothing
+        return 0, 0
+    listing = await asyncio.to_thread(_cache_listing)
+    now = _time.time()
+    size_of = {p: (sz, mt) for p, sz, mt in listing}
+    n = freed = 0
+    for p in localfiles.orphans([x[0] for x in listing], known, _CACHE_SIDECARS):
+        sz, mt = size_of[p]
+        if now - mt < min_age_s or ".." in p or not p.startswith(_CACHE_PREFIXES):
+            continue
+        try:
+            await asyncio.to_thread(os.unlink, os.path.join("/downloads", p))
+        except OSError:
+            continue
+        n += 1
+        freed += sz
+    if n:
+        log.info("[cache] removed %d leftover file(s) the index no longer points at, freed %s", n, _fmt_size(freed))
+    return n, freed
 
 
 async def _cache_gc_worker():
@@ -1732,9 +2035,14 @@ def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> 
 def _saved_chip(path: str, qs, local: int) -> str:
     style = ("background:rgba(16,185,129,0.15);color:#059669;border-color:#10b981;"
              if local else "")
-    return (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
+    chip = (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
             f'style="{style}padding:5px 12px;font-size:12px" '
             f'title="only what is already downloaded">● saved</a>')
+    # with "saved" chosen: everything of this kind that is on this machine, as one zip, at once
+    kind = {"/music": "audio", "/library": "book", "/videos": "video"}.get(path)
+    if local and kind and _signed_in():
+        chip += _export_btn({"scope": "saved", "kind": kind}, "⬇ Download all")
+    return chip
 
 
 @app.post("/api/fav/{msg_id}")
@@ -1991,7 +2299,7 @@ async def fetch_remove_many(request: Request):
             """UPDATE messages m SET local_path = NULL, local_accessed_at = NULL,
                       fetch_wanted_at = 'epoch'
                FROM (SELECT id, local_path FROM messages WHERE id = ANY($1::bigint[])) o
-               WHERE m.id = o.id RETURNING o.local_path""", ids)
+               WHERE m.id = o.id AND m.tg_chat_id > $2 RETURNING o.local_path""", ids, localfiles.LOCAL_CHAT_MAX)
     n = 0
     for r in rows:
         lp = r["local_path"]
@@ -2033,7 +2341,7 @@ async def fetch_cancel(msg_id: int):
     async with db_pool.acquire() as conn:
         lp = await conn.fetchval(
             """UPDATE messages SET fetch_wanted_at = 'epoch'
-               WHERE id = $1 RETURNING local_path""", msg_id)
+               WHERE id = $1 AND tg_chat_id > $2 RETURNING local_path""", msg_id, localfiles.LOCAL_CHAT_MAX)
         if lp is None:
             return {"ok": True}
         await conn.execute(
@@ -2129,7 +2437,7 @@ def _ebook_safe_to_convert(src: str, ext: str) -> bool:
     handing the file to calibre. Caps total uncompressed size at 500MB
     and entry count at 20K. Non-zip formats pass through (calibre has
     its own format-specific limits)."""
-    if ext not in ("epub", "cbz", "cbr"):
+    if ext not in ("epub", "cbz", "cbr", "docx", "odt"):
         return True  # mobi/azw/djvu/etc. not zip-based; trust calibre
     import zipfile
     try:
@@ -2181,7 +2489,9 @@ def _ebook_lock(msg_id: int):
 
 
 _EBOOK_CONVERTIBLE = ("epub", "mobi", "azw", "azw3", "djvu", "fb2",
-                      "lit", "cbr", "cbz", "rtf", "lrf", "pdb")
+                      "lit", "cbr", "cbz", "rtf", "lrf", "pdb",
+                      # plain documents a household uploads: readable, and read aloud, like a book
+                      "txt", "docx", "odt")
 
 def _ebook_paths(local_path: str):
     """Return (source_abs, pdf_abs, cover_abs) for a cached ebook."""
@@ -3075,6 +3385,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
 }).catch(() => { $("msg").textContent = "✗ could not open this book"; });
 })();
 </script>
+<script src="/mc/ping.js" defer></script>
 </body></html>"""
 
 
@@ -3611,6 +3922,7 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
 }).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
 })();
 </script>
+<script src="/mc/ping.js" defer></script>
 </body></html>"""
 
 
@@ -3619,9 +3931,16 @@ async def pdf_reader(msg_id: int):
     """The PDF reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    if not _pdf_source(row) and row and _is_local(row["local_path"]):
+        # here, but not a PDF yet (a text file, a .docx, a book in another
+        # format opened straight from a list): make the PDF now, once
+        ext = (row["local_path"] or "").rsplit(".", 1)[-1].lower()
+        src, pdf, _ = _ebook_paths(row["local_path"])
+        if ext in _EBOOK_CONVERTIBLE and os.path.exists(src) and _ebook_safe_to_convert(src, ext):
+            await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not _pdf_source(row):
         return HTMLResponse(
-            f'<p>This file is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            f'<p>This file cannot be shown here. <a href="/media/{msg_id}">Download it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
     return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
@@ -4206,6 +4525,7 @@ async function poll() {{
 }}
 poll();
 </script>
+<script src="/mc/ping.js" defer></script>
 </body></html>"""
     return HTMLResponse(body)
 
@@ -4468,56 +4788,949 @@ async def api_login_sms_verify(code: str = Form(...), password: Optional[str] = 
     return await login.sms_verify(code, password)
 
 
-async def wipe_private_channel_data() -> dict:
-    """Drop all channels with no public username (= private/invite-only) and
-    their cascade. Mirrors crawler/main.py:wipe_private_channel_data — see
-    that docstring for rationale. Called on user-explicit logout to leave the
-    dashboard in clean public-only state."""
+# ════════════════════════════════════════════════════════════════════
+# Private chats belong to the Telegram account that is in them.
+#
+# Signing out used to delete them. Now they are KEPT: moved out of the live
+# tables into "held_*" tables. Moved out rather than flagged, because a flag
+# would have to be honoured by every query on every page, in the search
+# index, by the crawler - and one forgotten place shows one person's family
+# photos to the next person who signs in here. What is not in the live
+# tables cannot be shown by anything.
+#
+# The same account signing in again gets everything back exactly as it was
+# (same ids, same progress marks), so only what is new has to be fetched.
+# Another account never sees it. Kept for PRIVATE_KEEP_DAYS without a
+# sign-in, then removed for good, files included.
+# ════════════════════════════════════════════════════════════════════
+PRIVATE_KEEP_DAYS = 365
+_HELD = (("channels", "held_channels"), ("messages", "held_messages"),
+         ("releases", "held_releases"), ("favorites", "held_favorites"))
+_PRIVATE_FOR = [object()]          # the account the live tables are arranged for
+_PRIVATE_LOCK = asyncio.Lock()
+_PRIVATE_RETRY = [0.0]
+
+
+async def _table_cols(conn, table: str) -> list:
+    return await conn.fetch(
+        """SELECT a.attname AS n, format_type(a.atttypid, a.atttypmod) AS t,
+                  a.attgenerated <> '' AS gen
+           FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+           WHERE c.relname = $1 AND pg_table_is_visible(c.oid)
+             AND a.attnum > 0 AND NOT a.attisdropped
+           ORDER BY a.attnum""", table)
+
+
+async def _held_prepare(conn) -> dict:
+    """The keeping tables exist and have every column the live ones have
+    (an update may have added some since the chats were put away).
+    Returns, per live table, the columns that are copied both ways."""
+    cols = {}
+    for live, held in _HELD:
+        await conn.execute(f"CREATE TABLE IF NOT EXISTS {held} (LIKE {live})")
+        have = {r["n"] for r in await _table_cols(conn, held)}
+        names = []
+        for r in await _table_cols(conn, live):
+            if r["n"] not in have:
+                await conn.execute(f'ALTER TABLE {held} ADD COLUMN "{r["n"]}" {r["t"]}')
+            if not r["gen"]:
+                names.append(r["n"])
+        cols[live] = names
+    await conn.execute("ALTER TABLE held_channels ADD COLUMN IF NOT EXISTS held_at TIMESTAMPTZ")
+    await conn.execute("CREATE INDEX IF NOT EXISTS held_messages_channel ON held_messages (channel_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS held_releases_msg ON held_releases (primary_msg_id)")
+    return cols
+
+
+def _colnames(names, prefix="") -> str:
+    return ", ".join(f'{prefix}"{n}"' for n in names)
+
+
+async def _hold_channels(conn, cols: dict, ids: list, owner) -> int:
+    """Move these private chats, and all that hangs on them, into keeping."""
+    if not ids:
+        return 0
+    await conn.execute(
+        "UPDATE channels SET account_user_id = COALESCE(account_user_id, $2) WHERE id = ANY($1::bigint[])",
+        ids, owner)
+    msgs = "SELECT id FROM messages WHERE channel_id = ANY($1::bigint[])"
+    # A chat that is already in keeping (a message arrived in the seconds
+    # between putting it away and the session ending) is added to, never
+    # replaced: its kept history stays, the new messages join it.
+    c = cols["channels"]
+    await conn.execute(
+        f"""INSERT INTO held_channels ({_colnames(c)}, held_at) SELECT {_colnames(c)}, NOW() FROM channels ch
+            WHERE ch.id = ANY($1::bigint[])
+              AND NOT EXISTS (SELECT 1 FROM held_channels hc WHERE hc.tg_chat_id = ch.tg_chat_id)""", ids)
+    c = cols["messages"]
+    sel = ", ".join("hc.id" if n == "channel_id" else f'm."{n}"' for n in c)
+    await conn.execute(
+        f"""INSERT INTO held_messages ({_colnames(c)})
+            SELECT {sel} FROM messages m
+            JOIN channels ch ON ch.id = m.channel_id
+            JOIN held_channels hc ON hc.tg_chat_id = ch.tg_chat_id
+            WHERE m.channel_id = ANY($1::bigint[])
+              AND NOT EXISTS (SELECT 1 FROM held_messages o
+                              WHERE o.channel_id = hc.id AND o.tg_message_id = m.tg_message_id)""", ids)
+    c = cols["releases"]
+    await conn.execute(
+        f"INSERT INTO held_releases ({_colnames(c)}) SELECT {_colnames(c)} FROM releases WHERE primary_msg_id IN ({msgs})", ids)
+    c = cols["favorites"]
+    await conn.execute(
+        f"INSERT INTO held_favorites ({_colnames(c)}) SELECT {_colnames(c)} FROM favorites WHERE msg_id IN ({msgs})", ids)
+    # and out of the live tables (downloads -> releases -> channels; messages
+    # and favourites follow their channel)
+    rels = f"SELECT id FROM releases WHERE primary_msg_id IN ({msgs})"
+    await conn.execute(f"DELETE FROM downloads WHERE release_id IN ({rels})", ids)
+    await conn.execute(
+        f"UPDATE monitored_movies SET grabbed_release_id = NULL WHERE grabbed_release_id IN ({rels})", ids)
+    await conn.execute(f"DELETE FROM releases WHERE primary_msg_id IN ({msgs})", ids)
+    await conn.execute("DELETE FROM channels WHERE id = ANY($1::bigint[])", ids)
+    return len(ids)
+
+
+async def _restore_channels(conn, cols: dict, uid: int) -> list:
+    """Give this account its chats back. Returns the live channel ids."""
+    ids = [r["id"] for r in await conn.fetch(
+        "SELECT id FROM held_channels WHERE account_user_id = $1", uid)]
+    if not ids:
+        return []
+    c = cols["channels"]
+    # (the crawler may already have listed a chat again in the seconds since
+    # signing in: then that row stays and the kept messages join it)
+    await conn.execute(
+        f"""INSERT INTO channels ({_colnames(c)}) SELECT {_colnames(c)} FROM held_channels
+            WHERE id = ANY($1::bigint[]) ON CONFLICT DO NOTHING""", ids)
+    c = cols["messages"]
+    sel = ", ".join("c.id" if n == "channel_id" else f'h."{n}"' for n in c)
+    await conn.execute(
+        f"""INSERT INTO messages ({_colnames(c)})
+            SELECT {sel} FROM held_messages h
+            JOIN held_channels hc ON hc.id = h.channel_id
+            JOIN channels c ON c.tg_chat_id = hc.tg_chat_id
+            WHERE hc.id = ANY($1::bigint[]) ON CONFLICT DO NOTHING""", ids)
+    c = cols["releases"]
+    await conn.execute(
+        f"""INSERT INTO releases ({_colnames(c)}) SELECT {_colnames(c)} FROM held_releases h
+            WHERE h.primary_msg_id IN (SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[]))
+              AND h.primary_msg_id IN (SELECT id FROM messages)
+            ON CONFLICT DO NOTHING""", ids)
+    c = cols["favorites"]
+    await conn.execute(
+        f"""INSERT INTO favorites ({_colnames(c)}) SELECT {_colnames(c)} FROM held_favorites h
+            WHERE h.msg_id IN (SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[]))
+              AND h.msg_id IN (SELECT id FROM messages)
+            ON CONFLICT DO NOTHING""", ids)
+    live = [r["id"] for r in await conn.fetch(
+        """SELECT c.id FROM channels c JOIN held_channels hc ON hc.tg_chat_id = c.tg_chat_id
+           WHERE hc.id = ANY($1::bigint[])""", ids)]
+    await _held_delete(conn, ids)
+    return live
+
+
+async def _held_delete(conn, ids: list) -> None:
+    held_msgs = "SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[])"
+    await conn.execute(f"DELETE FROM held_favorites WHERE msg_id IN ({held_msgs})", ids)
+    await conn.execute(f"DELETE FROM held_releases WHERE primary_msg_id IN ({held_msgs})", ids)
+    await conn.execute("DELETE FROM held_messages WHERE channel_id = ANY($1::bigint[])", ids)
+    await conn.execute("DELETE FROM held_channels WHERE id = ANY($1::bigint[])", ids)
+
+
+_HELD_FILES = (("thumb_path", THUMBS_DIR), ("preview_path", PREVIEWS_DIR), ("local_path", "/downloads"))
+
+
+async def _restored_files_check(live_ids: list) -> None:
+    """Thumbnails and previews are a short-lived cache and may have been
+    cleared while the chats were away: forget the ones that are gone, so
+    that they are fetched again when looked at, instead of showing a hole."""
+    for col, folder in _HELD_FILES:
+        async with db_pool.acquire() as conn:
+            paths = [r[0] for r in await conn.fetch(
+                f"""SELECT DISTINCT {col} FROM messages WHERE channel_id = ANY($1::bigint[])
+                    AND {col} IS NOT NULL AND left({col}, 2) <> '__'""", live_ids)]
+        gone = await asyncio.to_thread(
+            lambda: [x for x in paths if not os.path.exists(os.path.join(folder, x))])
+        if gone:
+            extra = ", thumb_md5 = NULL" if col == "thumb_path" else ""
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE messages SET {col} = NULL{extra} "
+                    f"WHERE channel_id = ANY($1::bigint[]) AND {col} = ANY($2::text[])", live_ids, gone)
+
+
+async def hold_private_channel_data(uid) -> dict:
+    """Signing out: every private chat in the live tables goes into keeping,
+    for the account it belongs to."""
+    async with _PRIVATE_LOCK:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                cols = await _held_prepare(conn)
+                if uid is None:
+                    v = await conn.fetchval("SELECT value FROM config WHERE key = 'last_account_id'")
+                    uid = int(v) if v and v.lstrip("-").isdigit() else None
+                ids = [r["id"] for r in await conn.fetch("SELECT id FROM channels WHERE username IS NULL AND local_root IS NULL")]
+                n = await _hold_channels(conn, cols, ids, uid)
+        _PUBLIC_MSG.clear()
+    if n:
+        logging.getLogger("tgarr").info("[private] %d private chats put into keeping (signed out)", n)
+    return {"kept": n}
+
+
+async def _private_reconcile() -> None:
+    """Arrange the live tables for whoever is signed in right now."""
+    if time.monotonic() < _PRIVATE_RETRY[0]:
+        return
+    async with _PRIVATE_LOCK:
+        uid = _me_id()
+        if uid == _PRIVATE_FOR[0]:
+            return
+        if uid is None:
+            # signed out. The sign-out button has already put the chats away;
+            # a session that ended some other way (revoked from the phone) is
+            # dealt with by the worker below, once it has stayed that way.
+            _PRIVATE_FOR[0] = None
+            return
+        log = logging.getLogger("tgarr")
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    cols = await _held_prepare(conn)
+                    v = await conn.fetchval("SELECT value FROM config WHERE key = 'last_account_id'")
+                    last = int(v) if v and v.lstrip("-").isdigit() else None
+                    if last is not None and last != uid:
+                        # chats nobody is marked on were the previous account's
+                        await conn.execute(
+                            "UPDATE channels SET account_user_id = $1 WHERE username IS NULL AND account_user_id IS NULL "
+                            "AND local_root IS NULL",
+                            last)
+                    others = [r["id"] for r in await conn.fetch(
+                        """SELECT id FROM channels WHERE username IS NULL
+                           AND account_user_id IS NOT NULL AND account_user_id <> $1""", uid)]
+                    put = await _hold_channels(conn, cols, others, None)
+                    back = await _restore_channels(conn, cols, uid)
+                    await conn.execute(
+                        """INSERT INTO config (key, value) VALUES ('last_account_id', $1)
+                           ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", str(uid))
+            _PRIVATE_FOR[0] = uid
+            _PUBLIC_MSG.clear()
+            if put:
+                log.info("[private] %d private chats of another account put into keeping", put)
+            if back:
+                log.info("[private] %d private chats given back to the account that signed in", len(back))
+                await _restored_files_check(back)
+        except Exception as e:
+            _PRIVATE_RETRY[0] = time.monotonic() + 20
+            log.exception("[private] arranging private chats failed: %s", e)
+
+
+async def _private_keep_days() -> int:
     async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            target_ids = [r["id"] for r in await conn.fetch(
-                "SELECT id FROM channels WHERE username IS NULL")]
-            if not target_ids:
-                return {"channels": 0, "messages": 0, "releases": 0}
-            msg_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE channel_id = ANY($1::int[])",
-                target_ids)
-            rel_target_q = """
-                SELECT r.id FROM releases r
-                JOIN messages m ON m.id = r.primary_msg_id
-                WHERE m.channel_id = ANY($1::int[])"""
-            await conn.execute(
-                f"DELETE FROM downloads WHERE release_id IN ({rel_target_q})",
-                target_ids)
-            await conn.execute(
-                f"UPDATE monitored_movies SET grabbed_release_id = NULL "
-                f"WHERE grabbed_release_id IN ({rel_target_q})",
-                target_ids)
-            rel_count = int((await conn.execute(
-                f"""DELETE FROM releases WHERE primary_msg_id IN (
-                       SELECT id FROM messages
-                       WHERE channel_id = ANY($1::int[]))""",
-                target_ids)).split()[-1])
-            await conn.execute(
-                "DELETE FROM channels WHERE id = ANY($1::int[])", target_ids)
-    logging.getLogger("tgarr").warning(
-        "[wipe-private] removed %d channels + %d messages + %d releases",
-        len(target_ids), msg_count, rel_count)
-    return {"channels": len(target_ids), "messages": msg_count,
-            "releases": rel_count}
+        v = await conn.fetchval("SELECT value FROM config WHERE key = 'private_keep_days'")
+    try:
+        return max(1, min(int(v), 3650)) if v else PRIVATE_KEEP_DAYS
+    except ValueError:
+        return PRIVATE_KEEP_DAYS
+
+
+async def _held_expire(days: int) -> dict:
+    """What has been in keeping longer than the keeping period goes for good:
+    the rows, and the files that belonged only to them."""
+    async with _PRIVATE_LOCK:
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT to_regclass('held_channels') IS NOT NULL"):
+                return {"chats": 0, "files": 0}
+            ids = [r["id"] for r in await conn.fetch(
+                "SELECT id FROM held_channels WHERE held_at < NOW() - make_interval(days => $1)", days)]
+            if not ids:
+                return {"chats": 0, "files": 0}
+            files = []
+            for col, folder in _HELD_FILES:
+                rows = await conn.fetch(
+                    f"""SELECT DISTINCT h.{col} AS p FROM held_messages h
+                        WHERE h.channel_id = ANY($1::bigint[]) AND h.{col} IS NOT NULL AND left(h.{col}, 2) <> '__'
+                          AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.{col} = h.{col})
+                          AND NOT EXISTS (SELECT 1 FROM held_messages o WHERE o.{col} = h.{col}
+                                          AND o.channel_id <> ALL($1::bigint[]))""", ids)
+                files += [os.path.join(folder, r["p"]) for r in rows]
+            async with conn.transaction():
+                await _held_delete(conn, ids)
+
+    def _rm():
+        n = 0
+        for f in files:
+            # only ever inside the download folder
+            if os.path.realpath(f).startswith("/downloads/") and os.path.isfile(f):
+                try:
+                    os.remove(f)
+                    n += 1
+                except OSError:
+                    pass
+        return n
+    removed = await asyncio.to_thread(_rm)
+    logging.getLogger("tgarr").info(
+        "[private] %d chats kept longer than %d days removed, with %d files", len(ids), days, removed)
+    return {"chats": len(ids), "files": removed}
+
+
+async def _private_keep_worker():
+    """Twice a minute: a session that ended without the sign-out button
+    (revoked from the phone, expired) - once it has stayed ended for two
+    looks, its private chats go into keeping too. Every half hour: clear
+    what has been kept too long."""
+    await asyncio.sleep(45)
+    out_seen = 0
+    tick = 0
+    while True:
+        try:
+            if _me_id() is None:
+                out_seen += 1
+                if out_seen == 2:
+                    await hold_private_channel_data(None)
+            else:
+                out_seen = 0
+                if _me_id() != _PRIVATE_FOR[0]:
+                    await _private_reconcile()
+            if tick % 60 == 0:
+                await _held_expire(await _private_keep_days())
+            tick += 1
+        except Exception as e:
+            logging.getLogger("tgarr").warning("[private] keep worker: %s", e)
+        await asyncio.sleep(30)
+
+
+@app.get("/api/settings/private_keep_days")
+async def get_private_keep_days():
+    return {"days": await _private_keep_days()}
+
+
+@app.post("/api/settings/private_keep_days")
+async def set_private_keep_days(request: Request):
+    try:
+        days = max(1, min(int((await request.json()).get("days")), 3650))
+    except Exception:
+        return JSONResponse({"status": "error", "message": "a number of days, 1 to 3650"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('private_keep_days', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", str(days))
+    return {"status": "ok", "days": days}
 
 
 @app.post("/api/login/logout")
 async def api_login_logout():
-    # Wipe BEFORE clearing the session — private channels are dead pointers
-    # without their owner account; central federation has the resources for
-    # next login to re-hydrate. Public slice stays for read-only browse.
+    # Keep, do not delete: the account's private chats leave the live tables
+    # and wait for it (see the block above).
+    uid = _me_id()
     try:
-        wipe = await wipe_private_channel_data()
+        wipe = await hold_private_channel_data(uid)
     except Exception as e:
-        logging.getLogger("tgarr").exception("[logout] wipe failed: %s", e)
+        logging.getLogger("tgarr").exception("[logout] keeping private chats failed: %s", e)
         wipe = {"error": str(e)}
-    return {**login.logout(), "wiped": wipe}
+    out = login.logout()
+    _SIGNED_IN[0] = 0.0
+    _ME_ID[0] = 0.0
+    _PRIVATE_FOR[0] = None
+    return {**out, "wiped": wipe}
+
+
+# ════════════════════════════════════════════════════════════════════
+# Many files as one download.
+#
+# "Every photo of the family group", "everything I have saved": chosen once,
+# fetched from Telegram in the background where it is not on this machine
+# yet (a few at a time, so that a film being watched is not starved), and
+# handed over as one zip that is made while it is being downloaded - no
+# second copy on disk. Only ever started by a person pressing the button.
+# ════════════════════════════════════════════════════════════════════
+EXPORT_MAX = 20000
+EXPORT_SLOTS = 3
+_EXPORT_KIND_SQL = {
+    "photo": "(m.media_type = 'photo' OR (m.media_type IS NULL AND m.file_name IS NULL"
+             " AND COALESCE(m.mime_type, '') = '' AND m.file_unique_id IS NOT NULL))",
+    "video": "m.media_type = 'video'",
+    "audio": "m.media_type = 'audio'",
+    "document": "m.media_type = 'document'",
+    "book": "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'",
+    "all": "(m.file_unique_id IS NOT NULL OR m.file_name IS NOT NULL)",
+}
+_EXPORT_KIND_NAME = {"photo": "photos", "video": "videos", "audio": "music", "document": "documents", "book": "books", "all": "all files"}
+_HERE = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
+_EXPORT_JS = (
+    '<script>if(!window.tgExport){window.tgExport=function(o){'
+    'function ask(b){return fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},'
+    'body:JSON.stringify(b)}).then(function(r){return r.json()})}'
+    'ask(Object.assign({check:true},o)).then(function(j){'
+    'if(j.status!=="ok"){alert(j.message||"That cannot be downloaded.");return}'
+    'if(!j.files){alert("There is nothing to download here.");return}'
+    'var m=j.files+" files"+(j.size?" ("+j.size+")":"")+" as one zip.";'
+    'if(j.to_fetch){m+=" "+j.to_fetch+" of them are not on this machine yet"+(j.fetch_size?" ("+j.fetch_size+")":"")+'
+    '": they are fetched from Telegram first, which takes a while."}'
+    'if(!confirm(m+" Go on?"))return;'
+    'ask(o).then(function(k){if(k.status==="ok"){location.href=k.ready?"/export/"+k.id+"/download":"/exports"}else{alert(k.message||"That did not work.")}})'
+    '})}}</script>')
+
+
+def _export_btn(what: dict, label: str) -> str:
+    return ('<button type="button" class="btn ghost" style="padding:5px 12px;font-size:12px" '
+            f'data-exp="{html.escape(_json.dumps(what), quote=True)}" '
+            'onclick="tgExport(JSON.parse(this.dataset.exp))">' + label + '</button>' + _EXPORT_JS)
+
+
+async def _export_pick(scope: str, ch, kind: str) -> list:
+    cond = [_EXPORT_KIND_SQL[kind],
+            "COALESCE(m.local_path, '') NOT IN ('__failed__', '__deleted__')",
+            "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
+    params = []
+    one = "COALESCE(m.file_unique_id, m.id::text)"       # the same file posted twice is taken once
+    if scope == "chat":
+        params.append(int(ch))
+        cond.append("c.id = $1")
+    elif scope == "private":
+        cond.append(_PRIVATE_CHAT)
+    else:
+        cond.append(_HERE)
+        one = "m.local_path"
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            f"""SELECT * FROM (
+                  SELECT DISTINCT ON ({one}) m.id, m.file_size, m.local_path, c.title, c.username
+                  FROM messages m JOIN channels c ON c.id = m.channel_id
+                  WHERE {' AND '.join(cond)} {_pub('c')}
+                  ORDER BY {one}, {_HERE} DESC, m.id) x
+                ORDER BY id LIMIT {EXPORT_MAX + 1}""", *params)
+
+
+@app.post("/api/export")
+async def api_export(request: Request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    scope, kind = b.get("scope"), b.get("kind") or "all"
+    if scope not in ("chat", "private", "saved") or kind not in _EXPORT_KIND_SQL:
+        return JSONResponse({"status": "error", "message": "what to download was not understood"}, status_code=400)
+    if scope == "chat" and not str(b.get("ch") or "").isdigit():
+        return JSONResponse({"status": "error", "message": "choose a chat first"}, status_code=400)
+    rows = await _export_pick(scope, b.get("ch"), kind)
+    if len(rows) > EXPORT_MAX:
+        return {"status": "error",
+                "message": f"That is more than {EXPORT_MAX:,} files. Choose one kind of file, or one chat, at a time."}
+    fetch = [r for r in rows if not _is_local(r["local_path"])]
+    if b.get("check"):
+        return {"status": "ok", "files": len(rows), "to_fetch": len(fetch),
+                "size": export.human(sum(r["file_size"] or 0 for r in rows)),
+                "fetch_size": export.human(sum(r["file_size"] or 0 for r in fetch))}
+    if not rows:
+        return {"status": "error", "message": "There is nothing to download here."}
+    what = _EXPORT_KIND_NAME[kind]
+    if scope == "chat":
+        title = f'{rows[0]["title"] or rows[0]["username"] or "chat"} - {what}'
+    elif scope == "private":
+        title = f"My private chats - {what}"
+    else:
+        title = "Saved files" + ("" if kind == "all" else f" - {what}")
+    async with db_pool.acquire() as conn:
+        jid = await conn.fetchval(
+            """INSERT INTO exports (title, owner, msg_ids, status, done_at)
+               VALUES ($1, $2, $3::bigint[], $4, CASE WHEN $4 = 'ready' THEN NOW() END) RETURNING id""",
+            title[:200], _me_id(), [r["id"] for r in rows], "fetching" if fetch else "ready")
+    return {"status": "ok", "id": jid, "ready": not fetch}
+
+
+async def _export_state(conn, ids: list) -> dict:
+    r = await conn.fetchrow(
+        """SELECT count(*) FILTER (WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__') AS ready,
+                  count(*) FILTER (WHERE local_path = '__user_queued__') AS queued,
+                  count(*) FILTER (WHERE local_path IS NULL) AS waiting,
+                  COALESCE(sum(file_size) FILTER (WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'), 0) AS bytes
+           FROM messages WHERE id = ANY($1::bigint[])""", ids)
+    d = dict(r)
+    d["total"] = len(ids)
+    d["missed"] = d["total"] - d["ready"] - d["queued"] - d["waiting"]
+    return d
+
+
+async def _export_worker():
+    """Feed the files an export still needs to the on-demand fetcher, a few
+    at a time, and notice when it has them all."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if _signed_in():
+                async with db_pool.acquire() as conn:
+                    jobs = await conn.fetch(
+                        "SELECT id, msg_ids FROM exports WHERE status = 'fetching' ORDER BY id LIMIT 5")
+                    for j in jobs:
+                        st = await _export_state(conn, j["msg_ids"])
+                        if st["waiting"] == 0 and st["queued"] == 0:
+                            await conn.execute(
+                                "UPDATE exports SET status = 'ready', done_at = NOW() WHERE id = $1", j["id"])
+                            continue
+                        room = EXPORT_SLOTS - st["queued"]
+                        if room > 0 and st["waiting"]:
+                            await conn.execute(
+                                """UPDATE messages SET local_path = '__user_queued__',
+                                          fetch_wanted_at = NOW() + INTERVAL '6 hours'
+                                   WHERE id IN (SELECT id FROM messages WHERE id = ANY($1::bigint[])
+                                                AND local_path IS NULL ORDER BY id LIMIT $2)""",
+                                j["msg_ids"], room)
+                        # a large file is only fetched to the end while someone wants it
+                        await conn.execute(
+                            """UPDATE messages SET fetch_wanted_at = NOW() + INTERVAL '6 hours'
+                               WHERE id = ANY($1::bigint[]) AND local_path = '__user_queued__'
+                                 AND (fetch_wanted_at IS NULL OR (fetch_wanted_at > 'epoch'
+                                      AND fetch_wanted_at < NOW() + INTERVAL '1 hour'))""", j["msg_ids"])
+                        break                      # one export at a time
+        except Exception as e:
+            logging.getLogger("tgarr").warning("[export] worker: %s", e)
+        await asyncio.sleep(4)
+
+
+async def _export_job(job_id: int):
+    """The job, if the person asking may have it."""
+    async with db_pool.acquire() as conn:
+        j = await conn.fetchrow("SELECT * FROM exports WHERE id = $1", job_id)
+    if not j or (j["owner"] is not None and j["owner"] != _me_id()):
+        return None
+    return j
+
+
+@app.get("/export/{job_id}/download")
+async def export_download(job_id: int):
+    j = await _export_job(job_id)
+    if not j:
+        return PlainTextResponse("not found", status_code=404)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT m.id, m.file_name, m.media_type, m.mime_type, m.posted_at, m.tg_message_id,
+                       m.local_path, m.file_size, COALESCE(c.title, c.username, 'chat') AS folder
+                FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.id = ANY($1::bigint[]) AND {_HERE} {_pub('c')}
+                ORDER BY c.title, m.posted_at, m.id""", j["msg_ids"])
+
+    def _pairs():
+        out = []
+        for arc, it in export.arc_names([dict(r) for r in rows]):
+            path = os.path.join("/downloads", it["local_path"])
+            try:
+                # inside the download folder, and complete (not one still arriving)
+                if not os.path.normpath(path).startswith("/downloads/"):
+                    continue
+                if it["file_size"] and os.path.getsize(path) < it["file_size"]:
+                    continue
+            except OSError:
+                continue
+            out.append((arc, path))
+        return out
+    pairs = await asyncio.to_thread(_pairs)
+    name = export.safe_name(j["title"], "tgarr") + ".zip"
+    return StreamingResponse(
+        export.zip_stream(pairs), media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(name),
+                 "Cache-Control": "no-store"})
+
+
+@app.post("/api/export/{job_id}/delete")
+async def api_export_delete(job_id: int):
+    j = await _export_job(job_id)
+    if not j:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+    async with db_pool.acquire() as conn:
+        # what was waiting its turn is not fetched after all; what has arrived stays saved
+        await conn.execute(
+            """UPDATE messages SET local_path = NULL
+               WHERE id = ANY($1::bigint[]) AND local_path = '__user_queued__'""", j["msg_ids"])
+        await conn.execute("DELETE FROM exports WHERE id = $1", job_id)
+    return {"status": "ok"}
+
+
+@app.get("/exports", response_class=HTMLResponse)
+async def page_exports():
+    me = _me_id()
+    async with db_pool.acquire() as conn:
+        jobs = await conn.fetch(
+            "SELECT * FROM exports WHERE owner IS NOT DISTINCT FROM $1 ORDER BY id DESC LIMIT 40", me)
+        states = [await _export_state(conn, j["msg_ids"]) for j in jobs]
+        chats = [] if me is None else await conn.fetch(
+            f"""SELECT c.id, c.title, c.username FROM channels c
+                WHERE (COALESCE(c.is_joined, FALSE) OR COALESCE(c.subscribed, FALSE) OR c.username IS NULL)
+                  AND COALESCE(c.audience, 'sfw') <> 'blocked_csam' {_pub('c')}
+                ORDER BY (c.username IS NOT NULL), lower(COALESCE(c.title, c.username, '')) LIMIT 800""")
+    busy = False
+    items = []
+    for j, st in zip(jobs, states):
+        fetching = j["status"] == "fetching"
+        busy = busy or fetching
+        pct = int(100 * (st["ready"] + st["missed"]) / max(1, st["total"]))
+        line = f'{st["ready"]:,} of {st["total"]:,} files here'
+        if st["bytes"]:
+            line += f' · {export.human(st["bytes"])}'
+        if st["missed"]:
+            line += f' · {st["missed"]:,} could not be fetched'
+        if fetching:
+            line += ' · fetching the rest from Telegram…'
+        items.append(
+            '<div class="dl-item"><div class="icon">🗜</div><div class="info">'
+            f'<div class="name">{html.escape(j["title"])}</div><div class="meta">{line}</div>'
+            + (f'<div style="height:6px;border-radius:3px;background:var(--border);margin-top:8px;overflow:hidden">'
+               f'<div style="height:100%;width:{pct}%;background:var(--accent)"></div></div>' if fetching else '')
+            + '</div><div class="right" style="display:flex;gap:8px;align-items:center">'
+            + (f'<a class="btn{" ghost" if fetching else ""}" href="/export/{j["id"]}/download">'
+               + ('⬇ What is here so far' if fetching else '⬇ Download zip') + '</a>' if st["ready"] else '')
+            + f'<button type="button" class="btn ghost" onclick="exDel({j["id"]})">'
+            + ('Stop' if fetching else 'Remove') + '</button></div></div>')
+    opts = "".join(
+        f'<option value="{c["id"]}">{html.escape(c["title"] or ("@" + (c["username"] or "chat")))}'
+        + ('' if c["username"] else ' 🔒') + '</option>' for c in chats)
+    kinds = "".join(f'<option value="{k}">{html.escape(v)}</option>' for k, v in _EXPORT_KIND_NAME.items())
+    form = ('<div class="empty-state"><div>Sign in to Telegram to download many files at once.</div></div>'
+            if me is None else
+            '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;'
+            'margin-bottom:22px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+            '<span>Download</span>'
+            f'<select id="exKind">{kinds}</select><span>of</span>'
+            f'<select id="exChat" style="max-width:min(360px,70vw)"><option value="saved">everything already saved here</option>'
+            f'<option value="private">all my private chats</option>{opts}</select>'
+            '<button type="button" class="btn" onclick="exGo()">as one zip</button></div>')
+    body = (
+        '<p style="color:var(--muted);margin-top:0">A whole chat, or everything you have saved, as one zip. '
+        'Files that are not on this machine yet are fetched from Telegram first; the zip can be downloaded when they are here. '
+        'What gets fetched stays in <a href="/downloads">Downloads</a> afterwards.</p>'
+        + form
+        + '<h2 class="section">Downloads prepared <span class="count">' + str(len(jobs)) + '</span></h2>'
+        + ('<div class="dl-list">' + "".join(items) + '</div>' if items else
+           '<div class="empty-state"><div class="icon">🗜</div><div>Nothing prepared yet.</div></div>')
+        + _EXPORT_JS
+        + '<script>function exGo(){var c=document.getElementById("exChat").value,k=document.getElementById("exKind").value;'
+          'tgExport(c==="saved"||c==="private"?{scope:c,kind:k}:{scope:"chat",ch:c,kind:k})}'
+          'function exDel(i){fetch("/api/export/"+i+"/delete",{method:"POST"}).then(function(){location.reload()})}'
+        + ('setTimeout(function(){if(document.activeElement.tagName!=="SELECT")location.reload()},6000);' if busy else '')
+        + '</script>')
+    return HTMLResponse(_layout("Download many at once", "/downloads", body))
+
+
+# ════════════════════════════════════════════════════════════════════
+# The household's own files (see localfiles.py): uploaded through the
+# browser. They are one "chat" with a made-up id, so every player and the
+# Media Center treat these files like any other. They belong to this install, not to a
+# Telegram account: signing out neither hides nor moves them.
+# ════════════════════════════════════════════════════════════════════
+_FILE_COLS = ["channel_id", "tg_chat_id", "tg_message_id", "file_unique_id", "file_name", "file_size",
+              "mime_type", "media_type", "posted_at", "local_path"]
+
+
+async def _local_channel(conn, root: str) -> tuple:
+    cid = localfiles.chat_id(root)
+    ch = await conn.fetchval(
+        """INSERT INTO channels (tg_chat_id, username, title, category, audience, local_root,
+                                 is_joined, subscribed, members_count)
+           VALUES ($1, NULL, $2, 'personal', 'sfw', $3, FALSE, FALSE, 0)
+           ON CONFLICT (tg_chat_id) DO UPDATE SET local_root = EXCLUDED.local_root, category = 'personal'
+           RETURNING id""", cid, localfiles.title(root), root)
+    return ch, cid
+
+
+async def _local_add(conn, root: str, files: list) -> int:
+    """files: (path below /downloads, size, time changed) - known to be new."""
+    import datetime as _dt
+    ch, cid = await _local_channel(conn, root)
+    nxt = (await conn.fetchval(
+        "SELECT COALESCE(max(tg_message_id), 0) FROM messages WHERE channel_id = $1", ch)) + 1
+    rows = []
+    for rel, size, mtime in files:
+        kind, mime = localfiles.classify(rel) or ("document", "application/octet-stream")
+        rows.append((ch, cid, nxt, localfiles.unique_id(rel), os.path.basename(rel), size, mime, kind,
+                     _dt.datetime.fromtimestamp(mtime, _dt.timezone.utc), rel))
+        nxt += 1
+    await conn.copy_records_to_table("messages", records=rows, columns=_FILE_COLS)
+    return len(rows)
+
+
+async def _local_forget(conn, ch: int, paths: list) -> None:
+    ids = [r["id"] for r in await conn.fetch(
+        "SELECT id FROM messages WHERE channel_id = $1 AND local_path = ANY($2::text[])", ch, paths)]
+    if ids:
+        await conn.execute("DELETE FROM downloads WHERE release_id IN "
+                           "(SELECT id FROM releases WHERE primary_msg_id = ANY($1::bigint[]))", ids)
+        await conn.execute("DELETE FROM releases WHERE primary_msg_id = ANY($1::bigint[])", ids)
+        await conn.execute("DELETE FROM messages WHERE id = ANY($1::bigint[])", ids)
+
+
+def _local_picture_make(src: str, dst: str, px: int) -> None:
+    from PIL import Image, ImageOps
+    with Image.open(src) as im:
+        im = ImageOps.exif_transpose(im)
+        im.thumbnail((px, px))
+        im.convert("RGB").save(dst, "JPEG", quality=82)
+
+
+async def _local_picture(msg_id: int, col: str, folder: str, px: int):
+    """A small picture of one of the household's own photos, made from the
+    file itself. None = this is not one of ours (ask Telegram as usual)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT local_path, media_type, tg_chat_id FROM messages WHERE id = $1", msg_id)
+    if not row or not localfiles.is_local(row["tg_chat_id"]):
+        return None
+    nothing = Response(_TINY_TRANSPARENT_GIF, status_code=410, media_type="image/gif")
+    if not _is_local(row["local_path"]):
+        return nothing
+    src = os.path.join("/downloads", row["local_path"])
+    if row["media_type"] == "photo":
+        pic = src                                    # a photo: the file itself
+    else:
+        # a film: the frame the browser took while it was uploading it (kept
+        # beside the file); a book: its cover, taken out of it the first time
+        pic = src + ".cover.jpg"
+        if not os.path.exists(pic) and row["media_type"] == "document":
+            e = localfiles.ext(src)
+            if e == "pdf" or e in _EBOOK_CONVERTIBLE:
+                try:
+                    await _ebook_cover(src, pic)
+                except Exception:
+                    pass
+        if not os.path.exists(pic):
+            return nothing
+    name = f"local-{msg_id}-{px}.jpg"
+    dst = os.path.join(folder, name)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        await asyncio.to_thread(_local_picture_make, pic, dst, px)
+    except Exception:
+        return nothing               # a format that cannot be read here (HEIC, a broken file)
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"UPDATE messages SET {col} = $2 WHERE id = $1", msg_id, name)
+    return FileResponse(dst, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.put("/api/files/upload")
+async def api_files_upload(request: Request, name: str = ""):
+    """One file, sent as the body of the request and written straight to its
+    place - no second copy on the way, whatever its size."""
+    import shutil
+    fname = localfiles.safe_name(name)
+    what = localfiles.classify(fname)
+    if what is None:
+        return JSONResponse({"status": "error", "message": "this kind of file is not taken"}, status_code=400)
+    size = int(request.headers.get("content-length") or 0)
+    try:
+        os.makedirs("/downloads/" + localfiles.MINE, exist_ok=True)
+        if size and size > shutil.disk_usage("/downloads").free - (1 << 30):
+            return JSONResponse({"status": "error", "message": "not enough room left on the disk"}, status_code=507)
+    except OSError:
+        pass
+    folder = f"/downloads/{localfiles.MINE}/{what[0]}"
+    os.makedirs(folder, exist_ok=True)
+    fname = localfiles.free_name(lambda n: os.path.exists(os.path.join(folder, n)), fname)
+    tmp = os.path.join(folder, "." + fname + ".part")
+    written = 0
+    try:
+        f = await asyncio.to_thread(open, tmp, "wb")
+        try:
+            async for chunk in request.stream():
+                if chunk:
+                    await asyncio.to_thread(f.write, chunk)
+                    written += len(chunk)
+        finally:
+            f.close()
+        if not written or (size and written != size):
+            raise ValueError("the file did not arrive whole")
+        os.replace(tmp, os.path.join(folder, fname))
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return JSONResponse({"status": "error", "message": str(e)[:120] or "not uploaded"}, status_code=400)
+    rel = f"{localfiles.MINE}/{what[0]}/{fname}"
+    async with db_pool.acquire() as conn:
+        await _local_add(conn, localfiles.MINE, [(rel, written, int(time.time()))])
+        mid = await conn.fetchval("SELECT id FROM messages WHERE local_path = $1 ORDER BY id DESC LIMIT 1", rel)
+    return {"status": "ok", "name": fname, "size": written, "id": mid, "kind": what[0]}
+
+
+@app.put("/api/files/thumb/{msg_id}")
+async def api_files_thumb(msg_id: int, request: Request):
+    """The picture for an uploaded film: one frame, taken by the browser that
+    is uploading it (it has the film and can play it; this machine has no
+    video tools). Kept beside the file, so it lasts as long as the film does."""
+    if int(request.headers.get("content-length") or 0) > 800_000:
+        return JSONResponse({"status": "error"}, status_code=413)
+    body = await request.body()
+    async with db_pool.acquire() as conn:
+        lp = await conn.fetchval(
+            """SELECT m.local_path FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE m.id = $1 AND c.local_root = $2""", msg_id, localfiles.MINE)
+    if not body or not _is_local(lp):
+        return JSONResponse({"status": "error"}, status_code=404)
+    cover = os.path.join("/downloads", lp) + ".cover.jpg"
+
+    def _make():
+        from PIL import Image
+        with Image.open(io.BytesIO(body)) as im:      # whatever arrives is redrawn, never stored as sent
+            im.load()
+            im.thumbnail((640, 640))
+            im.convert("RGB").save(cover, "JPEG", quality=82)
+    try:
+        await asyncio.to_thread(_make)
+    except Exception:
+        return JSONResponse({"status": "error", "message": "not a picture"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE messages SET thumb_path = NULL, preview_path = NULL WHERE id = $1", msg_id)
+    return {"status": "ok"}
+
+
+@app.post("/api/files/delete")
+async def api_files_delete(request: Request):
+    """Uploaded files only: a folder from elsewhere is never changed."""
+    try:
+        ids = [int(x) for x in (await request.json()).get("ids", [])][:2000]
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT m.id, m.channel_id, m.local_path FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE m.id = ANY($1::bigint[]) AND c.local_root = $2""", ids, localfiles.MINE)
+        for r in rows:
+            path = os.path.normpath(os.path.join("/downloads", r["local_path"] or ""))
+            if path.startswith(f"/downloads/{localfiles.MINE}/"):
+                for suf in ("", ".pdf", ".cover.jpg"):
+                    try:
+                        os.unlink(path + suf)
+                    except OSError:
+                        pass
+        if rows:
+            await _local_forget(conn, rows[0]["channel_id"], [r["local_path"] for r in rows])
+    return {"status": "ok", "removed": len(rows)}
+
+
+_FILES_JS = (
+    '<script>var fq=[],fBusy=false,fDone=0,fTotal=0,fBad=0,fPend=0;'
+    'function fThumb(f,id){try{var v=document.createElement("video"),u=URL.createObjectURL(f),over=false;fPend++;'
+    'function end(){if(over)return;over=true;fPend--;URL.revokeObjectURL(u)}'
+    'v.muted=true;v.preload="metadata";v.src=u;'
+    'v.onloadedmetadata=function(){v.currentTime=Math.min((v.duration||10)*0.1,30)};'
+    'v.onseeked=function(){try{var w=480,h=Math.round(w*v.videoHeight/v.videoWidth)||270,c=document.createElement("canvas");'
+    'c.width=w;c.height=h;c.getContext("2d").drawImage(v,0,0,w,h);'
+    'c.toBlob(function(b){if(!b){end();return}fetch("/api/files/thumb/"+id,{method:"PUT",body:b}).then(end,end)},"image/jpeg",0.8)}'
+    'catch(e){end()}};v.onerror=end;setTimeout(end,15000)}catch(e){}}'
+    'function fAdd(l){for(var i=0;i<l.length;i++){fq.push(l[i]);fTotal++}fNext()}'
+    'function fErr(t){fBad++;var d=document.createElement("div");d.textContent=t;document.getElementById("fErr").appendChild(d)}'
+    'function fNext(){if(fBusy)return;var f=fq.shift(),s=document.getElementById("fState"),b=document.getElementById("fBar");'
+    'if(!f){if(fTotal){s.textContent=fDone+" of "+fTotal+" uploaded";if(!fBad){var t0=Date.now(),iv=setInterval(function(){'
+    'if(fPend<=0||Date.now()-t0>20000){clearInterval(iv);location.reload()}},400)}}return}'
+    'fBusy=true;document.getElementById("fProg").style.display="block";var x=new XMLHttpRequest();'
+    'x.open("PUT","/api/files/upload?name="+encodeURIComponent(f.name));'
+    'x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(100*e.loaded/e.total);b.style.width=p+"%";'
+    's.textContent=(fDone+1)+" of "+fTotal+": "+f.name+" "+p+"%"}};'
+    'x.onload=function(){fBusy=false;if(x.status===200){fDone++;var r={};try{r=JSON.parse(x.responseText)}catch(e){}'
+    'if(r.id&&r.kind==="video")fThumb(f,r.id)}else{var m="";try{m=JSON.parse(x.responseText).message}catch(e){}'
+    'fErr(f.name+": "+(m||"not uploaded"))}fNext()};'
+    'x.onerror=function(){fBusy=false;fErr(f.name+": the connection was lost");fNext()};x.send(f)}'
+    'function fDel(){var ids=[];document.querySelectorAll(".f-ck:checked").forEach(function(c){ids.push(+c.value)});'
+    'if(!ids.length||!confirm("Delete "+ids.length+" uploaded file(s) from this machine for good?"))return;'
+    'fetch("/api/files/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:ids})})'
+    '.then(function(){location.reload()})}'
+    'var dz=document.getElementById("fDrop");if(dz){'
+    'dz.addEventListener("dragover",function(e){e.preventDefault();dz.classList.add("over")});'
+    'dz.addEventListener("dragleave",function(){dz.classList.remove("over")});'
+    'dz.addEventListener("drop",function(e){e.preventDefault();dz.classList.remove("over");fAdd(e.dataTransfer.files)})}'
+    '</script>')
+_FILE_ICON = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
+FILES_PAGE = 100
+_FILE_TABS = {"": "All", "video": "🎬 Videos", "audio": "🎵 Music", "photo": "🖼 Photos", "document": "📄 Documents"}
+
+
+def _file_href(r) -> str:
+    e = localfiles.ext(r["file_name"] or "")
+    if r["media_type"] == "video":
+        return f'/watch/{r["id"]}'
+    if e == "epub":
+        return f'/epub/{r["id"]}'
+    if e == "pdf" or e in _EBOOK_CONVERTIBLE:
+        return f'/pdf/{r["id"]}'          # read here (anything else is converted on first opening)
+    return f'/media/{r["id"]}'
+
+
+@app.get("/files", response_class=HTMLResponse)
+async def page_files(offset: int = 0, kind: str = "", q: str = ""):
+    offset = max(0, int(offset))
+    kind = kind if kind in _FILE_TABS else ""
+    q = (q or "").strip()[:100]
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    async with db_pool.acquire() as conn:
+        mine = await conn.fetch(
+            """SELECT m.id, m.file_name, m.file_size, m.media_type, m.indexed_at
+               FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE c.local_root = $1 AND ($3 = '' OR m.media_type = $3) AND m.file_name ILIKE $4
+               ORDER BY m.id DESC LIMIT $5 OFFSET $2""", localfiles.MINE, offset, kind, like, FILES_PAGE)
+        per = {r["media_type"]: r for r in await conn.fetch(
+            """SELECT m.media_type, count(*) AS n, COALESCE(sum(m.file_size), 0) AS b
+               FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE c.local_root = $1 AND m.file_name ILIKE $2 GROUP BY m.media_type""", localfiles.MINE, like)}
+    everything = {"n": sum(r["n"] for r in per.values()), "b": sum(r["b"] for r in per.values())}
+    tot = per.get(kind, {"n": 0, "b": 0}) if kind else everything
+    def _fqs(**over):
+        cur = {"kind": kind or None, "q": q or None, "offset": offset or None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "?" + "&".join(bits) if bits else ""
+    # one tab per kind: an upload goes to its tab by itself, by what the file is
+    tabs = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px">' + "".join(
+        _chip_link(f'{label} <span style="opacity:.6">{(per.get(k, {"n": 0})["n"] if k else everything["n"]):,}</span>',
+                   "/files" + _fqs(kind=k or None, offset=None), k == kind)
+        for k, label in _FILE_TABS.items()) + '</div>'
+    find = ('<form method="get" action="/files" style="display:flex;gap:8px;margin:0 0 12px">'
+            + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else '')
+            + f'<input type="text" name="q" value="{html.escape(q, quote=True)}" placeholder="find an uploaded file by name…" '
+              'style="flex:1;max-width:420px"/><button class="btn" type="submit">Find</button>'
+            + (f'<a class="btn ghost" href="/files{_fqs(q=None, offset=None)}">clear</a>' if q else '') + '</form>')
+    rows = "".join(
+        '<div class="f-card">'
+        f'<a class="f-pic" href="{_file_href(r)}" title="{html.escape(r["file_name"] or "file", quote=True)}">'
+        f'<span>{_FILE_ICON.get(r["media_type"], "📄")}</span>'
+        f'<img src="/api/thumb/{r["id"]}" loading="lazy" alt="" onerror="this.remove()"/></a>'
+        f'<label class="f-tick" title="tick to delete"><input type="checkbox" class="f-ck" value="{r["id"]}"/></label>'
+        f'<a class="f-name" href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a>'
+        f'<div class="f-meta">{export.human(r["file_size"])} · {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
+        '</div>' for r in mine)
+    pager = _page_nav("/files", _fqs, offset, FILES_PAGE, len(mine), tot["n"])
+    body = (
+        '<style>.f-drop{border:2px dashed var(--border);border-radius:14px;padding:26px 18px;text-align:center;'
+        'background:var(--surface);margin-bottom:10px}.f-drop.over{border-color:var(--accent);background:rgba(94,182,229,.10)}'
+        '.f-drop .btn{margin:8px 4px 0}'
+        '.f-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px}'
+        '.f-card{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}'
+        '.f-pic{display:flex;align-items:center;justify-content:center;position:relative;aspect-ratio:4/3;'
+        'background:rgba(127,127,127,.10);text-decoration:none;font-size:44px}'
+        '.f-pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}'
+        '.f-tick{position:absolute;top:6px;left:6px;width:26px;height:26px;display:flex;align-items:center;justify-content:center;'
+        'background:rgba(255,255,255,.85);border-radius:7px;cursor:pointer}.f-tick input{margin:0}'
+        '.f-name{display:block;padding:8px 10px 2px;font-size:13.5px;font-weight:600;color:var(--fg);text-decoration:none;'
+        'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.f-name:hover{color:var(--accent)}'
+        '.f-meta{padding:0 10px 9px;font-size:12px;color:var(--muted)}'
+        '@media (max-width:640px){.f-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}</style>'
+        '<p style="color:var(--muted);margin-top:0">Your own films, music, photos and books, played and read here like '
+        'everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.</p>'
+        '<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">Drop files here</div>'
+        '<div style="color:var(--muted);font-size:13px;margin-top:4px">or choose them - as many as you like, of any size</div>'
+        '<label class="btn">Choose files<input type="file" multiple style="display:none" onchange="fAdd(this.files)"/></label>'
+        '<label class="btn ghost">Choose a whole folder<input type="file" webkitdirectory multiple style="display:none" '
+        'onchange="fAdd(this.files)"/></label>'
+        '<div id="fProg" style="display:none;margin-top:14px"><div style="height:8px;border-radius:4px;background:var(--border);'
+        'overflow:hidden"><div id="fBar" style="height:100%;width:0;background:var(--accent)"></div></div>'
+        '<div id="fState" style="font-size:13px;color:var(--muted);margin-top:6px"></div></div>'
+        '<div id="fErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>'
+        f'<h2 class="section">Uploaded <span class="count">{tot["n"]:,}</span>'
+        '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
+        f'margin-left:10px">{export.human(tot["b"]) or "0 MB"}'
+        + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
+        + (find + tabs if (everything["n"] or q) else '')
+        + ('<div class="f-grid">' + rows + '</div>' + pager if mine else
+           '<div class="empty-state"><div class="icon">📂</div><div>'
+           + ('Nothing found by that name.' if q else 'Nothing of this kind uploaded yet.' if kind
+              else 'Nothing uploaded yet.') + '</div></div>')
+        + _FILES_JS)
+    return HTMLResponse(_layout("My files", "/files", body))
 
 
 @app.post("/api/photo/{msg_id}/delete")
@@ -4828,6 +6041,8 @@ div.ub { cursor:default; }
            text-decoration:none; cursor:pointer; }
 .ub-menu a:hover, .ub-menu button:hover { background:rgba(127,127,127,.1); }
 .ub-menu button { color:#dc2626; border-top:1px solid var(--border); border-radius:0 0 7px 7px; margin-top:4px; }
+.user a.ub-lk { display:block; text-align:center; margin:2px 10px 4px; padding:7px 12px; font-size:13px; color:var(--muted);
+                border:1px solid var(--border); border-radius:8px; }
 .user .ub-menu a { color:var(--fg); font-weight:400; }
 .user a.ub-in { color:#fff; }
 .ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
@@ -5059,6 +6274,7 @@ NAV_ITEMS = [
     ("/music",     "Music",     "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"),
     ("/library",   "Library",   "M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 18H6V4h7v6l2-1 2 1V4h1v16z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
+    ("/files",     "My files",  "M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"),
     # /system page still accessible by URL, just hidden from nav (admin only).
     ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
     ("/settings",  "Settings",  "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94 0 .31.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"),
@@ -5222,7 +6438,8 @@ def _user_block() -> str:
     if not _signed_in():
         return ('<div class="ub"><div class="ub-av none">?</div>'
                 '<div class="ub-txt"><b>Not signed in</b><small>browsing what is already indexed</small></div></div>'
-                '<a class="ub-in" href="/login">Sign in to Telegram</a>')
+                '<a class="ub-in" href="/login">Sign in to Telegram</a>'
+                + ('<a class="ub-lk" href="/lock">🔒 Lock</a>' if _ACCESS["pin"] else ''))
     user = login.ensure_user_info() or {}
     uname = user.get("username")
     name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or "Telegram account"
@@ -5237,8 +6454,10 @@ def _user_block() -> str:
         '<div class="ub-menu" id="tgUserMenu" hidden>'
         '<a href="/settings">Settings</a>'
         '<a href="/system">System status</a>'
+        '<a href="/mediacenter/manage">Media Center &amp; PIN</a>'
         + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
            if uname else '')
+        + ('<a href="/lock">🔒 Lock (back to the Media Center)</a>' if _ACCESS["pin"] else '')
         + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
         '<button type="button" class="ub" onclick="tgUserMenu(event)" title="account">'
         f'{av}<span class="ub-txt"><b>{html.escape(name)}</b>'
@@ -5247,8 +6466,7 @@ def _user_block() -> str:
         '<script>'
         'function tgUserMenu(e){e.stopPropagation();var m=document.getElementById("tgUserMenu");m.hidden=!m.hidden}'
         'document.addEventListener("click",function(){var m=document.getElementById("tgUserMenu");if(m)m.hidden=true});'
-        'function tgSignOut(){if(!confirm("Sign out of Telegram on this tgarr?\\n\\nPrivate chats are removed from '
-        'the index. Public channels and files already saved stay.")){return}'
+        'function tgSignOut(){if(!confirm("Sign out of Telegram on this tgarr?\\n\\nYour private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay.")){return}'
         'fetch("/api/login/logout",{method:"POST"}).then(function(){location.href="/"})}'
         '</script>')
 
@@ -5296,10 +6514,13 @@ MOBILE_CSS = """
 
 def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str] = None,
             top_actions_html: Optional[str] = None) -> str:
+    locked = _LOCKED.get()
     nav = "".join(
         f'<a href="{path}" class="navlink{" active" if path == active else ""}">'
         f'{_icon(svg)}<span>{name}</span></a>'
-        for path, name, svg in NAV_ITEMS
+        # a locked browser is shown the kids' pages and nothing else
+        for path, name, svg in ([("/mediacenter", "Media Center", "M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z")]
+                                if locked else NAV_ITEMS)
     )
     if top_actions_html is None:
         cfg = {
@@ -5335,7 +6556,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
     <div class="ver">v{TGARR_VERSION}</div>
   </div>
   <div class="navlinks">{nav}</div>
-  <div class="user">{_user_block()}</div>
+  <div class="user">{'<a class="ub-in" href="/unlock">🔒 Enter PIN</a>' if locked else _user_block()}</div>
 </aside>
 <main class="main">
   <header class="topbar">
@@ -5657,11 +6878,16 @@ async def api_deep_backfill_progress():
             -- (done + unfollowed) and purged ones drop off the list — the
             -- moat is the contributed resource data, not the channel row.
             WHERE purged_at IS NULL
+              -- public channels only: a private chat is read and kept whole
+              -- whatever happens, and its name has no business on a status page
+              AND username IS NOT NULL AND local_root IS NULL
               AND (subscribed = TRUE OR is_joined = TRUE
                    OR (COALESCE(enabled, TRUE) = TRUE
                        AND COALESCE(deep_backfilled, FALSE) = FALSE))
             ORDER BY deep_backfilled ASC, COALESCE(remote_msgs, 0) DESC
         """)
+        private_count = await conn.fetchval(
+            "SELECT count(*) FROM channels WHERE username IS NULL AND local_root IS NULL AND COALESCE(is_joined, FALSE)")
         released_count = await conn.fetchval("""
             SELECT count(*) FROM channels
             WHERE purged_at IS NULL
@@ -5703,7 +6929,54 @@ async def api_deep_backfill_progress():
          "pct_documents": pct(r["local_documents"], r["remote_documents"])}
         for r in rows],
         "released_count": released_count or 0,
+        "private_count": private_count or 0,
         "purged_count": purged_count or 0}
+
+
+async def _usenet_system_html() -> str:
+    """The Usenet side, for the System page: is the news server answering, what the index
+    reading is on, what it last brought, what is kept here. Nothing when Usenet is not set up."""
+    import datetime as _dt
+    cfg = await _usenet_cfg()
+    if not cfg.get("host"):
+        return ""
+    h3 = 'style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em"'
+    if not cfg.get("enabled"):
+        return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
+                '<div style="color:var(--muted)">Switched off. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
+    ready = await _usenet_ready()
+    async with db_pool.acquire() as conn:
+        kept = await conn.fetchrow(
+            """SELECT count(*) AS n, count(*) FILTER (WHERE audience = 'nsfw') AS adult,
+                      count(*) FILTER (WHERE detail = 1) AS exact FROM usenet_cards""")
+        level = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_nzb_conns'")
+    day = lambda t: time.strftime("%Y-%m-%d", time.gmtime(t))
+    w, last, state = _UN_INDEX.get("window"), _UN_INDEX.get("last"), _UN_INDEX.get("state") or ""
+    if state == "reading" and w:
+        now = (f'reading <b>{html.escape(w["grp"])}</b>, {day(w["t_from"])} to {day(w["t_to"])} '
+               f'({html.escape(str(w["mode"]))}, {int(w.get("connections") or 1)} connection{"" if int(w.get("connections") or 1) == 1 else "s"} allowed)')
+    else:
+        now = html.escape(state)
+    rows = [("News server", ('<span class="pill ok">answering</span> ' if ready else
+                             f'<span class="pill bad">not answering</span> {html.escape(_USENET.get("msg") or "")} ')
+             + html.escape(cfg["host"])),
+            ("Index reading", now or "starting")]
+    if last:
+        st = last.get("stats") or {}
+        rows.append(("Last window",
+                     f'<b>{html.escape(str(last.get("grp")))}</b> ({html.escape(str(last.get("mode")))}) · {int(st.get("headers") or 0):,} headers in '
+                     f'{int(st.get("seconds") or 0):,} s, {(st.get("bytes") or 0) / 1e6:.1f} MB · {int(last.get("cards") or 0):,} cards found, '
+                     f'{int(last.get("accepted") or 0):,} taken by tgarr.me'
+                     + (f' · {int(st["unread"]):,} stretches unread' if st.get("unread") else "")
+                     + f' · {_ago(_dt.datetime.fromtimestamp(last["at"], _dt.timezone.utc))}'))
+    rows.append(("Cards kept here", f'{kept["n"]:,} ({kept["exact"]:,} read in full' + (f', {kept["adult"]:,} adult' if kept["adult"] else "") + ')'))
+    rows.append(("Connections for an NZB", f'{usenet_scan.next_connections(level, {})} next time - as many as the provider gives'))
+    body = "".join(f'<tr><td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;color:#64748b;white-space:nowrap;width:1%">{k}</td>'
+                   f'<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0">{v}</td></tr>' for k, v in rows)
+    return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
+            f'<table style="width:100%;border-collapse:collapse;font-size:14px">{body}</table>'
+            '<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr reads headers only and makes NZBs; the downloading is '
+            'your downloader\'s. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
 
 
 @app.get("/system", response_class=HTMLResponse)
@@ -5767,6 +7040,7 @@ async def page_system():
     body = """
 <h2 class="section">System</h2>
 __ALLOWANCES__
+__USENET__
 <section style="margin-bottom:28px">
   <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Workers</h3>
   <div id="workersTable">loading...</div>
@@ -5858,7 +7132,8 @@ async function loadDeepBackfill() {
     <th style="text-align:right">Videos</th>
     <th style="text-align:right">Audio</th>
     <th style="text-align:right">Docs</th>
-    <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+    <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    + (j.private_count ? `<div style="font-size:12.5px;color:#64748b;margin-top:8px">Your ${j.private_count} private chat${j.private_count == 1 ? " is" : "s are"} read and kept whole; they are not listed here.</div>` : "");
 }
 loadWorkers(); loadDeepBackfill();
 setInterval(loadWorkers, 30000);
@@ -5872,6 +7147,11 @@ setInterval(loadDeepBackfill, 60000);
 </style>
 """
     body = body.replace("__ALLOWANCES__", allowances_html)
+    try:
+        body = body.replace("__USENET__", await _usenet_system_html())
+    except Exception as e:
+        log.warning("[system] usenet section: %s", e)
+        body = body.replace("__USENET__", "")
     return HTMLResponse(_layout("System", "/system", body))
 
 
@@ -5889,24 +7169,31 @@ async def health():
 
 
 _DASH_CACHE: dict = {"at": 0.0, "v": None}
+# A channel the user removed is cleared a little later (its files are reported to tgarr.me
+# first). Until then its rows are still in the tables - and the Dashboard went on counting
+# them: 130,000 items of five channels that had been removed hours before. For every number
+# on the Dashboard such a channel is gone the moment it is removed.
+_GOING = ("(SELECT id FROM channels WHERE unfollowed_at IS NOT NULL "
+          "AND NOT COALESCE(subscribed, FALSE) AND NOT COALESCE(is_joined, FALSE))")
 
 
 @app.get("/")
 async def root(request: Request, accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow(
-            """SELECT (SELECT count(*) FROM channels)                AS channels,
-                      (SELECT count(*) FROM messages)                AS messages,
+            f"""SELECT (SELECT count(*) FROM channels WHERE id NOT IN {_GOING}) AS channels,
+                      (SELECT count(*) FROM messages
+                         WHERE channel_id NOT IN {_GOING})           AS messages,
                       (SELECT count(*) FROM releases)                AS releases,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='video')                   AS videos,
+                         WHERE media_type='video' AND channel_id NOT IN {_GOING}) AS videos,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='photo')                   AS photos,
+                         WHERE media_type='photo' AND channel_id NOT IN {_GOING}) AS photos,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='audio')                   AS audio,
+                         WHERE media_type='audio' AND channel_id NOT IN {_GOING}) AS audio,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='document'
-                           AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$') AS books,
+                         WHERE media_type='document' AND channel_id NOT IN {_GOING}
+                           AND file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$') AS books,
                       (SELECT count(*) FROM downloads
                          WHERE status='pending')                     AS pending,
                       (SELECT count(*) FROM downloads
@@ -5956,11 +7243,11 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                             WHERE category IN ('movie', 'tv')
                               AND created_at > NOW() - INTERVAL '24 hours')        AS rel_new""")
             new_today = {r["media_type"]: r["n"] for r in await conn.fetch(
-                """SELECT media_type, count(*) AS n FROM messages
-                   WHERE indexed_at > NOW() - INTERVAL '24 hours' GROUP BY 1""")}
+                f"""SELECT media_type, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '24 hours' AND channel_id NOT IN {_GOING} GROUP BY 1""")}
             per_day = await conn.fetch(
-                """SELECT date_trunc('day', indexed_at)::date AS d, count(*) AS n FROM messages
-                   WHERE indexed_at > NOW() - INTERVAL '14 days' GROUP BY 1 ORDER BY 1""")
+                f"""SELECT date_trunc('day', indexed_at)::date AS d, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '14 days' AND channel_id NOT IN {_GOING} GROUP BY 1 ORDER BY 1""")
             latest = await conn.fetch(
                 """SELECT r.primary_msg_id, r.poster_url, r.category, r.season, r.episode,
                           r.quality, r.movie_year,
@@ -5981,6 +7268,39 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 if len(_uniq) == 12:
                     break
             latest = _uniq
+            # A tile says how many items the page behind it lists when it is opened -
+            # the same filters, in the same words. Counting every row instead gave
+            # "116,411 videos" over a page of ten: the page leaves out 18+ channels,
+            # clips under 50 MB and second copies of the same file, the tile did not.
+            _vis = "" if _signed_in() else " AND (c.username IS NOT NULL OR c.local_root IS NOT NULL)"
+            tile = {}
+            try:
+                for _cat in ("movie", "tv"):
+                    tile[_cat] = await conn.fetchval(
+                        f"""WITH base AS (SELECT r.id, {_WORK_KEY_SQL} AS wk FROM releases r
+                              LEFT JOIN messages m ON m.id = r.primary_msg_id
+                              LEFT JOIN channels c ON c.id = m.channel_id
+                              WHERE r.category = $1 AND COALESCE(r.size_bytes, 0) >= 100 * 1024 * 1024
+                                AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis} AND (c.id IS NULL OR c.id NOT IN {_GOING}))
+                            SELECT count(DISTINCT COALESCE(wk, 'id:' || id::text)) FROM base""", _cat)
+                tile["video"] = await conn.fetchval(
+                    f"""SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE m.media_type = 'video' AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis} AND c.id NOT IN {_GOING}
+                          AND (COALESCE(m.file_size, 0) >= 50 * 1024 * 1024 OR c.local_root IS NOT NULL)
+                          AND NOT EXISTS (SELECT 1 FROM messages o JOIN channels oc ON oc.id = o.channel_id
+                                          WHERE o.file_unique_id = m.file_unique_id AND o.id > m.id AND o.media_type = 'video'
+                                            AND COALESCE(oc.audience, 'sfw') = COALESCE(c.audience, 'sfw'){_pub("oc")})""")
+                _adult = "" if await _is_nsfw_enabled() else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"
+                tile["photo"] = await conn.fetchval(
+                    f"""SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+                        FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE (m.media_type = 'photo' OR (m.media_type IS NULL AND m.file_name IS NULL
+                                 AND COALESCE(m.mime_type, '') = '' AND m.file_unique_id IS NOT NULL))
+                          AND COALESCE(m.thumb_path, '') <> '__failed__' AND COALESCE(m.thumb_path, '') <> '__deleted__'
+                          AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'{_adult}{_vis} AND c.id NOT IN {_GOING}""")
+            except Exception as _e:
+                log.warning("[dashboard] tile counts: %s", _e)      # fall back to the plain totals below
+            lib = dict(lib, tile=tile)
             try:
                 hb = await conn.fetchval("SELECT max(last_seen) FROM worker_status")
             except Exception:
@@ -6053,17 +7373,28 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 f'<div class="tn">{n:,}</div><div class="tl">{label}</div>'
                 + (f'<div class="tp">+{_fmt_count(plus)} today</div>' if plus else '<div class="tp">&nbsp;</div>')
                 + '</a>')
+    _tn = lib.get("tile") or {}
+
+    def _shown(key, fallback):
+        return _tn[key] if _tn.get(key) is not None else fallback
+    # ("+N today" counts everything that arrived; it is left off where the page lists a
+    # selection of it, so that a tile never says "10" with "+2.3K today" under it)
     tiles = (
-        _tile("/releases?cat=movie", "🎬", lib["films"], "films", 0)
-        + _tile("/releases?cat=tv", "📺", lib["episodes"], "episodes", 0)
-        + _tile("/videos", "▶", st["videos"], "videos", new_today.get("video", 0))
+        _tile("/releases?cat=movie", "🎬", _shown("movie", lib["films"]), "films", 0)
+        + _tile("/releases?cat=tv", "📺", _shown("tv", lib["episodes"]), "episodes", 0)
+        + _tile("/videos", "▶", _shown("video", st["videos"]), "videos", 0 if "video" in _tn else new_today.get("video", 0))
         + _tile("/music", "🎵", st["audio"], "songs", new_today.get("audio", 0))
         + _tile("/library", "📚", st["books"], "books", 0)
-        + _tile("/gallery", "🖼", st["photos"], "photos", new_today.get("photo", 0))
+        + _tile("/gallery", "🖼", _shown("photo", st["photos"]), "photos", 0 if "photo" in _tn else new_today.get("photo", 0))
         + _tile("/channels", "📡", st["channels"], "channels", 0))
 
     # ── now ──
     now_bits = []
+    # out of the box anyone on the same network opens this page as the owner
+    if _signed_in() and not _ACCESS["pin"] and not _UI_PASSWORD:
+        now_bits.append('<a class="now-pill" href="/mediacenter/manage" title="with a PIN, other browsers get only '
+                        'the Media Center and what you allow there">🔓 No PIN yet: anyone on your network '
+                        'opens this page as you — set one</a>')
     arriving = [f for f in fetches if f["state"] in ("queued", "fetching")]
     if arriving:
         now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {len(arriving)} arriving for a player</a>')
@@ -6128,7 +7459,8 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         mix.append(("other files", other, "#cbd5e1"))
     tot = sum(v for _, v, _ in mix) or 1
     mix_html = (
-        '<div class="panel"><div class="ph"><span>What is indexed</span>'
+        '<div class="panel"><div class="ph"><span title="Every file in the index. The tiles above count what each page '
+        'lists when opened: no 18+ channels, no clips, one card per film - so they are smaller.">Everything in the index</span>'
         f'<span class="pn">{st["messages"]:,} items</span></div>'
         '<div class="mixbar">'
         + "".join(f'<div style="width:{v * 100 / tot:.2f}%;background:{c}" title="{k}: {v:,}"></div>'
@@ -6318,10 +7650,16 @@ async def api_channel_subscribe(username: str = Form(...)):
 
 @app.post("/api/channel/unsubscribe/{tg_chat_id}")
 async def api_channel_unsubscribe(tg_chat_id: int):
+    """Stop reading a public channel and let its index be cleared.
+    Also for a channel that is not followed at all: tgarr joins some channels
+    by itself, reads them and leaves again, and such a channel stayed in the
+    list for good - not followed, not joined, with a "+ Follow" button and no
+    way to take it off. Never a chat the account is in, never a private one."""
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """UPDATE channels SET subscribed=FALSE, unfollowed_at=NOW()
-               WHERE tg_chat_id=$1 AND subscribed=TRUE""", tg_chat_id)
+            """UPDATE channels SET subscribed = FALSE, unfollowed_at = COALESCE(unfollowed_at, NOW())
+               WHERE tg_chat_id = $1 AND username IS NOT NULL AND local_root IS NULL
+                 AND (subscribed = TRUE OR COALESCE(is_joined, FALSE) = FALSE)""", tg_chat_id)
     return {"status": "ok"}
 
 
@@ -6562,6 +7900,10 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         elif not r["is_joined"] and not r["dead_at"] and r["username"]:
             act = (f'<button class="abtn pri" {_ids} onclick="tgFollow(this)" '
                    f'title="read this public channel again, without joining it">+ Follow</button>')
+            if not r["unfollowed_at"]:
+                # not followed, not joined, and nobody ever unfollowed it: it can be taken off the list
+                act += (f' <button class="abtn" {_ids} onclick="tgRemove(this)" '
+                        f'title="take this channel and its index off this tgarr">Remove</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
@@ -6601,6 +7943,10 @@ function tgChGone(b, note) {
   b.disabled = true; b.textContent = note;
   if (row) { row.style.transition = "opacity .5s"; row.style.opacity = "0.35";
              setTimeout(function () { row.remove(); }, 900); }
+  // the numbers in the heading and on the chips are from when the page was made: once the
+  // last of a run of clicks has settled, read the page again so that they are right
+  clearTimeout(window.tgChAgain);
+  window.tgChAgain = setTimeout(function () { location.reload(); }, 1800);
 }
 function tgChSet(b, following) {
   // unfollowed: it has left the list. Followed again from "being cleared": it has left that view.
@@ -6626,6 +7972,14 @@ function tgUnfollow(b) {
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChSet(b, false); })
     .catch(function (e) { tgChFail(b, "Unfollow", e.message); });
+}
+function tgRemove(b) {
+  if (!confirm("Remove this channel from tgarr?\n\nIts films and files leave the index within a few hours. "
+               + "Files you saved and favourites stay. It can be followed again from Discover.")) return;
+  b.disabled = true; b.textContent = "…";
+  fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChGone(b, "Removed"); })
+    .catch(function (e) { tgChFail(b, "Remove", e.message); });
 }
 function tgFollow(b) {
   b.disabled = true; b.textContent = "…";
@@ -6930,6 +8284,1359 @@ async def api_registry_pull_now():
 # ════════════════════════════════════════════════════════════════════
 # Page: Gallery (Telegram-shared photos)
 # ════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+# Usenet - a second source, for people who have a Usenet account
+#
+# Off until an account is entered in Settings and the server answers. Then:
+#   * a slow scanner reads newsgroup headers and keeps one small card per
+#     named video / audio / e-book / photo release (usenet.py);
+#   * /newznab/usenet/api offers those cards to Sonarr and Radarr;
+#   * a grab is answered with the release's NZB, built at that moment by
+#     reading its stretch of headers again. tgarr does not download from
+#     Usenet: the *arr hands the NZB to its own downloader (SABnzbd, NZBGet).
+# In the *arr this is a second indexer entry, because an indexer is tied to
+# one download client: "tgarr" goes to tgarr itself (Telegram), "tgarr
+# Usenet" to the Usenet downloader.
+# ════════════════════════════════════════════════════════════════════
+_USENET = {"at": 0.0, "cfg": {}, "ok": None, "msg": "not tried yet", "checked": 0.0}
+_USENET_KEYS = ("usenet_enabled", "usenet_host", "usenet_port", "usenet_ssl", "usenet_user", "usenet_pass",
+                "usenet_per_day", "usenet_index", "usenet_conns")
+USENET_GROUPS = ("alt.binaries.teevee", "alt.binaries.hdtv.x264", "alt.binaries.x264", "alt.binaries.multimedia",
+                 "alt.binaries.tv", "alt.binaries.movies", "alt.binaries.sounds.lossless", "alt.binaries.ebook",
+                 "alt.binaries.e-book.technical")
+USENET_BLOCK = 200_000               # headers read in one go
+USENET_SETTLE = 30_000               # a release is taken as finished this many articles behind the reader
+USENET_START = "2009-01-01"          # where a group is first read from: old posts carry readable names
+
+
+async def _usenet_cfg(fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if (fresh or now - _USENET["at"] > 5) and db_pool is not None:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, value FROM config WHERE key = ANY($1::text[])", list(_USENET_KEYS))
+        d = {r["key"][7:]: r["value"] for r in rows}
+        _USENET.update(at=now, cfg={
+            "enabled": d.get("enabled") == "1", "host": (d.get("host") or "").strip(),
+            "port": int(d.get("port") or 563), "ssl": d.get("ssl", "1") != "0",
+            "user": d.get("user") or "", "pass": d.get("pass") or "",
+            "per_day": max(0, int(d.get("per_day") or 2_000_000)),
+            # With Usenet on, this install takes part in the shared index - as with Telegram,
+            # what it finds is shared: names and pointers, never files. There is no switch for
+            # that alone. "conns" is the most it is willing to use for reading the index; the
+            # registry says how many it may (one for an ordinary install): the smaller is used.
+            "index": d.get("enabled") == "1", "conns": max(1, min(int(d.get("conns") or 12), 20))})
+    return _USENET["cfg"]
+
+
+def _usenet_connect(cfg: dict):
+    return usenet.NNTP(cfg["host"], cfg["port"], cfg["user"] or None, cfg["pass"] or None, use_ssl=cfg["ssl"])
+
+
+def _usenet_try(cfg: dict) -> str:
+    """'' when the server lets us in and answers, otherwise why not (never the account's name)."""
+    try:
+        nn = _usenet_connect(cfg)
+    except usenet.NNTPError as e:
+        return str(e)
+    except Exception as e:
+        return f"could not connect: {type(e).__name__}"
+    try:
+        nn.group("alt.binaries.teevee")
+        return ""
+    except Exception as e:
+        return f"connected, but the server did not open a group: {e}"
+    finally:
+        nn.quit()
+
+
+async def _usenet_ready(recheck: bool = False) -> bool:
+    """Switched on, an account entered, and the server answered when last asked
+    (asked again at most every ten minutes)."""
+    cfg = await _usenet_cfg()
+    if not (cfg.get("enabled") and cfg.get("host")):
+        return False
+    if recheck or _USENET["ok"] is None or time.monotonic() - _USENET["checked"] > 600:
+        msg = await asyncio.to_thread(_usenet_try, cfg)
+        _USENET.update(ok=not msg, msg=msg or "working", checked=time.monotonic())
+    return bool(_USENET["ok"])
+
+
+def _usenet_scan_block(cfg: dict, grp: str, start, asm, count: int):
+    """Read `count` headers of a group from article `start` (None: from
+    USENET_START), feed them to the group's assembler, and return the cards of
+    the releases that are finished. Runs in a thread."""
+    import calendar
+    import random
+    nn = _usenet_connect(cfg)
+    try:
+        _n, first, last = nn.group(grp)
+        if start is None or start < first:
+            start = usenet.article_at(nn, first, last, calendar.timegm(time.strptime(USENET_START, "%Y-%m-%d")))
+        b0, lo, end = nn.bytes_in, start, min(last, start + count - 1)
+        while lo <= end:
+            for row in nn.over(lo, min(end, lo + 19999)):
+                asm.add(*row)
+            lo += 20000
+        cursor, cards = end + 1, []
+        for k, r in list(asm.rel.items()):
+            if r["art_hi"] >= cursor - USENET_SETTLE and cursor <= last:
+                continue                              # may still be arriving
+            del asm.rel[k]
+            c = usenet.card(r)
+            if not c:
+                continue
+            ids = [m for f in r["files"].values() for m, _s in f["parts"].values()]
+            sample = random.sample(ids, min(4, len(ids)))
+            c["alive"] = round(sum(1 for m in sample if nn.stat(m)) / max(1, len(sample)), 2)
+            cards.append(c)
+        resume = min([r["art_lo"] for r in asm.rel.values()] + [cursor])
+        return cards, cursor, max(resume, cursor - USENET_BLOCK), end - start + 1, nn.bytes_in - b0, first, last
+    finally:
+        nn.quit()
+
+
+async def _usenet_scan_worker():
+    """Reads a block of one group, then the next group, staying under the
+    day's allowance of headers (their download is the cost: about 350 bytes
+    each). Only while Usenet is switched on and the server answers."""
+    await asyncio.sleep(90)
+    logu = logging.getLogger("tgarr.usenet")
+    asms, cursors, turn = {}, {}, 0
+    while True:
+        try:
+            if not await _usenet_ready():
+                await asyncio.sleep(300)
+                continue
+            cfg = await _usenet_cfg()
+            day = time.strftime("%Y-%m-%d", time.gmtime())
+            async with db_pool.acquire() as conn:
+                used = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_today'") or ""
+                rows = await conn.fetch("SELECT grp, next_article, enabled FROM usenet_progress")
+            used_n = int(used.split(":")[1]) if used.startswith(day + ":") else 0
+            room = cfg["per_day"] - used_n
+            if room < 20000:
+                await asyncio.sleep(900)
+                continue
+            known = {r["grp"]: r for r in rows}
+            groups = [g for g in USENET_GROUPS if g not in known or known[g]["enabled"]]
+            if not groups:
+                await asyncio.sleep(900)
+                continue
+            grp = groups[turn % len(groups)]
+            turn += 1
+            start = cursors.get(grp, known[grp]["next_article"] if grp in known else None)
+            asm = asms.setdefault(grp, usenet.Assembler(grp))
+            try:
+                cards, cursor, resume, n, nbytes, first, last = await asyncio.to_thread(
+                    _usenet_scan_block, cfg, grp, start, asm, min(USENET_BLOCK, room))
+            except Exception as e:
+                logu.warning("[usenet] %s: %s", grp, str(e)[:120])
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO usenet_progress (grp, note) VALUES ($1, $2)
+                           ON CONFLICT (grp) DO UPDATE SET note = $2, updated_at = NOW()""", grp, str(e)[:200])
+                await asyncio.sleep(120)
+                continue
+            cursors[grp] = cursor
+            async with db_pool.acquire() as conn:
+                await _usenet_store(conn, cards)
+                await conn.execute(
+                    """INSERT INTO usenet_progress (grp, first_article, last_article, next_article, headers, cards, bytes, note)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+                       ON CONFLICT (grp) DO UPDATE SET first_article = $2, last_article = $3, next_article = $4,
+                           headers = usenet_progress.headers + $5, cards = usenet_progress.cards + $6,
+                           bytes = usenet_progress.bytes + $7, note = NULL, updated_at = NOW()""",
+                    grp, first, last, resume, n, len(cards), nbytes)
+                await conn.execute(
+                    """INSERT INTO config (key, value) VALUES ('usenet_today', $1)
+                       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", f"{day}:{used_n + n}")
+            logu.info("[usenet] %s: %s headers, %s cards, %.0f MB", grp, f"{n:,}", len(cards), nbytes / 1e6)
+            await asyncio.sleep(20 if cursor <= last else 600)
+        except Exception as e:
+            logu.warning("[usenet] scanner: %s: %s", type(e).__name__, str(e)[:160])
+            await asyncio.sleep(300)
+
+
+_USENET_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "posted_to", "files", "files_expected",
+                "segments", "segments_expected", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive")
+
+
+async def _usenet_store(conn, cards: list) -> None:
+    for c in cards:
+        row = dict(c)
+        row["grp"] = row.pop("group", row.get("grp"))
+        await conn.execute(
+            f"""INSERT INTO usenet_cards ({", ".join(_USENET_COLS)})
+                VALUES ({", ".join(f"${i + 1}" for i in range(len(_USENET_COLS)))})
+                ON CONFLICT (id) DO UPDATE SET size = EXCLUDED.size, files = EXCLUDED.files,
+                    segments = EXCLUDED.segments, segments_expected = EXCLUDED.segments_expected,
+                    complete = EXCLUDED.complete, art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo),
+                    art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi), alive = EXCLUDED.alive,
+                    posted_to = EXCLUDED.posted_to""",
+            *[bool(row.get(k)) if k == "complete" else row.get(k) for k in _USENET_COLS])
+
+
+def _usenet_nzb(cfg: dict, c) -> str:
+    """The NZB of one card, from the headers as they are on the server now. Runs in a thread."""
+    nn = _usenet_connect(cfg)
+    try:
+        nn.group(c["grp"])
+        asm = usenet.Assembler(c["grp"])
+        lo, hi = c["art_lo"] - 2000, c["art_hi"] + 2000
+        while lo <= hi:
+            for r in nn.over(lo, min(hi, lo + 19999)):
+                if usenet.poster_hash(r[2]) == c["poster"]:
+                    p = usenet.parse_subject(r[1])
+                    if p and usenet.release_key(p) == c["key"]:
+                        asm.add(*r)
+            lo += 20000
+        rels = asm.releases()
+        return usenet.build_nzb(rels[0]) if rels else ""
+    finally:
+        nn.quit()
+
+
+_USENET_EP_RX = re.compile(r"S(\d{1,2})E(\d{1,3})", re.I)
+
+
+def _usenet_item_xml(c, base_url: str, apikey: str) -> str:
+    link = html.escape(f"{base_url}/newznab/usenet/api?t=get&id=un-{c['id']}&apikey={apikey}", quote=True)
+    name, hd = c["name"], bool(re.search(r"\b(720|1080|2160)[pi]\b", c["name"], re.I))
+    ep = _USENET_EP_RX.search(name)
+    if c["kind"] == "video":
+        cat = ("5040" if hd else "5030") if ep or re.search(r"\b\d{4}[. ]\d{2}[. ]\d{2}\b", name) else ("2040" if hd else "2030")
+    else:
+        cat = {"audio": "3010", "ebook": "7020"}.get(c["kind"], "8000")
+    when = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(c["posted_from"] or 0))
+    attrs = f'      <newznab:attr name="category" value="{cat}"/>\n      <newznab:attr name="size" value="{c["size"] or 0}"/>\n'
+    if ep and cat.startswith("5"):
+        attrs += (f'      <newznab:attr name="season" value="{int(ep.group(1))}"/>\n'
+                  f'      <newznab:attr name="episode" value="{int(ep.group(2))}"/>\n')
+    attrs += f'      <newznab:attr name="group" value="{html.escape(c["grp"])}"/>\n'
+    return (f"    <item>\n      <title>{html.escape(name)}</title>\n"
+            f"      <guid isPermaLink=\"false\">un-{c['id']}</guid>\n      <link>{link}</link>\n"
+            f"      <pubDate>{when}</pubDate>\n      <category>{cat}</category>\n      <size>{c['size'] or 0}</size>\n"
+            f"      <description>Usenet, {html.escape(c['grp'])}</description>\n"
+            f"      <enclosure url=\"{link}\" length=\"{c['size'] or 0}\" type=\"application/x-nzb\"/>\n{attrs}    </item>")
+
+
+@app.get("/newznab/usenet/api", response_class=PlainTextResponse)
+@app.get("/newznab/usenet", response_class=PlainTextResponse)
+async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional[str] = Query(None),
+                         season: Optional[int] = None, ep: Optional[int] = None, cat: Optional[str] = None,
+                         limit: int = 100, offset: int = 0, apikey: Optional[str] = "tgarr",
+                         id: Optional[str] = None):
+    base_url = _base_url(request)
+    if t == "caps":
+        return Response(CAPS_XML, media_type="application/xml")
+    if t not in ("search", "tvsearch", "movie", "get"):
+        return _newznab_error(202, f"No such function ({t})")
+    # Nothing is offered unless Usenet is switched on and the server answers:
+    # a result that cannot be turned into an NZB is worse than no result.
+    if not await _usenet_ready():
+        if t == "get":
+            return _newznab_error(300, "Usenet is switched off or the news server is not answering", 503)
+        return Response(_feed_envelope("", "usenet (off)", base_url), media_type="application/xml")
+    if t == "get":
+        if not id or not re.fullmatch(r"un-[0-9a-f]{20}", id):
+            return _newznab_error(300, "No such item", 404)
+        async with db_pool.acquire() as conn:
+            c = await conn.fetchrow("SELECT * FROM usenet_cards WHERE id = $1", id[3:])
+        if not c or usenet_rules.forbidden({"name": c["name"], "groups": [c["grp"]], "audience": c["audience"]}):
+            return _newznab_error(300, "No such item", 404)
+        try:
+            if c["sketch"]:
+                _ucfg = await _usenet_cfg()
+                # as many connections as the provider gives: somebody is waiting for this.
+                # The number finds its own level (usenet_scan.next_connections) and is kept.
+                async with db_pool.acquire() as conn:
+                    _asked = usenet_scan.next_connections(
+                        await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_nzb_conns'"), {})
+                _UN_INDEX["nzb"] += 1                        # the index reading stands aside meanwhile
+                try:
+                    got = await asyncio.to_thread(
+                        usenet_scan.rebuild, _ucfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
+                        6000 if c["detail"] == 0 else 2000, c["name"], _asked)
+                finally:
+                    _UN_INDEX["nzb"] -= 1
+                _next = usenet_scan.next_connections(_asked, got)
+                if _next != _asked:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute("""INSERT INTO config (key, value) VALUES ('usenet_nzb_conns', $1)
+                                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", str(_next))
+                text = got["nzb"]
+                logging.getLogger("tgarr").info(
+                    "[usenet] NZB for %s: %s parts of %s file(s) in %.1fs over %s connection(s) of %s asked, %s request(s)%s%s",
+                    c["id"], f"{got['segments']:,}", got["files"], got.get("seconds", 0), got.get("connections", 1), _asked,
+                    got.get("requests", 0), f", {got['unread']} stretch(es) the server did not give" if got.get("unread") else "",
+                    f"; {_next} next time" if _next != _asked else "")
+                if text and not got.get("unread"):           # now it has been read in full: keep the exact figures
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE usenet_cards SET size = $2, files = $3, segments = $4, complete = $5,
+                                      art_lo = $6, art_hi = $7, detail = 1 WHERE id = $1""",
+                            c["id"], got["size"], got["files"], got["segments"], got["complete"], got["art_lo"], got["art_hi"])
+            else:
+                text = await asyncio.to_thread(_usenet_nzb, await _usenet_cfg(), c)
+        except Exception as e:
+            _USENET.update(ok=None)                          # look at the server again before the next answer
+            return _newznab_error(300, f"The news server did not give the headers: {str(e)[:80]}", 503)
+        if not text:
+            return _newznab_error(300, "This release is no longer on the news server", 404)
+        safe = "".join(ch if ord(ch) < 128 and ch not in '"\\' else "_" for ch in c["name"])[:150]
+        return Response(text, media_type="application/x-nzb",
+                        headers={"Content-Disposition": f'attachment; filename="{safe}.nzb"'})
+    where, params = ["alive >= 0.5"], []
+    for w in re.split(r"[\s.]+", q or "")[:8]:
+        if w:
+            params.append("%" + w.replace("%", "").replace("_", r"\_") + "%")
+            where.append(f"name ILIKE ${len(params)}")
+    if t == "tvsearch":
+        where.append(r"kind = 'video' AND name ~* 'S\d{1,2}E\d{1,3}|\d{4}[. ]\d{2}[. ]\d{2}'")
+        if season is not None and ep is not None:
+            params.append(rf"S0*{int(season)}E0*{int(ep)}(?!\d)")
+            where.append(f"name ~* ${len(params)}")
+        elif season is not None:
+            params.append(rf"S0*{int(season)}(E\d|\M)")
+            where.append(f"name ~* ${len(params)}")
+    elif t == "movie":
+        where.append(r"kind = 'video' AND name !~* 'S\d{1,2}E\d{1,3}'")
+    else:
+        where.append("kind IN ('video', 'audio', 'ebook')")
+    if not await _is_nsfw_enabled():
+        where.append("audience <> 'nsfw'")             # adult material only where it is switched on
+    lim = max(1, min(int(limit), 200))
+    await _usenet_from_registry(q or "")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT *, count(*) OVER() AS _total FROM usenet_cards WHERE {' AND '.join(where)}
+                ORDER BY complete DESC, posted_from DESC NULLS LAST LIMIT {lim} OFFSET {max(0, int(offset))}""", *params)
+    rows = [r for r in rows if not usenet_rules.forbidden({"name": r["name"], "groups": [r["grp"]], "audience": r["audience"]})]
+    items = "\n".join(_usenet_item_xml(r, base_url, apikey or "tgarr") for r in rows)
+    return Response(_feed_envelope(items, f"usenet t={t} q={q or ''}", base_url, offset=max(0, int(offset)),
+                                   total=rows[0]["_total"] if rows else 0), media_type="application/xml")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Taking part in the shared Usenet index (docs/USENET_INDEX.md).
+#
+# On whenever Usenet is on - there is no switch of its own. The registry
+# leases this install a window - a group and a stretch of time - and says
+# how to read it (sparsely at first: a few headers every couple of thousand
+# articles). The window is read over several connections, the releases seen
+# are sketched into cards, the cards are kept here (so this install's own
+# Sonarr finds them at once) and handed in. Searches ask the registry as
+# well and keep what it knows. Only headers are ever read; an NZB is made
+# when somebody asks for one.
+# ════════════════════════════════════════════════════════════════════
+_UN_INDEX = {"state": "off", "window": None, "at": 0.0, "last": None, "asked": {}, "nzb": 0}
+_UN_SKETCH_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "posted_to", "files", "files_expected",
+                   "segments", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive", "sketch", "detail", "audience")
+
+
+async def _usenet_tidy() -> dict:
+    """The cards kept here brought into line with usenet_rules as they are now: adult ones
+    labelled, those that are never kept deleted. At start and after cards are taken in -
+    whatever way they came (this install's own reading, the older scanner, the registry)."""
+    R = usenet_rules
+    async with db_pool.acquire() as conn:
+        labelled = await conn.execute(
+            "UPDATE usenet_cards SET audience = 'nsfw' WHERE audience <> 'nsfw' AND (name ~* $1 OR grp ~* $2)",
+            R.ADULT_NAME_SQL, R.ADULT_GROUP_SQL)
+        gone = await conn.execute(
+            """DELETE FROM usenet_cards WHERE name ~* $1 OR grp ~* $2 OR (audience = 'nsfw' AND name ~* $3)""",
+            R.FORBIDDEN_SQL, R.GROUP_FORBIDDEN_SQL, R.MINOR_SQL)
+    out = {"labelled_adult": int(labelled.split()[-1]), "deleted": int(gone.split()[-1])}
+    if out["labelled_adult"] or out["deleted"]:
+        logging.getLogger("tgarr").info("[usenet] cards put in line with the rules: %s", out)
+    return out
+
+
+async def _instance_uuid() -> str:
+    import uuid as _uuid
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval("SELECT value FROM config WHERE key = 'instance_uuid'")
+        if not v:
+            v = str(_uuid.uuid4())
+            await conn.execute("INSERT INTO config (key, value) VALUES ('instance_uuid', $1) ON CONFLICT (key) DO NOTHING", v)
+            v = await conn.fetchval("SELECT value FROM config WHERE key = 'instance_uuid'")
+    return v
+
+
+def _usenet_card_id(poster: str, key: str) -> str:
+    return hashlib.sha1(f"{poster}|{key}".encode("utf-8", "replace")).hexdigest()[:20]      # as the registry counts them
+
+
+async def _usenet_keep(cards: list) -> int:
+    """Sketched cards into this install's own table, in one go."""
+    rows = []
+    for c in cards:
+        grp = c.get("grp") or c["groups"][0]
+        judged = {"name": c["name"], "inner_name": c.get("inner_name"), "groups": list(c.get("groups") or ()) + [grp],
+                  "audience": c.get("audience")}
+        # wherever the card came from - this install's reading or the registry - it is judged here
+        if CSAM_RX.search(c["name"]) or usenet_rules.forbidden(judged) or not c.get("art_lo"):
+            continue
+        rows.append((_usenet_card_id(c["poster"], c["key"]), c["name"][:300], c["kind"], c.get("size"), grp,
+                     c["poster"], c.get("posted_from"), c.get("posted_to"), c.get("files"), c.get("files_expected"),
+                     c.get("segments"), c.get("complete"), c["first_message_id"], c["key"], c["art_lo"], c["art_hi"], 1.0, True,
+                     0 if c.get("detail") == 0 else 1,
+                     "nsfw" if (c.get("audience") == "nsfw" or usenet_rules.adult(judged)) else "sfw"))
+    if not rows:
+        return 0
+    cols = ", ".join(_UN_SKETCH_COLS)
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("CREATE TEMP TABLE _uk (LIKE usenet_cards INCLUDING DEFAULTS) ON COMMIT DROP")
+            await conn.copy_records_to_table("_uk", columns=list(_UN_SKETCH_COLS), records=rows)
+            await conn.execute(
+                f"""INSERT INTO usenet_cards ({cols}) SELECT DISTINCT ON (id) {cols} FROM _uk
+                    ON CONFLICT (id) DO UPDATE SET
+                      art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo), art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi),
+                      -- what was read in full is not put back to an estimate
+                      size = CASE WHEN usenet_cards.detail > EXCLUDED.detail THEN usenet_cards.size ELSE EXCLUDED.size END,
+                      detail = GREATEST(usenet_cards.detail, EXCLUDED.detail), alive = 1.0, sketch = TRUE,
+                      audience = CASE WHEN EXCLUDED.audience = 'nsfw' THEN 'nsfw' ELSE usenet_cards.audience END""")
+    return len(rows)
+
+
+def _usenet_index_window(cfg: dict, w: dict) -> dict:
+    """Read one leased window. Runs in a thread (it takes minutes)."""
+    import calendar as _cal
+    nn = usenet_scan.connect(cfg, packed=False)
+    try:
+        count, first, last = nn.group(w["grp"])
+        # the oldest article the provider has: a window before that has nothing in it here
+        oldest = None
+        for hop in range(6):
+            for r in nn.over(first + hop * 3000, first + hop * 3000 + 49):
+                oldest = usenet.when(r[3])
+                if oldest:
+                    break
+            if oldest:
+                break
+        if count <= 0 or (oldest and w["t_to"] <= oldest):
+            return {"empty": True, "stats": {"headers": 0, "bytes": 0, "seconds": 0}, "posters": [], "cards": [],
+                    "oldest": time.strftime("%Y-%m-%d", time.gmtime(oldest)) if oldest else None}
+        lo = usenet.article_at(nn, first, last, w["t_from"])
+        hi = usenet.article_at(nn, first, last, w["t_to"])
+    finally:
+        try:
+            nn.sock.close()
+        except Exception:
+            pass
+    sparse = tuple(w["read"]) if w.get("read") else None
+    sk = usenet_scan.Sketch(w["grp"], items=not sparse)
+    # how many connections: never more than the registry allows this install (one, unless it
+    # is told otherwise), and never more than is set here
+    allowed = max(1, min(int(w.get("connections") or 1), 20))
+    # subjects are judged on a thread of their own as they arrive: the reading threads are
+    # not held up, and a window read in full (millions of headers) is never held in memory
+    feed = usenet_scan.Feeder(sk.add_rows)
+    try:
+        st = usenet_scan.read_window(cfg, w["grp"], lo, max(lo, hi), read=sparse,
+                                     connections=max(1, min(cfg.get("conns", 1), allowed)), on_rows=feed.put,
+                                     hold=lambda: _UN_INDEX["nzb"] > 0)
+    finally:
+        feed.close()
+    if st["failed"] and len(st["failed"]) * 10 > st["requests"] + len(st["failed"]):
+        # more than a tenth of it unread: this is not a reading of the window. Hand nothing
+        # in (the lease runs out and the window is offered again) rather than call it read.
+        raise usenet.NNTPError(f"{len(st['failed'])} of {st['requests'] + len(st['failed'])} stretches could not be read")
+    cards = sk.cards(detail=0 if sparse else 1, min_size=100_000_000 if sparse else 0)
+    for c in cards:
+        c["grp"] = w["grp"]
+    c_ = sk.count
+    return {"empty": st["headers"] == 0, "posters": sk.poster_lines(), "cards": cards, "range": (lo, hi),
+            "oldest": time.strftime("%Y-%m-%d", time.gmtime(oldest)) if oldest else None,
+            "stats": {"headers": st["headers"], "bytes": st["bytes"], "seconds": st["seconds"], "requests": st["requests"],
+                      "unread": len(st["failed"]), "connections": st["connections"],
+                      "wanted": c_["wanted"], "unknown": c_["unknown"], "hidden": c_["hidden"] + c_["password"],
+                      "not_part": c_["not a part"]}}
+
+
+async def _usenet_index_worker():
+    logu = logging.getLogger("tgarr")
+    await asyncio.sleep(40)
+    tidied = 0.0
+    failed = {}                                    # window id -> when reading it last failed
+    while True:
+        w = None
+        try:
+            if time.time() - tidied > 3600:            # at start, and every hour: whatever way cards came in
+                tidied = time.time()
+                try:
+                    await _usenet_tidy()
+                except Exception as e:
+                    logu.warning("[usenet] tidy: %s", e)
+            cfg = await _usenet_cfg(fresh=True)
+            if not (cfg.get("index") and cfg.get("enabled") and cfg.get("host")):
+                _UN_INDEX["state"] = "off"
+                await asyncio.sleep(120)
+                continue
+            if not await _usenet_ready():
+                _UN_INDEX["state"] = "the news server is not answering"
+                await asyncio.sleep(300)
+                continue
+            uuid_ = await _instance_uuid()
+            wins = await asyncio.to_thread(usenet_client.lease, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], None, 0)
+            # A window that could not be read is left alone for six hours. The registry gives
+            # back what an install still holds, so without this one bad window was handed out
+            # again every ten minutes and nothing else was ever read.
+            wins = [x for x in wins if time.time() - failed.get(x["id"], 0) > 6 * 3600]
+            if not wins:
+                _UN_INDEX["state"] = "nothing to do right now"
+                await asyncio.sleep(1800)
+                continue
+            w = wins[0]
+            if usenet_rules.group_never(w["grp"]):
+                # tgarr.me does not hand such a group out; should one arrive all the same,
+                # it is not read (the lease runs out)
+                _UN_INDEX["state"] = "was handed a group that is not read; waiting"
+                await asyncio.sleep(3600)
+                continue
+            _UN_INDEX.update(state="reading", window=w, at=time.time())
+            logu.info("[usenet-index] window %s: %s %s, %s", w["id"], w["grp"],
+                      time.strftime("%Y-%m-%d", time.gmtime(w["t_from"])), w["mode"])
+            res = await asyncio.to_thread(_usenet_index_window, cfg, w)
+            kept = await _usenet_keep(res["cards"])
+            out = await asyncio.to_thread(
+                usenet_client.report, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], w["id"], res["stats"],
+                res["posters"], [{k: v for k, v in c.items() if k != "grp"} for c in res["cards"]], res["empty"])
+            _UN_INDEX.update(state="idle", last={"window": w["id"], "grp": w["grp"], "mode": w["mode"], "cards": len(res["cards"]),
+                                                  "kept": kept, "accepted": out["accepted"], "refused": out["refused"],
+                                                  "stats": res["stats"], "at": time.time()})
+            logu.info("[usenet-index] window %s done: %s headers in %ss (%.1f MB), %s cards, registry took %s, refused %s",
+                      w["id"], f"{res['stats']['headers']:,}", res["stats"]["seconds"], res["stats"]["bytes"] / 1e6,
+                      len(res["cards"]), out["accepted"], out["refused"])
+            await asyncio.sleep(5)
+        except Exception as e:
+            _UN_INDEX["state"] = f"waiting after a problem: {type(e).__name__}: {str(e)[:120]}"
+            logu.warning("[usenet-index] %s: %s", type(e).__name__, str(e)[:200])
+            if w is not None:
+                if len(failed) > 500:
+                    failed.clear()
+                failed[w["id"]] = time.time()
+                await asyncio.sleep(60)            # this window is set aside: on to the next one
+            else:
+                await asyncio.sleep(600)           # the registry or the settings: wait
+
+
+async def _usenet_from_registry(q: str) -> int:
+    """Before answering a search: what the registry knows for these words, kept here when it
+    can be fetched through this install's provider. At most once in ten minutes per question,
+    and never longer than a few seconds - the answer must not wait on the registry."""
+    cfg = await _usenet_cfg()
+    q = (q or "").strip().lower()
+    if not (cfg.get("index") and cfg.get("host") and len(q) >= 3):
+        return 0
+    now = time.time()
+    if now - _UN_INDEX["asked"].get(q, 0) < 600:
+        return 0
+    if len(_UN_INDEX["asked"]) > 2000:
+        _UN_INDEX["asked"].clear()
+    _UN_INDEX["asked"][q] = now
+    try:
+        cards = await asyncio.wait_for(asyncio.to_thread(usenet_client.search, UPDATE_REGISTRY_URL, cfg["host"], q), 6)
+    except Exception:
+        return 0
+    return await _usenet_keep([c for c in cards if c.get("art_lo") and c.get("grp")])
+
+
+@app.get("/api/usenet/index")
+async def api_usenet_index():
+    """What the index worker is doing (for looking; there is nothing to switch)."""
+    cfg = await _usenet_cfg()
+    async with db_pool.acquire() as conn:
+        kept = await conn.fetchval("SELECT count(*) FROM usenet_cards WHERE sketch")
+    return {"on": bool(cfg.get("index")), "conns": cfg.get("conns", 1), "state": _UN_INDEX["state"],
+            "window": _UN_INDEX["window"], "last": _UN_INDEX["last"], "cards": kept}
+
+
+@app.post("/api/usenet/settings")
+async def api_usenet_settings(request: Request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    vals = {"usenet_enabled": "1" if b.get("enabled") else "0", "usenet_host": str(b.get("host") or "").strip()[:200],
+            "usenet_port": str(int(b.get("port") or 563)), "usenet_ssl": "1" if b.get("ssl", True) else "0",
+            "usenet_user": str(b.get("user") or "")[:200],
+            "usenet_per_day": str(max(0, min(int(b.get("per_day") or 2_000_000), 200_000_000)))}
+    if b.get("password"):                                  # left empty = keep the one already kept
+        vals["usenet_pass"] = str(b["password"])[:300]
+    async with db_pool.acquire() as conn:
+        for k, v in vals.items():
+            await conn.execute("""INSERT INTO config (key, value) VALUES ($1, $2)
+                                  ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    await _usenet_cfg(fresh=True)
+    _USENET.update(ok=None)
+    ready = await _usenet_ready(recheck=True)
+    return {"status": "ok", "working": ready, "message": _USENET["msg"] if vals["usenet_enabled"] == "1" else "switched off"}
+
+
+@app.post("/api/usenet/enabled")
+async def api_usenet_enabled(request: Request):
+    """The on/off switch by itself: the account stays as it is."""
+    try:
+        on = bool((await request.json()).get("on"))
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('usenet_enabled', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", "1" if on else "0")
+    await _usenet_cfg(fresh=True)
+    _USENET.update(ok=None)
+    return {"status": "ok", "on": on, "working": await _usenet_ready(recheck=True) if on else False}
+
+
+@app.get("/settings/usenet", response_class=HTMLResponse)
+async def page_settings_usenet(request: Request):
+    cfg = await _usenet_cfg(fresh=True)
+    ready = await _usenet_ready() if cfg.get("enabled") and cfg.get("host") else False
+    state = ('<span class="pill ok">working</span>' if ready else
+             '<span class="pill muted">switched off</span>' if not cfg.get("enabled") else
+             f'<span class="pill bad">not working</span> <span style="color:var(--muted)">{html.escape(_USENET["msg"])}</span>')
+    base = _base_url(request)
+    body = f"""<style>.un-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
+.un-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0}}
+.un-grid label{{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--muted)}}
+.un-sw{{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}}
+.un-sw input{{position:absolute;opacity:0;width:0;height:0}}
+.un-sw span{{width:50px;height:28px;border-radius:999px;background:#cbd5e1;position:relative;transition:background .15s}}
+.un-sw span::after{{content:"";position:absolute;left:3px;top:3px;width:22px;height:22px;border-radius:50%;background:#fff;
+  box-shadow:0 1px 3px rgba(0,0,0,.3);transition:left .15s}}
+.un-sw input:checked + span{{background:#16a34a}}.un-sw input:checked + span::after{{left:25px}}
+.un-sw input:focus-visible + span{{outline:2px solid var(--accent);outline-offset:2px}}
+.un-grid input{{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
+</style>
+<div class="un-box"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px">
+<h3 style="margin:0;flex:1">Usenet {state}</h3>
+<label class="un-sw" title="switch Usenet on or off"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""} onchange="unToggle(this)"/><span></span><b>{"On" if cfg.get("enabled") else "Off"}</b></label></div>
+<p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
+card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
+tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet).</p>
+<p style="color:var(--muted);margin:6px 0 4px">Newsgroups hold fifteen years of posts, far more than one account reads in a lifetime, so the
+reading is shared, as it is for Telegram: tgarr.me hands every install a different stretch of a group, takes back the cards found
+there - a name, who posted it, where it lies - and a search here also finds what the others found. No file, no NZB and nothing
+about your account or your provider's name is sent. Reading the index uses one connection, so that your downloader keeps the rest.</p>
+<div class="un-grid">
+<label>News server<input id="unHost" value="{html.escape(cfg.get("host") or "", quote=True)}" placeholder="news.example.com"/></label>
+<label>Port<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
+<label>User name<input id="unUser" value="{html.escape(cfg.get("user") or "", quote=True)}" autocomplete="off"/></label>
+<label>Password<input id="unPass" type="password" placeholder="{"kept - leave empty to keep it" if cfg.get("pass") else ""}" autocomplete="new-password"/></label>
+<label>Data it may use per day, in MB<input id="unDay" type="number" step="100" min="0" value="{round(cfg.get("per_day", 2000000) * 350 / 1e6)}"/></label>
+</div>
+<label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
+<div style="height:8px"></div>
+<button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span>
+<p style="color:var(--muted);margin:14px 0 0;font-size:14px">No Usenet account yet, or thinking of a second one? What to look for, and which
+providers are the same network under another name: <a href="https://tgarr.me/usenet/" target="_blank" rel="noopener">tgarr.me/usenet</a>.</p></div>
+<h2 class="section">In Sonarr and Radarr</h2>
+<div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
+<p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
+Download client: <b>SABnzbd</b> (or NZBGet) - not "tgarr". An indexer goes to one download client, which is why Usenet needs its own entry.</p></div>
+<script>
+function unToggle(el){{
+  // the switch works at once, without touching the account fields
+  fetch("/api/usenet/enabled", {{method: "POST", headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{on: el.checked}})}}).then(r => r.json()).then(() => location.reload())
+    .catch(() => {{ el.checked = !el.checked; }});
+}}
+function unSave(){{
+  const m = document.getElementById("unMsg"); m.textContent = "testing…";
+  fetch("/api/usenet/settings", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{
+    enabled: document.getElementById("unOn").checked, host: document.getElementById("unHost").value,
+    port: +document.getElementById("unPort").value, ssl: document.getElementById("unSsl").checked,
+    user: document.getElementById("unUser").value, password: document.getElementById("unPass").value,
+    per_day: Math.round(+document.getElementById("unDay").value * 1e6 / 350)}})}}).then(r => r.json())
+    .then(j => {{ m.textContent = j.working ? "saved - the server answers" : "saved - " + (j.message || "not working"); setTimeout(() => location.reload(), 1200); }})
+    .catch(() => {{ m.textContent = "could not save"; }});
+}}
+</script>"""
+    return HTMLResponse(_layout("Usenet", "/settings", body, page_title="Usenet", top_actions_html=""))
+
+
+# ════════════════════════════════════════════════════════════════════
+# Kids' pages, the PIN, the kids' list
+# ════════════════════════════════════════════════════════════════════
+_UNLOCK_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr - PIN</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
+  display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;max-width:360px;width:100%;padding:28px;text-align:center;
+  box-shadow:0 10px 30px rgba(15,23,42,.08)}
+h1{margin:0 0 6px;font-size:22px}p{color:#64748b;font-size:14px;line-height:1.5;margin:6px 0 18px}
+input[type=password]{width:100%;box-sizing:border-box;padding:14px;font-size:26px;letter-spacing:8px;text-align:center;
+  border:1px solid #cbd5e1;border-radius:10px}
+input[type=password]:focus{outline:2px solid #0ea5e9;border-color:#0ea5e9}
+label{display:flex;gap:8px;align-items:center;justify-content:center;font-size:13px;color:#475569;margin:14px 0 4px}
+button{margin-top:12px;width:100%;padding:12px;font:inherit;font-size:15px;font-weight:600;color:#fff;background:#0ea5e9;
+  border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.6}
+#err{color:#b91c1c;font-size:14px;min-height:20px;margin-top:10px}a{color:#0284c7;font-size:13px}
+</style></head><body><div class="card">
+<h1>Enter the PIN</h1><p>Enter the PIN to open all of tgarr.</p>
+<form id="f" autocomplete="off">
+<input type="password" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="12" autofocus aria-label="PIN"/>
+<label><input type="checkbox" id="rem"/> keep this browser unlocked for 30 days</label>
+<button id="b" type="submit">Unlock</button><div id="err"></div></form>
+<a href="/mediacenter">&larr; back to the Media Center</a></div>
+<script>
+document.getElementById("f").addEventListener("submit", async function (e) {
+  e.preventDefault();
+  const b = document.getElementById("b"), err = document.getElementById("err");
+  b.disabled = true; err.textContent = "";
+  try {
+    const r = await fetch("/api/unlock", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({pin: document.getElementById("pin").value, remember: document.getElementById("rem").checked})});
+    const j = await r.json();
+    if (j.status === "ok") { location.href = "/"; return; }
+    err.textContent = j.message || "That is not the PIN.";
+  } catch (x) { err.textContent = "Could not reach tgarr."; }
+  document.getElementById("pin").value = ""; b.disabled = false; document.getElementById("pin").focus();
+});
+</script></body></html>"""
+
+
+@app.get("/unlock", response_class=HTMLResponse)
+async def page_unlock(request: Request):
+    if not await _is_locked(request):
+        return RedirectResponse("/")
+    return HTMLResponse(_UNLOCK_HTML)
+
+
+def _unlock_cookie(resp, secret: str, remember: bool):
+    seconds = access.REMEMBER_SECONDS if remember else access.UNLOCK_SECONDS
+    resp.set_cookie(access.COOKIE, access.make_token(secret, seconds), max_age=seconds,
+                    httponly=True, samesite="lax", path="/")
+    return resp
+
+
+@app.post("/api/unlock")
+async def api_unlock(request: Request):
+    cfg = await _access_cfg(fresh=True)
+    if not cfg["pin"]:
+        return {"status": "ok"}
+    who = request.client.host if request.client else "?"
+    wait = _GUESSES.wait(who)
+    if wait:
+        return JSONResponse({"status": "wait", "message": f"Too many wrong tries. Try again in {max(1, wait // 60)} min."},
+                            status_code=429)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not access.check_pin(str(body.get("pin") or ""), cfg["pin"]):
+        earned = _GUESSES.wrong(who)
+        return JSONResponse({"status": "wrong", "message": "That is not the PIN." + (
+            f" Too many wrong tries - wait {earned // 60} min." if earned else "")}, status_code=403)
+    _GUESSES.right(who)
+    return _unlock_cookie(JSONResponse({"status": "ok"}), cfg["secret"], bool(body.get("remember")))
+
+
+@app.get("/lock")
+async def page_lock():
+    """Lock this browser again: forget that the PIN was entered here, and go
+    to the Media Center. A plain address, so that it can be a link anywhere."""
+    resp = RedirectResponse("/mediacenter", status_code=303)
+    resp.delete_cookie(access.COOKIE, path="/")
+    return resp
+
+
+@app.post("/api/lock")
+async def api_lock():
+    resp = JSONResponse({"status": "ok"})
+    resp.delete_cookie(access.COOKIE, path="/")
+    return resp
+
+
+_MC_PING_JS = """(function(){
+  // tells the server "still here" while the page is in front or something is playing;
+  // the server counts the time and says when it is time to stop
+  function busy(){
+    if (document.visibilityState === "visible") return true;
+    var m = document.querySelectorAll("video,audio");
+    for (var i = 0; i < m.length; i++) if (!m[i].paused && !m[i].ended) return true;
+    return false;
+  }
+  function ping(){
+    if (!busy()) return;
+    fetch("/api/mc/ping", {credentials: "same-origin"}).then(function(r){ return r.json(); })
+      .then(function(j){ if (j && j.ok === false && location.pathname !== "/mediacenter/rest") location.href = "/mediacenter/rest"; })
+      .catch(function(){});
+  }
+  ping(); setInterval(ping, __EVERY__000); document.addEventListener("visibilitychange", ping);
+})();""".replace("__EVERY__", str(screentime.PING_SECONDS))
+
+
+@app.get("/mc/ping.js")
+async def mc_ping_js():
+    return Response(_MC_PING_JS, media_type="application/javascript", headers={"Cache-Control": "public, max-age=300"})
+
+
+@app.get("/api/mc/ping")
+async def api_mc_ping(request: Request):
+    """"Still here" from a page. A browser that has entered the PIN (or an
+    install with no PIN) is not counted and never told to stop."""
+    if not await _is_locked(request):
+        return {"ok": True, "free": True}
+    rules = await _mc_rules()
+    who, now = _mc_who(request), time.time()
+    await _mc_device(who, rules)
+    v = _DEVICES.ping(who, rules, now)
+    d = _DEVICES.by[who]
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO mc_usage (day, who, seconds) VALUES ($1, $2, $3)
+                                  ON CONFLICT (day, who) DO UPDATE SET seconds = GREATEST(mc_usage.seconds, $3)""",
+                               d["day"], who, d["used"])
+    except Exception:
+        pass
+    return v
+
+
+_MC_REST_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr Media Center</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;
+  background:#fff8ef;color:#2b2140;font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC",system-ui,sans-serif;text-align:center}
+@media (prefers-color-scheme:dark){body{background:#191624;color:#f3eefc}}
+.big{font-size:96px;line-height:1}h1{font-size:34px;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
+a{display:inline-block;margin-top:34px;font-size:13px;color:inherit;opacity:.55}
+</style></head><body><div><div class="big">__ICON__</div><h1>__TITLE__</h1><p>__TEXT__</p>
+<a href="/unlock">🔒 Enter PIN</a></div>
+<script>
+// look again every half minute: when it is time, go back in
+setInterval(function(){ fetch("/api/mc/ping").then(function(r){ return r.json(); })
+  .then(function(j){ if (j && j.ok) location.href = "/mediacenter"; }).catch(function(){}); }, 30000);
+</script></body></html>"""
+
+
+@app.get("/mediacenter/rest", response_class=HTMLResponse)
+async def page_mc_rest(request: Request):
+    rules = await _mc_rules()
+    who = _mc_who(request)
+    await _mc_device(who, rules)
+    v = _DEVICES.check(who, rules, time.time())
+    if v["ok"] or not await _is_locked(request):
+        return RedirectResponse("/mediacenter", status_code=303)
+    icon, title, text = {
+        "hours": ("🌙", "The Media Center is closed now", f"It opens again at {v['until']}."),
+        "day": ("🌟", "That is all for today", "Well done. See you tomorrow!"),
+        "rest": ("🤸", "Time for a break", f"Stretch, drink some water, look far away. Back at {v['until']}."),
+    }.get(v["why"], ("🌙", "The Media Center is closed now", ""))
+    return HTMLResponse(_MC_REST_HTML.replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
+
+
+@app.post("/api/kids/rules")
+async def api_kids_rules(request: Request):
+    try:
+        rules = screentime.clean(await request.json())
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('mc_rules', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", _json.dumps(rules))
+    await _mc_rules(fresh=True)
+    return {"status": "ok", "rules": rules}
+
+
+@app.post("/api/kids/pin")
+async def api_kids_pin(request: Request):
+    """Set, change or remove the PIN. A locked browser never reaches this (the
+    guard refuses it); changing or removing an existing PIN needs the old one."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    new, cur = str(body.get("pin") or ""), str(body.get("current") or "")
+    cfg = await _access_cfg(fresh=True)
+    if cfg["pin"] and not access.check_pin(cur, cfg["pin"]):
+        return JSONResponse({"status": "error", "message": "The current PIN is not right."}, status_code=403)
+    async with db_pool.acquire() as conn:
+        if not new:
+            await conn.execute("DELETE FROM config WHERE key = 'access_pin'")
+            await _access_cfg(fresh=True)
+            return {"status": "ok", "pin": False}
+        if not access.valid_pin(new):
+            return JSONResponse({"status": "error", "message": "A PIN is 4 to 12 digits."}, status_code=400)
+        secret = cfg["secret"] or access.new_secret()
+        for k, v in (("access_pin", access.hash_pin(new)), ("access_secret", secret)):
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    await _access_cfg(fresh=True)
+    # the browser that set the PIN stays unlocked
+    return _unlock_cookie(JSONResponse({"status": "ok", "pin": True}), secret, False)
+
+
+@app.post("/api/kids/allow")
+async def api_kids_allow(request: Request):
+    try:
+        body = await request.json()
+        kind, ref, on = str(body.get("kind")), int(body.get("ref")), bool(body.get("on"))
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    if kind not in ("channel", "message"):
+        return JSONResponse({"status": "error", "message": "bad kind"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        if on:
+            await conn.execute(
+                "INSERT INTO kids_allow (kind, ref) VALUES ($1, $2) ON CONFLICT DO NOTHING", kind, ref)
+        else:
+            await conn.execute("DELETE FROM kids_allow WHERE kind = $1 AND ref = $2", kind, ref)
+    _KID_OK.clear()
+    return {"status": "ok", "on": on}
+
+
+_MC_KINDS = {
+    # key: (label, icon, colour, SQL)
+    "video": ("Watch", "🎬", "#f97066", "m.media_type = 'video'"),
+    "audio": ("Listen", "🎧", "#12b5a6", "m.media_type = 'audio'"),
+    "book": ("Read", "📖", "#f5a524", r"m.file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz)$'"),
+    "photo": ("Photos", "🖼️", "#8b6cf6", "m.media_type = 'photo'"),
+}
+_MC_JUNK_RX = re.compile(
+    r"\b(2160p|1080p|720p|480p|4k|uhd|hdr\d*|dv|x26[45]|h\.?26[45]|hevc|avc|web-?dl|webrip|bluray|blu-ray|bdrip|"
+    r"hdtv|dvdrip|remux|aac\d?(\.\d)?|ddp?\d?(\.\d)?|atmos|dts(-hd)?|flac|mp3|10bit|8bit|repack|proper|"
+    r"高码率?|高清|超清|蓝光|国语|粤语|中字|双语|内封|简繁|英字)\b", re.I)
+
+
+def _friendly_name(file_name, caption) -> str:
+    """A title a person would say aloud, from a file name: no extension, no
+    dots and underscores, no technical tags, no '@channel' advert."""
+    t = (file_name or "").strip()
+    if not t:
+        t = (caption or "").strip().split("\n")[0]
+    t = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", t)
+    t = re.sub(r"[@#][\w.]+", " ", t)                      # @channel, #tag
+    t = re.sub(r"[\[【(（][^\]】)）]{0,40}[\]】)）]", " ", t)    # [group], 【广告】, (2019) goes too - the year is noise here
+    t = t.replace("_", " ").replace(".", " ")
+    # what streaming sites glue onto a title: "…-免费在线观看-酷播", "… 高清免费在线观看 XX影视网"
+    t = re.sub(r"[\s\-–—|]*(?:高清|超清)?(?:免费)?在线观看.*$", " ", t)
+    t = re.sub(r"\S*(?:影视网|电影网|资源网|影院|酷播)\S*", " ", t)
+    t = re.sub(r"(?:HD)?(?:中字|国语|粤语|双语)?(?:高清|超清|正片)+", " ", t, flags=re.I)
+    t = _MC_JUNK_RX.sub(" ", t)
+    t = re.sub(r"\s*-\s*[A-Za-z0-9]{2,12}\s*$", " ", t)    # -GROUP at the end
+    t = re.sub(r"\s{2,}", " ", t).strip(" -–—_·|")
+    return (t or (file_name or "untitled"))[:80]
+
+
+_MEDIACENTER_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>tgarr Media Center</title>
+<link rel="icon" href="/favicon.svg"/>
+<style>
+:root{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--accent:__COLOR__;
+  --shadow:0 6px 18px rgba(64,40,10,.10);--r:22px}
+@media (prefers-color-scheme:dark){:root{--bg:#191624;--card:#262234;--ink:#f3eefc;--soft:#a79fbd;--line:#342f45;
+  --shadow:0 6px 18px rgba(0,0,0,.35)}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+a{color:inherit;text-decoration:none}
+.top{display:flex;align-items:center;gap:14px;padding:18px clamp(16px,4vw,44px) 6px}
+.logo{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+/* tgarr's own mark and wordmark, as in the side menu of the main pages */
+.logo .mark{width:34px;height:34px;flex:none;color:#229ED9}
+.logo .wm{font-size:34px;font-weight:900;letter-spacing:-1.8px;line-height:.9;color:#229ED9}
+.logo .wm b{font-weight:900;color:var(--ink)}
+.logo .mc{font-size:21px;font-weight:700;color:var(--soft);padding-left:12px;margin-left:4px;border-left:2px solid var(--line);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pill{font-size:13px;color:var(--soft);padding:9px 14px;border-radius:999px;border:1.5px solid var(--line);
+  background:var(--card);white-space:nowrap}
+.pill:hover{border-color:var(--accent);color:var(--ink)}
+.cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);
+  padding:14px clamp(16px,4vw,44px) 4px}
+.cat{background:var(--card);border-radius:var(--r);padding:clamp(14px,2.4vw,24px) 10px;text-align:center;
+  box-shadow:var(--shadow);border:3px solid transparent;transition:transform .15s, border-color .15s}
+.cat:hover{transform:translateY(-3px)}
+.cat .ic{font-size:clamp(34px,6vw,56px);line-height:1.1;display:block}
+.cat b{display:block;font-size:clamp(15px,2.2vw,21px);margin-top:6px}
+.cat small{color:var(--soft);font-size:13px}
+.cat.on{border-color:var(--c);background:color-mix(in srgb, var(--c) 12%, var(--card))}
+.find{padding:16px clamp(16px,4vw,44px) 0;display:flex;gap:10px}
+.find input{flex:1;max-width:520px;font:inherit;font-size:18px;padding:13px 20px;border-radius:999px;
+  border:2px solid var(--line);background:var(--card);color:var(--ink);outline:none}
+.find input:focus{border-color:var(--accent)}
+.find button{font:inherit;font-size:17px;font-weight:700;padding:0 24px;border-radius:999px;border:0;
+  background:var(--accent);color:#fff;cursor:pointer}
+h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items:center;gap:8px}
+.row{display:flex;gap:14px;overflow-x:auto;padding:2px clamp(16px,4vw,44px) 10px;scrollbar-width:none}
+.row::-webkit-scrollbar{display:none}
+.row .card{flex:0 0 clamp(170px,22vw,240px)}
+.grid{display:grid;gap:clamp(12px,2vw,22px);padding:0 clamp(16px,4vw,44px);
+  grid-template-columns:repeat(auto-fill,minmax(clamp(150px,20vw,230px),1fr))}
+.grid.book{grid-template-columns:repeat(auto-fill,minmax(clamp(120px,15vw,170px),1fr))}
+.grid.photo{grid-template-columns:repeat(auto-fill,minmax(clamp(110px,14vw,170px),1fr));gap:8px}
+.card{background:var(--card);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);display:flex;
+  flex-direction:column;transition:transform .15s, box-shadow .15s;position:relative}
+.card:hover,.card:focus-visible{transform:translateY(-4px) scale(1.015);box-shadow:0 12px 26px rgba(64,40,10,.18);outline:none}
+.pic{aspect-ratio:16/10;background:linear-gradient(135deg,color-mix(in srgb,var(--c) 55%,#fff),var(--c));
+  display:flex;align-items:center;justify-content:center;font-size:54px;position:relative;overflow:hidden}
+.pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.book .pic{aspect-ratio:3/4}.photo .pic{aspect-ratio:1/1}.audio .pic{aspect-ratio:1/1}
+.play{position:absolute;right:10px;bottom:10px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.94);
+  display:flex;align-items:center;justify-content:center;font-size:20px;color:var(--c);box-shadow:0 3px 10px rgba(0,0,0,.25)}
+.saved{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.94);color:#157f3d;font-size:11.5px;font-weight:700;
+  padding:3px 9px;border-radius:999px}
+.name{padding:11px 14px 14px;font-size:15.5px;font-weight:700;line-height:1.3;word-break:break-word}
+.name span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.photo .name{display:none}
+.empty{margin:30px clamp(16px,4vw,44px);padding:46px 20px;text-align:center;background:var(--card);border-radius:var(--r);
+  color:var(--soft);font-size:17px;box-shadow:var(--shadow)}
+.empty i{display:block;font-size:54px;font-style:normal;margin-bottom:10px}
+.more{display:flex;gap:12px;justify-content:center;padding:26px 16px 50px}
+.more a{font-size:17px;font-weight:700;padding:13px 28px;border-radius:999px;background:var(--card);box-shadow:var(--shadow)}
+.more a.go{background:var(--accent);color:#fff}
+.lb{position:fixed;inset:0;background:rgba(10,8,18,.93);display:none;align-items:center;justify-content:center;z-index:9}
+.lb.on{display:flex}.lb img{max-width:96vw;max-height:92vh;border-radius:12px}
+.lb button{position:fixed;top:14px;right:16px;width:50px;height:50px;border-radius:50%;border:0;font-size:24px;cursor:pointer}
+.lb .nv{top:50%;transform:translateY(-50%)}.lb .pv{left:14px;right:auto}.lb .nx{right:14px}
+@media (max-width:560px){.cats{grid-template-columns:repeat(4,1fr);gap:8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
+</style></head>
+<body>
+<div class="top">
+  <a class="logo" href="/mediacenter" aria-label="tgarr Media Center">
+    <svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    <span class="wm">tg<b>arr</b></span><span class="mc">Media Center</span></a>
+  __TOPRIGHT__
+</div>
+<nav class="cats">__CATS__</nav>
+<form class="find" method="GET" action="/mediacenter">
+  <input type="hidden" name="kind" value="__KIND__"/>
+  <input type="search" name="q" value="__Q__" placeholder="What are you looking for?" aria-label="search"/>
+  <button type="submit">Find</button>
+</form>
+<div id="recent"></div>
+<h2>__HEADING__</h2>
+__GRID__
+__MORE__
+<div class="lb" id="lb"><button id="lbX" aria-label="close">✕</button>
+  <button class="nv pv" id="lbP" aria-label="previous">‹</button><img id="lbI" alt=""/>
+  <button class="nv nx" id="lbN" aria-label="next">›</button></div>
+<script>
+(function(){
+  var KEY = "tgarr.mc.recent";
+  function load(){ try { return JSON.parse(localStorage.getItem(KEY) || "[]"); } catch (e) { return []; } }
+  // remember what was opened in this browser, to offer it again
+  document.querySelectorAll("a.card[data-id]").forEach(function(a){
+    a.addEventListener("click", function(){
+      if (a.dataset.kind === "photo") return;
+      var r = load().filter(function(x){ return x.id !== a.dataset.id; });
+      r.unshift({id: a.dataset.id, kind: a.dataset.kind, name: a.dataset.name, href: a.getAttribute("href"),
+                 pic: a.dataset.pic || "", c: a.dataset.c, icon: a.dataset.icon});
+      try { localStorage.setItem(KEY, JSON.stringify(r.slice(0, 12))); } catch (e) {}
+    });
+  });
+  var rec = load();
+  if (rec.length && !"__Q__" && !__OFFSET__) {
+    var h = '<h2>⭐ Carry on</h2><div class="row">';
+    rec.forEach(function(x){
+      var name = document.createElement("div"); name.textContent = x.name;
+      h += '<a class="card ' + x.kind + '" style="--c:' + x.c + '" href="' + x.href + '"><div class="pic">' + (x.icon || "") +
+           (x.pic ? '<img loading="lazy" src="' + x.pic + '" alt="" onerror="this.remove()"/>' : "") +
+           '<span class="play">▶</span></div><div class="name"><span>' + name.innerHTML + '</span></div></a>';
+    });
+    document.getElementById("recent").innerHTML = h + "</div>";
+  }
+  // photos open large, with next and previous
+  var ph = Array.prototype.slice.call(document.querySelectorAll("a.card.photo")), at = 0;
+  var lb = document.getElementById("lb"), im = document.getElementById("lbI");
+  function show(i){ at = (i + ph.length) % ph.length; im.src = ph[at].getAttribute("href"); lb.classList.add("on"); }
+  ph.forEach(function(a, i){ a.addEventListener("click", function(e){ e.preventDefault(); show(i); }); });
+  document.getElementById("lbX").onclick = function(){ lb.classList.remove("on"); im.src = ""; };
+  document.getElementById("lbP").onclick = function(){ show(at - 1); };
+  document.getElementById("lbN").onclick = function(){ show(at + 1); };
+  lb.addEventListener("click", function(e){ if (e.target === lb) document.getElementById("lbX").onclick(); });
+  document.addEventListener("keydown", function(e){
+    if (!lb.classList.contains("on")) return;
+    if (e.key === "Escape") document.getElementById("lbX").onclick();
+    else if (e.key === "ArrowRight") show(at + 1); else if (e.key === "ArrowLeft") show(at - 1);
+  });
+})();
+</script>
+<script src="/mc/ping.js" defer></script>
+</body></html>"""
+
+
+@app.get("/kids")
+async def page_kids_old():
+    return RedirectResponse("/mediacenter", status_code=308)
+
+
+@app.get("/mediacenter", response_class=HTMLResponse)
+async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
+    """What a locked browser gets: the items on the Media Center list, as a
+    page of its own - large pictures, four big choices, nothing to configure."""
+    kind = kind if kind in _MC_KINDS else "video"
+    offset, per = max(0, int(offset)), 48
+    label, icon, colour, cond = _MC_KINDS[kind]
+    where, params = [_KID_SQL, cond], []
+    for w in (q or "").split()[:6]:
+        params.append(f"%{w}%")
+        where.append(f"COALESCE(m.file_name, m.caption, '') ILIKE ${len(params)}")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT m.id, m.file_name, m.caption,
+                   (m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__') AS saved
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where)}
+            ORDER BY saved DESC, m.posted_at DESC NULLS LAST LIMIT {per + 1} OFFSET {offset}""", *params)
+        counts = {k: await conn.fetchval(f"""
+            SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {_KID_SQL} AND {v[3]}""") for k, v in _MC_KINDS.items()}
+    more, rows = len(rows) > per, rows[:per]
+    locked = _LOCKED.get()
+    cats = "".join(
+        f'<a class="cat{" on" if k == kind else ""}" style="--c:{v[2]}" href="/mediacenter?kind={k}">'
+        f'<span class="ic">{v[1]}</span><b>{v[0]}</b><small>{counts[k]:,}</small></a>'
+        for k, v in _MC_KINDS.items())
+    cards = []
+    for r in rows:
+        name = _friendly_name(r["file_name"], r["caption"])
+        if kind == "book":
+            pic, href, ic = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", "📖"
+        elif kind == "audio":
+            pic, href, ic = "", f"/watch/{r['id']}", "🎵"
+        elif kind == "photo":
+            pic, href, ic = f"/api/thumb/{r['id']}", f"/api/photo-preview/{r['id']}", ""
+        else:
+            pic, href, ic = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", "🎬"
+        img = f'<img loading="lazy" src="{pic}" alt="" onerror="this.remove()"/>' if pic else ""
+        cards.append(
+            f'<a class="card {kind}" style="--c:{colour}" href="{href}" data-id="{r["id"]}" data-kind="{kind}" '
+            f'data-name="{html.escape(name, quote=True)}" data-pic="{pic}" data-c="{colour}" data-icon="{ic}">'
+            f'<div class="pic">{ic}{img}'
+            + ('<span class="saved">ready</span>' if r["saved"] and kind != "photo" else "")
+            + ('' if kind == "photo" else '<span class="play">▶</span>')
+            + f'</div><div class="name"><span>{html.escape(name)}</span></div></a>')
+    if cards:
+        grid = f'<div class="grid {kind}">{"".join(cards)}</div>'
+    elif q:
+        grid = '<div class="empty"><i>🔎</i>Nothing found. Try another word?</div>'
+    else:
+        grid = ('<div class="empty"><i>🌱</i>Nothing here yet.<br/>Things show up here once they are added to the Media Center.</div>')
+    qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
+    nav = ""
+    if offset or more:
+        nav = ('<div class="more">'
+               + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← Back</a>' if offset else "")
+               + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">More →</a>' if more else "")
+               + "</div>")
+    top_right = ('<a class="pill" href="/unlock" title="open all of tgarr">🔒 Enter PIN</a>' if locked else
+             ('<a class="pill" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
+             + '<a class="pill" href="/mediacenter/manage">⚙ Choose what is shown</a>'
+             '<a class="pill" href="/">← Back to tgarr</a>')
+    heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
+    page = (_MEDIACENTER_HTML.replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
+            .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
+            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
+            .replace("__GRID__", grid).replace("__MORE__", nav))
+    return HTMLResponse(page)
+
+
+_KIDS_CSS = """<style>
+.km-row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.km-row:last-child{border-bottom:none}.km-row span.n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.km-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:22px;overflow:hidden}
+.km-pad{padding:16px 18px}.km-row small{color:var(--muted)}
+.km-chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+/* four tabs: one thing at a time, each list with the page's full width */
+.km-tabs{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid var(--border);margin:0 0 20px}
+.km-tab{appearance:none;background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;padding:10px 16px;
+  font:inherit;font-weight:600;color:var(--muted);cursor:pointer;white-space:nowrap}
+.km-tab:hover{color:var(--fg)}
+.km-tab.on{color:var(--accent);border-bottom-color:var(--accent)}
+.km-tab .c{font-weight:400;opacity:.7;margin-left:4px}
+.km-pane[hidden]{display:none}
+.km-pane > p.note{color:var(--muted);margin:0 0 12px}
+.km-list{max-height:calc(100vh - 300px);min-height:240px;overflow:auto}
+.km-in{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}
+</style>"""
+
+
+@app.get("/mediacenter/manage", response_class=HTMLResponse)
+async def page_kids_manage():
+    cfg = await _access_cfg(fresh=True)
+    rules = await _mc_rules(fresh=True)
+    today = screentime.local(time.time(), rules.get("tz", 0))[0]
+    async with db_pool.acquire() as conn:
+        usage = await conn.fetch(
+            """SELECT who, sum(seconds) FILTER (WHERE day = $1) AS today, sum(seconds) AS week
+               FROM mc_usage WHERE day > $1 - 7 GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 12""", today)
+        opened = await conn.fetch(
+            """SELECT l.at, l.who, m.file_name, m.caption FROM mc_log l JOIN messages m ON m.id = l.msg_id
+               ORDER BY l.at DESC LIMIT 30""")
+        chans = await conn.fetch("""
+            SELECT c.id, c.title, c.username, COALESCE(c.audience, 'sfw') AS audience,
+                   (SELECT count(*) FROM messages m WHERE m.channel_id = c.id) AS n,
+                   EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'channel' AND k.ref = c.id) AS allowed
+            FROM channels c
+            WHERE EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id)
+            ORDER BY allowed DESC, n DESC LIMIT 400""")
+        # The files already saved on this machine (opened in a player, or
+        # grabbed), newest use first - plus anything ticked earlier that has
+        # since been cleared from disk, so that it can still be unticked.
+        items = await conn.fetch("""
+            SELECT m.id, m.file_name, m.media_type, m.file_size, c.title,
+                   (m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__') AS saved,
+                   EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'message' AND k.ref = m.id) AS allowed,
+                   EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'channel' AND k.ref = m.channel_id) AS by_channel
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE COALESCE(c.audience, 'sfw') = 'sfw'
+              AND ((m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
+                    AND split_part(m.local_path, '/', 1) IN ('video', 'audio', 'library'))
+                   OR m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message'))
+            ORDER BY COALESCE(m.local_accessed_at, m.indexed_at) DESC NULLS LAST, m.id DESC
+            LIMIT 2000""")
+
+    def box(kind, ref, on, dis=""):
+        return (f'<input type="checkbox" {"checked" if on else ""} {dis} '
+                f'onchange="kmAllow(\'{kind}\',{ref},this)"/>')
+    pin_box = (
+        '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">PIN</h3>'
+        + ('<p style="color:var(--muted);margin:0 0 12px">A PIN is set. Any browser that has not entered it sees only '
+           'the Media Center with what is ticked below. This browser is unlocked.</p>' if cfg["pin"] else
+           '<p style="color:var(--muted);margin:0 0 12px"><b style="color:#b45309">No PIN is set:</b> anybody who opens '
+           'this address sees everything you see. Set a PIN and other browsers get only the Media Center.</p>')
+        + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        + ('<input class="km-in" id="kmCur" type="password" inputmode="numeric" maxlength="12" placeholder="current PIN" style="width:140px"/>'
+           if cfg["pin"] else "")
+        + '<input class="km-in" id="kmNew" type="password" inputmode="numeric" maxlength="12" '
+          f'placeholder="{"new PIN" if cfg["pin"] else "PIN, 4 to 12 digits"}" style="width:170px"/>'
+        + f'<button class="btn" onclick="kmPin(false)">{"Change PIN" if cfg["pin"] else "Set PIN"}</button>'
+        + ('<button class="btn ghost" onclick="kmPin(true)">Remove PIN</button>'
+           '<button class="btn ghost" onclick="kmLock()">Lock this browser now</button>' if cfg["pin"] else "")
+        + '<span id="kmMsg" style="color:var(--muted);font-size:13px"></span></div></div></div>')
+    chan_rows = "".join(
+        f'<label class="km-row">{box("channel", c["id"], c["allowed"], "disabled" if c["audience"] != "sfw" else "")}'
+        f'<span class="n">{html.escape(c["title"] or c["username"] or "chat")}'
+        + (f' <small>@{html.escape(c["username"])}</small>' if c["username"] else ' <small>🔒 private</small>')
+        + (' <small>· 18+, never shown there</small>' if c["audience"] != "sfw" else "")
+        + f'</span><small>{c["n"]:,} items</small></label>' for c in chans)
+    ico = {"video": "🎬", "audio": "🎵", "photo": "🖼"}
+
+    def kind_of(r):
+        if r["media_type"] in ("video", "audio"):
+            return r["media_type"]
+        return "book"
+    item_rows = "".join(
+        f'<label class="km-row" data-k="{kind_of(r)}">'
+        + (box("message", r["id"], True, "disabled") if r["by_channel"] and not r["allowed"]
+           else box("message", r["id"], r["allowed"]))
+        + f'<span class="n">{ico.get(r["media_type"], "📄")} '
+          f'{html.escape(r["file_name"] or "item " + str(r["id"]))} <small>{html.escape(r["title"] or "")}</small>'
+        + (' <small>· shown already: its channel is ticked</small>' if r["by_channel"] and not r["allowed"] else "")
+        + ("" if r["saved"] else ' <small>· no longer saved here</small>')
+        + f'</span><small>{_fmt_size(r["file_size"]) or ""}</small></label>' for r in items)
+    n_kind = {k: sum(1 for r in items if kind_of(r) == k) for k in ("video", "audio", "book")}
+    chips = "".join(
+        f'<button type="button" class="btn ghost km-chip{" on" if k == "all" else ""}" data-k="{k}" onclick="kmShow(this)">{lbl} '
+        f'<span style="opacity:.6">{n:,}</span></button>'
+        for k, lbl, n in (("all", "All", len(items)), ("video", "🎬 Videos", n_kind["video"]),
+                          ("audio", "🎵 Music", n_kind["audio"]), ("book", "📄 Books", n_kind["book"])))
+    def mins(x):
+        x = int(x or 0)
+        return f"{x // 3600} h {x % 3600 // 60:02d} min" if x >= 3600 else f"{x // 60} min"
+    time_box = (
+        '<div class="km-box"><div class="km-pad">'
+        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><h3 style="margin:0;flex:1">Time</h3>'
+        f'<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="mcOn" {"checked" if rules["on"] else ""}/> <b>use time rules</b></label></div>'
+        '<p style="color:var(--muted);margin:0 0 12px">For browsers that have not entered the PIN. Counted per device, '
+        'only while a page is in front or something is playing.</p>'
+        '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
+        '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
+        + "".join(
+            f'<b>{lbl}</b><input class="km-in" type="time" id="mc_{k}_from" value="{rules[k]["from"]}"/>'
+            f'<input class="km-in" type="time" id="mc_{k}_to" value="{rules[k]["to"]}"/>'
+            f'<input class="km-in" type="number" min="0" max="1440" id="mc_{k}_limit" value="{rules[k]["limit"]}"/>'
+            for k, lbl in (("wd", "Monday to Friday"), ("we", "Saturday, Sunday")))
+        + '</div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px">'
+        f'<span>A break of <input class="km-in" type="number" min="0" max="240" id="mcRest" value="{rules["rest"]}" style="width:74px"/> minutes '
+        f'after <input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/> minutes in one go</span>'
+        '<button class="btn" onclick="mcSave()">Save</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
+        '</div></div>')
+    used_rows = (
+        "".join(f'<div class="km-row"><span class="n">📱 {html.escape(u["who"])}</span>'
+                f'<small>today {mins(u["today"])} · last 7 days {mins(u["week"])}</small></div>' for u in usage)
+        + "".join(f'<div class="km-row"><span class="n">{html.escape(_friendly_name(o["file_name"], o["caption"]))}</span>'
+                  f'<small>{_fmt_time(o["at"])} · {html.escape(o["who"])}</small></div>' for o in opened))
+    n_chan = sum(1 for c in chans if c["allowed"])
+    n_file = sum(1 for r in items if r["allowed"])
+    tabs = (("pin", "PIN &amp; time", ""), ("channels", "Channels", f"{n_chan:,} shown" if n_chan else ""),
+            ("files", "Files", f"{n_file:,} shown" if n_file else ""), ("usage", "Usage", ""))
+    body = (
+        _KIDS_CSS
+        + '<div class="km-tabs" role="tablist">'
+        + "".join(f'<button type="button" class="km-tab{" on" if k == "pin" else ""}" role="tab" data-t="{k}" onclick="kmTab(\'{k}\')">'
+                  f'{lbl}{f"<span class=c>{c}</span>" if c else ""}</button>' for k, lbl, c in tabs)
+        + '</div>'
+        + f'<div class="km-pane" id="km-pin">{pin_box}{time_box}</div>'
+        + '<div class="km-pane" id="km-channels" hidden>'
+          '<p class="note">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
+        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div></div>'
+        + '<div class="km-pane" id="km-files" hidden>'
+          '<p class="note">The files already saved on this machine. Tick the ones to show in the Media Center.</p>'
+        + (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">{chips}</div>'
+           f'<div class="km-box km-list" id="kmItems">{item_rows}</div>' if items else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing is saved yet. Files you open in a player '
+           'are kept and appear here.</div></div>')
+        + '</div>'
+        + '<div class="km-pane" id="km-usage" hidden>'
+          '<p class="note">Kept on this machine only: time per device, and what was opened in the Media Center.</p>'
+        + (f'<div class="km-box km-list">{used_rows}</div>' if used_rows else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing yet. Time and what was opened are listed '
+           'here once a browser without the PIN has used the Media Center.</div></div>')
+        + '</div>'
+        + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
+        + """<script>
+function kmAllow(kind, ref, el){
+  fetch("/api/kids/allow", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({kind: kind, ref: ref, on: el.checked})}).then(r => r.json())
+    .then(j => { if (j.status !== "ok") el.checked = !el.checked; }).catch(() => { el.checked = !el.checked; });
+}
+function kmPin(remove){
+  const cur = document.getElementById("kmCur"), nw = document.getElementById("kmNew"), msg = document.getElementById("kmMsg");
+  if (remove && !confirm("Remove the PIN? Anybody who opens this address will see everything again.")) return;
+  fetch("/api/kids/pin", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({pin: remove ? "" : nw.value, current: cur ? cur.value : ""})}).then(r => r.json())
+    .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "that did not work"; });
+}
+function mcSave(){
+  const g = id => document.getElementById(id), msg = g("mcMsg");
+  const part = k => ({from: g("mc_" + k + "_from").value, to: g("mc_" + k + "_to").value, limit: +g("mc_" + k + "_limit").value});
+  fetch("/api/kids/rules", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({
+    on: g("mcOn").checked, wd: part("wd"), we: part("we"), session: +g("mcSession").value, rest: +g("mcRest").value,
+    tz: -new Date().getTimezoneOffset()})}).then(r => r.json())
+    .then(j => { msg.textContent = j.status === "ok" ? "saved" : (j.message || "that did not work"); });
+}
+function kmShow(b){
+  document.querySelectorAll(".km-chip").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("#kmItems .km-row").forEach(r => { r.style.display = (b.dataset.k === "all" || r.dataset.k === b.dataset.k) ? "" : "none"; });
+}
+function kmLock(){ fetch("/api/lock", {method: "POST"}).then(() => { location.href = "/mediacenter"; }); }
+// the tab is kept in the address (#files), so a reload or a link comes back to it
+function kmTab(t, quiet){
+  if (!document.getElementById("km-" + t)) t = "pin";
+  document.querySelectorAll(".km-tab").forEach(b => { b.classList.toggle("on", b.dataset.t === t); b.setAttribute("aria-selected", b.dataset.t === t); });
+  document.querySelectorAll(".km-pane").forEach(p => { p.hidden = p.id !== "km-" + t; });
+  if (!quiet) history.replaceState(null, "", "#" + t);
+}
+kmTab((location.hash || "#pin").slice(1), true);
+window.addEventListener("hashchange", () => kmTab((location.hash || "#pin").slice(1), true));
+</script>""")
+    return HTMLResponse(_layout("Media Center", "/settings", body, page_title="Media Center & PIN", top_actions_html=""))
+
+
+# A private chat: no public @name and small (see the crawler's
+# PRIVATE_CHAT_SQL). A group of thousands that merely has no public name is
+# not "my private chats".
+_PRIVATE_CHAT = "(c.username IS NULL AND COALESCE(c.members_count, 0) < 200)"
+
+
 @app.get("/gallery", response_class=HTMLResponse)
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        q: Optional[str] = None, dc: Optional[str] = None,
@@ -6959,9 +9666,9 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     _in = _signed_in()
     if not _in:
         private = 0                       # no account, no private chats
-        where.append("c.username IS NOT NULL")
+        where.append("(c.username IS NOT NULL OR c.local_root IS NOT NULL)")
     if private:
-        where.append("c.username IS NULL")
+        where.append(_PRIVATE_CHAT)
     if q:
         for w in q.split():
             params.append(f"%{w}%")
@@ -7005,7 +9712,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         # with the most photos, shown as unexplained chips; a chat without a
         # @username could not be chosen at all.)
         all_channels = await conn.fetch(
-            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, count(*) AS n
+            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, count(*) AS n,
+                      {_PRIVATE_CHAT} AS private
                FROM messages m JOIN channels c ON c.id = m.channel_id
                WHERE m.media_type = 'photo'
                  AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
@@ -7017,6 +9725,15 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
             FROM messages m JOIN channels c ON c.id = m.channel_id
             WHERE {' AND '.join(where)}""", *params)
+        # the number beside "My private chats" is the number of pictures that
+        # choice shows: the same pictures counted the same way (one per image,
+        # not one per post), not a sum of posts
+        priv_n = 0 if not _in else await conn.fetchval(f"""
+            SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where[:3])} AND {_PRIVATE_CHAT}
+              AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+              {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}""")
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -7058,8 +9775,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         if (ch and r["id"] == ch) or (channel and r["username"] == channel):
             picked = r
             break
-    priv = [r for r in all_channels if not r["username"]]
-    priv_n = sum(r["n"] for r in priv)
+    priv = [r for r in all_channels if r["private"]]
 
     def _name(r):
         return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
@@ -7068,7 +9784,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
         f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
         + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
-           else '<small>🔒 private</small>')
+           else '<small>🔒 private</small>' if r["private"]
+           else '<small>group · no public name</small>')
         + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
         for r in all_channels)
     picker = (
@@ -7107,6 +9824,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                       "photos from chats and groups that have no public @username - yours alone")
            if priv else "")
         + picker
+        + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
+                       "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
+           else _export_btn({"scope": "private", "kind": "photo"}, "⬇ Download all") if (private and _in)
+           else "")
         + '<span class="sep"></span><span class="lbl">Sort:</span>'
         + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
         + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
@@ -7672,7 +10393,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
             "        WHEN m.audio_duration_sec >= 20 THEN 0.5 ELSE 0.2 END "
             # Actual audio quality: lossless containers first, then the
             # average bitrate implied by size / duration (kbit/s).
-            " * CASE WHEN m.file_name ~* '\.(flac|ape|wav|alac|aiff?|dsf|wv)$' "
+            " * CASE WHEN m.file_name ~* '\\.(flac|ape|wav|alac|aiff?|dsf|wv)$' "
             "             OR m.mime_type ~* '(flac|wav|x-ape|aiff)' THEN 1.25 "
             "        WHEN COALESCE(m.audio_duration_sec, 0) < 20 "
             "             OR COALESCE(m.file_size, 0) = 0 THEN 1.0 "
@@ -8069,12 +10790,22 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
     elif aud == "nsfw":
         where.append("c.audience = 'nsfw'")
     if min_mb and min_mb > 0:
-        where.append(f"COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024}")
+        # (the floor keeps clips and adverts out; a family's own short films are neither)
+        where.append(f"(COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024} OR c.local_root IS NOT NULL)")
     if local:
         where.append(_LOCAL_SQL)
     if fav:
         where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
 
+    # One card per file. The same film posted to five channels is one file
+    # (Telegram gives it one id) and was five cards. Only while browsing:
+    # a search, favourites, or "saved here" look at each post on its own,
+    # where hiding four of five could hide the one that matched.
+    if not (q or fav or local):
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM messages o JOIN channels oc ON oc.id = o.channel_id "
+            "WHERE o.file_unique_id = m.file_unique_id AND o.id > m.id AND o.media_type = 'video' "
+            "AND COALESCE(oc.audience, 'sfw') = COALESCE(c.audience, 'sfw')" + _pub("oc") + ")")
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
     where_sql = " AND ".join(where)
@@ -8340,7 +11071,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         sort = "best"
     where = ["1=1"]
     if not _signed_in():
-        where.append("c.username IS NOT NULL")
+        where.append("(c.username IS NOT NULL OR c.local_root IS NOT NULL)")
     params = []
     if q:
         for w in q.split():
@@ -8642,7 +11373,8 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
                 f'text-transform:none;letter-spacing:0;margin-left:10px">'
                 f'{_fmt_size(saved["bytes"]) or "0 MB"}'
-                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>') + '</span></h2>'
+                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>'
+                   ' · <a href="/exports">download many at once</a>') + '</span></h2>'
                 f'{search}'
                 f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
         if not saved["rows"]:
@@ -8686,7 +11418,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             '.sv-list .ck{width:30px}.sv-list .ic{width:30px}.sv-list .num{white-space:nowrap;color:var(--muted);'
             'font-size:13px}.sv-list .ac{white-space:nowrap;text-align:right}'
             '.sv-list .nm a{color:var(--fg);text-decoration:none;word-break:break-all}'
-            '.sv-list .nm a:hover{color:var(--accent)}</style>'
+            '.sv-list .nm a:hover{color:var(--accent)}'
+            # a phone has no room for six columns: name on top, size under it, the
+            # tick box in front, the two buttons behind; "last opened" is left out
+            '@media (max-width:640px){.sv-list thead{display:none}.sv-list,.sv-list tbody{display:block}'
+            '.sv-list tr{display:grid;grid-template-columns:30px minmax(0,1fr) auto;align-items:center;'
+            'border-bottom:1px solid var(--border);padding:6px 4px}.sv-list tr:last-child{border-bottom:none}'
+            '.sv-list td{border:none;padding:2px 6px}.sv-list td.ic,.sv-list td:nth-child(5){display:none}'
+            '.sv-list td.ck{grid-column:1;grid-row:1 / span 2;width:auto}.sv-list td.nm{grid-column:2;grid-row:1}'
+            '.sv-list td:nth-child(4){grid-column:2;grid-row:2;font-size:12px}'
+            '.sv-list td.ac{grid-column:3;grid-row:1 / span 2}.sv-list .dl-ctrls{flex-wrap:nowrap}}</style>'
             + ('' if ro else
                '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
                '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
@@ -9172,7 +11913,7 @@ async def page_settings(request: Request):
         f'<div class="acct-meta">API ID <code>{html.escape(str(login.API_ID or "-"))}</code> · '
         f'session at <code>_data/session/tgarr.session</code></div></div>'
         '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'Sign out of Telegram on this tgarr?'
-        '\\n\\nPrivate chats are removed from the index. Public channels and files already saved stay.\'))'
+        '\\n\\nYour private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay.\'))'
         'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">Sign out</button></div></div>')
 
     # ── this machine ──
@@ -9384,6 +12125,37 @@ async def page_settings(request: Request):
   </div>
 </div>
 
+<h2 class="section">Privacy</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">🔒</div>
+    <div class="info">
+      <div class="name">Private chats after signing out</div>
+      <div class="meta">Signing out puts your private chats away on this machine, so that signing in again brings them
+      straight back without fetching them a second time. Another Telegram account signing in here never sees them. Kept for
+      <input id="pkDays" type="number" min="1" max="3650" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg)"/>
+      days without a sign-in, then removed for good. <span id="pkMsg" style="color:var(--muted)"></span></div>
+    </div>
+    <div class="right"><button class="btn" onclick="pkSave()">Save</button></div>
+  </div>
+</div>
+<script>
+fetch("/api/settings/private_keep_days").then(r => r.json()).then(j => {{ document.getElementById("pkDays").value = j.days; }});
+function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", headers: {{"Content-Type": "application/json"}},
+  body: JSON.stringify({{days: +document.getElementById("pkDays").value}})}}).then(r => r.json())
+  .then(j => {{ document.getElementById("pkMsg").textContent = j.status === "ok" ? "saved" : (j.message || "not saved"); }}); }}
+</script>
+<h2 class="section">Other sources</h2>
+<div class="dl-list">
+  <div class="dl-item">
+    <div class="icon">📰</div>
+    <div class="info">
+      <div class="name">Usenet</div>
+      <div class="meta">With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.</div>
+    </div>
+    <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
+  </div>
+</div>
 <h2 class="section">Metadata sources</h2>
 <div class="dl-list">
   <div class="dl-item">

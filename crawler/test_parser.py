@@ -18,6 +18,10 @@ CASES = [
     ("Breaking.Bad.S01E02.720p.BluRay.x265.mkv",
      {"title": "Breaking Bad", "type": "tv", "season": 1, "episode": 2, "quality": "720p"}),
     ("The.Office.US.3x07.HDTV.avi", {"type": "tv", "season": 3, "episode": 7}),
+    # a title posted as a hashtag: the mark is not part of the title
+    ("#老九门.S01E03.1080p.mkv", {"title": "老九门", "type": "tv", "season": 1, "episode": 3}),
+    ("#太平年 第12集 4K.mp4", {"title": "太平年", "episode": 12}),
+    ("#1 Happy Family USA S01E02.mkv", {"title": "#1 Happy Family USA", "season": 1, "episode": 2}),
 
     # ── the release year is the LAST one before the tags ──────────────
     ("Blade.Runner.2049.2017.2160p.UHD.BluRay.mkv",

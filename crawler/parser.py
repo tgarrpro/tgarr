@@ -23,6 +23,10 @@ RX_RES = re.compile(
     r"(?:(?<![0-9])(?=[0-9]{3,4}p)|\b)(2160p|1440p|1080p|720p|576p|480p|360p|240p|4K|UHD)\b",
     re.IGNORECASE)
 # a source tag glued in front of the resolution ("HD1080P", "BD720p")
+# "#太平年 第12集": channels post the title as a hashtag. The mark is not part of the
+# title ("#1 Happy Family USA" is the one real title that starts with it: a number
+# and a space follow).
+RX_HASH_PREFIX = re.compile("^[#＃]+(?![0-9]+(?:[ ]|$))[ ]*")
 RX_RES_PREFIX = re.compile(r"\b(?:F?HD|BD|WEB)(?=(?:2160|1440|1080|720|576|480)p\b)", re.IGNORECASE)
 # "阳光电影dygod.org.", "www.xxx.com-", "[电影天堂www.dytt8.net]" in front of the title
 RX_SITE_PREFIX = re.compile(
@@ -412,6 +416,7 @@ def parse_filename(name: str) -> dict:
     base = RX_SITE_TAIL.sub("", base) or base
     base = RX_SITE_PREFIX.sub("", base) or base
     base = RX_RES_PREFIX.sub("", base)
+    base = RX_HASH_PREFIX.sub("", base) or base
     work = base
 
     out = {}

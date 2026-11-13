@@ -10,6 +10,12 @@
 
 ---
 
+## Two sources, and a household
+
+**Telegram and Usenet, one indexer.** Since 0.5.8 tgarr reads Usenet as well: give it a Usenet account (Settings → Usenet) and it reads newsgroup *headers*, keeps a card for every named film, episode, album and book, and makes the NZB itself when Sonarr or Radarr wants one - no outside NZB indexer, no invite. Your downloader (SABnzbd, NZBGet) does the downloading; tgarr never downloads from Usenet. Like the Telegram index, the reading is shared: every install reads a different stretch and all of them can search what any of them found - names and pointers, never files. [Choosing a Usenet provider](https://tgarr.me/usenet/).
+
+**A media center the family can use.** Films, series, music, books, photos and your own uploaded files, played in the browser. Set a PIN and every other browser at home gets only the Media Center, with only what you ticked - whole channels or single files - and with time rules: opening hours, minutes a day, a break after so long in one go. Adult material is labelled and left out unless you switch it on; sexual material involving children is never indexed.
+
 ## The thesis
 
 **NZB's curated quality + Telegram's mass-scale reach, finally bridged into the *arr stack.**

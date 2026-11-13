@@ -48,4 +48,25 @@ walk = walk[:walk.index("await backfill_channel(chat_id, title, dialog.chat.user
 ok("INSERT INTO channels (tg_chat_id, title, is_joined)" in walk and "is_joined = TRUE" in walk,
    "the start-up backfill registers a dialog as joined before reading it")
 
+# What is in a private chat is kept whole: the sweeps that clear public-channel
+# junk (tiny photos, short clips, advert words, repeated pictures, old news)
+# must each leave private chats alone.
+sweep = src[src.index("async def decay_eviction_worker()"):src.index("DIALOG_LEAVE_DELAY_SEC = int(")]
+deletes = sweep.count("DELETE FROM messages")
+spared = (sweep.count("channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL")
+          + sweep.count("channel_id NOT IN (SELECT id FROM channels WHERE {PRIVATE_CHAT_SQL})")
+          + sweep.count("AND NOT (c.username IS NULL AND COALESCE(c.members_count, 0) < 200)"))
+ok(deletes >= 6 and spared == deletes, f"every sweep spares private chats ({spared} of {deletes})")
+ok('PRIVATE_CHAT_SQL = "username IS NULL AND COALESCE(members_count, 0) < 200"' in src,
+   "a private chat is a small chat with no public name")
+ok("(True, None) if is_private else _quality_check(" in src, "no size floor or advert filter on a private chat's files")
+ok('st["noise"] and not st["followed"] and not is_private' in src,
+   "a chat judged noise is not indexed, unless it is followed or private")
+
+# history requests keep a gap, for every reader
+ok("await _hist_gap()        # the next item costs a request" in src and "_HIST_SLOT[0] = slot" in src,
+   "no two history requests closer than the gap, whoever asks")
+ok("AND tg_chat_id > -100000000000000000" in src, "own files are never turned into releases")
+ok('return {"kept": "by the api"}' in src, "a revoked session deletes no private chat")
+
 print(f"ok - {n} checks")
