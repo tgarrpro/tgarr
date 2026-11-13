@@ -2661,6 +2661,38 @@ async def epub_chapter(msg_id: int, n: int):
                  "Cache-Control": "private, max-age=3600"})
 
 
+# What both readers need to read aloud: the browser's own voices (Edge offers
+# Microsoft's natural ones), a voice chosen for the text's language, the text
+# cut into short pieces (some voices stop on long passages), and a toast.
+_SPEECH_JS = r"""
+const synth = window.speechSynthesis;
+function toast(text, ms){
+  let t = document.getElementById("toast");
+  if (!t) { t = document.createElement("div"); t.id = "toast"; t.className = "toast"; document.body.appendChild(t); }
+  t.textContent = text; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, ms || 4000);
+}
+function voiceFor(text){
+  const cjk = (text.match(/[一-鿿]/g) || []).length, kana = (text.match(/[぀-ヿ]/g) || []).length,
+        hangul = (text.match(/[가-힯]/g) || []).length;
+  const lang = kana > 10 ? "ja" : hangul > 10 ? "ko" : cjk > text.length * 0.15 ? "zh" : (navigator.language || "en").slice(0, 2);
+  const vs = synth.getVoices().filter(v => v.lang && v.lang.toLowerCase().startsWith(lang));
+  const score = v => (/natural|neural/i.test(v.name) ? 8 : 0) + (/online/i.test(v.name) ? 4 : 0) + (/microsoft|google/i.test(v.name) ? 2 : 0)
+    + (lang === "zh" && /zh[-_]cn|hans/i.test(v.lang) ? 1 : 0);
+  return {voice: vs.sort((a, b) => score(b) - score(a))[0] || null, lang: lang === "zh" ? "zh-CN" : lang};
+}
+function chunks(text){
+  // sentences, packed into pieces of about 200 characters: some voices stop on long passages
+  const out = []; let buf = "";
+  (text.match(/[^.!?。！？；;\n]+[.!?。！？；;\n]*/g) || [text]).forEach(s => {
+    if (buf && (buf + s).length > 200) { out.push(buf); buf = ""; }
+    buf += s;
+    while (buf.length > 260) { out.push(buf.slice(0, 240)); buf = buf.slice(240); }
+  });
+  if (buf.trim()) out.push(buf);
+  return out.map(x => x.trim()).filter(Boolean);
+}
+"""
+
 _EPUB_READER_HTML = r"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
@@ -2710,6 +2742,9 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:2px 0 0}
 .shade.open{display:block}
 .msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--mut);
   z-index:1;pointer-events:none;font-size:15px}
+.toast{position:fixed;left:50%;bottom:76px;transform:translateX(-50%);background:rgba(15,23,42,.9);color:#fff;
+  font-size:13px;padding:8px 14px;border-radius:8px;z-index:20;max-width:86vw;text-align:center;pointer-events:none}
+button.on{background:var(--acc,#2563eb);color:#fff;border-color:var(--acc,#2563eb)}
 .tip{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:rgba(15,23,42,.88);color:#fff;
   padding:9px 16px;border-radius:20px;font-size:13px;z-index:6;pointer-events:none;transition:opacity .6s}
 @media (max-width:640px){.hide-s{display:none}.bar{gap:5px;padding:6px 8px}button,.btn{padding:7px 9px}}
@@ -2719,6 +2754,7 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:2px 0 0}
   <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
   <button id="tocBtn" title="table of contents">&#9776;<span class="hide-s"> Contents</span></button>
   <div class="ttl" id="ttl">__TITLE__</div>
+  <button id="readBtn" title="read aloud from here; the page follows the voice (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
   <button id="fsDown" title="smaller text">A&minus;</button>
   <button id="fsUp" title="larger text">A+</button>
   <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
@@ -2764,7 +2800,8 @@ function frac(){
 function savePos(){ try { localStorage.setItem(KEY, JSON.stringify({ch, frac: frac()})); } catch (e) {} }
 function css(){
   const c = THEMES[theme];
-  let s = "html{background:" + c[0] + "}body{background:" + c[0] + ";color:" + c[1] + ";font-size:" + fs + "px}";
+  let s = "html{background:" + c[0] + "}body{background:" + c[0] + ";color:" + c[1] + ";font-size:" + fs + "px}" +
+          ".tg-reading{background:rgba(250,204,21," + (theme === "dark" ? ".22" : ".32") + ");border-radius:3px}";
   if (mode === "paged") {
     const col = Math.min(W - 44, 860), P = Math.max(22, Math.round((W - col) / 2));
     s += "html{height:100%;overflow:hidden}" +
@@ -2820,7 +2857,7 @@ function load(n, f){
 }
 function go(d){
   if (busy || !doc) return;
-  hideTip();
+  hideTip(); userMoved();
   if (mode === "paged") {
     if (page + d >= 0 && page + d < pages) { page += d; doc.body.scrollLeft = page * W; ui(); return; }
   } else {
@@ -2835,9 +2872,10 @@ function onKey(e){
   const k = e.key;
   if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey) || k === "ArrowDown" && mode === "paged") { e.preventDefault(); go(1); }
   else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey) || k === "ArrowUp" && mode === "paged") { e.preventDefault(); go(-1); }
-  else if (k === "Home") { e.preventDefault(); load(0, 0); }
-  else if (k === "End") { e.preventDefault(); load(titles.length - 1, 1); }
+  else if (k === "Home") { e.preventDefault(); userMoved(); load(0, 0); }
+  else if (k === "End") { e.preventDefault(); userMoved(); load(titles.length - 1, 1); }
   else if (k === "Escape") toc(false);
+  else if ((k === "r" || k === "R") && !e.ctrlKey && !e.metaKey) $("readBtn").click();
 }
 let wheelAt = 0;
 function onWheel(e){
@@ -2869,6 +2907,12 @@ fr.addEventListener("load", function(){
   wire(doc);
   doc.addEventListener("scroll", () => { if (mode !== "paged") ui(); }, {passive: true});
   layout(pendingFrac);
+  if (reading) {
+    // the voice asked for this chapter: start at its top. A person did: read what is in view.
+    if (readerLoad) { readerLoad = false; blocks = collect(); if (blocks.length) readBlock(0); else readFromView(); }
+    else readFromView();
+  }
+  readerLoad = false;
   // pictures arriving change the page count: lay out again, stay where we are
   let t = null;
   Array.from(doc.images || []).forEach(im => { if (!im.complete) im.addEventListener("load", () => {
@@ -2882,7 +2926,66 @@ $("fsUp").onclick = () => { fs = Math.min(30, fs + 2); saveSt(); layout(frac());
 $("fsDown").onclick = () => { fs = Math.max(12, fs - 2); saveSt(); layout(frac()); };
 $("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); layout(frac()); };
 $("modeBtn").onclick = () => { const f = frac(); mode = mode === "paged" ? "scroll" : "paged"; saveSt(); layout(f); };
-$("slider").addEventListener("change", e => load(+e.target.value, 0));
+$("slider").addEventListener("change", e => { userMoved(); load(+e.target.value, 0); });
+// ---- read aloud: paragraph by paragraph, the page following the voice ----
+__SPEECH_JS__
+let reading = false, readRun = 0, blocks = [], readerLoad = false, moveT = null;
+const BLOCKS = "p,h1,h2,h3,h4,h5,h6,li,blockquote,dd,dt,td,th,pre,figcaption";
+function collect(){
+  if (!doc || !doc.body) return [];
+  const all = Array.from(doc.body.querySelectorAll(BLOCKS)).filter(el =>
+    (el.textContent || "").trim() && !Array.from(el.querySelectorAll(BLOCKS)).some(k => (k.textContent || "").trim()));
+  return all.length ? all : ((doc.body.textContent || "").trim() ? [doc.body] : []);
+}
+function pageOf(el){ return Math.max(0, Math.floor((el.getBoundingClientRect().left + doc.body.scrollLeft + 2) / W)); }
+function firstInView(){
+  for (let i = 0; i < blocks.length; i++) {
+    const r = blocks[i].getBoundingClientRect();
+    if (mode === "paged" ? pageOf(blocks[i]) >= page : r.bottom > 40) return i;
+  }
+  return blocks.length;
+}
+function unmark(){ if (doc) doc.querySelectorAll(".tg-reading").forEach(x => x.classList.remove("tg-reading")); }
+function stopRead(why){
+  reading = false; readRun++; clearTimeout(moveT); if (synth) synth.cancel(); unmark();
+  $("readBtn").classList.remove("on"); if (why) toast(why, 6000);
+}
+function readBlock(i){
+  if (!reading) return;
+  const run = ++readRun; synth.cancel(); unmark();
+  if (i >= blocks.length) {
+    if (ch >= titles.length - 1) { stopRead("the end of the book"); return; }
+    readerLoad = true; load(ch + 1, 0); return;          // goes on when the chapter has arrived
+  }
+  const el = blocks[i], text = (el.textContent || "").replace(/\s+/g, " ").trim();
+  if (el !== doc.body) el.classList.add("tg-reading");
+  if (mode === "paged") { const p = Math.min(pages - 1, pageOf(el)); if (p !== page) { page = p; doc.body.scrollLeft = page * W; ui(); } }
+  else if (el !== doc.body) el.scrollIntoView({block: "center", behavior: "smooth"});
+  const parts = chunks(text), v = voiceFor(text);
+  if (!parts.length) { readBlock(i + 1); return; }
+  parts.forEach((part, k) => {
+    const u = new SpeechSynthesisUtterance(part);
+    if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
+    if (k === parts.length - 1) u.onend = () => { if (reading && run === readRun) readBlock(i + 1); };
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    synth.speak(u);
+  });
+}
+function readFromView(){
+  if (!reading || busy || !doc) return;        // a chapter on its way: its arrival starts the reading
+  blocks = collect();
+  if (!blocks.length) { if (ch < titles.length - 1) { readerLoad = true; load(ch + 1, 0); } else stopRead("nothing to read here"); return; }
+  readBlock(Math.min(firstInView(), blocks.length - 1));
+}
+// a person turned the page or jumped: read on from what is now in view
+function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 320); }
+$("readBtn").onclick = () => {
+  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (reading) { stopRead(); return; }
+  reading = true; $("readBtn").classList.add("on"); readFromView();
+};
+if (!synth) $("readBtn").style.display = "none";
+else { synth.getVoices(); window.addEventListener("beforeunload", () => synth.cancel()); }
 function toc(open){ $("drawer").classList.toggle("open", open); $("shade").classList.toggle("open", open);
   if (open) { const c = document.querySelector("#tocList a.cur"); if (c) c.scrollIntoView({block: "center"}); } }
 $("tocBtn").onclick = () => toc(!$("drawer").classList.contains("open"));
@@ -2918,7 +3021,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
   let listed = 0;
   titles.forEach((t, i) => { if (!t) return; listed++;
     const a = document.createElement("a"); a.textContent = t; a.dataset.i = i;
-    a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
+    a.onclick = () => { toc(false); userMoved(); load(i, 0); }; fragm.appendChild(a); });
   if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "Section " + (i + 1);
     a.dataset.i = i; a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
   list.appendChild(fragm);
@@ -2943,7 +3046,7 @@ async def epub_render(msg_id: int):
             f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.epub$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
-    return HTMLResponse(_EPUB_READER_HTML.replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -3371,33 +3474,9 @@ $("fitBtn").onclick = () => { fit = fit === "page" ? "width" : fit === "width" ?
 $("twoBtn").onclick = () => { two = !two; saveSt(); redraw(); ui(); };
 const fullscreen = () => { if (document.fullscreenElement) document.exitFullscreen(); else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen(); };
 $("fsBtn").onclick = fullscreen;
-function toast(text, ms){
-  let t = $("toast"); if (!t) { t = document.createElement("div"); t.id = "toast"; t.className = "toast"; document.body.appendChild(t); }
-  t.textContent = text; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, ms || 4000);
-}
-// ---- read aloud: the browser's own voices (Edge has Microsoft's natural ones) ----
-const synth = window.speechSynthesis;
+// ---- read aloud ----
+__SPEECH_JS__
 let reading = false, readN = 0, readRun = 0, blanks = 0, byReader = false;
-function voiceFor(text){
-  const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length, kana = (text.match(/[\u3040-\u30ff]/g) || []).length,
-        hangul = (text.match(/[\uac00-\ud7af]/g) || []).length;
-  const lang = kana > 10 ? "ja" : hangul > 10 ? "ko" : cjk > text.length * 0.15 ? "zh" : (navigator.language || "en").slice(0, 2);
-  const vs = synth.getVoices().filter(v => v.lang && v.lang.toLowerCase().startsWith(lang));
-  const score = v => (/natural|neural/i.test(v.name) ? 8 : 0) + (/online/i.test(v.name) ? 4 : 0) + (/microsoft|google/i.test(v.name) ? 2 : 0)
-    + (lang === "zh" && /zh[-_]cn|hans/i.test(v.lang) ? 1 : 0);
-  return {voice: vs.sort((a, b) => score(b) - score(a))[0] || null, lang: lang === "zh" ? "zh-CN" : lang};
-}
-function chunks(text){
-  // sentences, packed into pieces of about 200 characters: some voices stop on long passages
-  const out = []; let buf = "";
-  (text.match(/[^.!?。！？；;\n]+[.!?。！？；;\n]*/g) || [text]).forEach(s => {
-    if (buf && (buf + s).length > 200) { out.push(buf); buf = ""; }
-    buf += s;
-    while (buf.length > 260) { out.push(buf.slice(0, 240)); buf = buf.slice(240); }
-  });
-  if (buf.trim()) out.push(buf);
-  return out.map(x => x.trim()).filter(Boolean);
-}
 function stopRead(why){
   reading = false; readRun++; if (synth) synth.cancel(); ui(); if (why) toast(why, 6000);
 }
@@ -3503,7 +3582,7 @@ async def pdf_reader(msg_id: int):
             f'<p>This file is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
-    return HTMLResponse(_PDF_READER_HTML.replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
