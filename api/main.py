@@ -10,6 +10,7 @@ Sonarr grab → SAB `addurl` → row in `downloads` table → crawler's worker f
 via MTProto → drops file in /downloads/tgarr/<release>/ → Sonarr's CDH imports.
 """
 import asyncio
+import hashlib
 import html
 import io
 import json as _json
@@ -394,6 +395,8 @@ def _js_str(v) -> str:
 
 import metadata as md  # local module
 import usenet  # local module
+import usenet_scan  # local module
+import usenet_client  # local module
 
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
@@ -580,6 +583,7 @@ async def _startup():
     asyncio.create_task(_ebook_queue_restore())
     asyncio.create_task(_arr_alias_sync_worker())
     asyncio.create_task(_usenet_scan_worker())
+    asyncio.create_task(_usenet_index_worker())
     asyncio.create_task(_private_keep_worker())
     asyncio.create_task(_export_worker())
     asyncio.create_task(_cache_gc_worker())
@@ -917,6 +921,10 @@ async def _migrate_schema():
               art_lo BIGINT, art_hi BIGINT, alive REAL, added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_usenet_cards_posted ON usenet_cards (posted_from DESC);
+            -- cards made by the index scanner (or taken from the registry): found again by their own key;
+            -- detail 0 = seen in a sparse pass, size estimated
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS sketch BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS detail SMALLINT NOT NULL DEFAULT 1;
             CREATE TABLE IF NOT EXISTS usenet_progress (
               grp TEXT PRIMARY KEY, first_article BIGINT, last_article BIGINT, next_article BIGINT,
               headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
@@ -8107,7 +8115,7 @@ async def api_registry_pull_now():
 # ════════════════════════════════════════════════════════════════════
 _USENET = {"at": 0.0, "cfg": {}, "ok": None, "msg": "not tried yet", "checked": 0.0}
 _USENET_KEYS = ("usenet_enabled", "usenet_host", "usenet_port", "usenet_ssl", "usenet_user", "usenet_pass",
-                "usenet_per_day")
+                "usenet_per_day", "usenet_index", "usenet_conns")
 USENET_GROUPS = ("alt.binaries.teevee", "alt.binaries.hdtv.x264", "alt.binaries.x264", "alt.binaries.multimedia",
                  "alt.binaries.tv", "alt.binaries.movies", "alt.binaries.sounds.lossless", "alt.binaries.ebook",
                  "alt.binaries.e-book.technical")
@@ -8126,7 +8134,9 @@ async def _usenet_cfg(fresh: bool = False) -> dict:
             "enabled": d.get("enabled") == "1", "host": (d.get("host") or "").strip(),
             "port": int(d.get("port") or 563), "ssl": d.get("ssl", "1") != "0",
             "user": d.get("user") or "", "pass": d.get("pass") or "",
-            "per_day": max(0, int(d.get("per_day") or 2_000_000))})
+            "per_day": max(0, int(d.get("per_day") or 2_000_000)),
+            # taking part in the shared index (off unless switched on), and how many connections to read with
+            "index": d.get("index") == "1", "conns": max(1, min(int(d.get("conns") or 8), 20))})
     return _USENET["cfg"]
 
 
@@ -8347,7 +8357,19 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
         if not c:
             return _newznab_error(300, "No such item", 404)
         try:
-            text = await asyncio.to_thread(_usenet_nzb, await _usenet_cfg(), c)
+            if c["sketch"]:
+                got = await asyncio.to_thread(
+                    usenet_scan.rebuild, await _usenet_cfg(), c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
+                    6000 if c["detail"] == 0 else 2000, c["name"])
+                text = got["nzb"]
+                if text:                                     # now it has been read in full: keep the exact figures
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """UPDATE usenet_cards SET size = $2, files = $3, segments = $4, complete = $5,
+                                      art_lo = $6, art_hi = $7, detail = 1 WHERE id = $1""",
+                            c["id"], got["size"], got["files"], got["segments"], got["complete"], got["art_lo"], got["art_hi"])
+            else:
+                text = await asyncio.to_thread(_usenet_nzb, await _usenet_cfg(), c)
         except Exception as e:
             _USENET.update(ok=None)                          # look at the server again before the next answer
             return _newznab_error(300, f"The news server did not give the headers: {str(e)[:80]}", 503)
@@ -8374,6 +8396,7 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
     else:
         where.append("kind IN ('video', 'audio', 'ebook')")
     lim = max(1, min(int(limit), 200))
+    await _usenet_from_registry(q or "")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             f"""SELECT *, count(*) OVER() AS _total FROM usenet_cards WHERE {' AND '.join(where)}
@@ -8381,6 +8404,192 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
     items = "\n".join(_usenet_item_xml(r, base_url, apikey or "tgarr") for r in rows)
     return Response(_feed_envelope(items, f"usenet t={t} q={q or ''}", base_url, offset=max(0, int(offset)),
                                    total=rows[0]["_total"] if rows else 0), media_type="application/xml")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Taking part in the shared Usenet index (docs/USENET_INDEX.md).
+#
+# Off unless switched on (config usenet_index = 1). When on: the registry
+# leases this install a window - a group and a stretch of time - and says
+# how to read it (sparsely at first: a few headers every couple of thousand
+# articles). The window is read over several connections, the releases seen
+# are sketched into cards, the cards are kept here (so this install's own
+# Sonarr finds them at once) and handed in. Searches ask the registry as
+# well and keep what it knows. Only headers are ever read; an NZB is made
+# when somebody asks for one.
+# ════════════════════════════════════════════════════════════════════
+_UN_INDEX = {"state": "off", "window": None, "at": 0.0, "last": None, "asked": {}}
+_UN_SKETCH_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "posted_to", "files", "files_expected",
+                   "segments", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive", "sketch", "detail")
+
+
+async def _instance_uuid() -> str:
+    import uuid as _uuid
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval("SELECT value FROM config WHERE key = 'instance_uuid'")
+        if not v:
+            v = str(_uuid.uuid4())
+            await conn.execute("INSERT INTO config (key, value) VALUES ('instance_uuid', $1) ON CONFLICT (key) DO NOTHING", v)
+            v = await conn.fetchval("SELECT value FROM config WHERE key = 'instance_uuid'")
+    return v
+
+
+def _usenet_card_id(poster: str, key: str) -> str:
+    return hashlib.sha1(f"{poster}|{key}".encode("utf-8", "replace")).hexdigest()[:20]      # as the registry counts them
+
+
+async def _usenet_keep(cards: list) -> int:
+    """Sketched cards into this install's own table, in one go."""
+    rows = []
+    for c in cards:
+        if CSAM_RX.search(c["name"]) or not c.get("art_lo"):
+            continue
+        rows.append((_usenet_card_id(c["poster"], c["key"]), c["name"][:300], c["kind"], c.get("size"), c.get("grp") or c["groups"][0],
+                     c["poster"], c.get("posted_from"), c.get("posted_to"), c.get("files"), c.get("files_expected"),
+                     c.get("segments"), c.get("complete"), c["first_message_id"], c["key"], c["art_lo"], c["art_hi"], 1.0, True,
+                     0 if c.get("detail") == 0 else 1))
+    if not rows:
+        return 0
+    cols = ", ".join(_UN_SKETCH_COLS)
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("CREATE TEMP TABLE _uk (LIKE usenet_cards INCLUDING DEFAULTS) ON COMMIT DROP")
+            await conn.copy_records_to_table("_uk", columns=list(_UN_SKETCH_COLS), records=rows)
+            await conn.execute(
+                f"""INSERT INTO usenet_cards ({cols}) SELECT DISTINCT ON (id) {cols} FROM _uk
+                    ON CONFLICT (id) DO UPDATE SET
+                      art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo), art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi),
+                      -- what was read in full is not put back to an estimate
+                      size = CASE WHEN usenet_cards.detail > EXCLUDED.detail THEN usenet_cards.size ELSE EXCLUDED.size END,
+                      detail = GREATEST(usenet_cards.detail, EXCLUDED.detail), alive = 1.0, sketch = TRUE""")
+    return len(rows)
+
+
+def _usenet_index_window(cfg: dict, w: dict) -> dict:
+    """Read one leased window. Runs in a thread (it takes minutes)."""
+    import calendar as _cal
+    nn = usenet_scan.connect(cfg, packed=False)
+    try:
+        count, first, last = nn.group(w["grp"])
+        # the oldest article the provider has: a window before that has nothing in it here
+        oldest = None
+        for hop in range(6):
+            for r in nn.over(first + hop * 3000, first + hop * 3000 + 49):
+                oldest = usenet.when(r[3])
+                if oldest:
+                    break
+            if oldest:
+                break
+        if count <= 0 or (oldest and w["t_to"] <= oldest):
+            return {"empty": True, "stats": {"headers": 0, "bytes": 0, "seconds": 0}, "posters": [], "cards": [],
+                    "oldest": time.strftime("%Y-%m-%d", time.gmtime(oldest)) if oldest else None}
+        lo = usenet.article_at(nn, first, last, w["t_from"])
+        hi = usenet.article_at(nn, first, last, w["t_to"])
+    finally:
+        try:
+            nn.sock.close()
+        except Exception:
+            pass
+    sparse = tuple(w["read"]) if w.get("read") else None
+    sk = usenet_scan.Sketch(w["grp"])
+    got = []
+    st = usenet_scan.read_window(cfg, w["grp"], lo, max(lo, hi), read=sparse, connections=cfg.get("conns", 8), on_rows=got.append)
+    for rows in got:
+        sk.add_rows(rows)
+    cards = sk.cards(detail=0 if sparse else 1, min_size=100_000_000 if sparse else 0)
+    for c in cards:
+        c["grp"] = w["grp"]
+    c_ = sk.count
+    return {"empty": st["headers"] == 0, "posters": sk.poster_lines(), "cards": cards, "range": (lo, hi),
+            "oldest": time.strftime("%Y-%m-%d", time.gmtime(oldest)) if oldest else None,
+            "stats": {"headers": st["headers"], "bytes": st["bytes"], "seconds": st["seconds"], "requests": st["requests"],
+                      "wanted": c_["wanted"], "unknown": c_["unknown"], "hidden": c_["hidden"] + c_["password"],
+                      "not_part": c_["not a part"]}}
+
+
+async def _usenet_index_worker():
+    logu = logging.getLogger("tgarr")
+    await asyncio.sleep(40)
+    while True:
+        try:
+            cfg = await _usenet_cfg(fresh=True)
+            if not (cfg.get("index") and cfg.get("enabled") and cfg.get("host")):
+                _UN_INDEX["state"] = "off"
+                await asyncio.sleep(120)
+                continue
+            if not await _usenet_ready():
+                _UN_INDEX["state"] = "the news server is not answering"
+                await asyncio.sleep(300)
+                continue
+            uuid_ = await _instance_uuid()
+            wins = await asyncio.to_thread(usenet_client.lease, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], None, 0)
+            if not wins:
+                _UN_INDEX["state"] = "nothing to do right now"
+                await asyncio.sleep(1800)
+                continue
+            w = wins[0]
+            _UN_INDEX.update(state="reading", window=w, at=time.time())
+            logu.info("[usenet-index] window %s: %s %s, %s", w["id"], w["grp"],
+                      time.strftime("%Y-%m-%d", time.gmtime(w["t_from"])), w["mode"])
+            res = await asyncio.to_thread(_usenet_index_window, cfg, w)
+            kept = await _usenet_keep(res["cards"])
+            out = await asyncio.to_thread(
+                usenet_client.report, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], w["id"], res["stats"],
+                res["posters"], [{k: v for k, v in c.items() if k != "grp"} for c in res["cards"]], res["empty"])
+            _UN_INDEX.update(state="idle", last={"window": w["id"], "grp": w["grp"], "mode": w["mode"], "cards": len(res["cards"]),
+                                                  "kept": kept, "accepted": out["accepted"], "refused": out["refused"],
+                                                  "stats": res["stats"], "at": time.time()})
+            logu.info("[usenet-index] window %s done: %s headers in %ss (%.1f MB), %s cards, registry took %s, refused %s",
+                      w["id"], f"{res['stats']['headers']:,}", res["stats"]["seconds"], res["stats"]["bytes"] / 1e6,
+                      len(res["cards"]), out["accepted"], out["refused"])
+            await asyncio.sleep(5)
+        except Exception as e:
+            _UN_INDEX["state"] = f"waiting after a problem: {type(e).__name__}: {str(e)[:120]}"
+            logu.warning("[usenet-index] %s: %s", type(e).__name__, str(e)[:200])
+            await asyncio.sleep(600)
+
+
+async def _usenet_from_registry(q: str) -> int:
+    """Before answering a search: what the registry knows for these words, kept here when it
+    can be fetched through this install's provider. At most once in ten minutes per question,
+    and never longer than a few seconds - the answer must not wait on the registry."""
+    cfg = await _usenet_cfg()
+    q = (q or "").strip().lower()
+    if not (cfg.get("index") and cfg.get("host") and len(q) >= 3):
+        return 0
+    now = time.time()
+    if now - _UN_INDEX["asked"].get(q, 0) < 600:
+        return 0
+    if len(_UN_INDEX["asked"]) > 2000:
+        _UN_INDEX["asked"].clear()
+    _UN_INDEX["asked"][q] = now
+    try:
+        cards = await asyncio.wait_for(asyncio.to_thread(usenet_client.search, UPDATE_REGISTRY_URL, cfg["host"], q), 6)
+    except Exception:
+        return 0
+    return await _usenet_keep([c for c in cards if c.get("art_lo") and c.get("grp")])
+
+
+@app.get("/api/usenet/index")
+async def api_usenet_index():
+    """What the index worker is doing (for the settings page and for looking)."""
+    return {"state": _UN_INDEX["state"], "window": _UN_INDEX["window"], "last": _UN_INDEX["last"]}
+
+
+@app.post("/api/usenet/index")
+async def api_usenet_index_set(request: Request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    vals = {"usenet_index": "1" if b.get("on") else "0"}
+    if b.get("conns"):
+        vals["usenet_conns"] = str(max(1, min(int(b["conns"]), 20)))
+    async with db_pool.acquire() as conn:
+        for k, v in vals.items():
+            await conn.execute("""INSERT INTO config (key, value) VALUES ($1, $2)
+                                  ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    return {"status": "ok"}
 
 
 @app.post("/api/usenet/settings")
