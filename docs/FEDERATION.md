@@ -85,7 +85,7 @@ GET /api/v1/registry?audience=sfw&only_verified=1&limit=5000
 
 Returns canonical channel list ordered by `distinct_contributors DESC, members_count DESC`. Filterable by `audience` (sfw / nsfw), `only_verified` (true = require ≥3 contributors), `since` (only updated channels), `min_contributors`.
 
-Free-tier clients (no API key) can pull only `only_verified=1, audience=sfw`. Paid tiers unlock larger pulls, NSFW, and per-channel detail. See [PRICING.md](PRICING.md).
+Free-tier clients (no API key) can pull only `only_verified=1, audience=sfw`. Paid tiers unlock larger pulls, NSFW, and per-channel detail.
 
 ## Server-side hardening
 

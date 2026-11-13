@@ -17,11 +17,7 @@ The two are intentionally decoupled. Anyone can run the registry server from `re
 
 ## What the hosted service offers
 
-See [PRICING.md](PRICING.md) for the tier table. Briefly:
-
-- **Free** — verified SFW channel list. Anonymous, rate-limited.
-- **$9.99 / year Standard** — full SFW registry + federated release search.
-- **$29.99 / year Plus** — adds NSFW. Age-verified at checkout.
+Today the hosted registry is open to every install, anonymous and rate-limited. Nothing is sold and no prices are set.
 
 ## Why this structure
 

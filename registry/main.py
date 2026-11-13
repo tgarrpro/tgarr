@@ -1344,8 +1344,7 @@ async def get_registry(
         if today_pulls and today_pulls >= daily_cap:
             raise HTTPException(
                 429, f"daily registry-pull limit exceeded ({daily_cap} for "
-                     f"{'paid' if api_key else 'free'} tier — see "
-                     f"https://tgarr.me/docs/PRICING.md)")
+                     f"{'paid' if api_key else 'free'} tier)")
         # Record this pull now (before serving) so concurrent pulls count.
         await conn.execute(
             "INSERT INTO registry_pulls (ip_hash, api_key_set) VALUES ($1, $2)",
