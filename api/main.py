@@ -8482,11 +8482,27 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
             return _newznab_error(300, "No such item", 404)
         try:
             if c["sketch"]:
+                _ucfg = await _usenet_cfg()
+                # as many connections as the provider gives: somebody is waiting for this.
+                # The number finds its own level (usenet_scan.next_connections) and is kept.
+                async with db_pool.acquire() as conn:
+                    _asked = usenet_scan.next_connections(
+                        await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_nzb_conns'"), {})
                 got = await asyncio.to_thread(
-                    usenet_scan.rebuild, await _usenet_cfg(), c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
-                    6000 if c["detail"] == 0 else 2000, c["name"])
+                    usenet_scan.rebuild, _ucfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
+                    6000 if c["detail"] == 0 else 2000, c["name"], _asked)
+                _next = usenet_scan.next_connections(_asked, got)
+                if _next != _asked:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute("""INSERT INTO config (key, value) VALUES ('usenet_nzb_conns', $1)
+                                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", str(_next))
                 text = got["nzb"]
-                if text:                                     # now it has been read in full: keep the exact figures
+                logging.getLogger("tgarr").info(
+                    "[usenet] NZB for %s: %s parts of %s file(s) in %.1fs over %s connection(s) of %s asked, %s request(s)%s%s",
+                    c["id"], f"{got['segments']:,}", got["files"], got.get("seconds", 0), got.get("connections", 1), _asked,
+                    got.get("requests", 0), f", {got['unread']} stretch(es) the server did not give" if got.get("unread") else "",
+                    f"; {_next} next time" if _next != _asked else "")
+                if text and not got.get("unread"):           # now it has been read in full: keep the exact figures
                     async with db_pool.acquire() as conn:
                         await conn.execute(
                             """UPDATE usenet_cards SET size = $2, files = $3, segments = $4, complete = $5,
@@ -8615,15 +8631,22 @@ def _usenet_index_window(cfg: dict, w: dict) -> dict:
         except Exception:
             pass
     sparse = tuple(w["read"]) if w.get("read") else None
-    sk = usenet_scan.Sketch(w["grp"])
-    got = []
+    sk = usenet_scan.Sketch(w["grp"], items=not sparse)
     # how many connections: never more than the registry allows this install (one, unless it
     # is told otherwise), and never more than is set here
     allowed = max(1, min(int(w.get("connections") or 1), 20))
-    st = usenet_scan.read_window(cfg, w["grp"], lo, max(lo, hi), read=sparse,
-                                 connections=max(1, min(cfg.get("conns", 1), allowed)), on_rows=got.append)
-    for rows in got:
-        sk.add_rows(rows)
+    # subjects are judged on a thread of their own as they arrive: the reading threads are
+    # not held up, and a window read in full (millions of headers) is never held in memory
+    feed = usenet_scan.Feeder(sk.add_rows)
+    try:
+        st = usenet_scan.read_window(cfg, w["grp"], lo, max(lo, hi), read=sparse,
+                                     connections=max(1, min(cfg.get("conns", 1), allowed)), on_rows=feed.put)
+    finally:
+        feed.close()
+    if st["failed"] and len(st["failed"]) * 10 > st["requests"] + len(st["failed"]):
+        # more than a tenth of it unread: this is not a reading of the window. Hand nothing
+        # in (the lease runs out and the window is offered again) rather than call it read.
+        raise usenet.NNTPError(f"{len(st['failed'])} of {st['requests'] + len(st['failed'])} stretches could not be read")
     cards = sk.cards(detail=0 if sparse else 1, min_size=100_000_000 if sparse else 0)
     for c in cards:
         c["grp"] = w["grp"]
@@ -8631,6 +8654,7 @@ def _usenet_index_window(cfg: dict, w: dict) -> dict:
     return {"empty": st["headers"] == 0, "posters": sk.poster_lines(), "cards": cards, "range": (lo, hi),
             "oldest": time.strftime("%Y-%m-%d", time.gmtime(oldest)) if oldest else None,
             "stats": {"headers": st["headers"], "bytes": st["bytes"], "seconds": st["seconds"], "requests": st["requests"],
+                      "unread": len(st["failed"]), "connections": st["connections"],
                       "wanted": c_["wanted"], "unknown": c_["unknown"], "hidden": c_["hidden"] + c_["password"],
                       "not_part": c_["not a part"]}}
 
@@ -8701,7 +8725,11 @@ async def _usenet_from_registry(q: str) -> int:
 @app.get("/api/usenet/index")
 async def api_usenet_index():
     """What the index worker is doing (for the settings page and for looking)."""
-    return {"state": _UN_INDEX["state"], "window": _UN_INDEX["window"], "last": _UN_INDEX["last"]}
+    cfg = await _usenet_cfg()
+    async with db_pool.acquire() as conn:
+        kept = await conn.fetchval("SELECT count(*) FROM usenet_cards WHERE sketch")
+    return {"on": bool(cfg.get("index")), "conns": cfg.get("conns", 1), "state": _UN_INDEX["state"],
+            "window": _UN_INDEX["window"], "last": _UN_INDEX["last"], "cards": kept}
 
 
 @app.post("/api/usenet/index")
@@ -8711,12 +8739,16 @@ async def api_usenet_index_set(request: Request):
     except Exception:
         b = {}
     vals = {"usenet_index": "1" if b.get("on") else "0"}
-    if b.get("conns"):
-        vals["usenet_conns"] = str(max(1, min(int(b["conns"]), 20)))
+    try:
+        if b.get("conns"):
+            vals["usenet_conns"] = str(max(1, min(int(b["conns"]), 20)))
+    except (TypeError, ValueError):
+        return JSONResponse({"status": "error", "message": "connections must be a number"}, status_code=400)
     async with db_pool.acquire() as conn:
         for k, v in vals.items():
             await conn.execute("""INSERT INTO config (key, value) VALUES ($1, $2)
                                   ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+    await _usenet_cfg(fresh=True)
     return {"status": "ok"}
 
 
@@ -8793,6 +8825,22 @@ tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet 
 <label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
 <div style="height:8px"></div>
 <button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span></div>
+<div class="un-box"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px">
+<h3 style="margin:0;flex:1">Shared index</h3>
+<label class="un-sw" title="take part in the shared index"><input type="checkbox" id="unIdx" {"checked" if cfg.get("index") else ""} onchange="unIdxSave()"/><span></span><b>{"On" if cfg.get("index") else "Off"}</b></label></div>
+<p style="color:var(--muted);margin:0 0 4px">Newsgroups hold fifteen years of posts: far more than one account reads in a lifetime.
+With this on, tgarr.me hands this install a stretch of a group to read - headers only - and takes back one small card per film,
+episode, album or book found there: its name, who posted it and where it lies. Every install taking part reads a different
+stretch, and a search here also finds what the others found. No file, no NZB and nothing about your account or your provider's
+name is sent; nothing is downloaded.</p>
+<div class="un-grid">
+<label>Connections it may use<input id="unConns" type="number" min="1" max="20" value="{cfg.get("conns", 1)}" onchange="unIdxSave()"/></label>
+</div>
+<p style="color:var(--muted);margin:0 0 6px;font-size:13px">This is for reading the index, and tgarr.me says how many an install may
+use - one, as a rule - so that your downloader keeps the rest. Making an NZB when Sonarr asks for one is another matter: somebody is
+waiting, so for those few seconds tgarr uses as many connections as your provider gives (sixteen to begin with, more if there was
+room, fewer if the provider refused).</p>
+<div id="unIdxState" style="font-size:14px;line-height:1.7"></div></div>
 <h2 class="section">In Sonarr and Radarr</h2>
 <div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
 <p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
@@ -8804,6 +8852,33 @@ function unToggle(el){{
     body: JSON.stringify({{on: el.checked}})}}).then(r => r.json()).then(() => location.reload())
     .catch(() => {{ el.checked = !el.checked; }});
 }}
+function unIdxSave(){{
+  fetch("/api/usenet/index", {{method: "POST", headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{on: document.getElementById("unIdx").checked, conns: +document.getElementById("unConns").value}})}})
+    .then(r => r.json()).then(j => {{ if (j.status === "ok") location.reload(); else unIdxShow({{state: j.message || "could not save"}}); }})
+    .catch(() => unIdxShow({{state: "could not save"}}));
+}}
+function unIdxShow(j){{
+  const el = document.getElementById("unIdxState"), n = x => (x || 0).toLocaleString(), esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
+  const day = t => new Date(t * 1000).toISOString().slice(0, 10);
+  let out = [];
+  if (j.on === false) {{ el.innerHTML = '<span style="color:var(--muted)">Not taking part.</span>'; return; }}
+  let what = esc(j.state || "");
+  if (j.state === "reading" && j.window)
+    what = "reading <b>" + esc(j.window.grp) + "</b>, " + day(j.window.t_from) + " to " + day(j.window.t_to) + " (" + esc(j.window.mode) + ", " + n(j.window.connections) + " connection" + (j.window.connections === 1 ? "" : "s") + " allowed)";
+  out.push("Now: " + what);
+  if (j.last) {{
+    const s = j.last.stats || {{}};
+    out.push("Last: <b>" + esc(j.last.grp) + "</b> - " + n(s.headers) + " headers in " + n(Math.round(s.seconds || 0)) + " s (" + ((s.bytes || 0) / 1e6).toFixed(1) + " MB), "
+      + n(j.last.cards) + " cards found, " + n(j.last.accepted) + " taken by tgarr.me" + (s.unread ? ", " + n(s.unread) + " stretches unread" : ""));
+  }}
+  if (j.cards != null) out.push(n(j.cards) + " cards from the index are kept here and offered to Sonarr and Radarr.");
+  el.innerHTML = out.join("<br/>");
+}}
+function unIdxPoll(){{
+  fetch("/api/usenet/index").then(r => r.json()).then(unIdxShow).catch(() => {{}});
+}}
+unIdxPoll(); setInterval(unIdxPoll, 15000);
 function unSave(){{
   const m = document.getElementById("unMsg"); m.textContent = "testing…";
   fetch("/api/usenet/settings", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{

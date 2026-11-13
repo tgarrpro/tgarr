@@ -97,4 +97,270 @@ ok(len(C.provider_key("x.y")) == 16 and C.provider_key("") == "" and C.provider_
 ok([(len(c), m) for c, m in C.pages(list(range(4500)))] == [(2000, True), (2000, True), (500, False)], "cards go in calls of two thousand, the last one saying so")
 ok(list(C.pages([])) == [([], False)], "a window with nothing in it is still reported")
 
+
+# ---- reading over several connections (a made-up news server, no network) --------------------
+import threading
+import time as _time
+
+
+class _Sock:
+    def __init__(self, srv=None):
+        self.srv = srv
+
+    def close(self):
+        if self.srv is not None:                # a closed connection is a free place again
+            with self.srv.lock:
+                self.srv.opened -= 1
+            self.srv = None
+
+
+class FakeServer:
+    """Articles 1..n of one group. Each is one part of some file of some release."""
+
+    def __init__(self, articles, refuse_after=None, bad=(), slow=0.0):
+        self.articles = articles          # number -> (subject, poster, date, message-id, bytes)
+        self.refuse_after = refuse_after  # connections it allows at once
+        self.bad = dict.fromkeys(bad, 0) if not isinstance(bad, dict) else bad      # (a, b) -> times it fails (None: always)
+        self.failures = collections.Counter()
+        self.opened = 0
+        self.asked = []
+        self.slow = slow
+        self.lock = threading.Lock()
+
+    def opener(self, cfg):
+        with self.lock:
+            if self.refuse_after is not None and self.opened >= self.refuse_after:
+                raise U.NNTPError("502 too many connections")
+            self.opened += 1
+        nn = type("NN", (), {})()
+        nn.at, nn.wire, nn.sock = "alt.binaries.test", 0, _Sock(self)
+        self.most = max(getattr(self, "most", 0), self.opened)
+        return nn
+
+    def pull(self, nn, a, b, keep=None):
+        with self.lock:
+            self.asked.append((a, b))
+            if (a, b) in self.bad:
+                self.failures[(a, b)] += 1
+                if self.bad[(a, b)] is None or self.failures[(a, b)] <= self.bad[(a, b)]:
+                    raise U.NNTPError("connection closed")
+        if self.slow:
+            _time.sleep(self.slow)
+        rows = [(n,) + self.articles[n] + ((),) for n in range(a, b + 1)
+                if n in self.articles and (keep is None or keep(self.articles[n][1].encode()))]
+        nn.wire += 40 * len(rows)
+        return rows
+
+
+import collections
+
+POSTER = "Poster One <one@example.com>"
+
+
+def post(arts, start, name, files, parts, poster=POSTER, tag="Some.Film.2010.1080p.BluRay.x264-GRP"):
+    """Lay a release down from article `start`: `files` files of `parts` parts each."""
+    n = start
+    for fi in range(1, files + 1):
+        fname = f"{name}.part{fi:02d}.rar" if files > 1 else name
+        for p in range(1, parts + 1):
+            arts[n] = (f'{tag} [{fi}/{files}] - "{fname}" yEnc ({p}/{parts})', poster, "Mon, 04 Jan 2010 10:00:00 +0000",
+                       f"<{name}-{fi}-{p}@test>", 700_000)
+            n += 1
+    return n
+
+
+ARTS = {}
+_end = post(ARTS, 30_000, "some.film.2010.1080p.bluray.x264-grp", 40, 3000)            # 120,000 articles: 30,000..149,999
+for _n in range(1, 30_000):                                                                # other people's posts before it
+    ARTS[_n] = (f'junk [{_n % 7 + 1}/7] - "other{_n // 50}.bin" yEnc ({_n % 50 + 1}/50)', "Somebody Else <x@example.com>",
+                "Mon, 04 Jan 2010 09:00:00 +0000", f"<o{_n}@test>", 500_000)
+ok(_end == 150_000, "the made-up release is 120,000 articles")
+
+srv = FakeServer(ARTS, slow=0.05)
+got = []
+st = S.read_window({}, "alt.binaries.test", 1, 149_999, connections=6, on_rows=got.append, opener=srv.opener, pull=srv.pull)
+ok(st["headers"] == len(ARTS) and st["failed"] == [] and st["connections"] == 6 and st["requests"] == 8, f"six connections read everything, eight stretches: {st}")
+ok(sorted(r[0] for rows in got for r in rows) == sorted(ARTS), "every article once, none twice")
+
+# the provider allows two connections, twelve were asked for
+srv = FakeServer(ARTS, refuse_after=2, slow=0.01)
+got = []
+st = S.read_window({}, "alt.binaries.test", 1, 149_999, connections=12, on_rows=got.append, opener=srv.opener, pull=srv.pull)
+ok(st["failed"] == [] and st["headers"] == len(ARTS) and srv.most == 2, f"read in full with the two it allows: {srv.most} at once, {st['refused']} refusals")
+ok(sorted(r[0] for rows in got for r in rows) == sorted(ARTS), "and still every article exactly once")
+
+# a stretch that fails twice is read by another try; one that always fails is reported
+srv = FakeServer(ARTS, bad={(20_001, 40_000): 2, (100_001, 120_000): None})
+got = []
+st = S.read_window({}, "alt.binaries.test", 1, 149_999, connections=4, on_rows=got.append, opener=srv.opener, pull=srv.pull)
+ok(st["failed"] == [(100_001, 120_000)], f"the stretch the server never gives is named: {st['failed']}")
+ok(srv.failures[(100_001, 120_000)] == S.TRIES and srv.failures[(20_001, 40_000)] == 3, "after four tries, and the flaky one came on its third")
+ok(st["headers"] == len(ARTS) - 20_000, "everything else was read")
+st = S.read_window({}, "alt.binaries.test", 1, 100, connections=5, opener=FakeServer(ARTS, refuse_after=0).opener, pull=srv.pull)
+ok(st["failed"] == [(1, 100)] and st["headers"] == 0, "no connection at all: the stretch is reported, nothing hangs")
+st = S.read_window({}, "alt.binaries.test", 1, 149_999, connections=3, stop=lambda: True, opener=srv.opener, pull=srv.pull)
+ok(len(st["failed"]) == 8 and st["requests"] == 0, "stopped before it began: every stretch is reported unread")
+
+# ---- the NZB, over one connection and over twelve -------------------------------------------
+PH = U.poster_hash(POSTER)
+KEY = S.describe(ARTS[30_000][0])[3]
+srv1 = FakeServer(ARTS)
+one = S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, "Some Film", connections=1, opener=srv1.opener, pull=srv1.pull)
+srv12 = FakeServer(ARTS)
+twelve = S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, "Some Film", connections=12, opener=srv12.opener, pull=srv12.pull)
+ok(one["segments"] == 120_000 and one["complete"] and one["files"] == 40 and one["art_lo"] == 30_000 and one["art_hi"] == 149_999,
+   f"seen at two articles in its middle, found whole: {one['segments']} parts, {one['art_lo']}..{one['art_hi']}")
+ok(twelve["nzb"] == one["nzb"] and twelve["segments"] == one["segments"] and twelve["complete"], "twelve connections make the same NZB, byte for byte")
+ok(twelve["connections"] > 1 and one["connections"] == 1, f"and did use several ({twelve['connections']})")
+ok(one["nzb"].count("<segment ") == 120_000 and one["nzb"].count("<file ") == 40, "every part of every file is in it")
+slow1, slow12 = FakeServer(ARTS, slow=0.3), FakeServer(ARTS, slow=0.3)
+t = _time.time(); S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, connections=1, opener=slow1.opener, pull=slow1.pull); t1 = _time.time() - t
+t = _time.time(); S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, connections=12, opener=slow12.opener, pull=slow12.pull); t12 = _time.time() - t
+ok(len(slow12.asked) <= len(slow1.asked) * 3 + 2, f"without asking for much more ({len(slow1.asked)} requests against {len(slow12.asked)})")
+ok(t12 < t1 - 0.6, f"and sooner when the server takes its time ({t1:.2f}s against {t12:.2f}s)")
+# a stretch the server will not give: the NZB is what was read, and is not called complete
+holed = FakeServer(ARTS, bad={(74_000 - 6000 + 20_000 * 0 + 0, 0): None})
+bad_srv = FakeServer(ARTS)
+orig_pull = bad_srv.pull
+
+
+def _pull_with_hole(nn, a, b, keep=None):
+    if a <= 100_500 <= b:
+        raise U.NNTPError("connection closed")
+    return orig_pull(nn, a, b, keep)
+
+
+part = S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, connections=4, opener=bad_srv.opener, pull=_pull_with_hole)
+ok(part["unread"] >= 1 and not part["complete"] and 0 < part["segments"] < 120_000 and part["nzb"],
+   f"with a stretch unread it says so and is not called complete ({part['segments']} of 120,000 parts, {part['unread']} unread)")
+gone = S.rebuild({}, "alt.binaries.test", PH, "no such release", 60_000, 61_000, 6000, connections=4, opener=bad_srv.opener, pull=orig_pull)
+ok(gone["nzb"] == "" and gone["segments"] == 0, "a release that is not there gives no NZB")
+try:
+    S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, connections=4, opener=FakeServer(ARTS, refuse_after=0).opener, pull=orig_pull)
+    ok(False, "no connection must be an error, not an empty NZB")
+except U.NNTPError:
+    ok(True, "no connection at all is an error - not 'no longer on the server'")
+
+ok(twelve["refused"] == 0 and twelve["wanted"] >= 4 and one["wanted"] == 1, f"it says how many connections it had work for ({twelve['wanted']}) and that none was refused")
+tight = FakeServer(ARTS, refuse_after=3, slow=0.02)
+few = S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, "Some Film", connections=16, opener=tight.opener, pull=tight.pull)
+ok(few["nzb"] == one["nzb"] and tight.most == 3 and few["refused"] > 0, f"a provider that allows three: the same NZB over three, and the refusals are counted ({few['refused']})")
+ok(S.next_connections(16, few) <= 3, f"so the next NZB asks for no more than it allows ({S.next_connections(16, few)})")
+
+# how many connections next time
+ok(S.next_connections(16, {"connections": 16, "wanted": 16, "refused": 0}) == 22, "sixteen were open and none refused: twenty-two next time")
+ok(S.next_connections(22, {"connections": 22, "wanted": 22, "refused": 0}) == 28, "and on, six at a time")
+ok(S.next_connections(46, {"connections": 46, "wanted": 46, "refused": 0}) == 50, "to fifty at most")
+ok(S.next_connections(22, {"connections": 17, "wanted": 22, "refused": 9}) == 17, "refused beyond seventeen: seventeen it is")
+ok(S.next_connections(16, {"connections": 0, "wanted": 16, "refused": 16}) == 1, "never below one")
+ok(S.next_connections(16, {"connections": 3, "wanted": 3, "refused": 0}) == 16, "a small release that had work for three says nothing about sixteen")
+ok(S.next_connections(16, {"connections": 16, "wanted": 16, "refused": 2}) == 16, "all open in the end but some had to ask twice: this is the level")
+ok(S.next_connections(None, {}) == 16 and S.next_connections("junk", {}) == 16, "sixteen to begin with")
+
+# rows of other posters are turned down before they are decoded
+_decoded = []
+_real_decode = U.decode
+U.decode = lambda b: (_decoded.append(1), _real_decode(b))[1]
+try:
+    srv_k = FakeServer(ARTS)
+    S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, connections=4, opener=srv_k.opener, pull=srv_k.pull)
+finally:
+    U.decode = _real_decode
+ok(len(_decoded) <= 4, f"each poster is decoded once, however many articles ({len(_decoded)} decodes for 150,000 articles)")
+
+# ---- asking the server for one field first -----------------------------------------------------
+class WireNN:
+    """A connection that answers from the made-up articles, speaking the protocol's lines."""
+
+    def __init__(self, arts, xhdr=True, server="news.test"):
+        self.arts, self.xhdr, self.server = arts, xhdr, server
+        self.packed, self.wire, self.at, self.said = False, 0, "alt.binaries.test", []
+        self.sock, self.f = self, self
+        self.head, self.lines = b"", []
+
+    def sendall(self, data):
+        cmd = data.decode().strip()
+        self.said.append(cmd)
+        word, rest = cmd.split(" ", 1)
+        lo, hi = (int(x) for x in rest.split(" ")[-1].split("-"))
+        nums = [n for n in range(lo, hi + 1) if n in self.arts]
+        if word == "XHDR" and not self.xhdr:
+            self.head, self.lines = b"500 What?", []
+        elif word == "XHDR":
+            self.head, self.lines = b"221 From follows", [f"{n} {self.arts[n][1]}".encode() for n in nums]
+        else:
+            self.head = b"224 overview follows"
+            self.lines = ["\t".join([str(n), self.arts[n][0], self.arts[n][1], self.arts[n][2], self.arts[n][3], "", str(self.arts[n][4]), "1",
+                                     "Xref: news.test alt.binaries.test:" + str(n)]).encode() for n in nums]
+
+    def _line(self):
+        return self.head
+
+    def _multiline(self):
+        return self.lines
+
+    def close(self):
+        pass
+
+
+MIXED = dict(ARTS)
+for _n in range(200_000, 220_000):                                    # a stretch where the poster has 40 articles among 20,000
+    MIXED[_n] = ARTS[30_000 + (_n - 200_000) // 500] if _n % 500 == 250 else (
+        'x - "noise.bin" yEnc (1/1)', "Somebody Else <x@example.com>", "Mon, 04 Jan 2010 09:00:00 +0000", f"<n{_n}@test>", 500_000)
+_mine = lambda raw: U.poster_hash(U.decode(raw)) == PH
+nn = WireNN(MIXED)
+rows = S.xover_of(nn, 200_000, 219_999, _mine)
+ok(len(rows) == 40 and all(r[2] == POSTER for r in rows), f"the poster's forty articles out of twenty thousand ({len(rows)})")
+ok(nn.said == ["XHDR From 200000-219999", "XOVER 200250-219750"], f"asked who posted what, then for the stretch they are in and no wider: {nn.said}")
+nn = WireNN(MIXED)
+ok(S.xover_of(nn, 1, 20_000, _mine) == [] and nn.said == ["XHDR From 1-20000"], "a stretch with nothing of theirs costs one small question and no headers")
+ok(S.numbers_by(WireNN(MIXED), 29_990, 30_010, _mine) == list(range(30_000, 30_011)), "the numbers, in order")
+old = WireNN(MIXED, xhdr=False, server="old.test")
+rows = S.xover_of(old, 200_000, 219_999, _mine)
+ok(len(rows) == 40 and old.said == ["XHDR From 200000-219999", "XOVER 200000-219999"], "a server without the one-field command is asked for everything")
+old2 = WireNN(MIXED, xhdr=False, server="old.test")
+S.xover_of(old2, 200_000, 219_999, _mine)
+ok(old2.said == ["XOVER 200000-219999"] and "old.test" in S.NO_FROM_FIELD and "news.test" not in S.NO_FROM_FIELD, "and is not asked for it a second time")
+
+# ---- small files, read in full: listed with their Message-IDs --------------------------------
+SMALL = {}
+_n = 1
+for _i, (_nm, _parts) in enumerate((("Author A - First Book.epub", 2), ("Author B - Second Book.pdf", 5), ("Author C - Third.epub", 1))):
+    for _p in range(1, _parts + 1):
+        SMALL[_n] = (f'Ebook collection March [{_i + 1}/3] - "{_nm}" yEnc ({_p}/{_parts})', POSTER, "Mon, 04 Jan 2010 10:00:00 +0000", f"<b{_i}-{_p}@test>", 300_000)
+        _n += 1
+sk = S.Sketch("alt.binaries.e-book", items=True)
+sk.add_rows([(k,) + v + ((),) for k, v in SMALL.items()])
+cards = sk.cards(detail=1)
+ok(len(cards) == 1 and cards[0]["kind"] == "ebook", f"one card for the post: {[(c['name'], c['kind']) for c in cards]}")
+its = cards[0].get("items") or []
+ok([(i["name"], len(i["message_ids"])) for i in its] == [("Author A - First Book.epub", 2), ("Author B - Second Book.pdf", 5), ("Author C - Third.epub", 1)],
+   f"its three books listed, each with the Message-IDs of its parts: {[(i['name'], len(i['message_ids'])) for i in its]}")
+ok(its[1]["message_ids"] == [f"<b1-{p}@test>" for p in range(1, 6)], "in the order of the parts")
+half = S.Sketch("alt.binaries.e-book", items=True)
+half.add_rows([(k,) + v + ((),) for k, v in SMALL.items() if k != 4])                      # one part of the second book missing
+ok([i["name"] for i in half.cards(detail=1)[0]["items"]] == ["Author A - First Book.epub", "Author C - Third.epub"], "a book with a part missing is not listed")
+sparse = S.Sketch("alt.binaries.e-book")
+sparse.add_rows([(k,) + v + ((),) for k, v in SMALL.items()])
+ok("items" not in sparse.cards(detail=0)[0], "a sparse reading lists nothing: it has not seen every part")
+film = S.Sketch("alt.binaries.test", items=True)
+film.add_rows([(k,) + ARTS[k] + ((),) for k in range(30_000, 36_000)])
+ok(all("items" not in c for c in film.cards(detail=1)), "a film is never listed file by file")
+
+# ---- judging on a thread of its own ----------------------------------------------------------
+seen_rows = []
+fd = S.Feeder(seen_rows.extend, waiting=2)
+for _k in range(50):
+    fd.put([_k])
+fd.close()
+ok(seen_rows == list(range(50)), "everything handed in is judged, in order, before close returns")
+fd = S.Feeder(lambda rows: 1 / 0, waiting=2)
+for _k in range(10):
+    fd.put([_k])                                    # must not block for ever when the judge has failed
+try:
+    fd.close()
+    ok(False, "a failure while judging must come out")
+except ZeroDivisionError:
+    ok(True, "a failure while judging comes out at close, and no reader was left waiting")
+
 print(f"ok - {n} checks")
