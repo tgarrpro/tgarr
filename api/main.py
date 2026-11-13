@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 import login  # local module
 import access  # local module
 import screentime  # local module
+import export  # local module
 import contextvars
 
 
@@ -563,6 +564,7 @@ async def _startup():
     asyncio.create_task(_arr_alias_sync_worker())
     asyncio.create_task(_usenet_scan_worker())
     asyncio.create_task(_private_keep_worker())
+    asyncio.create_task(_export_worker())
     asyncio.create_task(_cache_gc_worker())
     asyncio.create_task(_update_check_worker())
 
@@ -915,6 +917,15 @@ async def _migrate_schema():
               ref BIGINT NOT NULL,
               added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               PRIMARY KEY (kind, ref)
+            );
+            CREATE TABLE IF NOT EXISTS exports (
+              id BIGSERIAL PRIMARY KEY,
+              title TEXT NOT NULL,
+              owner BIGINT,
+              msg_ids BIGINT[] NOT NULL,
+              status TEXT NOT NULL DEFAULT 'fetching',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              done_at TIMESTAMPTZ
             );
             CREATE TABLE IF NOT EXISTS series_alias_lookups (
               tvdb_id BIGINT PRIMARY KEY,
@@ -5016,6 +5027,281 @@ async def api_login_logout():
     return {**out, "wiped": wipe}
 
 
+# ════════════════════════════════════════════════════════════════════
+# Many files as one download.
+#
+# "Every photo of the family group", "everything I have saved": chosen once,
+# fetched from Telegram in the background where it is not on this machine
+# yet (a few at a time, so that a film being watched is not starved), and
+# handed over as one zip that is made while it is being downloaded - no
+# second copy on disk. Only ever started by a person pressing the button.
+# ════════════════════════════════════════════════════════════════════
+EXPORT_MAX = 20000
+EXPORT_SLOTS = 3
+_EXPORT_KIND_SQL = {
+    "photo": "(m.media_type = 'photo' OR (m.media_type IS NULL AND m.file_name IS NULL"
+             " AND COALESCE(m.mime_type, '') = '' AND m.file_unique_id IS NOT NULL))",
+    "video": "m.media_type = 'video'",
+    "audio": "m.media_type = 'audio'",
+    "document": "m.media_type = 'document'",
+    "all": "(m.file_unique_id IS NOT NULL OR m.file_name IS NOT NULL)",
+}
+_EXPORT_KIND_NAME = {"photo": "photos", "video": "videos", "audio": "music", "document": "documents", "all": "all files"}
+_HERE = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
+_EXPORT_JS = (
+    '<script>if(!window.tgExport){window.tgExport=function(o){'
+    'function ask(b){return fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},'
+    'body:JSON.stringify(b)}).then(function(r){return r.json()})}'
+    'ask(Object.assign({check:true},o)).then(function(j){'
+    'if(j.status!=="ok"){alert(j.message||"That cannot be downloaded.");return}'
+    'if(!j.files){alert("There is nothing to download here.");return}'
+    'var m=j.files+" files"+(j.size?" ("+j.size+")":"")+" as one zip.";'
+    'if(j.to_fetch){m+=" "+j.to_fetch+" of them are not on this machine yet"+(j.fetch_size?" ("+j.fetch_size+")":"")+'
+    '": they are fetched from Telegram first, which takes a while."}'
+    'if(!confirm(m+" Go on?"))return;'
+    'ask(o).then(function(k){if(k.status==="ok"){location.href="/exports"}else{alert(k.message||"That did not work.")}})'
+    '})}}</script>')
+
+
+def _export_btn(what: dict, label: str) -> str:
+    return ('<button type="button" class="btn ghost" style="padding:5px 12px;font-size:12px" '
+            f'data-exp="{html.escape(_json.dumps(what), quote=True)}" '
+            'onclick="tgExport(JSON.parse(this.dataset.exp))">' + label + '</button>' + _EXPORT_JS)
+
+
+async def _export_pick(scope: str, ch, kind: str) -> list:
+    cond = [_EXPORT_KIND_SQL[kind],
+            "COALESCE(m.local_path, '') NOT IN ('__failed__', '__deleted__')",
+            "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
+    params = []
+    one = "COALESCE(m.file_unique_id, m.id::text)"       # the same file posted twice is taken once
+    if scope == "chat":
+        params.append(int(ch))
+        cond.append("c.id = $1")
+    elif scope == "private":
+        cond.append(_PRIVATE_CHAT)
+    else:
+        cond.append(_HERE)
+        one = "m.local_path"
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            f"""SELECT * FROM (
+                  SELECT DISTINCT ON ({one}) m.id, m.file_size, m.local_path, c.title, c.username
+                  FROM messages m JOIN channels c ON c.id = m.channel_id
+                  WHERE {' AND '.join(cond)} {_pub('c')}
+                  ORDER BY {one}, {_HERE} DESC, m.id) x
+                ORDER BY id LIMIT {EXPORT_MAX + 1}""", *params)
+
+
+@app.post("/api/export")
+async def api_export(request: Request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    scope, kind = b.get("scope"), b.get("kind") or "all"
+    if scope not in ("chat", "private", "saved") or kind not in _EXPORT_KIND_SQL:
+        return JSONResponse({"status": "error", "message": "what to download was not understood"}, status_code=400)
+    if scope == "chat" and not str(b.get("ch") or "").isdigit():
+        return JSONResponse({"status": "error", "message": "choose a chat first"}, status_code=400)
+    rows = await _export_pick(scope, b.get("ch"), kind)
+    if len(rows) > EXPORT_MAX:
+        return {"status": "error",
+                "message": f"That is more than {EXPORT_MAX:,} files. Choose one kind of file, or one chat, at a time."}
+    fetch = [r for r in rows if not _is_local(r["local_path"])]
+    if b.get("check"):
+        return {"status": "ok", "files": len(rows), "to_fetch": len(fetch),
+                "size": export.human(sum(r["file_size"] or 0 for r in rows)),
+                "fetch_size": export.human(sum(r["file_size"] or 0 for r in fetch))}
+    if not rows:
+        return {"status": "error", "message": "There is nothing to download here."}
+    what = _EXPORT_KIND_NAME[kind]
+    if scope == "chat":
+        title = f'{rows[0]["title"] or rows[0]["username"] or "chat"} - {what}'
+    elif scope == "private":
+        title = f"My private chats - {what}"
+    else:
+        title = "Saved files" + ("" if kind == "all" else f" - {what}")
+    async with db_pool.acquire() as conn:
+        jid = await conn.fetchval(
+            """INSERT INTO exports (title, owner, msg_ids, status, done_at)
+               VALUES ($1, $2, $3::bigint[], $4, CASE WHEN $4 = 'ready' THEN NOW() END) RETURNING id""",
+            title[:200], _me_id(), [r["id"] for r in rows], "fetching" if fetch else "ready")
+    return {"status": "ok", "id": jid}
+
+
+async def _export_state(conn, ids: list) -> dict:
+    r = await conn.fetchrow(
+        """SELECT count(*) FILTER (WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__') AS ready,
+                  count(*) FILTER (WHERE local_path = '__user_queued__') AS queued,
+                  count(*) FILTER (WHERE local_path IS NULL) AS waiting,
+                  COALESCE(sum(file_size) FILTER (WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'), 0) AS bytes
+           FROM messages WHERE id = ANY($1::bigint[])""", ids)
+    d = dict(r)
+    d["total"] = len(ids)
+    d["missed"] = d["total"] - d["ready"] - d["queued"] - d["waiting"]
+    return d
+
+
+async def _export_worker():
+    """Feed the files an export still needs to the on-demand fetcher, a few
+    at a time, and notice when it has them all."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if _signed_in():
+                async with db_pool.acquire() as conn:
+                    jobs = await conn.fetch(
+                        "SELECT id, msg_ids FROM exports WHERE status = 'fetching' ORDER BY id LIMIT 5")
+                    for j in jobs:
+                        st = await _export_state(conn, j["msg_ids"])
+                        if st["waiting"] == 0 and st["queued"] == 0:
+                            await conn.execute(
+                                "UPDATE exports SET status = 'ready', done_at = NOW() WHERE id = $1", j["id"])
+                            continue
+                        room = EXPORT_SLOTS - st["queued"]
+                        if room > 0 and st["waiting"]:
+                            await conn.execute(
+                                """UPDATE messages SET local_path = '__user_queued__',
+                                          fetch_wanted_at = NOW() + INTERVAL '6 hours'
+                                   WHERE id IN (SELECT id FROM messages WHERE id = ANY($1::bigint[])
+                                                AND local_path IS NULL ORDER BY id LIMIT $2)""",
+                                j["msg_ids"], room)
+                        # a large file is only fetched to the end while someone wants it
+                        await conn.execute(
+                            """UPDATE messages SET fetch_wanted_at = NOW() + INTERVAL '6 hours'
+                               WHERE id = ANY($1::bigint[]) AND local_path = '__user_queued__'
+                                 AND (fetch_wanted_at IS NULL OR (fetch_wanted_at > 'epoch'
+                                      AND fetch_wanted_at < NOW() + INTERVAL '1 hour'))""", j["msg_ids"])
+                        break                      # one export at a time
+        except Exception as e:
+            logging.getLogger("tgarr").warning("[export] worker: %s", e)
+        await asyncio.sleep(4)
+
+
+async def _export_job(job_id: int):
+    """The job, if the person asking may have it."""
+    async with db_pool.acquire() as conn:
+        j = await conn.fetchrow("SELECT * FROM exports WHERE id = $1", job_id)
+    if not j or (j["owner"] is not None and j["owner"] != _me_id()):
+        return None
+    return j
+
+
+@app.get("/export/{job_id}/download")
+async def export_download(job_id: int):
+    j = await _export_job(job_id)
+    if not j:
+        return PlainTextResponse("not found", status_code=404)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT m.id, m.file_name, m.media_type, m.mime_type, m.posted_at, m.tg_message_id,
+                       m.local_path, m.file_size, COALESCE(c.title, c.username, 'chat') AS folder
+                FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.id = ANY($1::bigint[]) AND {_HERE} {_pub('c')}
+                ORDER BY c.title, m.posted_at, m.id""", j["msg_ids"])
+
+    def _pairs():
+        out = []
+        for arc, it in export.arc_names([dict(r) for r in rows]):
+            path = os.path.join("/downloads", it["local_path"])
+            try:
+                # inside the download folder, and complete (not one still arriving)
+                if not os.path.realpath(path).startswith("/downloads/"):
+                    continue
+                if it["file_size"] and os.path.getsize(path) < it["file_size"]:
+                    continue
+            except OSError:
+                continue
+            out.append((arc, path))
+        return out
+    pairs = await asyncio.to_thread(_pairs)
+    name = export.safe_name(j["title"], "tgarr") + ".zip"
+    return StreamingResponse(
+        export.zip_stream(pairs), media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(name),
+                 "Cache-Control": "no-store"})
+
+
+@app.post("/api/export/{job_id}/delete")
+async def api_export_delete(job_id: int):
+    j = await _export_job(job_id)
+    if not j:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+    async with db_pool.acquire() as conn:
+        # what was waiting its turn is not fetched after all; what has arrived stays saved
+        await conn.execute(
+            """UPDATE messages SET local_path = NULL
+               WHERE id = ANY($1::bigint[]) AND local_path = '__user_queued__'""", j["msg_ids"])
+        await conn.execute("DELETE FROM exports WHERE id = $1", job_id)
+    return {"status": "ok"}
+
+
+@app.get("/exports", response_class=HTMLResponse)
+async def page_exports():
+    me = _me_id()
+    async with db_pool.acquire() as conn:
+        jobs = await conn.fetch(
+            "SELECT * FROM exports WHERE owner IS NOT DISTINCT FROM $1 ORDER BY id DESC LIMIT 40", me)
+        states = [await _export_state(conn, j["msg_ids"]) for j in jobs]
+        chats = [] if me is None else await conn.fetch(
+            f"""SELECT c.id, c.title, c.username FROM channels c
+                WHERE (COALESCE(c.is_joined, FALSE) OR COALESCE(c.subscribed, FALSE) OR c.username IS NULL)
+                  AND COALESCE(c.audience, 'sfw') <> 'blocked_csam' {_pub('c')}
+                ORDER BY (c.username IS NOT NULL), lower(COALESCE(c.title, c.username, '')) LIMIT 800""")
+    busy = False
+    items = []
+    for j, st in zip(jobs, states):
+        fetching = j["status"] == "fetching"
+        busy = busy or fetching
+        pct = int(100 * (st["ready"] + st["missed"]) / max(1, st["total"]))
+        line = f'{st["ready"]:,} of {st["total"]:,} files here'
+        if st["bytes"]:
+            line += f' · {export.human(st["bytes"])}'
+        if st["missed"]:
+            line += f' · {st["missed"]:,} could not be fetched'
+        if fetching:
+            line += ' · fetching the rest from Telegram…'
+        items.append(
+            '<div class="dl-item"><div class="icon">🗜</div><div class="info">'
+            f'<div class="name">{html.escape(j["title"])}</div><div class="meta">{line}</div>'
+            + (f'<div style="height:6px;border-radius:3px;background:var(--border);margin-top:8px;overflow:hidden">'
+               f'<div style="height:100%;width:{pct}%;background:var(--accent)"></div></div>' if fetching else '')
+            + '</div><div class="right" style="display:flex;gap:8px;align-items:center">'
+            + (f'<a class="btn{" ghost" if fetching else ""}" href="/export/{j["id"]}/download">'
+               + ('⬇ What is here so far' if fetching else '⬇ Download zip') + '</a>' if st["ready"] else '')
+            + f'<button type="button" class="btn ghost" onclick="exDel({j["id"]})">'
+            + ('Stop' if fetching else 'Remove') + '</button></div></div>')
+    opts = "".join(
+        f'<option value="{c["id"]}">{html.escape(c["title"] or ("@" + (c["username"] or "chat")))}'
+        + ('' if c["username"] else ' 🔒') + '</option>' for c in chats)
+    kinds = "".join(f'<option value="{k}">{html.escape(v)}</option>' for k, v in _EXPORT_KIND_NAME.items())
+    form = ('<div class="empty-state"><div>Sign in to Telegram to download many files at once.</div></div>'
+            if me is None else
+            '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;'
+            'margin-bottom:22px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+            '<span>Download</span>'
+            f'<select id="exKind">{kinds}</select><span>of</span>'
+            f'<select id="exChat" style="max-width:min(360px,70vw)"><option value="saved">everything already saved here</option>'
+            f'<option value="private">all my private chats</option>{opts}</select>'
+            '<button type="button" class="btn" onclick="exGo()">as one zip</button></div>')
+    body = (
+        '<p style="color:var(--muted);margin-top:0">A whole chat, or everything you have saved, as one zip. '
+        'Files that are not on this machine yet are fetched from Telegram first; the zip can be downloaded when they are here. '
+        'What gets fetched stays in <a href="/downloads">Downloads</a> afterwards.</p>'
+        + form
+        + '<h2 class="section">Downloads prepared <span class="count">' + str(len(jobs)) + '</span></h2>'
+        + ('<div class="dl-list">' + "".join(items) + '</div>' if items else
+           '<div class="empty-state"><div class="icon">🗜</div><div>Nothing prepared yet.</div></div>')
+        + _EXPORT_JS
+        + '<script>function exGo(){var c=document.getElementById("exChat").value,k=document.getElementById("exKind").value;'
+          'tgExport(c==="saved"||c==="private"?{scope:c,kind:k}:{scope:"chat",ch:c,kind:k})}'
+          'function exDel(i){fetch("/api/export/"+i+"/delete",{method:"POST"}).then(function(){location.reload()})}'
+        + ('setTimeout(function(){if(document.activeElement.tagName!=="SELECT")location.reload()},6000);' if busy else '')
+        + '</script>')
+    return HTMLResponse(_layout("Download many at once", "/downloads", body))
+
+
 @app.post("/api/photo/{msg_id}/delete")
 async def api_photo_delete(msg_id: int):
     """Delete the cached file + mark all rows sharing the MD5 as deleted.
@@ -8672,6 +8958,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                       "photos from chats and groups that have no public @username - yours alone")
            if priv else "")
         + picker
+        + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
+                       "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
+           else _export_btn({"scope": "private", "kind": "photo"}, "⬇ Download all") if (private and _in)
+           else "")
         + '<span class="sep"></span><span class="lbl">Sort:</span>'
         + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
         + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
@@ -10207,7 +10497,8 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
                 f'text-transform:none;letter-spacing:0;margin-left:10px">'
                 f'{_fmt_size(saved["bytes"]) or "0 MB"}'
-                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>') + '</span></h2>'
+                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>'
+                   ' · <a href="/exports">download many at once</a>') + '</span></h2>'
                 f'{search}'
                 f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
         if not saved["rows"]:
