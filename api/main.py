@@ -9249,6 +9249,23 @@ def _alias_in_name(alias: str, raw: str) -> bool:
     return False
 
 
+def _alias_names_release(alias: str, raw: str) -> bool:
+    """Does this alias name this release? A whole-token match - and, for a
+    very short non-English alias, only at the start of the name: two-character
+    titles are common (主角, 家业, 三体) but so are two-character words
+    (生命 is 'Life' the series and also just 'life'), and '宇宙的奇迹' must
+    not be offered as 'Cosmos'."""
+    if not _alias_in_name(alias, raw):
+        return False
+    if alias.isascii() or len(alias) > 2:
+        return True
+    head = raw.lstrip("#[【(（ \t")
+    if not head.startswith(alias):
+        return False
+    after = head[len(alias):len(alias) + 1]
+    return not after.isalnum()
+
+
 async def _refresh_series_aliases():
     """Reload alias map from DB. Called lazily — once per minute is plenty
     for newznab feed queries."""
@@ -9286,7 +9303,7 @@ def _rewrite_release_title_sync(r, my_dc=None) -> str:
     file_dc = r["file_dc"] if hasattr(r, "__getitem__") and "file_dc" in (r.keys() if hasattr(r, "keys") else []) else None
     dc_tag = f"-dc{file_dc}" if file_dc else ""
     for alias_text, canonical, season, kind in _series_aliases_cache:
-        if alias_text in raw and _alias_in_name(alias_text, raw):
+        if alias_text in raw and _alias_names_release(alias_text, raw):
             if kind == "movie" and r["category"] == "tv":
                 continue   # a movie's alias must not rename a TV episode
             if kind != "movie" and r["category"] == "movie":

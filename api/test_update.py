@@ -124,6 +124,16 @@ ok(_al == ["京城奇探", "경성기탐"],
 ok(main._names_to_aliases({"cases between us", "CASES BETWEEN US"}, "Cases Between Us") == [],
    "the title itself in another case is not an alias")
 
+# ---- a very short alias only names a release that starts with it --------
+ok(main._alias_names_release("主角", "#主角.2160p"), "a two-character title at the start of the name")
+ok(main._alias_names_release("生命", "生命.第1集.1080p"), "the series itself")
+ok(not main._alias_names_release("生命", "宇宙与生命 第3集"), "the same word later in another title")
+ok(not main._alias_names_release("生命", "纪录片.生命.的奇迹"), "not at the start")
+ok(not main._alias_names_release("生命", "生命线.第2集"), "glued to more of a longer title")
+ok(main._alias_names_release("京城奇探", "[4K] 京城奇探 第5集"), "a longer alias may sit anywhere")
+ok(main._alias_names_release("Halo", "The.Halo.Effect.S01E01"), "English aliases keep the whole-token rule")
+ok(not main._alias_names_release("Halo", "Halogen.S01E01"), "and are not matched inside a word")
+
 # ---- the season a release is offered under (Newznab TV search) ----------
 _saved_aliases = main._series_aliases_cache
 main._series_aliases_cache = [("舌尖上的中国第三季", "A Bite of China", 3, "tv"),
