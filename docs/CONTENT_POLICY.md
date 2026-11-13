@@ -15,7 +15,6 @@ Channels matching adult-content keywords across English, Chinese, Russian, and A
 - **Hidden by default** everywhere in the UI.
 - User must explicitly opt in via the `/settings` page checkbox affirming they are 18+ and accept compliance responsibility.
 - Federated only if the operator's instance has not disabled contribution.
-- The hosted `registry.tgarr.me` exposes NSFW only to the Plus tier ($29.99/yr) which requires age verification at checkout.
 
 ## Tier 3 — CSAM (hard block, zero tolerance)
 
