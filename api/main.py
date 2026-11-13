@@ -8857,7 +8857,9 @@ about your account or your provider's name is sent. Reading the index uses one c
 </div>
 <label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
 <div style="height:8px"></div>
-<button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span></div>
+<button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span>
+<p style="color:var(--muted);margin:14px 0 0;font-size:14px">No Usenet account yet, or thinking of a second one? What to look for, and which
+providers are the same network under another name: <a href="https://tgarr.me/usenet/" target="_blank" rel="noopener">tgarr.me/usenet</a>.</p></div>
 <h2 class="section">In Sonarr and Radarr</h2>
 <div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
 <p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
