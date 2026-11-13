@@ -3015,7 +3015,9 @@ function readFromView(){
   if (!reading || busy || !doc) return;        // a chapter on its way: its arrival starts the reading
   blocks = collect();
   if (!blocks.length) { if (ch < titles.length - 1) { readerLoad = true; load(ch + 1, 0); } else stopRead("nothing to read here"); return; }
-  readBlock(Math.min(firstInView(), blocks.length - 1));
+  // nothing readable on this page or after it (a picture, a blank end): readBlock
+  // then goes on to the next chapter - never back to an earlier paragraph
+  readBlock(firstInView());
 }
 // a person turned the page or jumped: read on from what is now in view
 function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 450); }
