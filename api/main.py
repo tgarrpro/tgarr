@@ -8491,9 +8491,13 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
                 async with db_pool.acquire() as conn:
                     _asked = usenet_scan.next_connections(
                         await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_nzb_conns'"), {})
-                got = await asyncio.to_thread(
-                    usenet_scan.rebuild, _ucfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
-                    6000 if c["detail"] == 0 else 2000, c["name"], _asked)
+                _UN_INDEX["nzb"] += 1                        # the index reading stands aside meanwhile
+                try:
+                    got = await asyncio.to_thread(
+                        usenet_scan.rebuild, _ucfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
+                        6000 if c["detail"] == 0 else 2000, c["name"], _asked)
+                finally:
+                    _UN_INDEX["nzb"] -= 1
                 _next = usenet_scan.next_connections(_asked, got)
                 if _next != _asked:
                     async with db_pool.acquire() as conn:
@@ -8564,7 +8568,7 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
 # well and keep what it knows. Only headers are ever read; an NZB is made
 # when somebody asks for one.
 # ════════════════════════════════════════════════════════════════════
-_UN_INDEX = {"state": "off", "window": None, "at": 0.0, "last": None, "asked": {}}
+_UN_INDEX = {"state": "off", "window": None, "at": 0.0, "last": None, "asked": {}, "nzb": 0}
 _UN_SKETCH_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "posted_to", "files", "files_expected",
                    "segments", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive", "sketch", "detail", "audience")
 
@@ -8670,7 +8674,8 @@ def _usenet_index_window(cfg: dict, w: dict) -> dict:
     feed = usenet_scan.Feeder(sk.add_rows)
     try:
         st = usenet_scan.read_window(cfg, w["grp"], lo, max(lo, hi), read=sparse,
-                                     connections=max(1, min(cfg.get("conns", 1), allowed)), on_rows=feed.put)
+                                     connections=max(1, min(cfg.get("conns", 1), allowed)), on_rows=feed.put,
+                                     hold=lambda: _UN_INDEX["nzb"] > 0)
     finally:
         feed.close()
     if st["failed"] and len(st["failed"]) * 10 > st["requests"] + len(st["failed"]):

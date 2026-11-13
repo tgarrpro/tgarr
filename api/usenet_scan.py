@@ -158,7 +158,7 @@ TRIES = 4                              # how often one stretch is asked for befo
 
 
 def read_window(cfg: dict, grp: str, lo: int, hi: int, read=None, connections: int = 8, on_rows=None, stop=None,
-                opener=None, pull=None, keep=None, pool=None, spans=None) -> dict:
+                opener=None, pull=None, keep=None, pool=None, spans=None, hold=None) -> dict:
     """Read lo..hi of a group over several connections. read = (m, every) for a sparse reading,
     None for everything (in stretches of 20,000). Rows go to on_rows(rows) as they come, from
     the reading threads.
@@ -171,6 +171,9 @@ def read_window(cfg: dict, grp: str, lo: int, hi: int, read=None, connections: i
     rounds, signing in sixteen times for every round costs more than the reading.
     spans: several stretches of the group [(lo, hi), ...] read as one piece of work, in place
     of lo..hi (which are then not looked at).
+    hold() -> bool: while it says so, no new stretch is begun (the one in hand is finished).
+    The index reads for hours and nobody waits for it; when somebody asks for an NZB, the
+    index stands aside for those seconds instead of sharing the provider with it.
 
     A stretch that fails goes back in the queue, so another connection takes it. A connection
     that cannot be opened twice running gives up while others are still working: a provider
@@ -193,6 +196,9 @@ def read_window(cfg: dict, grp: str, lo: int, hi: int, read=None, connections: i
             with lock:
                 nn = pool.pop() if pool else None
         while not (stop and stop()):
+            if hold is not None and hold():
+                time.sleep(0.2)
+                continue
             with lock:
                 if not todo:
                     if busy[0] == 0:
@@ -586,9 +592,10 @@ def rebuild(cfg: dict, grp: str, poster: str, key: str, art_lo: int, art_hi: int
         return n
 
     try:
-        return _rebuild(cfg, grp, key, art_lo, art_hi, pad, name, connections, take, files, span, cost)
+        out = _rebuild(cfg, grp, key, art_lo, art_hi, pad, name, connections, take, files, span, cost)
+        out["seconds"] = round(time.time() - t_all, 1)
+        return out
     finally:
-        cost["seconds"] = round(time.time() - t_all, 1)
         for nn in pool:
             try:
                 nn.sock.close()

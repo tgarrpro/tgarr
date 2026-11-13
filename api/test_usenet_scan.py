@@ -201,6 +201,17 @@ ok(st["failed"] == [(1, 100)] and st["headers"] == 0, "no connection at all: the
 st = S.read_window({}, "alt.binaries.test", 1, 149_999, connections=3, stop=lambda: True, opener=srv.opener, pull=srv.pull)
 ok(len(st["failed"]) == 8 and st["requests"] == 0, "stopped before it began: every stretch is reported unread")
 
+# while somebody waits for an NZB the index reading begins nothing new
+_held = [True]
+_srv = FakeServer(ARTS)
+_t = threading.Thread(target=lambda: S.read_window({}, "alt.binaries.test", 1, 149_999, connections=4, opener=_srv.opener, pull=_srv.pull, hold=lambda: _held[0]))
+_t.start()
+_time.sleep(0.5)
+ok(_srv.asked == [], "held: not one stretch is asked for")
+_held[0] = False
+_t.join(20)
+ok(len(_srv.asked) == 8 and not _t.is_alive(), "let go: it reads everything")
+
 # ---- the NZB, over one connection and over twelve -------------------------------------------
 PH = U.poster_hash(POSTER)
 KEY = S.describe(ARTS[30_000][0])[3]
@@ -208,6 +219,7 @@ srv1 = FakeServer(ARTS)
 one = S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, "Some Film", connections=1, opener=srv1.opener, pull=srv1.pull)
 srv12 = FakeServer(ARTS)
 twelve = S.rebuild({}, "alt.binaries.test", PH, KEY, 60_000, 61_000, 6000, "Some Film", connections=12, opener=srv12.opener, pull=srv12.pull)
+ok(one["seconds"] > 0, f"it says how long it took ({one['seconds']} s)")
 ok(one["segments"] == 120_000 and one["complete"] and one["files"] == 40 and one["art_lo"] == 30_000 and one["art_hi"] == 149_999,
    f"seen at two articles in its middle, found whole: {one['segments']} parts, {one['art_lo']}..{one['art_hi']}")
 ok(twelve["nzb"] == one["nzb"] and twelve["segments"] == one["segments"] and twelve["complete"], "twelve connections make the same NZB, byte for byte")
