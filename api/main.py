@@ -81,6 +81,76 @@ def _cross_site(request) -> bool:
         return True
 
 
+# ── nobody signed in to Telegram ───────────────────────────────────────
+# What is already indexed from PUBLIC channels, and files already saved on
+# this machine, stay readable: none of that needed the account. Two things do
+# not stay open:
+#   * anything from a private chat or group (no public @username). It was
+#     readable only because the account was a member; with the account gone
+#     it is nobody's business. Lists leave it out (see _pub) and the
+#     by-id endpoints below answer 404 for it.
+#   * anything that acts through the account: follow, unfollow, grab, fetch,
+#     settings. The pages hide those buttons; this refuses the requests.
+_PRIVATE_ID_RX = re.compile(
+    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/lyrics|api/fav|"
+    r"ebook-pdf|ebook-cover|epub|pdf)/(\d+)(?:/|$)")
+_PUBLIC_MSG: dict = {}
+
+
+_SIGNED_IN = [0.0, False]
+
+
+def _signed_in() -> bool:
+    # asked many times while one page is built (every card, every list):
+    # look at the session file at most once a second
+    now = time.monotonic()
+    if now - _SIGNED_IN[0] > 1.0:
+        try:
+            _SIGNED_IN[1] = bool(login.session_exists() and not _is_revoked())
+        except Exception:
+            _SIGNED_IN[1] = False
+        _SIGNED_IN[0] = now
+    return _SIGNED_IN[1]
+
+
+def _pub(alias: str = "c") -> str:
+    """SQL to append to a WHERE: public channels only, when nobody is signed in."""
+    return "" if _signed_in() else f" AND {alias}.username IS NOT NULL"
+
+
+def _pub_m(alias: str = "m") -> str:
+    """The same for a query on messages that may not join channels at all (a
+    page's count and facet queries reuse its filter without the join)."""
+    return "" if _signed_in() else (
+        f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL)")
+
+
+async def _signed_out_block(request: Request):
+    if _signed_in():
+        return None
+    path = request.url.path
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if path.startswith("/api/") and not path.startswith("/api/login"):
+            return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
+                                status_code=401)
+        return None
+    m = _PRIVATE_ID_RX.match(path)
+    if m and db_pool is not None:
+        mid = int(m.group(1))
+        ok = _PUBLIC_MSG.get(mid)
+        if ok is None:
+            async with db_pool.acquire() as conn:
+                ok = bool(await conn.fetchval(
+                    """SELECT c.username IS NOT NULL FROM messages m
+                       JOIN channels c ON c.id = m.channel_id WHERE m.id = $1""", mid))
+            if len(_PUBLIC_MSG) > 20000:
+                _PUBLIC_MSG.clear()
+            _PUBLIC_MSG[mid] = ok
+        if not ok:
+            return PlainTextResponse("not found", status_code=404)
+    return None
+
+
 def _ct_equal(a: str, b: str) -> bool:
     import hmac
     return hmac.compare_digest(a.encode(), b.encode())
@@ -114,6 +184,9 @@ async def _request_guard(request: Request, call_next):
         if not ok:
             return Response("authentication required", status_code=401,
                             headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
+    blocked = await _signed_out_block(request)
+    if blocked is not None:
+        return blocked
     return await call_next(request)
 
 
@@ -154,7 +227,7 @@ import metadata as md  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.6"
+TGARR_VERSION = "0.5.7"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -321,6 +394,7 @@ async def _startup():
     asyncio.create_task(_ebook_queue_restore())
     asyncio.create_task(_arr_alias_sync_worker())
     asyncio.create_task(_cache_gc_worker())
+    asyncio.create_task(_update_check_worker())
 
 
 async def _migrate_schema():
@@ -371,6 +445,7 @@ async def _migrate_schema():
             ALTER TABLE discovered ADD COLUMN IF NOT EXISTS video_files INTEGER;
             ALTER TABLE discovered ADD COLUMN IF NOT EXISTS book_files INTEGER;
             ALTER TABLE discovered ADD COLUMN IF NOT EXISTS audio_files INTEGER;
+            ALTER TABLE discovered ADD COLUMN IF NOT EXISTS last_file_at TIMESTAMPTZ;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_title TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_performer TEXT;
@@ -398,6 +473,14 @@ async def _migrate_schema():
               last_error TEXT,
               last_error_at TIMESTAMPTZ
             );
+            ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS unfollowed_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS handle_known BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_preview BOOLEAN;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_cursor BIGINT;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS web_done BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS central_pulled_at TIMESTAMPTZ;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS via_web BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_oldest_tg_id BIGINT;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
@@ -629,6 +712,14 @@ async def _migrate_schema():
               added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_alias_canon ON series_aliases (canonical_title);
+            -- Which series have been asked about (other-language names by
+            -- TVDB number), so each is asked once, not every hour.
+            CREATE TABLE IF NOT EXISTS series_alias_lookups (
+              tvdb_id BIGINT PRIMARY KEY,
+              looked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              names INT NOT NULL DEFAULT 0,
+              source TEXT
+            );
             CREATE TABLE IF NOT EXISTS stats_history (
               snapshot_at TIMESTAMPTZ NOT NULL,
               metric TEXT NOT NULL,
@@ -1469,6 +1560,157 @@ async def _cache_usage() -> list:
                GROUP BY 1 ORDER BY 3 DESC""")
 
 
+# ═════════════════════════════════════════════════
+# Is there a newer tgarr, and is this install updating itself?
+#
+# Until 0.5.7 nothing in tgarr said that a newer version existed. Installs
+# whose updater was missing or broken (most installs made before 0.5.6, and
+# 0.5.6 itself on a current Docker engine) simply stayed where they were, and
+# their owners had no way to know.
+#
+# Every ~6 hours the registry is asked which version is current (one small
+# GET that sends nothing about this install; the answer is cached by the CDN).
+# A newer version alone is not news - the updater installs it within the
+# hour. It becomes a notice on the Dashboard when this install is STILL
+# behind several hours after it first learned of the version: then the
+# updater is not doing its job, and the notice says what to run.
+# Off with TGARR_UPDATE_CHECK=false.
+# ═════════════════════════════════════════════════
+UPDATE_CHECK_ENABLED = os.environ.get("TGARR_UPDATE_CHECK", "true").lower() != "false"
+UPDATE_REGISTRY_URL = os.environ.get("TGARR_REGISTRY_URL", "https://tgarr.me").rstrip("/")
+UPDATE_STALLED_AFTER_S = 4 * 3600
+UPDATE_HELP_URL = "https://github.com/tgarrpro/tgarr/blob/main/docs/install/upgrade.md"
+_PINNED_TAG = os.environ.get("TGARR_PINNED_TAG", "").strip()
+_VERSION_RX = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,4}$")
+
+
+def _ver_tuple(v: str) -> tuple:
+    return tuple(int(x) for x in v.split(".")) if v and _VERSION_RX.match(v) else ()
+
+
+def _update_fetch() -> str:
+    req = urllib.request.Request(UPDATE_REGISTRY_URL + "/api/v1/version",
+                                 headers={"User-Agent": f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        v = str(_json.loads(r.read(65536)).get("current_version", ""))
+    return v if _VERSION_RX.match(v) else ""
+
+
+async def _update_note(latest: str, now: float) -> None:
+    """Record what the registry said. `update_seen` remembers WHEN this install
+    first learned of a version newer than itself; it is what 'still behind
+    after N hours' is measured from, and it is kept across restarts."""
+    async with db_pool.acquire() as conn:
+        async def put(k, v):
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ($1, $2)
+                   ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+        await put("update_latest", latest)
+        await put("update_checked_at", str(int(now)))
+        if _ver_tuple(latest) > _ver_tuple(TGARR_VERSION):
+            seen = await conn.fetchval("SELECT value FROM config WHERE key = 'update_seen'") or ""
+            if seen.split("|")[0] != latest:
+                await put("update_seen", f"{latest}|{int(now)}")
+        else:
+            await conn.execute("DELETE FROM config WHERE key IN ('update_seen', 'update_dismissed')")
+
+
+async def _update_check_worker():
+    import random
+    if not UPDATE_CHECK_ENABLED:
+        return
+    await asyncio.sleep(random.uniform(45, 300))
+    while True:
+        try:
+            latest = await asyncio.to_thread(_update_fetch)
+            if latest:
+                await _update_note(latest, time.time())
+        except Exception as e:
+            log.info("[update] could not ask %s which version is current: %s", UPDATE_REGISTRY_URL, e)
+        # 6 h, spread out so installs do not all ask at once
+        await asyncio.sleep(21600 + random.uniform(0, 3600))
+
+
+def _update_state(rows: dict, now: float) -> dict:
+    """Pure: what to tell the user, from the stored config values."""
+    latest = rows.get("update_latest") or ""
+    if not UPDATE_CHECK_ENABLED or _ver_tuple(latest) <= _ver_tuple(TGARR_VERSION):
+        return {"kind": "current"}
+    seen_v, _, seen_at = (rows.get("update_seen") or "").partition("|")
+    try:
+        behind_s = max(0, now - float(seen_at)) if seen_v == latest else 0
+    except ValueError:
+        behind_s = 0
+    st = {"latest": latest, "hours": int(behind_s // 3600)}
+    if rows.get("update_dismissed") == latest:
+        st["kind"] = "dismissed"
+    elif _PINNED_TAG and _PINNED_TAG not in ("latest", "edge"):
+        st.update(kind="pinned", tag=_PINNED_TAG)
+    elif behind_s >= UPDATE_STALLED_AFTER_S:
+        st["kind"] = "stalled"
+    else:
+        st["kind"] = "pending"
+    return st
+
+
+async def _update_banner() -> str:
+    async with db_pool.acquire() as conn:
+        rows = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key IN "
+            "('update_latest', 'update_seen', 'update_dismissed')")}
+    st = _update_state(rows, time.time())
+    if st["kind"] in ("current", "dismissed", "pending"):
+        return ""
+    latest = html.escape(st["latest"])
+    hide = ('<form method="POST" action="/api/update/dismiss" style="margin:0">'
+            '<button class="abtn" type="submit" title="hide until the next version">Hide</button></form>')
+    box = ('<div style="background:{bg};border:1px solid {bd};border-radius:12px;padding:14px 18px;'
+           'margin-bottom:16px;line-height:1.6;display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">'
+           '<div style="flex:1;min-width:240px">{body}</div>{hide}</div>')
+    if st["kind"] == "pinned":
+        body = (f'<b>tgarr {latest} is available.</b> This install stays on {html.escape(TGARR_VERSION)} '
+                f'because <code>TGARR_TAG={html.escape(st["tag"])}</code> is set in <code>.env</code>. '
+                f'Remove that line and run <code>docker compose up -d</code> to follow new versions.')
+        return box.format(bg="#eff6ff", bd="#bfdbfe", body=body, hide=hide)
+    body = (f'<b>tgarr {latest} is available, and this install is still on {html.escape(TGARR_VERSION)}.</b> '
+            f'It has not updated itself in {st["hours"]} hours, so its updater is probably missing or not running. '
+            f'To update now, in the folder that holds <code>docker-compose.yml</code>:'
+            f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
+            f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">How to make updates automatic again</a>')
+    return box.format(bg="#fffbeb", bd="#fde68a", body=body, hide=hide)
+
+
+@app.get("/api/me/avatar")
+async def me_avatar():
+    if not _signed_in() or not os.path.isfile(login.AVATAR_FILE):
+        return Response(status_code=404)
+    return FileResponse(login.AVATAR_FILE, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.post("/api/update/dismiss")
+async def update_dismiss():
+    async with db_pool.acquire() as conn:
+        latest = await conn.fetchval("SELECT value FROM config WHERE key = 'update_latest'")
+        if latest:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('update_dismissed', $1)
+                   ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", latest)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/api/update")
+async def update_status():
+    async with db_pool.acquire() as conn:
+        rows = {r["key"]: r["value"] for r in await conn.fetch(
+            "SELECT key, value FROM config WHERE key IN "
+            "('update_latest', 'update_seen', 'update_dismissed', 'update_checked_at')")}
+    st = _update_state(rows, time.time())
+    st.update(running=TGARR_VERSION, enabled=UPDATE_CHECK_ENABLED,
+              checked_at=int(rows["update_checked_at"]) if rows.get("update_checked_at", "").isdigit() else None)
+    return st
+
+
 def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> str:
     """'showing a-b of n' + prev / next. `qs(offset=...)` builds the query string."""
     if not total or (offset == 0 and shown >= total):
@@ -1700,6 +1942,8 @@ async def _player_saved(q=None, kind=None, sort="recent", fav=0, limit=50, offse
         where.append(_SAVED_KINDS[kind])
     if fav:
         where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
+    if _pub_m("m"):
+        where.append(_pub_m("m")[5:])           # signed out: public channels only
     wsql = " AND ".join(where)
     order = _SAVED_SORTS.get(sort, _SAVED_SORTS["recent"])
     async with db_pool.acquire() as conn:
@@ -1707,9 +1951,10 @@ async def _player_saved(q=None, kind=None, sort="recent", fav=0, limit=50, offse
             f"SELECT count(*) AS n, COALESCE(sum(m.file_size), 0) AS bytes FROM messages m WHERE {wsql}",
             *params)
         kinds = await conn.fetch(
-            """SELECT split_part(local_path, '/', 1) AS k, count(*) AS n
+            f"""SELECT split_part(local_path, '/', 1) AS k, count(*) AS n
                FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
                  AND split_part(local_path, '/', 1) IN ('video', 'audio', 'library')
+                 {_pub_m("messages")}
                GROUP BY 1""")
         rows = await conn.fetch(
             f"""SELECT m.id, m.file_name, m.file_size, m.media_type, m.local_path,
@@ -2416,6 +2661,38 @@ async def epub_chapter(msg_id: int, n: int):
                  "Cache-Control": "private, max-age=3600"})
 
 
+# What both readers need to read aloud: the browser's own voices (Edge offers
+# Microsoft's natural ones), a voice chosen for the text's language, the text
+# cut into short pieces (some voices stop on long passages), and a toast.
+_SPEECH_JS = r"""
+const synth = window.speechSynthesis;
+function toast(text, ms){
+  let t = document.getElementById("toast");
+  if (!t) { t = document.createElement("div"); t.id = "toast"; t.className = "toast"; document.body.appendChild(t); }
+  t.textContent = text; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, ms || 4000);
+}
+function voiceFor(text){
+  const cjk = (text.match(/[一-鿿]/g) || []).length, kana = (text.match(/[぀-ヿ]/g) || []).length,
+        hangul = (text.match(/[가-힯]/g) || []).length;
+  const lang = kana > 10 ? "ja" : hangul > 10 ? "ko" : cjk > text.length * 0.15 ? "zh" : (navigator.language || "en").slice(0, 2);
+  const vs = synth.getVoices().filter(v => v.lang && v.lang.toLowerCase().startsWith(lang));
+  const score = v => (/natural|neural/i.test(v.name) ? 8 : 0) + (/online/i.test(v.name) ? 4 : 0) + (/microsoft|google/i.test(v.name) ? 2 : 0)
+    + (lang === "zh" && /zh[-_]cn|hans/i.test(v.lang) ? 1 : 0);
+  return {voice: vs.sort((a, b) => score(b) - score(a))[0] || null, lang: lang === "zh" ? "zh-CN" : lang};
+}
+function chunks(text){
+  // sentences, packed into pieces of about 200 characters: some voices stop on long passages
+  const out = []; let buf = "";
+  (text.match(/[^.!?。！？；;\n]+[.!?。！？；;\n]*/g) || [text]).forEach(s => {
+    if (buf && (buf + s).length > 200) { out.push(buf); buf = ""; }
+    buf += s;
+    while (buf.length > 260) { out.push(buf.slice(0, 240)); buf = buf.slice(240); }
+  });
+  if (buf.trim()) out.push(buf);
+  return out.map(x => x.trim()).filter(Boolean);
+}
+"""
+
 _EPUB_READER_HTML = r"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
@@ -2465,6 +2742,9 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:2px 0 0}
 .shade.open{display:block}
 .msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--mut);
   z-index:1;pointer-events:none;font-size:15px}
+.toast{position:fixed;left:50%;bottom:76px;transform:translateX(-50%);background:rgba(15,23,42,.9);color:#fff;
+  font-size:13px;padding:8px 14px;border-radius:8px;z-index:20;max-width:86vw;text-align:center;pointer-events:none}
+button.on{background:var(--acc,#2563eb);color:#fff;border-color:var(--acc,#2563eb)}
 .tip{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:rgba(15,23,42,.88);color:#fff;
   padding:9px 16px;border-radius:20px;font-size:13px;z-index:6;pointer-events:none;transition:opacity .6s}
 @media (max-width:640px){.hide-s{display:none}.bar{gap:5px;padding:6px 8px}button,.btn{padding:7px 9px}}
@@ -2474,6 +2754,8 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:2px 0 0}
   <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
   <button id="tocBtn" title="table of contents">&#9776;<span class="hide-s"> Contents</span></button>
   <div class="ttl" id="ttl">__TITLE__</div>
+  <button id="readBtn" title="read aloud from here; the page follows the voice (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
+  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
   <button id="fsDown" title="smaller text">A&minus;</button>
   <button id="fsUp" title="larger text">A+</button>
   <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
@@ -2508,9 +2790,18 @@ const $ = id => document.getElementById(id);
 const fr = $("bk");
 let titles = [], ch = 0, page = 0, pages = 1, W = 0, doc = null, pendingFrac = 0, busy = false;
 let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.reader") || "{}"); } catch (e) {}
-let fs = st.fs || 18, theme = st.theme || "light", mode = st.mode || "paged";
+let fs = st.fs || 18, theme = st.theme || "light", mode = st.mode || "paged", two = !!st.two;
+const calm = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+// two pages only where there is room for them
+const spread = () => two && mode === "paged" && W >= 900;
+// turning a page: the text slides sideways, the new page coming in as the old one leaves
+function slide(){
+  const x = page * W;
+  if (calm) { doc.body.scrollLeft = x; return; }
+  try { doc.body.scrollTo({left: x, behavior: "smooth"}); } catch (e) { doc.body.scrollLeft = x; }
+}
 const THEMES = {light: ["#ffffff", "#1f2937"], sepia: ["#f6efdc", "#433422"], dark: ["#15181d", "#c9d1d9"]};
-function saveSt(){ try { localStorage.setItem("tgarr.reader", JSON.stringify({fs, theme, mode})); } catch (e) {} }
+function saveSt(){ try { localStorage.setItem("tgarr.reader", JSON.stringify({fs, theme, mode, two})); } catch (e) {} }
 function frac(){
   if (mode === "paged") return pages > 1 ? page / (pages - 1) : 0;
   const se = doc && doc.scrollingElement; if (!se) return 0;
@@ -2519,11 +2810,17 @@ function frac(){
 function savePos(){ try { localStorage.setItem(KEY, JSON.stringify({ch, frac: frac()})); } catch (e) {} }
 function css(){
   const c = THEMES[theme];
-  let s = "html{background:" + c[0] + "}body{background:" + c[0] + ";color:" + c[1] + ";font-size:" + fs + "px}";
+  let s = "html{background:" + c[0] + "}body{background:" + c[0] + ";color:" + c[1] + ";font-size:" + fs + "px}" +
+          ".tg-reading{background:rgba(250,204,21," + (theme === "dark" ? ".22" : ".32") + ");border-radius:3px}";
   if (mode === "paged") {
-    const col = Math.min(W - 44, 860), P = Math.max(22, Math.round((W - col) / 2));
+    // one screen = one column with a margin P either side; or two columns
+    // with the same 2P between them as between screens, so a screen is
+    // always exactly W wide whichever it is
+    const col = Math.min(W - 44, 860);
+    const P = spread() ? Math.max(24, Math.round(W * 0.035)) : Math.max(22, Math.round((W - col) / 2));
+    const cw = spread() ? Math.floor((W - 4 * P) / 2) : W - 2 * P;
     s += "html{height:100%;overflow:hidden}" +
-         "body{margin:0;height:100vh;box-sizing:border-box;padding:26px " + P + "px;column-width:" + (W - 2 * P) +
+         "body{margin:0;height:100vh;box-sizing:border-box;padding:26px " + P + "px;column-width:" + cw +
          "px;column-gap:" + (2 * P) + "px;column-fill:auto;overflow:hidden}" +
          "img,svg{max-height:calc(100vh - 90px);width:auto;max-width:100%;break-inside:avoid}" +
          "h1,h2,h3,h4{break-after:avoid}";
@@ -2540,6 +2837,7 @@ function layout(keep){
   el.textContent = css();
   document.body.dataset.theme = theme; document.body.dataset.mode = mode;
   $("modeLbl").textContent = mode === "paged" ? "Scroll" : "Pages";
+  $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
   if (mode === "paged") {
     pages = Math.max(1, Math.round(doc.body.scrollWidth / W));
     page = Math.min(pages - 1, Math.max(0, Math.round(keep * (pages - 1))));
@@ -2568,13 +2866,16 @@ function load(n, f){
   n = Math.max(0, Math.min((titles.length || 1) - 1, n));
   ch = n; pendingFrac = f || 0; busy = true;
   $("msg").style.display = "flex"; $("msg").textContent = "loading…";
-  fr.src = "/epub/" + ID + "/ch/" + n;
+  // replace, not assign: setting src made every chapter a step in the tab's
+  // history, so "Library" (one step back) only went back one chapter
+  const url = "/epub/" + ID + "/ch/" + n;
+  try { fr.contentWindow.location.replace(url); } catch (e) { fr.src = url; }
 }
 function go(d){
   if (busy || !doc) return;
-  hideTip();
+  hideTip(); userMoved();
   if (mode === "paged") {
-    if (page + d >= 0 && page + d < pages) { page += d; doc.body.scrollLeft = page * W; ui(); return; }
+    if (page + d >= 0 && page + d < pages) { page += d; slide(); ui(); return; }
   } else {
     const se = doc.scrollingElement, max = se.scrollHeight - se.clientHeight, step = se.clientHeight * 0.9;
     if ((d > 0 && se.scrollTop < max - 2) || (d < 0 && se.scrollTop > 2)) { se.scrollTop += d * step; setTimeout(ui, 60); return; }
@@ -2587,9 +2888,11 @@ function onKey(e){
   const k = e.key;
   if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey) || k === "ArrowDown" && mode === "paged") { e.preventDefault(); go(1); }
   else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey) || k === "ArrowUp" && mode === "paged") { e.preventDefault(); go(-1); }
-  else if (k === "Home") { e.preventDefault(); load(0, 0); }
-  else if (k === "End") { e.preventDefault(); load(titles.length - 1, 1); }
+  else if (k === "Home") { e.preventDefault(); userMoved(); load(0, 0); }
+  else if (k === "End") { e.preventDefault(); userMoved(); load(titles.length - 1, 1); }
   else if (k === "Escape") toc(false);
+  else if ((k === "r" || k === "R") && !e.ctrlKey && !e.metaKey) $("readBtn").click();
+  else if (k === "2") $("twoBtn").click();
 }
 let wheelAt = 0;
 function onWheel(e){
@@ -2621,6 +2924,12 @@ fr.addEventListener("load", function(){
   wire(doc);
   doc.addEventListener("scroll", () => { if (mode !== "paged") ui(); }, {passive: true});
   layout(pendingFrac);
+  if (reading) {
+    // the voice asked for this chapter: start at its top. A person did: read what is in view.
+    if (readerLoad) { readerLoad = false; blocks = collect(); if (blocks.length) readBlock(0); else readFromView(); }
+    else readFromView();
+  }
+  readerLoad = false;
   // pictures arriving change the page count: lay out again, stay where we are
   let t = null;
   Array.from(doc.images || []).forEach(im => { if (!im.complete) im.addEventListener("load", () => {
@@ -2634,7 +2943,91 @@ $("fsUp").onclick = () => { fs = Math.min(30, fs + 2); saveSt(); layout(frac());
 $("fsDown").onclick = () => { fs = Math.max(12, fs - 2); saveSt(); layout(frac()); };
 $("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); layout(frac()); };
 $("modeBtn").onclick = () => { const f = frac(); mode = mode === "paged" ? "scroll" : "paged"; saveSt(); layout(f); };
-$("slider").addEventListener("change", e => load(+e.target.value, 0));
+$("twoBtn").onclick = () => { const f = frac(); two = !two; saveSt(); layout(f); };
+$("slider").addEventListener("change", e => { userMoved(); load(+e.target.value, 0); });
+// ---- read aloud: paragraph by paragraph, the page following the voice ----
+__SPEECH_JS__
+let reading = false, readRun = 0, blocks = [], readerLoad = false, moveT = null;
+const BLOCKS = "p,h1,h2,h3,h4,h5,h6,li,blockquote,dd,dt,td,th,pre,figcaption";
+function collect(){
+  if (!doc || !doc.body) return [];
+  const all = Array.from(doc.body.querySelectorAll(BLOCKS)).filter(el =>
+    (el.textContent || "").trim() && !Array.from(el.querySelectorAll(BLOCKS)).some(k => (k.textContent || "").trim()));
+  return all.length ? all : ((doc.body.textContent || "").trim() ? [doc.body] : []);
+}
+// the pages a paragraph starts and ends on: one that runs over a page break
+// has a piece in each column
+function pagesOf(el){
+  // Measured against the first thing in the chapter, not against how far the
+  // text is scrolled: while a page is sliding the two do not add up, and a
+  // paragraph on this page was taken for one on the next.
+  const first = doc.body.firstElementChild || el, ref = first.getClientRects()[0], rs = el.getClientRects();
+  if (!ref || !rs.length) return [page, page];
+  // columns start a whole screen apart (half a screen with two pages)
+  const at = x => Math.max(0, Math.min(pages - 1, Math.floor((x - ref.left + W * 0.2) / W)));
+  return [at(rs[0].left), at(rs[rs.length - 1].left)];
+}
+function turnTo(p){ if (p !== page) { page = p; slide(); ui(); } }
+function firstInView(){
+  for (let i = 0; i < blocks.length; i++) {
+    // on this page or after it - a paragraph that began on the page before
+    // and ends on this one counts
+    if (mode === "paged" ? pagesOf(blocks[i])[1] >= page : blocks[i].getBoundingClientRect().bottom > 40) return i;
+  }
+  return blocks.length;
+}
+function unmark(){ if (doc) doc.querySelectorAll(".tg-reading").forEach(x => x.classList.remove("tg-reading")); }
+function stopRead(why){
+  reading = false; readRun++; clearTimeout(moveT); if (synth) synth.cancel(); unmark();
+  $("readBtn").classList.remove("on"); if (why) toast(why, 6000);
+}
+function readBlock(i){
+  if (!reading) return;
+  const run = ++readRun; synth.cancel(); unmark();
+  if (i >= blocks.length) {
+    if (ch >= titles.length - 1) { stopRead("the end of the book"); return; }
+    readerLoad = true; load(ch + 1, 0); return;          // goes on when the chapter has arrived
+  }
+  const el = blocks[i], text = (el.textContent || "").replace(/\s+/g, " ").trim();
+  if (el !== doc.body) el.classList.add("tg-reading");
+  // show the paragraph - unless part of it is already on screen (do not pull
+  // the page back to where it began)
+  const span = mode === "paged" && el !== doc.body ? pagesOf(el) : null;
+  if (span) { if (page < span[0] || page > span[1]) turnTo(span[0]); }
+  else if (el !== doc.body) el.scrollIntoView({block: "center", behavior: "smooth"});
+  const parts = chunks(text), v = voiceFor(text);
+  if (!parts.length) { readBlock(i + 1); return; }
+  parts.forEach((part, k) => {
+    const u = new SpeechSynthesisUtterance(part);
+    if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
+    // a paragraph that runs over the page: turn when the voice gets that far
+    if (span && span[1] > span[0]) u.onstart = () => {
+      if (!reading || run !== readRun) return;
+      const want = span[0] + Math.min(span[1] - span[0], Math.floor(k / parts.length * (span[1] - span[0] + 1)));
+      if (want > page) turnTo(want);
+    };
+    if (k === parts.length - 1) u.onend = () => { if (reading && run === readRun) readBlock(i + 1); };
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    synth.speak(u);
+  });
+}
+function readFromView(){
+  if (!reading || busy || !doc) return;        // a chapter on its way: its arrival starts the reading
+  blocks = collect();
+  if (!blocks.length) { if (ch < titles.length - 1) { readerLoad = true; load(ch + 1, 0); } else stopRead("nothing to read here"); return; }
+  // nothing readable on this page or after it (a picture, a blank end): readBlock
+  // then goes on to the next chapter - never back to an earlier paragraph
+  readBlock(firstInView());
+}
+// a person turned the page or jumped: read on from what is now in view
+function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 450); }
+$("readBtn").onclick = () => {
+  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (reading) { stopRead(); return; }
+  reading = true; $("readBtn").classList.add("on"); readFromView();
+};
+if (!synth) $("readBtn").style.display = "none";
+else { synth.getVoices(); window.addEventListener("beforeunload", () => synth.cancel()); }
 function toc(open){ $("drawer").classList.toggle("open", open); $("shade").classList.toggle("open", open);
   if (open) { const c = document.querySelector("#tocList a.cur"); if (c) c.scrollIntoView({block: "center"}); } }
 $("tocBtn").onclick = () => toc(!$("drawer").classList.contains("open"));
@@ -2644,8 +3037,19 @@ setTimeout(hideTip, 7000);
 // "back": players open in a new tab, where there is no page to go back to.
 // Go back if there is one; otherwise close the tab (the list is still open
 // behind it); if the browser will not close it, go to the list.
+// A link followed inside the book still adds a step, so count the steps
+// from where the reader opened and go back over all of them at once.
+let startLen = history.length;
+try {
+  const k = "tgarr.start." + ID, s = +sessionStorage.getItem(k);
+  const nav = (performance.getEntriesByType("navigation")[0] || {}).type;
+  if (nav === "reload" && s && s <= history.length) startLen = s;
+  else sessionStorage.setItem(k, startLen);
+} catch (e) {}
 function tgBack(fallback){
-  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) { history.back(); return; }
+  if (history.length > 1 && document.referrer && document.referrer.indexOf(location.host) > 0) {
+    history.go(-(1 + Math.max(0, history.length - startLen))); return;
+  }
   window.close();
   setTimeout(function(){ location.href = fallback; }, 200);
 }
@@ -2659,7 +3063,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
   let listed = 0;
   titles.forEach((t, i) => { if (!t) return; listed++;
     const a = document.createElement("a"); a.textContent = t; a.dataset.i = i;
-    a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
+    a.onclick = () => { toc(false); userMoved(); load(i, 0); }; fragm.appendChild(a); });
   if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "Section " + (i + 1);
     a.dataset.i = i; a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
   list.appendChild(fragm);
@@ -2684,7 +3088,7 @@ async def epub_render(msg_id: int):
             f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.epub$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
-    return HTMLResponse(_EPUB_READER_HTML.replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -2799,6 +3203,48 @@ def _pdf_render(path: str, n: int, width: int, clean: bool):
         return buf.getvalue(), "image/png"
 
 
+_CJK_CH = "\u2e80-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef"
+_PDF_JOIN_CJK_RX = re.compile(f"([{_CJK_CH}])[ \\t]*\\n[ \\t]*(?=[{_CJK_CH}])")
+_PDF_HYPHEN_RX = re.compile(r"([A-Za-z])-\n([a-z])")
+
+
+def _pdf_text_clean(raw: str) -> str:
+    """A page's text as it should be spoken: lines of one paragraph joined
+    (Chinese without a space, a word hyphenated across lines made whole),
+    paragraphs kept apart, page-break marks and stray spaces removed."""
+    t = (raw or "").replace("\f", "\n").replace("\r", "")
+    t = _PDF_HYPHEN_RX.sub(r"\1\2", t)
+    t = _PDF_JOIN_CJK_RX.sub(r"\1", t)
+    paras = [re.sub(r"[ \t]*\n[ \t]*", " ", p).strip() for p in re.split(r"\n[ \t]*\n+", t)]
+    return "\n".join(re.sub(r"[ \t]{2,}", " ", p) for p in paras if p)[:20000]
+
+
+def _pdf_text(path: str, n: int) -> str:
+    import subprocess
+    r = subprocess.run(["pdftotext", "-f", str(n), "-l", str(n), "-enc", "UTF-8", path, "-"],
+                       capture_output=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError("could not read this page's text")
+    return _pdf_text_clean(r.stdout.decode("utf-8", "replace"))
+
+
+@app.get("/pdf/{msg_id}/text/{n}")
+async def pdf_text(msg_id: int, n: int):
+    """The words on one page (for reading aloud). Empty for a scanned page:
+    that is a picture of text, and there are no words in the file."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    path = _pdf_source(row)
+    if not path:
+        return JSONResponse({"error": "not downloaded yet"}, status_code=404)
+    try:
+        text = await asyncio.to_thread(_pdf_text, path, max(1, int(n)))
+    except Exception as e:
+        return JSONResponse({"error": str(e), "text": ""}, status_code=422)
+    return JSONResponse({"page": n, "text": text},
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+
 @app.get("/pdf/{msg_id}/info")
 async def pdf_info(msg_id: int):
     async with db_pool.acquire() as conn:
@@ -2884,6 +3330,17 @@ body[data-theme=sepia] .pg img{mix-blend-mode:multiply}
 body[data-theme=dark] .pg{background:#1b1d22}
 body[data-theme=dark] .pg img{filter:invert(.92) hue-rotate(180deg)}
 .pg .no{position:absolute;right:8px;bottom:6px;font-size:11px;color:#94a3b8;pointer-events:none}
+/* one page at a time: each page is a slide filling the stage; turning the
+   page moves two slides sideways together */
+.stage.paged{overflow:hidden;padding:0;position:relative;touch-action:pan-y pinch-zoom}
+.slide{position:absolute;inset:0;overflow:auto;display:flex;padding:8px;will-change:transform;
+  -webkit-overflow-scrolling:touch}
+.slide .pair{margin:auto;display:flex;gap:10px;flex:none;align-items:flex-start}
+.slide .pg{margin:0;flex:none}
+.toast{position:fixed;left:50%;bottom:76px;transform:translateX(-50%);background:rgba(15,23,42,.9);color:#fff;
+  font-size:13px;padding:8px 14px;border-radius:8px;z-index:20;max-width:86vw;text-align:center;pointer-events:none}
+.slide.mv{transition:transform .28s cubic-bezier(.3,.1,.3,1)}
+@media (prefers-reduced-motion:reduce){.slide.mv{transition:none}}
 .pos{flex:1;min-width:0;text-align:center;font-size:13px;color:var(--mut)}
 .pos b{color:var(--fg)}
 .pos input[type=number]{width:64px;font:inherit;text-align:center;border:1px solid var(--line);border-radius:6px;
@@ -2897,6 +3354,11 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
   <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
   <div class="ttl">__TITLE__</div>
   <button id="wmBtn" title="on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.">Hide watermark</button>
+  <button id="readBtn" title="read this book aloud from the current page, turning pages as it goes (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
+  <button id="modeBtn" title="one page at a time (pages slide sideways), or one long scroll">Pages</button>
+  <button id="fitBtn" title="how a page fills the window: the whole page, its width, or its height">Fit page</button>
+  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
+  <button id="fsBtn" class="hide-s" title="full screen (F)">&#9974;</button>
   <button id="zOut" title="smaller (-)">A&minus;</button>
   <button id="zIn" title="larger (+)">A+</button>
   <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
@@ -2921,8 +3383,13 @@ let pages = 0, ratio = 1.414, cur = 1, els = [];
 let st = {}; try { st = JSON.parse(localStorage.getItem("tgarr.pdfreader") || "{}"); } catch (e) {}
 let book = {}; try { book = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
 let zoom = st.zoom || 1, theme = st.theme || "light";
+// "paged": one page at a time, turned sideways like a book (the default).
+// "scroll": every page in one long column.
+let mode = st.mode === "scroll" ? "scroll" : "paged";
+let fit = ["page", "width", "height"].includes(st.fit) ? st.fit : "page";   // paged mode only
+let two = !!st.two;                                                           // two pages side by side
 let clean = book.clean !== undefined ? book.clean : (st.clean !== undefined ? !!st.clean : true);
-const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean})); } catch (e) {} };
+const saveSt = () => { try { localStorage.setItem("tgarr.pdfreader", JSON.stringify({zoom, theme, clean, mode, fit, two})); } catch (e) {} };
 const saveBook = () => { try { localStorage.setItem(KEY, JSON.stringify({page: cur, clean})); } catch (e) {} };
 function pageW(){ return Math.round(Math.min(stage.clientWidth - 16, 980) * zoom); }
 function reqW(){ return Math.min(3200, Math.round(pageW() * Math.min(3, window.devicePixelRatio || 1))); }
@@ -2949,35 +3416,178 @@ function build(){
   }
   stage.innerHTML = ""; stage.appendChild(f); size(); refresh();
 }
+// ---- one page at a time ----
+let slide = null, moving = false; const ratios = {};
+const calm = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+// two pages only where there is room for them
+const spread = () => two && mode === "paged" && stage.clientWidth >= 760;
+const step = () => spread() ? 2 : 1;
+const left = n => spread() ? n - ((n - 1) % 2) : n;       // the page a spread starts on
+function fitW(r){
+  // at zoom 1: the whole page ("page"), as wide as the window ("width"), or as tall ("height")
+  const W = (stage.clientWidth - 16 - (spread() ? 10 : 0)) / (spread() ? 2 : 1), H = stage.clientHeight - 16;
+  const w = fit === "width" ? Math.min(W, 2400) : fit === "height" ? H / r : Math.min(W, H / r, 1600);
+  return Math.round(Math.max(120, w) * zoom);
+}
+function pageSrc(n, w){
+  const px = Math.min(3200, Math.ceil(w * Math.min(3, window.devicePixelRatio || 1) / 100) * 100);
+  return "/pdf/" + ID + "/page/" + n + "?w=" + px + (clean ? "&clean=1" : "");
+}
+function mkSlide(first){
+  const s = document.createElement("div"); s.className = "slide"; s.dataset.n = first;
+  const pair = document.createElement("div"); pair.className = "pair";
+  pair.appendChild(mkPage(first));
+  if (spread() && first + 1 <= pages) pair.appendChild(mkPage(first + 1));
+  s.appendChild(pair);
+  return s;
+}
+function mkPage(n){
+  const el = document.createElement("div"); el.className = "pg";
+  const fit = r => { const w = fitW(r); el.style.width = w + "px"; el.style.height = Math.round(w * r) + "px"; return w; };
+  const r0 = ratios[n] || ratio, w = fit(r0);
+  const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+  img.onload = () => { if (!img.naturalWidth) return; const r = img.naturalHeight / img.naturalWidth;
+    if (Math.abs(r - r0) > 0.01) { ratios[n] = r; fit(r); } };
+  img.src = pageSrc(n, w);
+  const no = document.createElement("span"); no.className = "no"; no.textContent = n;
+  el.appendChild(img); el.appendChild(no);
+  return el;
+}
+function settle(){
+  // a turn still in flight: finish it at once, so that quick presses never queue up
+  stage.querySelectorAll(".slide").forEach(x => { if (x !== slide) x.remove(); });
+  if (slide) { slide.classList.remove("mv"); slide.style.transform = ""; }
+  moving = false;
+}
+function show(n, dir){
+  n = left(Math.max(1, Math.min(pages, n | 0)));
+  if (moving) settle();
+  const old = slide, s = mkSlide(n);
+  slide = s; cur = n; ui(); saveBook(); turned();
+  [n + step(), n + step() + 1, n - 1, n - 2].forEach(k => { if (k >= 1 && k <= pages) { const i = new Image(); i.src = pageSrc(k, fitW(ratios[k] || ratio)); } });
+  if (!old || !dir || calm) { stage.querySelectorAll(".slide,.msg").forEach(x => x.remove()); stage.appendChild(s); return; }
+  // dir +1: the new page comes in from the right and pushes the old one out
+  // to the left; -1 the other way round
+  moving = true;
+  s.style.transform = "translateX(" + (dir * 100) + "%)";
+  stage.appendChild(s); s.getBoundingClientRect();
+  s.classList.add("mv"); old.classList.add("mv");
+  s.style.transform = "translateX(0)"; old.style.transform = "translateX(" + (-dir * 100) + "%)";
+  const done = () => { if (slide === s && moving) settle(); };
+  s.addEventListener("transitionend", done, {once: true}); setTimeout(done, 450);
+}
+function setMode(m){
+  mode = m === "scroll" ? "scroll" : "paged";
+  stage.classList.toggle("paged", mode === "paged");
+  stage.innerHTML = ""; els = []; slide = null; moving = false;
+  if (mode === "paged") show(cur, 0); else { build(); go(cur); }
+  ui();
+}
 function go(n, smooth){
-  n = Math.max(1, Math.min(pages, n | 0)); if (!els[n - 1]) return;
+  n = Math.max(1, Math.min(pages, n | 0));
+  if (mode === "paged") { n = left(n); if (n !== cur || !slide) show(n, smooth ? Math.sign(n - cur) : 0); return; }
+  if (!els[n - 1]) return;
   stage.scrollTo({top: els[n - 1].offsetTop - 8, behavior: smooth ? "smooth" : "auto"});
 }
 function track(){
+  if (mode !== "scroll" || !els.length) return;
   const mid = stage.scrollTop + stage.clientHeight * 0.35; let lo = 0, hi = els.length - 1, k = 0;
   while (lo <= hi) { const m = (lo + hi) >> 1; if (els[m].offsetTop <= mid) { k = m; lo = m + 1; } else hi = m - 1; }
   if (k + 1 !== cur) { cur = k + 1; ui(); saveBook(); }
 }
 function ui(){
   if (document.activeElement !== $("pno")) $("pno").value = cur;
-  $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur >= pages;
+  $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur + step() > pages;
+  $("fitBtn").textContent = "Fit " + fit; $("fitBtn").disabled = mode !== "paged";
+  $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
+  $("readBtn").classList.toggle("on", reading);
   $("wmBtn").classList.toggle("on", clean); document.body.dataset.theme = theme;
+  $("modeBtn").textContent = mode === "paged" ? "Pages" : "Scroll";
 }
 let tt = null; stage.addEventListener("scroll", () => { clearTimeout(tt); tt = setTimeout(track, 60); }, {passive: true});
-$("prev").onclick = () => go(cur - 1, true); $("next").onclick = () => go(cur + 1, true);
+$("prev").onclick = () => go(cur - step(), true); $("next").onclick = () => go(cur + step(), true);
 $("pno").addEventListener("change", e => go(+e.target.value));
 $("slider").addEventListener("input", e => { $("pno").value = e.target.value; });
 $("slider").addEventListener("change", e => go(+e.target.value));
-function rezoom(z){ const keep = cur; zoom = Math.max(0.5, Math.min(2.5, z)); saveSt(); size(); refresh(); go(keep); }
+function redraw(){ const keep = cur; if (mode === "paged") show(keep, 0); else { size(); refresh(); go(keep); } }
+function rezoom(z){ zoom = Math.max(0.5, Math.min(2.5, z)); saveSt(); redraw(); }
+$("modeBtn").onclick = () => { setMode(mode === "paged" ? "scroll" : "paged"); saveSt(); };
+$("fitBtn").onclick = () => { fit = fit === "page" ? "width" : fit === "width" ? "height" : "page"; saveSt(); redraw(); ui(); };
+$("twoBtn").onclick = () => { two = !two; saveSt(); redraw(); ui(); };
+const fullscreen = () => { if (document.fullscreenElement) document.exitFullscreen(); else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen(); };
+$("fsBtn").onclick = fullscreen;
+// ---- read aloud ----
+__SPEECH_JS__
+let reading = false, readN = 0, readRun = 0, blanks = 0, byReader = false;
+function stopRead(why){
+  reading = false; readRun++; if (synth) synth.cancel(); ui(); if (why) toast(why, 6000);
+}
+async function readFrom(n){
+  const run = ++readRun; readN = n; if (synth) synth.cancel();
+  let j = {}; try { j = await fetch("/pdf/" + ID + "/text/" + n).then(r => r.json()); } catch (e) {}
+  if (!reading || run !== readRun) return;
+  const text = (j.text || "").trim();
+  const nextPage = () => {
+    if (!reading || run !== readRun) return;
+    if (n >= pages) { stopRead("the end of the book"); return; }
+    byReader = true; go(n + 1, true); byReader = false; readFrom(n + 1);
+  };
+  if (!text) {
+    if (++blanks >= 3) { stopRead("no words to read on these pages - a scanned book holds pictures of text"); return; }
+    nextPage(); return;
+  }
+  blanks = 0;
+  const parts = chunks(text), v = voiceFor(text);
+  parts.forEach((part, i) => {
+    const u = new SpeechSynthesisUtterance(part);
+    if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
+    if (i === parts.length - 1) u.onend = nextPage;
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    synth.speak(u);
+  });
+}
+function turned(){
+  // the reader turned the page itself: nothing to do. A person did: read on from there.
+  if (reading && !byReader) readFrom(cur);
+}
+$("readBtn").onclick = () => {
+  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (reading) { stopRead(); return; }
+  reading = true; blanks = 0; ui(); readFrom(cur);
+};
+if (!synth) $("readBtn").style.display = "none";
+else { synth.getVoices(); window.addEventListener("beforeunload", () => synth.cancel()); }
+// a swipe turns the page (one finger, clearly sideways)
+let sx = null, sy = 0;
+stage.addEventListener("touchstart", e => { sx = e.touches.length === 1 ? e.touches[0].clientX : null; sy = e.touches[0].clientY; }, {passive: true});
+stage.addEventListener("touchend", e => {
+  if (mode !== "paged" || sx === null) return;
+  const t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy; sx = null;
+  if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.5) go(cur + (dx < 0 ? step() : -step()), true);
+}, {passive: true});
+// the wheel scrolls inside a page that is taller than the window; at its
+// edge (or when it fits) it turns the page
+let wheelAt = 0;
+stage.addEventListener("wheel", e => {
+  if (mode !== "paged" || !slide || e.ctrlKey) return;
+  const d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  const top = slide.scrollTop <= 0, bottom = slide.scrollTop + slide.clientHeight >= slide.scrollHeight - 1;
+  if (!((d > 0 && bottom) || (d < 0 && top))) return;
+  e.preventDefault();
+  if (Math.abs(d) > 6 && Date.now() - wheelAt > 420) { wheelAt = Date.now(); go(cur + (d > 0 ? step() : -step()), true); }
+}, {passive: false});
 $("zIn").onclick = () => rezoom(zoom * 1.2); $("zOut").onclick = () => rezoom(zoom / 1.2);
 $("themeBtn").onclick = () => { theme = theme === "light" ? "sepia" : theme === "sepia" ? "dark" : "light"; saveSt(); ui(); };
-$("wmBtn").onclick = () => { clean = !clean; saveSt(); saveBook(); ui(); refresh(); };
-window.addEventListener("resize", () => { const keep = cur; size(); refresh(); go(keep); });
+$("wmBtn").onclick = () => { clean = !clean; saveSt(); saveBook(); ui(); if (mode === "paged") show(cur, 0); else refresh(); };
+window.addEventListener("resize", redraw);
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" && e.target.type === "number") return;
   const k = e.key;
-  if (k === "ArrowRight" || k === "PageDown") { e.preventDefault(); go(cur + 1, true); }
-  else if (k === "ArrowLeft" || k === "PageUp") { e.preventDefault(); go(cur - 1, true); }
+  if (k === "ArrowRight" || k === "PageDown" || (k === " " && !e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur + step(), true); }
+  else if (k === "ArrowLeft" || k === "PageUp" || (k === " " && e.shiftKey && mode === "paged")) { e.preventDefault(); go(cur - step(), true); }
+  else if (k === "f" || k === "F") fullscreen();
+  else if (k === "r" || k === "R") $("readBtn").click();
+  else if (k === "2") $("twoBtn").click();
   else if (k === "Home") go(1); else if (k === "End") go(pages);
   else if (k === "+" || k === "=") rezoom(zoom * 1.2); else if (k === "-") rezoom(zoom / 1.2);
 });
@@ -2995,10 +3605,9 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
   if (j.error) { $("msg").textContent = "✗ " + j.error; return; }
   pages = j.pages; ratio = j.ratio || 1.414;
   $("ptotal").textContent = pages; $("slider").max = pages; $("pno").max = pages;
-  build();
   const h = parseInt((location.hash || "").slice(1), 10);
   cur = (h >= 1 && h <= pages) ? h : Math.min(pages, book.page || 1);
-  go(cur); ui();
+  setMode(mode);
 }).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
 })();
 </script>
@@ -3015,7 +3624,7 @@ async def pdf_reader(msg_id: int):
             f'<p>This file is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
-    return HTMLResponse(_PDF_READER_HTML.replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -3167,6 +3776,9 @@ async def media_status(msg_id: int):
     total = row["file_size"] or 0
     file_dc = row["file_dc"] if (row["file_dc"] or 0) > 0 else None
     my_dc = await _get_my_dc()
+    if not _signed_in() and not _is_local(lp):
+        # nobody to fetch it: say so instead of waiting for a download that cannot start
+        return JSONResponse({"status": "signedout"})
     if lp != "__failed__":
         await _want_fetch(msg_id)
     cross_dc = bool(file_dc and my_dc and file_dc != my_dc)
@@ -3545,6 +4157,12 @@ async function poll() {{
           : `<span style="color:#f59e0b">● file DC ${{j.file_dc}} ≠ your DC ${{j.my_dc}} — cross-DC, may hit FloodWait</span>`;
       }}
     }}
+    if (j.status === "signedout") {{
+      document.getElementById("status").textContent = "This file is not saved on this machine";
+      document.getElementById("hint").innerHTML =
+        'Fetching it needs a Telegram account. <a href="/login" style="color:#5eb6e5">Sign in</a> to play it.';
+      return;
+    }}
     if (j.status === "failed") {{
       document.getElementById("status").textContent = "✗ could not fetch this file";
       document.getElementById("hint").textContent =
@@ -3758,13 +4376,76 @@ qrStart();
 </body></html>"""
 
 
+APP_SETUP_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>tgarr - first-time setup</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
+  display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;max-width:560px;width:100%;padding:30px 32px;
+  box-shadow:0 10px 30px rgba(15,23,42,.08)}
+h1{margin:0 0 6px;font-size:24px}h1 span{color:#0ea5e9}
+p{color:#475569;line-height:1.55;margin:8px 0}
+ol{color:#334155;line-height:1.7;padding-left:20px;margin:14px 0 18px}
+label{display:block;font-size:13px;font-weight:600;color:#334155;margin:14px 0 5px}
+input{width:100%;box-sizing:border-box;padding:11px 12px;font:inherit;font-size:15px;border:1px solid #cbd5e1;
+  border-radius:8px;font-family:ui-monospace,Consolas,monospace}
+input:focus{outline:2px solid #0ea5e9;border-color:#0ea5e9}
+button{margin-top:20px;width:100%;padding:12px;font:inherit;font-size:15px;font-weight:600;color:#fff;
+  background:#0ea5e9;border:0;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.6;cursor:default}
+#err{color:#b91c1c;font-size:14px;margin-top:12px;min-height:20px}
+small{color:#64748b;font-size:12.5px;line-height:1.5;display:block;margin-top:16px}
+a{color:#0284c7}
+</style></head><body><div class="card">
+<h1>tg<span>arr</span> - one step before signing in</h1>
+<p>Telegram asks every program that connects to it for an <b>app id</b> and <b>app hash</b>.
+They are free, belong to your own account, and take a minute to get:</p>
+<ol>
+<li>Open <a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>
+and sign in with your phone number (the code arrives in Telegram itself).</li>
+<li>Fill in "Create new application" - any title and short name will do - and press Create.</li>
+<li>Copy <b>App api_id</b> and <b>App api_hash</b> into the two boxes below.</li>
+</ol>
+<form id="f" autocomplete="off">
+<label for="i">App api_id</label><input id="i" name="api_id" inputmode="numeric" placeholder="1234567" required/>
+<label for="h">App api_hash</label><input id="h" name="api_hash" placeholder="32 letters and digits" required/>
+<button id="b" type="submit">Save and continue to sign-in</button>
+<div id="err"></div>
+</form>
+<small>The two values stay on this machine, beside the Telegram session. Setting TG_API_ID and
+TG_API_HASH in the .env file does the same thing and takes precedence.</small>
+</div>
+<script>
+document.getElementById("f").addEventListener("submit", async function (e) {
+  e.preventDefault();
+  const b = document.getElementById("b"), err = document.getElementById("err");
+  b.disabled = true; err.textContent = "";
+  try {
+    const r = await fetch("/api/login/app", {method: "POST", body: new FormData(e.target)}).then(r => r.json());
+    if (r.status === "ok") { location.href = "/login"; return; }
+    err.textContent = r.message || "That did not work.";
+  } catch (x) { err.textContent = "Could not reach tgarr: " + x; }
+  b.disabled = false;
+});
+</script></body></html>"""
+
+
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(preview: Optional[int] = None):
     # .revoked marker overrides "already signed in" — session file is stale,
     # account was logged out upstream, must re-auth before doing anything.
     if login.session_exists() and not preview and not _is_revoked():
         return RedirectResponse("/")
+    if not login.app_configured():
+        return HTMLResponse(APP_SETUP_HTML)
     return HTMLResponse(LOGIN_HTML)
+
+
+@app.post("/api/login/app")
+async def api_login_app(api_id: str = Form(""), api_hash: str = Form("")):
+    return login.save_app(api_id, api_hash)
 
 
 @app.post("/api/login/qr/start")
@@ -4123,8 +4804,34 @@ aside.nav { width:260px; min-width:260px; background:var(--surface); border-righ
 .navlink:hover { background:#f1f5f9; color:var(--fg); }
 .navlink.active { color:var(--accent); background:#e0f2fe; border-left-color:var(--accent); font-weight:600; }
 .navlink svg { width:22px; height:22px; flex-shrink:0; }
-.user { padding:18px 22px; border-top:1px solid var(--border); font-size:14px; color:var(--muted); }
+.user { padding:10px 12px; border-top:1px solid var(--border); font-size:14px; color:var(--muted); }
 .user .name { color:var(--fg); font-weight:600; font-size:15px; }
+.ub-wrap { position:relative; }
+.ub { display:flex; align-items:center; gap:10px; width:100%; padding:8px 10px; border:0; background:none;
+      border-radius:10px; font:inherit; color:inherit; text-align:left; cursor:pointer; }
+button.ub:hover { background:rgba(127,127,127,.1); }
+div.ub { cursor:default; }
+.ub-av { width:38px; height:38px; border-radius:50%; flex:none; object-fit:cover; display:flex; align-items:center;
+         justify-content:center; color:#fff; font-weight:700; font-size:16px; background:var(--accent); }
+.ub-av.none { background:rgba(127,127,127,.25); color:var(--muted); }
+.ub-txt { flex:1; min-width:0; line-height:1.25; }
+.ub-txt b { display:block; color:var(--fg); font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden;
+            text-overflow:ellipsis; }
+.ub-txt small { display:block; font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden;
+                text-overflow:ellipsis; }
+.ub-ch { color:var(--muted); font-size:18px; line-height:1; padding:0 2px; }
+.ub-menu { position:absolute; left:0; right:0; bottom:calc(100% + 6px); background:var(--surface);
+           border:1px solid var(--border); border-radius:10px; box-shadow:0 10px 30px rgba(15,23,42,.16);
+           padding:6px; z-index:60; }
+.ub-menu a, .ub-menu button { display:block; width:100%; box-sizing:border-box; padding:9px 12px; border:0;
+           background:none; border-radius:7px; font:inherit; font-size:14px; color:var(--fg); text-align:left;
+           text-decoration:none; cursor:pointer; }
+.ub-menu a:hover, .ub-menu button:hover { background:rgba(127,127,127,.1); }
+.ub-menu button { color:#dc2626; border-top:1px solid var(--border); border-radius:0 0 7px 7px; margin-top:4px; }
+.user .ub-menu a { color:var(--fg); font-weight:400; }
+.user a.ub-in { color:#fff; }
+.ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
+         color:#fff; text-align:center; text-decoration:none; font-weight:600; font-size:13px; }
 .user a { color:var(--accent); text-decoration:none; font-size:14px; font-weight:600; }
 
 main.main { flex:1; display:flex; flex-direction:column; min-width:0; }
@@ -4459,8 +5166,48 @@ _LIST_CSS = """<style>
 .bar-tools{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
 .bar-tools .sep{width:1px;height:22px;background:var(--border);margin:0 6px}
 .bar-tools .lbl{font-size:12px;color:var(--muted);margin-right:2px}
-@media (max-width:820px){.ls-num{display:none}.ls-act{min-width:0}.abtn{min-width:0;padding:0 10px}}
+.ls-head{display:flex;align-items:center;gap:14px;padding:9px 16px;border-bottom:1px solid var(--border);
+  background:rgba(127,127,127,.06);font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted);user-select:none}
+.ls-head a{color:inherit;text-decoration:none;cursor:pointer;white-space:nowrap}
+.ls-head a:hover,.ls-head a.on{color:var(--accent)}
+.ls-head i{font-style:normal;font-size:9px;margin-left:4px;display:inline-block;width:8px}
+.ls-head .ls-num{font-variant-numeric:normal}
+.sort-chips{display:none;gap:6px;flex-wrap:wrap;align-items:center}
+@media (max-width:820px){.ls-num{display:none}.ls-act{min-width:0}.abtn{min-width:0;padding:0 10px}
+  .ls-head{display:none}.sort-chips{display:inline-flex}}
 </style>"""
+
+
+def _ls_head(cols, sort: str, order: str, href) -> str:
+    """The clickable column header of a .ls list.
+
+    cols: (key, label, css class, first direction). key None = not sortable.
+    Clicking the column that is already sorted turns it round; clicking
+    another sorts by it in the direction that is useful first (biggest /
+    newest first for numbers and dates, A-Z for names)."""
+    out = ['<div class="ls-head"><span style="width:40px;flex:none"></span>']
+    for key, label, css, first in cols:
+        if not key:
+            out.append(f'<span class="{css}">{label}</span>')
+            continue
+        on = key == sort
+        nxt = ("asc" if order == "desc" else "desc") if on else first
+        arrow = ("▲" if order == "asc" else "▼") if on else ""
+        out.append(f'<a class="{css}{" on" if on else ""}" href="{href(key, nxt)}" '
+                   f'title="sort by {label}{" (click again to reverse)" if on else ""}">'
+                   f'{label}<i>{arrow}</i></a>')
+    return "".join(out) + "</div>"
+
+
+def _ls_sort(view: list, keyfn, order: str, name) -> list:
+    """Sort by keyfn in the given direction; rows without a value always go
+    last, whichever way round; equal rows stay in name order."""
+    view = sorted(view, key=name)
+    have = [r for r in view if keyfn(r) not in (None, "")]
+    rest = [r for r in view if keyfn(r) in (None, "")]
+    have.sort(key=keyfn, reverse=(order == "desc"))
+    return have + rest
 
 
 def _color_for(s: str) -> str:
@@ -4471,11 +5218,39 @@ def _color_for(s: str) -> str:
 
 
 def _user_block() -> str:
-    if login.session_exists():
-        user = login.ensure_user_info() or {}
-        name = user.get("username") or user.get("first_name") or "anonymous"
-        return f'<div class="name">@{html.escape(str(name))}</div><div>signed in</div>'
-    return '<div class="name">not signed in</div><a href="/login">sign in →</a>'
+    """The account at the foot of the side menu: picture, name, a small menu."""
+    if not _signed_in():
+        return ('<div class="ub"><div class="ub-av none">?</div>'
+                '<div class="ub-txt"><b>Not signed in</b><small>browsing what is already indexed</small></div></div>'
+                '<a class="ub-in" href="/login">Sign in to Telegram</a>')
+    user = login.ensure_user_info() or {}
+    uname = user.get("username")
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or "Telegram account"
+    try:
+        av_v = int(os.path.getmtime(login.AVATAR_FILE))
+        av = f'<img class="ub-av" src="/api/me/avatar?v={av_v}" alt="">'
+    except OSError:
+        av = (f'<div class="ub-av" style="background:{_color_for(name)}">'
+              f'{html.escape(name[0].upper())}</div>')
+    return (
+        '<div class="ub-wrap">'
+        '<div class="ub-menu" id="tgUserMenu" hidden>'
+        '<a href="/settings">Settings</a>'
+        '<a href="/system">System status</a>'
+        + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
+           if uname else '')
+        + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
+        '<button type="button" class="ub" onclick="tgUserMenu(event)" title="account">'
+        f'{av}<span class="ub-txt"><b>{html.escape(name)}</b>'
+        f'<small>{("@" + html.escape(uname)) if uname else "signed in"}</small></span>'
+        '<span class="ub-ch">⋯</span></button></div>'
+        '<script>'
+        'function tgUserMenu(e){e.stopPropagation();var m=document.getElementById("tgUserMenu");m.hidden=!m.hidden}'
+        'document.addEventListener("click",function(){var m=document.getElementById("tgUserMenu");if(m)m.hidden=true});'
+        'function tgSignOut(){if(!confirm("Sign out of Telegram on this tgarr?\\n\\nPrivate chats are removed from '
+        'the index. Public channels and files already saved stay.")){return}'
+        'fetch("/api/login/logout",{method:"POST"}).then(function(){location.href="/"})}'
+        '</script>')
 
 
 # Phones / narrow windows: the 260px sidebar used to eat two thirds of the
@@ -4500,7 +5275,12 @@ MOBILE_CSS = """
              border-left:none; border-bottom:3px solid transparent; white-space:nowrap; }
   .navlink.active { border-left-color:transparent; border-bottom-color:var(--accent); }
   .navlink svg { width:20px; height:20px; }
-  aside.nav .user { display:none; }
+  aside.nav .user { flex:none; padding:4px 8px; border-top:none; }
+  aside.nav .user .ub-txt, aside.nav .user .ub-ch, aside.nav .user div.ub { display:none; }
+  aside.nav .user .ub { padding:4px; width:auto; }
+  aside.nav .user .ub-av { width:32px; height:32px; font-size:14px; }
+  aside.nav .user .ub-menu { top:calc(100% + 8px); bottom:auto; left:auto; right:0; width:220px; }
+  aside.nav .user .ub-in { margin:0; padding:7px 10px; font-size:12px; white-space:nowrap; }
   main.main { min-height:0; }
   .topbar { height:auto; padding:10px 14px; gap:10px; flex-wrap:wrap; }
   .topbar h1 { font-size:20px; }
@@ -4565,6 +5345,24 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
   <div class="content">{body_html}</div>
 </main>
 <script>
+// On a wide screen the list scrolls inside .content, not the window, so the
+// browser does not put it back after a reload: any button that reloads the
+// page (pause, remove, refresh…) sent the reader to the top. Remember the
+// place per page and restore it - on a reload only, never on a fresh visit.
+(function () {{
+  var box = document.querySelector('.content');
+  if (!box) return;
+  var key = 'tgScroll:' + location.pathname + location.search;
+  try {{
+    var nav = (performance.getEntriesByType('navigation')[0] || {{}}).type;
+    var saved = sessionStorage.getItem(key);
+    if (nav === 'reload' && saved) box.scrollTop = parseInt(saved, 10) || 0;
+    sessionStorage.removeItem(key);
+    window.addEventListener('pagehide', function () {{
+      if (box.scrollTop > 0) sessionStorage.setItem(key, String(box.scrollTop));
+    }});
+  }} catch (e) {{}}
+}})();
 async function tgGrab(btn) {{
   const guid = btn.dataset.guid;
   const orig = btn.textContent;
@@ -4676,7 +5474,7 @@ async def api_workers():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT worker, last_seen, last_action, iter_count, "
-            "error_count, last_error, last_error_at "
+            "error_count, last_error, last_error_at, quiet_for_s "
             "FROM worker_status ORDER BY last_seen DESC")
         _rec_mode = (await conn.fetchval(
             "SELECT value FROM config WHERE key='dialog_reconcile_mode'") or "off").lower()
@@ -4695,6 +5493,10 @@ async def api_workers():
     for r in rows:
         seen.add(r["worker"])
         expected_max = _EXPECTED_WORKERS.get(r["worker"], 3600)
+        # the job said it would be quiet this long: silence within that
+        # (plus a margin) is what it promised, not a fault
+        if r["quiet_for_s"]:
+            expected_max = max(expected_max, int(r["quiet_for_s"] * 1.25) + 120)
         out.append({
             "worker": r["worker"],
             "last_seen": r["last_seen"].isoformat() if r["last_seen"] else None,
@@ -5167,7 +5969,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                    JOIN messages m ON m.id = r.primary_msg_id
                    JOIN channels c ON c.id = m.channel_id
                    WHERE r.poster_url IS NOT NULL AND r.category IN ('movie', 'tv')
-                     AND COALESCE(c.audience, 'sfw') = 'sfw'
+                     AND COALESCE(c.audience, 'sfw') = 'sfw'""" + _pub() + """
                    ORDER BY r.created_at DESC, r.id DESC LIMIT 60""")
             _seen, _uniq = set(), []
             for _r in latest:                       # one poster per title
@@ -5225,9 +6027,16 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
     else:
         sh = _status("off", "Shared with tgarr.me", "nothing shared yet")
     used = sum(r["bytes"] for r in usage)
-    sto = _status("warn" if free_gb < 10 else "ok", "Storage",
+    try:
+        import shutil as _sh
+        _du = _sh.disk_usage("/downloads")
+        _sto_lvl = _disk_level(_du.free, _du.total)
+    except OSError:
+        _sto_lvl = "off"
+    sto = _status(_sto_lvl, "Storage",
                   f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
     status_html = f'<div class="st-row">{tg}{cr}{sh}{sto}</div>'
+    status_html = await _update_banner() + status_html
     if not browsable:
         status_html = (
             '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;'
@@ -5488,7 +6297,7 @@ async def api_channel_subscribe(username: str = Form(...)):
             "SELECT id FROM channels WHERE username ILIKE $1", u)
         if existing:
             await conn.execute(
-                """UPDATE channels SET subscribed=TRUE,
+                """UPDATE channels SET subscribed=TRUE, unfollowed_at=NULL, purged_at=NULL,
                    last_polled_at=NULL, subscribe_error=NULL
                    WHERE id=$1""", existing)
             return {"status": "ok", "message": f"already known — re-queued @{u}",
@@ -5498,8 +6307,8 @@ async def api_channel_subscribe(username: str = Form(...)):
         placeholder = -abs(hash(u)) // 1000 - 1_000_000_000_000
         new_id = await conn.fetchval(
             """INSERT INTO channels (tg_chat_id, username, title,
-                                     subscribed, backfilled)
-               VALUES ($1, $2, $3, TRUE, FALSE)
+                                     subscribed, backfilled, handle_known)
+               VALUES ($1, $2, $3, TRUE, FALSE, FALSE)
                ON CONFLICT (tg_chat_id) DO NOTHING
                RETURNING id""",
             placeholder, u, f"@{u} (resolving…)")
@@ -5511,8 +6320,8 @@ async def api_channel_subscribe(username: str = Form(...)):
 async def api_channel_unsubscribe(tg_chat_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """UPDATE channels SET subscribed=FALSE WHERE tg_chat_id=$1
-               AND subscribed=TRUE""", tg_chat_id)
+            """UPDATE channels SET subscribed=FALSE, unfollowed_at=NOW()
+               WHERE tg_chat_id=$1 AND subscribed=TRUE""", tg_chat_id)
     return {"status": "ok"}
 
 
@@ -5530,7 +6339,7 @@ async def api_set_audience(tg_chat_id: int, value: str = Form(...)):
 
 @app.get("/channels", response_class=HTMLResponse)
 async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = "films",
-                        offset: int = 0, limit: int = 50,
+                        order: str = "", offset: int = 0, limit: int = 50,
                         min_members: Optional[int] = None, eligible: int = 0,
                         audience: str = ""):
     if not login.session_exists():
@@ -5566,7 +6375,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                  WHERE r.category IN ('movie', 'tv') GROUP BY 1)
                SELECT c.tg_chat_id, c.username, c.title, c.backfilled, c.members_count,
                       c.audience, c.subscribed, c.is_joined, c.dead_at, c.subscribe_error,
-                      c.purged_at,
+                      c.purged_at, c.unfollowed_at, c.handle_known, c.web_preview,
                       COALESCE(a.msgs, 0) AS msgs, COALESCE(a.media, 0) AS media,
                       COALESCE(a.videos, 0) AS videos, COALESCE(a.songs, 0) AS songs,
                       COALESCE(a.photos, 0) AS photos, COALESCE(a.docs, 0) AS docs,
@@ -5585,15 +6394,21 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
 
     def _shared(r):
         return (r["members_count"] or 0) >= CONTRIB_MIN_MEMBERS and r["media"] >= CONTRIB_MIN_MEDIA
+    # A channel the user unfollowed has left the list as far as they are
+    # concerned, even while its index is still being cleared: it shows only
+    # under "being cleared" (where it can be followed again in time).
+    def _uf(r):
+        return bool(r["unfollowed_at"]) and not r["subscribed"] and not r["is_joined"]
     kinds = {
-        "all": lambda r: True,
-        "films": lambda r: r["films"] > 0,
+        "all": lambda r: not _uf(r),
+        "films": lambda r: r["films"] > 0 and not _uf(r),
         "joined": lambda r: r["is_joined"],
         "subscribed": lambda r: r["subscribed"] and not r["is_joined"],
-        "shared": _shared,
-        "loose": lambda r: not r["is_joined"] and not r["subscribed"] and not r["dead_at"],
-        "empty": lambda r: r["media"] == 0,
-        "dead": lambda r: r["dead_at"] is not None,
+        "shared": lambda r: _shared(r) and not _uf(r),
+        "loose": lambda r: not r["is_joined"] and not r["subscribed"] and not r["dead_at"] and not _uf(r),
+        "empty": lambda r: r["media"] == 0 and not _uf(r),
+        "dead": lambda r: r["dead_at"] is not None and not _uf(r),
+        "clearing": _uf,
     }
     if show not in kinds:
         show = "all"
@@ -5603,16 +6418,21 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         words = [w.lower() for w in q.split()]
         view = [r for r in view
                 if all(w in ((r["title"] or "") + " " + (r["username"] or "")).lower() for w in words)]
+    def _name(r):
+        return (r["title"] or r["username"] or "~").lower()
     sorts = {
-        "films": lambda r: (-r["films"], -r["media"]),
-        "media": lambda r: (-r["media"], -r["films"]),
-        "members": lambda r: (-(r["members_count"] or 0),),
-        "recent": lambda r: (-(r["last_post"].timestamp() if r["last_post"] else 0),),
-        "name": lambda r: ((r["title"] or r["username"] or "~").lower(),),
+        "films": lambda r: (r["films"], r["media"]),
+        "media": lambda r: (r["media"], r["films"]),
+        "members": lambda r: r["members_count"],
+        "recent": lambda r: r["last_post"],
+        "name": _name,
     }
     if sort not in sorts:
         sort = "films"
-    view.sort(key=sorts[sort])
+    first_dir = {"name": "asc"}
+    if order not in ("asc", "desc"):
+        order = first_dir.get(sort, "desc")
+    view = _ls_sort(view, sorts[sort], order, _name)
     page_size = max(10, min(limit, 200))
     page_offset = max(0, offset)
     page = view[page_offset:page_offset + page_size]
@@ -5620,6 +6440,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
     def _cqs(**over):
         cur = {"q": q, "show": show if show != "all" else None,
                "sort": sort if sort != "films" else None,
+               "order": order if order != first_dir.get(sort, "desc") else None,
                "limit": limit if limit != 50 else None}
         cur.update(over)
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
@@ -5647,17 +6468,31 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         + _chip_link("no files" + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
         + (_chip_link("gone" + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
                       show == "dead", "channels Telegram no longer serves") if counts["dead"] else "")
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("films", "/channels" + _cqs(sort=None, offset=None), sort == "films")
-        + _chip_link("files", "/channels" + _cqs(sort="media", offset=None), sort == "media")
-        + _chip_link("members", "/channels" + _cqs(sort="members", offset=None), sort == "members")
-        + _chip_link("latest post", "/channels" + _cqs(sort="recent", offset=None), sort == "recent")
-        + _chip_link("name", "/channels" + _cqs(sort="name", offset=None), sort == "name"))
+        + (_chip_link("being cleared" + _n("clearing"), "/channels" + _cqs(show="clearing", offset=None),
+                      show == "clearing",
+                      "channels you unfollowed: their index is being cleared and they then disappear. "
+                      "Follow one again here to keep it.") if counts["clearing"] else "")
+        # on a phone there is no room for the column header: the same sorts as chips
+        + '<span class="sort-chips"><span class="sep"></span><span class="lbl">Sort:</span>'
+        + _chip_link("films", "/channels" + _cqs(sort=None, order=None, offset=None), sort == "films")
+        + _chip_link("files", "/channels" + _cqs(sort="media", order=None, offset=None), sort == "media")
+        + _chip_link("members", "/channels" + _cqs(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link("latest post", "/channels" + _cqs(sort="recent", order=None, offset=None), sort == "recent")
+        + _chip_link("name", "/channels" + _cqs(sort="name", order=None, offset=None), sort == "name")
+        + '</span>')
+    head = _ls_head(
+        (("name", "Channel", "ls-main", "asc"), ("films", "Films", "ls-num", "desc"),
+         ("media", "Files", "ls-num", "desc"), ("members", "Members", "ls-num", "desc"),
+         ("recent", "Latest post", "ls-num lp", "desc"), (None, "", "ls-act", "")),
+        sort, order, lambda k, d: "/channels" + _cqs(sort=k if k != "films" else None,
+                                                     order=d if d != first_dir.get(k, "desc") else None,
+                                                     offset=None))
     search = (
         '<form method="GET" action="/channels" style="display:flex;gap:8px;margin:0 0 12px">'
         + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
                   for k, v in (("show", show if show != "all" else None),
-                               ("sort", sort if sort != "films" else None)) if v)
+                               ("sort", sort if sort != "films" else None),
+                               ("order", order if order != first_dir.get(sort, "desc") else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
           'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
           '<button class="btn" type="submit">Search</button>'
@@ -5674,8 +6509,19 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
             tags.append('<span class="tag bad" title="Telegram no longer serves this channel">gone</span>')
         elif r["is_joined"]:
             tags.append('<span class="tag ok" title="your account is a member">joined</span>')
+        elif r["subscribed"] and not r["handle_known"]:
+            tags.append('<span class="tag acc" title="read from tgarr.me and Telegram\'s public web page; '
+                        'your account is not used until you open one of its files">'
+                        + ('followed · web' if r["web_preview"] else 'followed · listed') + '</span>')
         elif r["subscribed"]:
             tags.append('<span class="tag acc" title="read without joining">followed</span>')
+        elif r["unfollowed_at"]:
+            tags.append('<span class="tag warn" title="you unfollowed it: its films and files are being '
+                        'cleared from this index and it will leave this list. Follow it again to keep it.">'
+                        'unfollowed · being cleared</span>')
+        elif r["purged_at"] and not purge_on:
+            tags.append('<span class="tag" title="unfollowed and cleared; only files you saved or marked '
+                        'as favourite are still here">not followed · cleared</span>')
         elif purge_on and r["purged_at"]:
             tags.append('<span class="tag" title="not followed any more; its files have been cleared '
                         'from this index. tgarr.me still lists it: follow it again to get them back.">'
@@ -5708,21 +6554,24 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                 txt = f'{ico} {_n_things(n, word)}'
                 has.append(f'<a href="{href}">{txt}</a>' if href else f'<span>{txt}</span>')
         act = ""
+        _ids = (f'data-id="{r["tg_chat_id"]}" '
+                f'data-uname="{html.escape(r["username"] or "", quote=True)}"')
         if r["subscribed"] and not r["is_joined"]:
-            act = (f'<button class="abtn" onclick="tgUnfollow(this,{r["tg_chat_id"]})" '
+            act = (f'<button class="abtn" {_ids} onclick="tgUnfollow(this)" '
                    f'title="stop reading this channel">Unfollow</button>')
         elif not r["is_joined"] and not r["dead_at"] and r["username"]:
-            act = (f'<button class="abtn pri" data-uname="{html.escape(r["username"], quote=True)}" '
-                   f'onclick="tgFollow(this)" title="read this public channel again, without joining it">'
-                   f'+ Follow</button>')
+            act = (f'<button class="abtn pri" {_ids} onclick="tgFollow(this)" '
+                   f'title="read this public channel again, without joining it">+ Follow</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
             f'{" ".join(tags)}</div>'
             f'<div class="ls-sub">{handle}{"".join(has) or "<span>no files indexed</span>"}</div></div>'
-            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
-            f'<div class="ls-num" style="width:104px"><b style="font-size:13px;font-weight:500">'
-            f'{_ago(r["last_post"]) or "–"}</b><span>latest post</span></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["films"]) if r["films"] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["media"]) if r["media"] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
+            f'<div class="ls-num lp"><b style="font-size:13px;font-weight:500">'
+            f'{_ago(r["last_post"]) or "–"}</b></div>'
             f'<div class="ls-act">{act}</div></div>')
 
     if not page:
@@ -5731,25 +6580,64 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                       "No channels yet. Join channels in Telegram, or follow some from Discover.")
                    + '</div></div>')
     else:
-        listing = (f'<div class="ls">{"".join(_row(r) for r in page)}</div>'
+        listing = (f'<div class="ls">{head}{"".join(_row(r) for r in page)}</div>'
                    + _page_nav("/channels", _cqs, page_offset, page_size, len(page), len(view)))
     body = (
-        f'{_LIST_CSS}'
+        f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
         f'<h2 class="section">Channels <span class="count">{len(view):,}'
         + (f' of {len(rows):,}' if len(view) != len(rows) else '') + '</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
         'letter-spacing:0;margin-left:10px"><a href="/discover">find more on Discover →</a></span></h2>'
         f'{search}<div class="bar-tools">{chips}</div>{listing}'
-        '<script>function tgUnfollow(b,id){if(!confirm(' + _js_str(
-            "Stop reading this channel?\n\nIts films and files will be CLEARED from this index once tgarr.me "
-            "holds a record of them. You can follow it again later, from here or from Discover, to get them back."
-            if purge_on else
-            "Stop reading this channel?\n\nNothing new will be indexed from it. What is already indexed stays.")
-        + '))return;'
-        'b.disabled=true;b.textContent="…";fetch("/api/channel/unsubscribe/"+id,{method:"POST"}).then(()=>location.reload())}'
-        'function tgFollow(b){b.disabled=true;b.textContent="…";fetch("/api/channel/subscribe",{method:"POST",'
-        'headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"username="+encodeURIComponent(b.dataset.uname)})'
-        '.then(()=>location.reload())}</script>')
+        # The button changes where it is. Reloading the page for one click
+        # threw the reader back to the top of a long list every time.
+        '<script>var tgUnfollowAsk=' + _js_str(
+            "Stop reading this channel and take it off this list?\n\n"
+            "Its films and files are cleared from this index within a few hours. Files you saved to "
+            "this machine and your favourites are kept. You can find the channel again on Discover.")
+        + r""";
+function tgChGone(b, note) {
+  var row = b.closest(".ls-row");
+  b.disabled = true; b.textContent = note;
+  if (row) { row.style.transition = "opacity .5s"; row.style.opacity = "0.35";
+             setTimeout(function () { row.remove(); }, 900); }
+}
+function tgChSet(b, following) {
+  // unfollowed: it has left the list. Followed again from "being cleared": it has left that view.
+  if (!following) { tgChGone(b, "Removed"); return; }
+  if (location.search.indexOf("show=clearing") >= 0) { tgChGone(b, "Following"); return; }
+  b.disabled = false;
+  if (following) {
+    b.className = "abtn"; b.textContent = "Unfollow"; b.title = "stop reading this channel";
+    b.onclick = function () { tgUnfollow(b); };
+  } else if (b.dataset.uname) {
+    b.className = "abtn pri"; b.textContent = "+ Follow";
+    b.title = "read this public channel again, without joining it";
+    b.onclick = function () { tgFollow(b); };
+  } else { b.remove(); }
+}
+function tgChFail(b, label, why) {
+  b.disabled = false; b.textContent = "Failed - retry"; b.title = why || "the request did not go through";
+  setTimeout(function () { if (b.textContent === "Failed - retry") b.textContent = label; }, 4000);
+}
+function tgUnfollow(b) {
+  if (!confirm(tgUnfollowAsk)) return;
+  b.disabled = true; b.textContent = "…";
+  fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChSet(b, false); })
+    .catch(function (e) { tgChFail(b, "Unfollow", e.message); });
+}
+function tgFollow(b) {
+  b.disabled = true; b.textContent = "…";
+  fetch("/api/channel/subscribe", {method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: "username=" + encodeURIComponent(b.dataset.uname)})
+    .then(function (r) { return r.json().then(function (j) {
+      if (!r.ok || j.status === "error") throw new Error(j.message || ("HTTP " + r.status));
+      tgChSet(b, true); }); })
+    .catch(function (e) { tgChFail(b, "+ Follow", e.message); });
+}
+</script>""")
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 
@@ -5770,7 +6658,8 @@ def _profile_pills(r) -> str:
 
 @app.get("/discover", response_class=HTMLResponse)
 async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] = None,
-                        sort: str = "best", mine: int = 0, offset: int = 0, limit: int = 50):
+                        sort: str = "best", order: str = "", mine: int = 0, offset: int = 0,
+                        limit: int = 50):
     async with db_pool.acquire() as conn:
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
         if not login.session_exists() and not n_channels:
@@ -5795,7 +6684,8 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         rows = await conn.fetch(f"""
             SELECT username, title, members_count, media_count, audience,
                    language, category, distinct_contributors, verified,
-                   last_pulled_at, release_files, video_files, book_files, audio_files
+                   last_pulled_at, release_files, video_files, book_files, audio_files,
+                   last_file_at
             FROM discovered
             WHERE {' AND '.join(where)}""")
         total = await conn.fetchval("SELECT count(*) FROM discovered WHERE dismissed = FALSE")
@@ -5808,25 +6698,35 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         view = [r for r in view
                 if all(w in ((r["title"] or "") + " " + r["username"]).lower() for w in words)]
     lead = kind_col or "release_files"
+    def _dname(r):
+        return (r["title"] or r["username"]).lower()
     sorts = {
         # what the channel carries first - the reason most people install
         # tgarr - then how many installs vouch for it
-        "best": lambda r: (-(r[lead] or 0), -int(bool(r["verified"])),
-                           -(r["distinct_contributors"] or 0), -(r["members_count"] or 0)),
-        "seen": lambda r: (-(r["distinct_contributors"] or 0), -(r[lead] or 0)),
-        "members": lambda r: (-(r["members_count"] or 0),),
-        "files": lambda r: (-(r["media_count"] or 0),),
+        "best": lambda r: (r[lead] or 0, int(bool(r["verified"])),
+                           r["distinct_contributors"] or 0, r["members_count"] or 0),
+        "lead": lambda r: r[lead] or None,
+        "seen": lambda r: (r["distinct_contributors"] or 0, r[lead] or 0),
+        "members": lambda r: r["members_count"],
+        "files": lambda r: r["media_count"] or None,
+        "recent": lambda r: r["last_file_at"],
+        "name": _dname,
     }
     if sort not in sorts:
         sort = "best"
-    view = sorted(view, key=sorts[sort])
+    dfirst = {"name": "asc"}
+    if order not in ("asc", "desc"):
+        order = dfirst.get(sort, "desc")
+    view = _ls_sort(view, sorts[sort], order, _dname)
     page_size = max(10, min(limit, 200))
     page_offset = max(0, offset)
     page = view[page_offset:page_offset + page_size]
 
     def _dq(**over):
         cur = {"kind": kind or None, "audience": audience if audience != "sfw" else None,
-               "q": q, "sort": sort if sort != "best" else None, "mine": 1 if mine else None,
+               "q": q, "sort": sort if sort != "best" else None,
+               "order": order if order != dfirst.get(sort, "desc") else None,
+               "mine": 1 if mine else None,
                "limit": limit if limit != 50 else None}
         cur.update(over)
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
@@ -5841,13 +6741,16 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
            + _chip_link("SFW", "/discover" + _dq(audience=None, offset=None), audience == "sfw")
            + _chip_link("18+", "/discover" + _dq(audience="nsfw", offset=None), audience == "nsfw")
            if nsfw_on else '')
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("best match", "/discover" + _dq(sort=None, offset=None), sort == "best",
+        + '<span class="sep"></span>'
+        + _chip_link("best match", "/discover" + _dq(sort=None, order=None, offset=None), sort == "best",
                      "most of what you are looking at, then how many installs vouch for it")
-        + _chip_link("most seen", "/discover" + _dq(sort="seen", offset=None), sort == "seen",
+        + '<span class="sort-chips"><span class="lbl">Sort:</span>'
+        + _chip_link("most seen", "/discover" + _dq(sort="seen", order=None, offset=None), sort == "seen",
                      "indexed by the most tgarr installs")
-        + _chip_link("members", "/discover" + _dq(sort="members", offset=None), sort == "members")
-        + _chip_link("files", "/discover" + _dq(sort="files", offset=None), sort == "files")
+        + _chip_link("members", "/discover" + _dq(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link("files", "/discover" + _dq(sort="files", order=None, offset=None), sort == "files")
+        + _chip_link("latest file", "/discover" + _dq(sort="recent", order=None, offset=None), sort == "recent")
+        + '</span>'
         + '<span class="sep"></span>'
         + _chip_link(f'include the {len(have):,} I already have', "/discover" + _dq(mine=None if mine else 1, offset=None),
                      bool(mine)))
@@ -5856,6 +6759,7 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
                   for k, v in (("kind", kind), ("audience", audience if audience != "sfw" else None),
                                ("sort", sort if sort != "best" else None),
+                               ("order", order if order != dfirst.get(sort, "desc") else None),
                                ("mine", 1 if mine else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
           'placeholder="find a channel by name or @username…" style="flex:1;min-width:150px;max-width:420px"/>'
@@ -5863,13 +6767,18 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">clear</a>' if q else '')
         + '<span style="flex:1"></span>'
           '<span id="tgPullToast" style="font-size:13px;color:var(--muted);display:none"></span>'
-          '<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
-          'title="ask tgarr.me for its current list now">↻ Refresh list</button></form>')
+        + ('<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
+           'title="ask tgarr.me for its current list now">↻ Refresh list</button>' if _signed_in() else '')
+        + '</form>')
+
+    _in = _signed_in()
 
     def _card(r):
         u = r["username"]
         mine_ = known.get(u.lower())
-        btn = ('<button class="abtn" disabled>✓ Following</button>' if mine_ else
+        btn = ('<a class="abtn" href="/login" title="following a channel needs a Telegram account">'
+               'Sign in to follow</a>' if not _in else
+               '<button class="abtn" disabled>✓ Following</button>' if mine_ else
                f'<button class="abtn pri" data-uname="{html.escape(u, quote=True)}" '
                f'onclick="tgDiscoverSubscribe(this)" '
                f'title="tgarr reads this public channel without your account joining it">+ Follow</button>')
@@ -5890,9 +6799,13 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
             + ('<span class="tag warn">18+</span>' if r["audience"] == "nsfw" else '')
             + f'</div><div class="ls-sub"><a href="https://t.me/{html.escape(u)}" target="_blank" rel="noopener" '
             f'title="open in Telegram">@{html.escape(u)}</a>{"".join(has)}</div></div>'
-            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
-            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b>'
-            f'<span>installs</span></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r[lead]) if r[lead] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["media_count"]) if r["media_count"] else "–"}</b></div>'
+            f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
+            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b></div>'
+            f'<div class="ls-num lp" title="when the newest file that tgarr installs have reported for this '
+            f'channel was posted"><b style="font-size:13px;font-weight:500">'
+            f'{_ago(r["last_file_at"]) or "–"}</b></div>'
             f'<div class="ls-act">{btn}</div></div>')
 
     if not rows and not total:
@@ -5908,11 +6821,19 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
                    + ('<div style="margin-top:8px;font-size:13px">“Refresh list” asks tgarr.me for it now.</div>'
                       if not rows and not (q or kind) else '') + '</div>')
     else:
-        listing = (f'<div class="ls">{"".join(_card(r) for r in page)}</div>'
+        dhead = _ls_head(
+            (("name", "Channel", "ls-main", "asc"),
+             ("lead", {"book_files": "Books", "audio_files": "Songs"}.get(lead, "Films"), "ls-num", "desc"),
+             ("files", "Files", "ls-num", "desc"), ("members", "Members", "ls-num", "desc"),
+             ("seen", "Installs", "ls-num", "desc"), ("recent", "Latest file", "ls-num lp", "desc"),
+             (None, "", "ls-act", "")),
+            sort, order, lambda k, d: "/discover" + _dq(sort=k, order=d if d != dfirst.get(k, "desc") else None,
+                                                        offset=None))
+        listing = (f'<div class="ls">{dhead}{"".join(_card(r) for r in page)}</div>'
                    + _page_nav("/discover", _dq, page_offset, page_size, len(page), len(view)))
 
     body = (
-        f'{_LIST_CSS}'
+        f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
         f'<h2 class="section">Discover <span class="count">{len(view):,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
         f'letter-spacing:0;margin-left:10px">public channels other tgarr installs index · '
@@ -6035,6 +6956,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         # any chat, by its own id: a private chat has no @username to go by
         params.append(int(ch))
         where.append(f"c.id = ${len(params)}")
+    _in = _signed_in()
+    if not _in:
+        private = 0                       # no account, no private chats
+        where.append("c.username IS NOT NULL")
     if private:
         where.append("c.username IS NULL")
     if q:
@@ -6085,6 +7010,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                WHERE m.media_type = 'photo'
                  AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
                  {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}
+                 {"" if _in else "AND FALSE"}
                GROUP BY c.id
                ORDER BY count(*) DESC""")
         matched = await conn.fetchval(f"""
@@ -6761,7 +7687,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         "size":     "m.file_size DESC NULLS LAST",
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
-    where_parts = ["m.media_type = 'audio'"]
+    where_parts = ["m.media_type = 'audio'" + _pub_m()]
     params = []
     if q:
         params.append(f"%{q}%")
@@ -6955,7 +7881,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         "title":  "m.file_name ASC NULLS LAST",
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
-    where_parts = ["m.media_type = 'document'",
+    where_parts = ["m.media_type = 'document'" + _pub_m(),
                    "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"]
     params = []
     if q:
@@ -7131,7 +8057,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         if not n:
             return RedirectResponse("/login")
 
-    where = ["m.media_type = 'video'",
+    where = ["m.media_type = 'video'" + _pub_m(),
              "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
     params = []
     if q:
@@ -7331,10 +8257,13 @@ def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=No
                 f'title="other copies of this title: other resolutions or uploads">{versions} versions</a>')
     meta = [x for x in (_fmt_size(size), _fmt_dur_short(duration)) if x]
     acts = f'<a class="b pri" href="{watch}">▶ Play</a>'
-    if guid:
+    if not _signed_in():
+        fav = None                        # favourites and grabs belong to the account
+    if guid and _signed_in():
         acts += (f'<button class="b grab-btn" data-guid="{guid}" onclick="tgGrab(this)" '
                  f'title="save it to the download folder (the one Sonarr/Radarr read)">⬇ Grab</button>')
-    else:
+    elif _signed_in() or saved:
+        # signed out, only a file that is already on this machine can be handed over
         acts += (f'<a class="b sq" href="/media/{msg_id}" download title="download to this device">⬇</a>')
     if fav is not None:
         acts += (f'<button class="b sq{" on" if fav else ""}" onclick="tgFavCard(this,{msg_id})" '
@@ -7398,8 +8327,11 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         offset: int = 0,
                         min_mb: int = 100, aud: str = "sfw",
                         work: Optional[str] = None, sort: str = "best"):
-    if not login.session_exists():
-        return RedirectResponse("/login")
+    if not _signed_in():
+        # readable without the account, as long as there is something to read
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT 1 FROM channels LIMIT 1"):
+                return RedirectResponse("/login")
     _sorts = {"best": "composite_score DESC NULLS LAST, posted_at DESC NULLS LAST",
               "new": "posted_at DESC NULLS LAST, id DESC",
               "size": "size_bytes DESC NULLS LAST, id DESC",
@@ -7407,6 +8339,8 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     if sort not in _sorts:
         sort = "best"
     where = ["1=1"]
+    if not _signed_in():
+        where.append("c.username IS NOT NULL")
     params = []
     if q:
         for w in q.split():
@@ -7427,7 +8361,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     # aud == "any" or anything else → no audience filter beyond csam
     def _qual(w):
         # audience refs already use c. prefix — pass through
-        if "c.audience" in w:
+        if "c.audience" in w or "c.username" in w:
             return w
         return (w.replace("name ILIKE", "r.name ILIKE")
                  .replace("category =", "r.category =")
@@ -7629,9 +8563,10 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 async def page_downloads(tab: str = "players", q: Optional[str] = None,
                          kind: Optional[str] = None, sort: str = "recent",
                          fav: int = 0, offset: int = 0, limit: int = 50):
-    if not login.session_exists():
-        return RedirectResponse("/login")
-    tab = "grabs" if tab == "grabs" else "players"
+    # signed out: what is already saved from public channels can still be
+    # opened; nothing can be fetched, paused or removed
+    ro = not _signed_in()
+    tab = "grabs" if (tab == "grabs" and not ro) else "players"
     page_size = max(10, min(limit, 200))
     page_offset = max(0, offset)
     _my_dc = await _get_my_dc()
@@ -7655,7 +8590,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                WHERE d.status IN ('completed','failed','cancelled')
                ORDER BY d.finished_at DESC NULLS LAST LIMIT 100""")
 
-    fetches = await _player_fetches()
+    fetches = [] if ro else await _player_fetches()
     saved = (await _player_saved(q, kind, sort, fav, page_size, page_offset)
              if tab == "players" else None)
 
@@ -7706,8 +8641,8 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
         head = (f'<h2 class="section">Saved from players <span class="count">{saved["total"]:,}</span>'
                 f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
                 f'text-transform:none;letter-spacing:0;margin-left:10px">'
-                f'{_fmt_size(saved["bytes"]) or "0 MB"} · '
-                f'<a href="/settings#cache">clean-up rules</a></span></h2>'
+                f'{_fmt_size(saved["bytes"]) or "0 MB"}'
+                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>') + '</span></h2>'
                 f'{search}'
                 f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
         if not saved["rows"]:
@@ -7728,7 +8663,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 state = ""
             trs.append(
                 f'<tr data-id="{r["id"]}">'
-                f'<td class="ck"><input type="checkbox" class="sv"/></td>'
+                f'<td class="ck">{"" if ro else "<input type=checkbox class=sv />"}</td>'
                 f'<td class="ic">{ico.get(r["media_type"], "📄")}</td>'
                 f'<td class="nm"><a href="/watch/{r["id"]}">'
                 f'{html.escape(r["file_name"] or r["local_path"].rsplit("/", 1)[-1])}</a> '
@@ -7738,8 +8673,9 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<td class="ac"><div class="dl-ctrls">'
                 f'<a class="dl-btn sq" href="/media/{r["id"]}" download '
                 f'title="download to this device">⬇</a>'
-                f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
-                f'title="remove from the server">✗</button></div></td></tr>')
+                + ('' if ro else
+                   f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
+                   f'title="remove from the server">✗</button>') + '</div></td></tr>')
         table = (
             '<style>.sv-list{width:100%;border-collapse:collapse;background:var(--surface);'
             'border:1px solid var(--border);border-radius:10px;overflow:hidden}'
@@ -7751,15 +8687,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             'font-size:13px}.sv-list .ac{white-space:nowrap;text-align:right}'
             '.sv-list .nm a{color:var(--fg);text-decoration:none;word-break:break-all}'
             '.sv-list .nm a:hover{color:var(--accent)}</style>'
-            '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
-            '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
-            '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
-            '<span id="svN" style="color:var(--muted)"></span></div>'
-            '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
+            + ('' if ro else
+               '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
+               '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
+               '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
+               '<span id="svN" style="color:var(--muted)"></span></div>')
+            + '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
             '<th>last opened</th><th></th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table>'
             + _page_nav("/downloads", _dqs, page_offset, page_size, len(saved["rows"]), saved["total"])
-            + '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
+            + ('' if ro else '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
               'n=document.getElementById("svN");const boxes=()=>[...document.querySelectorAll(".sv")];'
               'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;n.textContent=c?c+" selected":""}'
               'all.onchange=()=>{boxes().forEach(b=>b.checked=all.checked);upd()};'
@@ -7768,7 +8705,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
               'if(!ids.length||!confirm("Remove "+ids.length+" file(s) from the server? They stay in the index '
               'and can be fetched again."))return;'
               'fetch("/api/fetch/remove",{method:"POST",headers:{"Content-Type":"application/json"},'
-              'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>')
+              'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>'))
         return head + table
 
     _fetch_js = ('<script>function fetchCancel(id){fetch("/api/fetch/"+id+"/cancel",{method:"POST"})'
@@ -7956,6 +8893,11 @@ function dlAct(id, action){
     tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
             + _tab("players", "Opened in players", len(fetches))
             + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active)) + '</div>')
+    if ro:
+        tabs = ('<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;'
+                'padding:12px 16px;margin-bottom:20px;color:var(--muted);font-size:14px">'
+                'Not signed in: files already saved from public channels can be opened and downloaded. '
+                '<a href="/login">Sign in to Telegram</a> to fetch more or to remove any.</div>')
     if tab == "players":
         body = f'{dl_css}{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
     else:
@@ -7975,13 +8917,15 @@ function dlAct(id, action){
 @app.get("/search", response_class=HTMLResponse)
 async def page_search(q: Optional[str] = None,
                       scope: Optional[str] = None):
-    if not login.session_exists():
-        return RedirectResponse("/login")
+    if not _signed_in():
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT 1 FROM channels LIMIT 1"):
+                return RedirectResponse("/login")
     scope = scope if scope in ("releases", "messages", "channels") else "releases"
     nsfw_on = await _is_nsfw_enabled()
     # what may be shown: never the hard-blocked, adult only when switched on
     gate = ("COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
-            + ("" if nsfw_on else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"))
+            + ("" if nsfw_on else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'") + _pub())
     results_html, elapsed_ms, found = "", 0, 0
     if q:
         t0 = time.time()
@@ -8110,8 +9054,81 @@ async def page_search(q: Optional[str] = None,
 # ════════════════════════════════════════════════════════════════════
 # Page: Settings
 # ════════════════════════════════════════════════════════════════════
+# ── the machine tgarr runs on, as far as a container can see it ───────
+def _disk_level(free: float, total: float) -> str:
+    """ok / warn / bad for a disk. Both an absolute floor and a share: 10 GB
+    free is plenty on a small disk's scale and nothing next to a 4K film."""
+    if not total:
+        return "off"
+    gb, share = free / 1024 ** 3, free / total
+    if gb < 5 or share < 0.03:
+        return "bad"
+    if gb < 20 or share < 0.10:
+        return "warn"
+    return "ok"
+
+
+def _host_info() -> dict:
+    """Disk, memory, load and uptime of the host. A bind-mounted folder
+    reports the host's disk, and /proc shows the host's memory and load, so
+    these are the real machine's numbers - not the container's."""
+    import platform
+    import shutil
+    info = {"disks": [], "mem": None, "load": None, "cores": os.cpu_count() or 0,
+            "uptime_s": None, "kernel": platform.release(), "arch": platform.machine()}
+    seen = {}
+    for path, label in (("/downloads", "Downloads folder"), ("/app/session", "tgarr data")):
+        try:
+            dev = os.stat(path).st_dev
+            u = shutil.disk_usage(path)
+        except OSError:
+            continue
+        if dev in seen:
+            seen[dev]["label"] += " + " + label.lower()
+            continue
+        d = {"label": label, "total": u.total, "free": u.free, "used": u.total - u.free,
+             "level": _disk_level(u.free, u.total)}
+        seen[dev] = d
+        info["disks"].append(d)
+    try:
+        kv = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                kv[k] = int(v.split()[0]) * 1024
+        total, avail = kv.get("MemTotal", 0), kv.get("MemAvailable", 0)
+        if total:
+            share = avail / total
+            info["mem"] = {"total": total, "avail": avail,
+                           "level": "bad" if share < 0.05 else "warn" if share < 0.12 else "ok"}
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        l1, l5, l15 = os.getloadavg()
+        per = l5 / max(1, info["cores"])
+        info["load"] = {"l1": l1, "l5": l5, "l15": l15,
+                        "level": "bad" if per > 3 else "warn" if per > 1.5 else "ok"}
+    except (OSError, AttributeError):
+        pass
+    try:
+        with open("/proc/uptime") as f:
+            info["uptime_s"] = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return info
+
+
+def _fmt_uptime(sec) -> str:
+    if not sec:
+        return "–"
+    d, h = int(sec // 86400), int(sec % 86400 // 3600)
+    return f"{d} d {h} h" if d else f"{h} h {int(sec % 3600 // 60)} min"
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def page_settings(request: Request):
+    if not _signed_in():
+        return RedirectResponse("/login")     # settings belong to the account
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
     async with db_pool.acquire() as conn:
@@ -8138,19 +9155,126 @@ async def page_settings(request: Request):
     cache_detail = " · ".join(
         f'{r["n"]:,} {_kind.get(r["kind"], r["kind"])} ({_fmt_size(r["bytes"]) or "0"})'
         for r in _usage) or "nothing downloaded yet"
-    user_html = (
-        f'<div class="name">@{html.escape(str(user.get("username") or user.get("first_name") or "-"))} '
-        f'<span class="pill ok">signed in</span></div>'
-        if authed else
-        '<div class="name">not signed in <span class="pill bad">no session</span></div>'
-    )
-    user_right = (
-        '<a class="btn" href="/login">Sign in</a>' if not authed
-        else '<button class="ghost" onclick="if(confirm(\'Sign out and remove session?\'))fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/login\')">Sign out</button>'
-    )
+    _full = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
+    _uname = user.get("username")
+    _shown = _full or (("@" + _uname) if _uname else "Telegram account")
+    try:                                   # the account's own picture, when it has one
+        _av = (f'<img class="acct-av" src="/api/me/avatar?v={int(os.path.getmtime(login.AVATAR_FILE))}" alt="">')
+    except OSError:
+        _av = (f'<div class="acct-av" style="background:{_color_for(_shown)}">'
+               f'{html.escape(_shown.lstrip("@")[:1].upper())}</div>')
+    account_html = (
+        f'<div class="acct">{_av}<div class="acct-txt">'
+        f'<div class="acct-name">{html.escape(_shown)}</div>'
+        f'<div class="acct-sub">'
+        + (f'@{html.escape(_uname)} · ' if _uname and _full else '')
+        + f'Telegram data center {my_dc_disp} <span class="pill ok">signed in</span></div>'
+        f'<div class="acct-meta">API ID <code>{html.escape(str(login.API_ID or "-"))}</code> · '
+        f'session at <code>_data/session/tgarr.session</code></div></div>'
+        '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'Sign out of Telegram on this tgarr?'
+        '\\n\\nPrivate chats are removed from the index. Public channels and files already saved stay.\'))'
+        'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">Sign out</button></div></div>')
+
+    # ── this machine ──
+    host = await asyncio.to_thread(_host_info)
+    async with db_pool.acquire() as conn:
+        db_bytes = await conn.fetchval("SELECT pg_database_size(current_database())")
+        idx_counts = await conn.fetchrow(
+            "SELECT (SELECT count(*) FROM channels) AS ch, (SELECT count(*) FROM messages) AS msgs")
+    _lvl_col = {"ok": "#10b981", "warn": "#f59e0b", "bad": "#ef4444", "off": "#94a3b8"}
+
+    def _bar(share: float, level: str) -> str:
+        return (f'<div class="sys-bar"><i style="width:{max(2, min(100, share * 100)):.0f}%;'
+                f'background:{_lvl_col[level]}"></i></div>')
+
+    def _gb(b) -> str:
+        g = (b or 0) / 1024 ** 3
+        return f"{g:.0f} GB" if g >= 10 else f"{g:.1f} GB"
+    tiles, alerts = [], []
+    for d in host["disks"]:
+        used_share = d["used"] / d["total"] if d["total"] else 0
+        tiles.append(
+            f'<div class="sys-t {d["level"]}"><div class="sys-l">💽 {html.escape(d["label"])}</div>'
+            f'<div class="sys-n">{_gb(d["free"])} <small>free</small></div>'
+            f'{_bar(used_share, d["level"])}'
+            f'<div class="sys-s">{_gb(d["used"])} used of {_gb(d["total"])} · {used_share * 100:.0f}% full</div></div>')
+        if d["level"] in ("warn", "bad"):
+            alerts.append((d["level"],
+                           f'<b>{html.escape(d["label"])}: {_gb(d["free"])} free.</b> '
+                           + ("New downloads and plays will start failing. " if d["level"] == "bad" else
+                              "Space is getting short. ")
+                           + 'Free some under <a href="#files">Downloaded files</a> below, or set an automatic clean-up there.'))
+    if host["mem"]:
+        m = host["mem"]
+        tiles.append(
+            f'<div class="sys-t {m["level"]}"><div class="sys-l">🧠 Memory</div>'
+            f'<div class="sys-n">{_gb(m["avail"])} <small>available</small></div>'
+            f'{_bar(1 - m["avail"] / m["total"], m["level"])}'
+            f'<div class="sys-s">of {_gb(m["total"])} in this machine</div></div>')
+        if m["level"] == "bad":
+            alerts.append(("bad", f'<b>Memory: only {_gb(m["avail"])} available.</b> '
+                                  'Converting e-books and playing several files at once may fail.'))
+    if host["load"]:
+        ld = host["load"]
+        tiles.append(
+            f'<div class="sys-t {ld["level"]}"><div class="sys-l">⚙ Processor</div>'
+            f'<div class="sys-n">{host["cores"]} <small>cores</small></div>'
+            f'<div class="sys-s">load {ld["l1"]:.2f} · {ld["l5"]:.2f} · {ld["l15"]:.2f}'
+            f'<br>(1, 5 and 15 minutes)</div></div>')
+    tiles.append(
+        f'<div class="sys-t"><div class="sys-l">🗂 Index</div>'
+        f'<div class="sys-n">{_fmt_size(db_bytes) or "0"}</div>'
+        f'<div class="sys-s">{idx_counts["ch"]:,} channels · {_fmt_count(idx_counts["msgs"])} posts<br>'
+        f'downloaded files: {html.escape(cache_total)}</div></div>')
+    tiles.append(
+        f'<div class="sys-t"><div class="sys-l">🖥 System</div>'
+        f'<div class="sys-n">{_fmt_uptime(host["uptime_s"])} <small>up</small></div>'
+        f'<div class="sys-s">Linux {html.escape(host["kernel"])}<br>{html.escape(host["arch"])} · '
+        f'tgarr {TGARR_VERSION}</div></div>')
+    alerts.sort(key=lambda a: a[0] != "bad")
+    machine_html = (
+        "".join(f'<div class="sys-alert {lvl}">{txt}</div>' for lvl, txt in alerts)
+        + f'<div class="sys">{"".join(tiles)}</div>')
 
     body = f"""
 <style>
+.settings h2.section {{ margin-top:32px; }}
+.settings .dl-list {{ border-radius:12px; }}
+.settings .dl-item {{ grid-template-columns:44px 1fr auto; gap:16px; padding:18px 20px; align-items:start; }}
+.settings .dl-item .icon {{ width:44px; height:44px; border-radius:12px; background:rgba(127,127,127,.09);
+  display:flex; align-items:center; justify-content:center; font-size:20px; }}
+.settings .dl-item .info .name {{ font-size:15.5px; line-height:1.5; }}
+.settings .dl-item .info .meta {{ font-size:13.5px; }}
+.settings code {{ font-size:12.5px; padding:1px 6px; border-radius:5px; background:rgba(127,127,127,.12); }}
+.acct {{ display:flex; align-items:center; gap:22px; padding:22px 24px; background:var(--surface);
+  border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow); flex-wrap:wrap; }}
+.acct-av {{ width:92px; height:92px; border-radius:50%; object-fit:cover; flex:none; display:flex;
+  align-items:center; justify-content:center; color:#fff; font-size:38px; font-weight:700;
+  box-shadow:0 0 0 4px var(--surface), 0 0 0 5px var(--border); }}
+.acct-txt {{ flex:1; min-width:220px; }}
+.acct-name {{ font-size:22px; font-weight:700; color:var(--fg); line-height:1.25; }}
+.acct-sub {{ margin-top:4px; font-size:14px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+.acct-meta {{ margin-top:10px; font-size:13px; color:var(--muted); }}
+.acct-act {{ flex:none; }}
+.sys {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(165px, 1fr)); gap:12px; }}
+.sys-t {{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px;
+  box-shadow:var(--shadow); }}
+.sys-t.warn {{ border-color:#fcd34d; background:#fffbeb; }}
+.sys-t.bad {{ border-color:#fca5a5; background:#fef2f2; }}
+.sys-l {{ font-size:12px; font-weight:600; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); }}
+.sys-n {{ font-size:24px; font-weight:700; color:var(--fg); margin:6px 0 8px; line-height:1.15; }}
+.sys-n small {{ font-size:13px; font-weight:500; color:var(--muted); }}
+.sys-t.warn .sys-n {{ color:#b45309; }} .sys-t.bad .sys-n {{ color:#b91c1c; }}
+.sys-s {{ font-size:12.5px; color:var(--muted); line-height:1.5; }}
+.sys-bar {{ height:6px; border-radius:3px; background:rgba(127,127,127,.18); overflow:hidden; margin-bottom:8px; }}
+.sys-bar i {{ display:block; height:100%; border-radius:3px; }}
+.sys-alert {{ padding:12px 16px; border-radius:10px; margin-bottom:12px; font-size:14px; line-height:1.55; }}
+.sys-alert.warn {{ background:#fffbeb; border:1px solid #fde68a; color:#92400e; }}
+.sys-alert.bad {{ background:#fef2f2; border:1px solid #fecaca; color:#991b1b; }}
+.sys-alert a {{ color:inherit; font-weight:600; }}
+@media (max-width:820px) {{ .acct {{ padding:16px; gap:14px; }} .acct-av {{ width:68px; height:68px; font-size:28px; }}
+  .acct-name {{ font-size:19px; }} .settings .dl-item {{ grid-template-columns:36px 1fr; }}
+  .settings .dl-item .icon {{ width:36px; height:36px; font-size:17px; }} .settings .dl-item .right {{ grid-column:1 / -1; }} }}
 .settings .dl-item .meta {{ display:block; line-height:1.65; }}
 .settings .dl-item .meta .pill {{ vertical-align:middle; }}
 .settings input[type=number] {{ font:inherit; font-size:14px; padding:6px 8px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--fg); text-align:center; }}
@@ -8160,16 +9284,10 @@ async def page_settings(request: Request):
 </style>
 <script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
 <div class="settings">
-<h2 class="section">Telegram account</h2>
-<div class="dl-list">
-  <div class="dl-item">
-    <div class="icon">👤</div>
-    <div class="info">{user_html}
-      <div class="meta">API ID <code>{os.environ.get("TG_API_ID","-")}</code> · session at <code>_data/session/tgarr.session</code></div>
-    </div>
-    <div class="right">{user_right}</div>
-  </div>
-</div>
+{account_html}
+
+<h2 class="section">This machine</h2>
+{machine_html}
 
 <h2 class="section">Library</h2>
 <div class="dl-list">
@@ -8200,7 +9318,7 @@ async def page_settings(request: Request):
     </div>
   </div>
   <div class="dl-item" id="cache">
-    <div class="icon">💾</div>
+    <div class="icon" id="files">💾</div>
     <div class="info">
       <div class="name">Downloaded files — <span class="pill ok">{cache_total}</span></div>
       <div class="meta">
@@ -8495,6 +9613,23 @@ def _alias_in_name(alias: str, raw: str) -> bool:
     return False
 
 
+def _alias_names_release(alias: str, raw: str) -> bool:
+    """Does this alias name this release? A whole-token match - and, for a
+    very short non-English alias, only at the start of the name: two-character
+    titles are common (主角, 家业, 三体) but so are two-character words
+    (生命 is 'Life' the series and also just 'life'), and '宇宙的奇迹' must
+    not be offered as 'Cosmos'."""
+    if not _alias_in_name(alias, raw):
+        return False
+    if alias.isascii() or len(alias) > 2:
+        return True
+    head = raw.lstrip("#[【(（ \t")
+    if not head.startswith(alias):
+        return False
+    after = head[len(alias):len(alias) + 1]
+    return not after.isalnum()
+
+
 async def _refresh_series_aliases():
     """Reload alias map from DB. Called lazily — once per minute is plenty
     for newznab feed queries."""
@@ -8511,6 +9646,19 @@ async def _refresh_series_aliases():
     _series_aliases_loaded_at = time.time()
 
 
+_OFFERED_SE_RX = re.compile(r"\.S(\d{1,3})E\d{1,4}")
+
+
+def _offered_season(r) -> int:
+    """The season a release is offered to an *arr under: its own; else the one
+    in the name it is given on the way out (an alias can name a season, and a
+    release without one goes out as season 1); else 1."""
+    if r["season"] is not None:
+        return int(r["season"])
+    m = _OFFERED_SE_RX.search(_rewrite_release_title_sync(r))
+    return int(m.group(1)) if m else 1
+
+
 def _rewrite_release_title_sync(r, my_dc=None) -> str:
     """Outbound rewrite (release → newznab feed). Substring match against
     cached alias map. DC tag included as release-group suffix so Sonarr sees
@@ -8519,7 +9667,7 @@ def _rewrite_release_title_sync(r, my_dc=None) -> str:
     file_dc = r["file_dc"] if hasattr(r, "__getitem__") and "file_dc" in (r.keys() if hasattr(r, "keys") else []) else None
     dc_tag = f"-dc{file_dc}" if file_dc else ""
     for alias_text, canonical, season, kind in _series_aliases_cache:
-        if alias_text in raw and _alias_in_name(alias_text, raw):
+        if alias_text in raw and _alias_names_release(alias_text, raw):
             if kind == "movie" and r["category"] == "tv":
                 continue   # a movie's alias must not rename a TV episode
             if kind != "movie" and r["category"] == "movie":
@@ -8562,6 +9710,61 @@ def _expand_inbound_query(q: str) -> list:
     return list(variants)
 
 
+ALIAS_LOOKUPS_PER_RUN = 40
+
+
+def _names_to_aliases(names, canonical: str) -> list:
+    """The names worth matching release names against: specific enough
+    (_alias_ok), not the canonical title itself, not absurdly long."""
+    canon = (canonical or "").strip().casefold()
+    out = []
+    for n in sorted(names):
+        n = (n or "").strip()
+        if n and n.casefold() != canon and len(n) <= 80 and _alias_ok(n):
+            out.append(n)
+    return out
+
+
+async def _alias_names_from_metadata(series: list) -> int:
+    """Other-language names for the series Sonarr tracks, by TVDB number.
+    Each series is asked about once (again after two weeks if nothing was
+    found, or sooner after a failed request). A name never replaces an alias
+    that came from Sonarr, Radarr or was entered by hand."""
+    # newest first: the series just added is the one being searched for now
+    known = [(int(s["tvdbId"]), s.get("title") or "")
+             for s in sorted(series, key=lambda s: s.get("id") or 0, reverse=True)
+             if s.get("tvdbId") and s.get("title")]
+    if not known:
+        return 0
+    async with db_pool.acquire() as conn:
+        done = {r["tvdb_id"] for r in await conn.fetch(
+            """SELECT tvdb_id FROM series_alias_lookups
+               WHERE names > 0 OR looked_at > NOW() - INTERVAL '14 days'""")}
+        key = await conn.fetchval("SELECT value FROM config WHERE key='tmdb_api_key'")
+    added = 0
+    for tvdb_id, canonical in [k for k in known if k[0] not in done][:ALIAS_LOOKUPS_PER_RUN]:
+        try:
+            names, source = await md.series_names(tvdb_id, key or None)
+        except Exception as e:
+            logging.getLogger("tgarr.alias").info("names for tvdb %s: %s - later", tvdb_id, str(e)[:80])
+            await asyncio.sleep(2)
+            continue
+        aliases = _names_to_aliases(names, canonical)
+        async with db_pool.acquire() as conn:
+            for a in aliases:
+                r = await conn.execute(
+                    """INSERT INTO series_aliases (alias_text, canonical_title, season, kind, source, external_id)
+                       VALUES ($1, $2, NULL, 'tv', $3, $4) ON CONFLICT (alias_text) DO NOTHING""",
+                    a, canonical, source, tvdb_id)
+                added += r.endswith("1")
+            await conn.execute(
+                """INSERT INTO series_alias_lookups (tvdb_id, names, source) VALUES ($1, $2, $3)
+                   ON CONFLICT (tvdb_id) DO UPDATE SET looked_at = NOW(), names = $2, source = $3""",
+                tvdb_id, len(aliases), source)
+        await asyncio.sleep(0.4)
+    return added
+
+
 async def _arr_alias_sync_worker():
     """Pull Sonarr+Radarr series + alternateTitles, UPSERT into series_aliases.
     Runs hourly. Endpoints + keys from env. Failures non-fatal — manual
@@ -8593,6 +9796,16 @@ async def _arr_alias_sync_worker():
                             "%s fetch failed: %s", app_name, e)
                         return []
                 items = await asyncio.to_thread(_fetch)
+                if kind == "tv" and items:
+                    try:
+                        n_meta = await _alias_names_from_metadata(items)
+                        if n_meta:
+                            logging.getLogger("tgarr.alias").info(
+                                "%d other-language series names added", n_meta)
+                            global _series_aliases_loaded_at
+                            _series_aliases_loaded_at = 0.0      # use them at once
+                    except Exception as e:
+                        logging.getLogger("tgarr.alias").warning("series names: %s", e)
                 aliases = []
                 for it in items:
                     canonical = it.get("title") or ""
@@ -8761,8 +9974,12 @@ async def newznab_api(
     if t == "tvsearch":
         where_parts.append("r.category = 'tv'")
         if season is not None:
+            # A release with no season of its own ("第 12 集", "EP12" - most
+            # Chinese series) is offered as season 1, or as the season its
+            # alias names; it must be findable under that season too. Sonarr
+            # always asks with a season, so "r.season = N" alone hid them all.
             params.append(season)
-            where_parts.append(f"r.season = ${len(params)}")
+            where_parts.append(f"(r.season = ${len(params)} OR r.season IS NULL)")
         if ep is not None:
             params.append(ep)
             where_parts.append(f"r.episode = ${len(params)}")
@@ -8811,9 +10028,12 @@ async def newznab_api(
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
+    total = rows[0]["_total"] if rows else 0
+    if t == "tvsearch" and season is not None:
+        rows = [r for r in rows if _offered_season(r) == season]
+        total = max(0, offset) + len(rows)
     items = "\n".join(_item_xml(r, base_url, apikey or "tgarr",
                                  my_dc=_release_my_dc) for r in rows)
-    total = rows[0]["_total"] if rows else 0
     return Response(
         _feed_envelope(items, f"search t={t} q={q or ''}", base_url,
                        offset=max(0, offset), total=total),

@@ -124,7 +124,7 @@ A starter list of channels is at <https://tgarr.me/channels/>.
 |---|---|
 | Dashboard 404 | Container failed to start — `docker compose logs api` |
 | 0 releases after 30 min | All joined channels are link-only or have no media. Join a real piracy/media channel. |
-| Crawler logs `FloodWait` | Telegram rate-limit — Pyrogram handles automatically. Reduce `TG_BACKFILL_LIMIT` for faster startup. |
+| Crawler logs `FloodWait` | Telegram rate-limit — handled automatically. Reduce `TG_BACKFILL_LIMIT` for faster startup. |
 | Download stuck "downloading" | Big file or slow Telegram DC. Watch `_data/downloads/tgarr/<release>/*.temp` size. |
 | Sonarr "test" indexer fails | Bad URL. From the CasaOS box, `curl http://localhost:8765/newznab/api?t=caps` should return XML. |
 

@@ -12,6 +12,7 @@ import asyncio
 import base64
 import io
 import json
+import re
 import logging
 import os
 from typing import Optional
@@ -25,7 +26,10 @@ from pyrogram import Client
 # thumbnails, previews, downloads, backfill — died with "Peer id invalid".
 # Widen the range to the current MTProto limit.
 from pyrogram import utils as _pyro_utils
-if _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
+# (Only the original Pyrogram has this constant. Kurigram, the maintained fork
+# tgarr uses now, handles the larger ids by itself and does not define it.)
+if getattr(_pyro_utils, "MIN_CHANNEL_ID", None) is not None \
+        and _pyro_utils.MIN_CHANNEL_ID > -1007852516352:
     _pyro_utils.MIN_CHANNEL_ID = -1007852516352
 from pyrogram.errors import (
     AuthTokenExpired,
@@ -43,14 +47,65 @@ from pyrogram.raw.types.auth import (
 
 log = logging.getLogger("tgarr.login")
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
 SESSION_DIR = "/app/session"
+# The Telegram app id and hash: from .env when given there, otherwise from
+# this file, written by the first-run page. An install that has neither
+# starts anyway and asks for them in the browser.
+APP_FILE = os.path.join(SESSION_DIR, "telegram_app.json")
+_APP_HASH_RX = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _valid_app(api_id, api_hash) -> bool:
+    return (str(api_id).isdigit() and 0 < int(api_id) < 10 ** 12
+            and bool(_APP_HASH_RX.match(str(api_hash))))
+
+
+def _load_app():
+    api_id, api_hash = (os.environ.get("TG_API_ID") or "").strip(), (os.environ.get("TG_API_HASH") or "").strip()
+    if _valid_app(api_id, api_hash):
+        return int(api_id), api_hash, "env"
+    try:
+        with open(APP_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if _valid_app(d.get("api_id"), d.get("api_hash")):
+            return int(d["api_id"]), d["api_hash"], "file"
+    except (OSError, ValueError):
+        pass
+    return 0, "", ""
+
+
+API_ID, API_HASH, APP_SOURCE = _load_app()
+
+
+def app_configured() -> bool:
+    return bool(API_ID)
+
+
+def save_app(api_id: str, api_hash: str) -> dict:
+    """Keep the id and hash typed into the first-run page. Only while none is
+    set: a working install's values are never replaced from the browser."""
+    global API_ID, API_HASH, APP_SOURCE
+    if app_configured():
+        return {"status": "error", "message": "the Telegram app is already set"}
+    api_id, api_hash = (api_id or "").strip(), (api_hash or "").strip().lower()
+    if not _valid_app(api_id, api_hash):
+        return {"status": "error",
+                "message": "The App api_id is a number and the App api_hash is 32 letters and digits (0-9, a-f)."}
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    tmp = APP_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"api_id": int(api_id), "api_hash": api_hash}, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, APP_FILE)
+    API_ID, API_HASH, APP_SOURCE = int(api_id), api_hash, "file"
+    return {"status": "ok"}
 REVOKED_MARKER = os.path.join(SESSION_DIR, ".revoked")
 # user_info lives in-memory (lost on container restart) but the session file
 # persists on the mounted volume. Persist the self-user beside it so the
 # sidebar doesn't fall back to @anonymous after a watchtower restart.
 USER_INFO_FILE = os.path.join(SESSION_DIR, "user_info.json")
+# the account's profile picture, written by the crawler (it holds the live client)
+AVATAR_FILE = os.path.join(SESSION_DIR, "avatar.jpg")
 
 # The crawler owns the LIVE session file (tgarr.session). The login flow never
 # opens it: every attempt runs against a scratch session and the result is
@@ -139,10 +194,19 @@ def ensure_user_info() -> Optional[dict]:
     session file — reload it here so callers (sidebar, settings) show the
     real username instead of @anonymous until a get_me re-populates it.
     """
-    if state.user_info:
-        return state.user_info
     if not session_exists():
         return None
+    # the crawler rewrites the file when it learns more (last name, a renamed
+    # account): take the newer copy rather than what sign-in left in memory
+    try:
+        mt = os.path.getmtime(USER_INFO_FILE)
+        if mt != getattr(state, "_user_info_mtime", None):
+            state._user_info_mtime = mt
+            state.user_info = None
+    except OSError:
+        pass
+    if state.user_info:
+        return state.user_info
     try:
         if os.path.exists(USER_INFO_FILE):
             with open(USER_INFO_FILE, "r", encoding="utf-8") as f:
@@ -353,20 +417,23 @@ async def _qr_poll_loop():
                 # DC auth_key triggers AUTH_TOKEN_EXPIRED on ImportLoginToken.
                 from pyrogram.session import Auth, Session
                 try:
+                    # Kurigram connects to an address it is given (Pyrogram
+                    # had the data centres' addresses built in): ask for the
+                    # new one while still connected to the old, and store it
+                    # with the session - connect() refuses a session that
+                    # holds no server address.
+                    opt = await client.get_dc_option(
+                        r.dc_id, ipv6=bool(getattr(client, "ipv6", False)))
+                    test_mode = await client.storage.test_mode()
                     await client.session.stop()
                     await client.storage.dc_id(r.dc_id)
+                    await client.storage.server_address(opt.ip_address)
+                    await client.storage.port(opt.port)
                     new_auth_key = await Auth(
-                        client,
-                        await client.storage.dc_id(),
-                        await client.storage.test_mode(),
-                    ).create()
+                        client, r.dc_id, opt.ip_address, opt.port, test_mode).create()
                     await client.storage.auth_key(new_auth_key)
                     client.session = Session(
-                        client,
-                        await client.storage.dc_id(),
-                        await client.storage.auth_key(),
-                        await client.storage.test_mode(),
-                    )
+                        client, r.dc_id, opt.ip_address, opt.port, new_auth_key, test_mode)
                     await client.session.start()
                     r2 = await client.invoke(ImportLoginToken(token=r.token))
                     if isinstance(r2, LoginTokenSuccess):
@@ -460,7 +527,7 @@ def logout() -> dict:
     state.client = None
     removed = []
     _reset_scratch()
-    for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json"):
+    for fn in ("tgarr.session", "tgarr.session-journal", "user_info.json", "avatar.jpg"):
         path = os.path.join(SESSION_DIR, fn)
         if os.path.exists(path):
             try:

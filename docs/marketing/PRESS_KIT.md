@@ -10,7 +10,7 @@
 >
 > The project addresses two long-standing gaps in self-hosted media tooling. First, the NZB indexer ecosystem serves only ~200,000 paid users globally and single-indexer outages routinely break Sonarr/Radarr workflows. Second, the BitTorrent alternative exposes the user's IP to thousands of peers, triggers ISP DMCA notices, and invites DPI throttling. tgarr eliminates both: it indexes a billion-user content layer (Telegram) and delivers files over encrypted MTProto, which is indistinguishable from ordinary Telegram chat traffic to an observer.
 >
-> The stack is Python (Pyrogram + asyncpg + FastAPI), Postgres 16, Meilisearch, packaged as Docker compose. Multi-arch images (amd64 + arm64) run on Synology DSM, CasaOS, Unraid, TrueNAS Scale, QNAP, Portainer, plain Linux, or Kubernetes. tgarr is MIT licensed, content-neutral, and explicitly does not host files or encourage copyright infringement — full statement in the project's RESPONSIBLE_USE.md.
+> The stack is Python (Kurigram + asyncpg + FastAPI), Postgres 16, Meilisearch, packaged as Docker compose. Multi-arch images (amd64 + arm64) run on Synology DSM, CasaOS, Unraid, TrueNAS Scale, QNAP, Portainer, plain Linux, or Kubernetes. tgarr is MIT licensed, content-neutral, and explicitly does not host files or encourage copyright infringement — full statement in the project's RESPONSIBLE_USE.md.
 
 ## 500-word description (full article / Wikipedia-style entry)
 
@@ -24,7 +24,7 @@
 >
 > ## Architecture
 >
-> tgarr consists of four cooperating components: a Pyrogram-based crawler that listens to channels the user has joined under their own Telegram user account; a Postgres + Meilisearch index that stores parsed release metadata; a FastAPI-based Newznab XML API server that Sonarr/Radarr query; and a worker that streams completed files from Telegram's CDN via MTProto and delivers them to the user's *arr completed folder, where Sonarr or Radarr import them as if they had arrived from any NZB indexer.
+> tgarr consists of four cooperating components: a Kurigram-based crawler that listens to channels the user has joined under their own Telegram user account; a Postgres + Meilisearch index that stores parsed release metadata; a FastAPI-based Newznab XML API server that Sonarr/Radarr query; and a worker that streams completed files from Telegram's CDN via MTProto and delivers them to the user's *arr completed folder, where Sonarr or Radarr import them as if they had arrived from any NZB indexer.
 >
 > The Newznab API contract means Sonarr and Radarr require no special configuration — tgarr appears in their indexer list as a generic Newznab source. Existing Quality Profiles, search behavior, and Plex/Jellyfin import workflows all continue to function unchanged.
 >
@@ -72,7 +72,7 @@
 - **Codeberg mirror:** https://codeberg.org/tgarr-pro/tgarr
 - **First release:** v0.1.0-alpha, 2026
 - **License:** MIT
-- **Language:** Python (Pyrogram, FastAPI, asyncpg)
+- **Language:** Python (Kurigram, FastAPI, asyncpg)
 - **Datastore:** PostgreSQL 16 + Meilisearch
 - **Deployment:** Docker Compose, multi-arch (amd64/arm64)
 - **Maintainers:** tgarr contributors (open-source community)
@@ -103,7 +103,7 @@ These land in v0.2.
 - **Sonarr** — TV automation manager that tgarr serves as an indexer for
 - **Radarr** — Movie automation manager that tgarr serves as an indexer for
 - **NZBHydra2** — Meta-indexer that can use tgarr as one of its backends
-- **Pyrogram** — MTProto Python library that tgarr is built on
+- **Kurigram** — the maintained fork of Pyrogram, the MTProto Python library tgarr is built on
 - **Jellyfin / Plex** — media servers downstream from the *arr stack
 
 ## Embargo / press preview policy

@@ -18,6 +18,7 @@ Defense in depth:
 - distinct_contributors >= 3 → channel auto-verified (community confirmation).
 """
 import asyncio
+import gzip
 import hashlib
 import html
 import json
@@ -25,6 +26,7 @@ import logging
 import os
 import re
 import struct
+from datetime import datetime, timezone
 import time
 from typing import Optional
 
@@ -36,7 +38,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("tgarr-registry")
 
 DB_DSN = os.environ["DB_DSN"]
-VERSION = "0.5.6"
+VERSION = "0.5.7"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
 # PostgreSQL regexes (used with ~*). Keep the three copies (crawler, api,
@@ -134,6 +136,11 @@ async def _startup():
     await _seed_honeypots()
     asyncio.create_task(_build_central_sketch())
     asyncio.create_task(_audience_classifier())
+    try:
+        import webcrawl
+        webcrawl.start()        # slow reader of t.me's public preview, own thread
+    except Exception as e:
+        log.warning("web reader not started: %s: %s", type(e).__name__, e)
     log.info("registry up — schema applied + honeypots seeded + bloom builder scheduled")
 
 
@@ -157,7 +164,6 @@ async def _startup():
 BLOOM_M_BITS = 256 * 1024 * 1024  # 32 MiB
 BLOOM_M_BYTES = BLOOM_M_BITS // 8
 BLOOM_K = 8
-BLOOM_REBUILD_INTERVAL_SEC = 300
 # Default 3 — consensus threshold. Set to 1 for solo-client demo / testing
 # (lets Bloom include single-source fuids so the client can verify the
 # skip-redundant-push path before other clients exist).
@@ -176,71 +182,123 @@ def _bloom_indices(fuid: str) -> list:
     ]
 
 
+# The filter is a SUMMARY of what the registry holds, and installs need it
+# only to avoid uploading what is already here. It used to be rebuilt every
+# five minutes with the build time inside it, so it differed every five
+# minutes and every install downloaded all of it (20 MB on the wire) again
+# and again: 99% of everything this server sent.
+#
+# Now: one summary per UTC day, of everything first seen BEFORE that day
+# began - identical for everybody all day, so "do you have a newer one?" is
+# answered with 304. And each finished day's additions are published as a
+# small list of its own (GET …/delta/<day>): an install that has yesterday's
+# summary fetches a few hundred kilobytes, not the summary again. A finished
+# day never changes, so its list can be cached for ever by anything in front
+# of the registry.
+SKETCH_DELTA_DAYS = 30                 # how far back a day's additions are served
+_central_sketch_day: str = ""          # the UTC day the current summary is for
+_delta_cache: dict = {}                # day -> gzip bytes
+
+
+def _utc_day(offset_days: int = 0) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + offset_days * 86400))
+
+
+def _fill_bloom(ids) -> bytearray:
+    b = bytearray(BLOOM_M_BYTES)
+    for fuid in ids:
+        for idx in _bloom_indices(fuid):
+            b[idx >> 3] |= (1 << (idx & 7))
+    return b
+
+
 async def _build_central_sketch():
-    """Periodic Bloom rebuild — runs forever on a background task."""
-    global _central_sketch_blob, _central_sketch_etag
+    """Build the day's summary at start and again whenever the UTC day turns."""
+    global _central_sketch_blob, _central_sketch_etag, _central_sketch_day
     while True:
-        try:
-            t0 = time.time()
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT file_unique_id FROM registry_resources "
-                    "WHERE distinct_contributors >= $1 "
-                    "  AND file_unique_id IS NOT NULL",
-                    BLOOM_DC_THRESHOLD)
-            # ~4M ids x 8 hashes is tens of seconds of pure Python. Run it in a
-            # worker thread: on the event loop it froze every request for the
-            # whole build, every 5 minutes.
-            fuids = [r["file_unique_id"] for r in rows if r["file_unique_id"]]
-            del rows
-
-            def _fill(ids):
-                b = bytearray(BLOOM_M_BYTES)
-                for fuid in ids:
-                    for idx in _bloom_indices(fuid):
-                        b[idx >> 3] |= (1 << (idx & 7))
-                return b
-
-            bits = await asyncio.to_thread(_fill, fuids)
-            n = len(fuids)
-            del fuids
-            # 20-byte header: magic(4) + m_bits(4) + k(1) + reserved(3) + n(4) + built_at(4)
-            header = struct.pack(
-                "<4sIB3xII",
-                b"BLM1", BLOOM_M_BITS, BLOOM_K, n, int(time.time()))
-            blob = bytes(header) + bytes(bits)
-            etag = hashlib.sha256(blob).hexdigest()[:32]
-            _central_sketch_blob = blob
-            _central_sketch_etag = etag
-            log.info("[bloom] rebuilt n=%d m=%d k=%d bytes=%d build_ms=%d etag=%s",
-                     n, BLOOM_M_BITS, BLOOM_K, len(blob),
-                     int((time.time()-t0)*1000), etag)
-        except Exception as e:
-            log.warning("[bloom] rebuild failed: %s", e)
-        await asyncio.sleep(BLOOM_REBUILD_INTERVAL_SEC)
+        day = _utc_day()
+        if day != _central_sketch_day:
+            try:
+                t0 = time.time()
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT file_unique_id FROM registry_resources "
+                        "WHERE distinct_contributors >= $1 AND file_unique_id IS NOT NULL "
+                        "  AND first_seen_at < $2::date",
+                        BLOOM_DC_THRESHOLD, datetime.strptime(day, "%Y-%m-%d").date())
+                # ~4M ids x 8 hashes is tens of seconds of pure Python: in a
+                # worker thread, or every request waits for the build.
+                fuids = [r["file_unique_id"] for r in rows if r["file_unique_id"]]
+                del rows
+                bits = await asyncio.to_thread(_fill_bloom, fuids)
+                n = len(fuids)
+                del fuids
+                # 20-byte header: magic(4) + m_bits(4) + k(1) + reserved(3) + n(4) + built_at(4).
+                # built_at is the START of the day, not the moment of the build:
+                # the same day gives the same bytes after a restart.
+                day_start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+                header = struct.pack("<4sIB3xII", b"BLM1", BLOOM_M_BITS, BLOOM_K, n, day_start)
+                blob = bytes(header) + bytes(bits)
+                _central_sketch_blob = blob
+                _central_sketch_etag = hashlib.sha256(blob).hexdigest()[:32]
+                _central_sketch_day = day
+                for old in [d for d in _delta_cache if d < _utc_day(-SKETCH_DELTA_DAYS - 1)]:
+                    _delta_cache.pop(old, None)
+                log.info("[bloom] summary for %s: n=%d bytes=%d build_ms=%d etag=%s",
+                         day, n, len(blob), int((time.time() - t0) * 1000), _central_sketch_etag)
+            except Exception as e:
+                log.warning("[bloom] rebuild failed: %s", e)
+                await asyncio.sleep(120)
+                continue
+        await asyncio.sleep(60)
 
 
 @app.get("/api/v1/known_resources/sketch")
 async def known_resources_sketch(request: Request):
-    """Bloom filter of consensus-met file_unique_ids. Clients fetch this and
-    skip pushing fuids that test 'present' — those already have ≥3 contributors
-    so further pushes are redundant.
-
-    ETag-based caching: client passes If-None-Match → 304 if unchanged.
-    Server rebuilds every 5 min. Filter format documented in builder above.
+    """Bloom filter of the file ids the registry held when today (UTC) began.
+    Clients skip uploading what tests 'present'. The same bytes all day:
+    If-None-Match gets 304. X-Sketch-Day names the day; additions since are
+    under /api/v1/known_resources/delta/<day>.
     """
     if not _central_sketch_blob:
         return Response("sketch not ready yet", status_code=503,
                         headers={"Retry-After": "30"})
+    head = {"ETag": f'"{_central_sketch_etag}"', "X-Sketch-Day": _central_sketch_day,
+            "Cache-Control": "public, max-age=3600"}
     inm = request.headers.get("if-none-match", "").strip('"')
     if inm == _central_sketch_etag:
-        return Response(status_code=304,
-                        headers={"ETag": f'"{_central_sketch_etag}"'})
-    return Response(
-        _central_sketch_blob,
-        media_type="application/octet-stream",
-        headers={"ETag": f'"{_central_sketch_etag}"',
-                 "Cache-Control": "public, max-age=300"})
+        return Response(status_code=304, headers=head)
+    return Response(_central_sketch_blob, media_type="application/octet-stream", headers=head)
+
+
+@app.get("/api/v1/known_resources/delta/{day}")
+async def known_resources_delta(day: str):
+    """The file ids first seen on one finished UTC day: gzip, one id per line.
+    An install holding the summary for <day> adds these and then holds the
+    summary for the day after. Never changes once the day is over."""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+        raise HTTPException(400, "day must be YYYY-MM-DD")
+    if day >= _utc_day():
+        raise HTTPException(404, "that day is not over yet")
+    if day < _utc_day(-SKETCH_DELTA_DAYS):
+        raise HTTPException(410, "too old: fetch the summary instead")
+    hit = _delta_cache.get(day)
+    if hit is None:
+        try:
+            d0 = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, "day must be YYYY-MM-DD")
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT file_unique_id FROM registry_resources "
+                "WHERE first_seen_at >= $1::date AND first_seen_at < ($1::date + 1) "
+                "  AND distinct_contributors >= $2 AND file_unique_id IS NOT NULL",
+                d0, BLOOM_DC_THRESHOLD)
+        text = "\n".join(r["file_unique_id"] for r in rows).encode()
+        hit = (await asyncio.to_thread(gzip.compress, text, 6), len(rows))
+        _delta_cache[day] = hit
+    return Response(hit[0], media_type="application/gzip", headers={
+        "Cache-Control": "public, max-age=31536000, immutable", "X-Count": str(hit[1])})
 
 
 async def _audience_classifier():
@@ -292,7 +350,10 @@ async def _audience_classifier():
                                 count(*) FILTER (WHERE rr.media_type = 'video') AS v,
                                 count(*) FILTER (WHERE rr.file_name ~* $1) AS rel,
                                 count(*) FILTER (WHERE rr.file_name ~* $2) AS b,
-                                count(*) FILTER (WHERE rr.media_type = 'audio') AS a
+                                count(*) FILTER (WHERE rr.media_type = 'audio') AS a,
+                                -- a post cannot be from the future: a wrong clock
+                                -- (or a liar) must not make a channel look busy
+                                LEAST(max(ch.posted_at), NOW()) AS last_file
                          FROM registry_resource_channels ch
                          JOIN registry_resources rr USING (file_unique_id)
                          WHERE NOT rr.blocked
@@ -301,6 +362,8 @@ async def _audience_classifier():
                          UPDATE registry_channels rc
                             SET release_files = st.rel, video_files = st.v,
                                 book_files = st.b, audio_files = st.a,
+                                -- the web reader may have seen a newer file post
+                                last_file_at = GREATEST(rc.last_file_at, st.last_file),
                                 files_stats_at = NOW()
                            FROM st WHERE rc.username = st.u
                          RETURNING 1)
@@ -633,6 +696,21 @@ async def contribute(request: Request):
             await _bump_suspicion(f"inst:{inst_hash}", 30 * seeds_csam_flagged,
                                 f"csam-seed-x{seeds_csam_flagged}")
 
+    # === What the install found for the candidates it was given ===
+    # Without this a dead or private candidate stayed "not looked at" and was
+    # handed out again and again. Only a candidate still waiting is changed.
+    seed_results = _seed_results_clean(body.get("seed_results"))
+    if seed_results:
+        async with db_pool.acquire() as conn:
+            await conn.executemany(
+                """UPDATE seed_candidates
+                      SET validation_status = $2, validated_at = NOW(),
+                          validation_attempts = COALESCE(validation_attempts, 0) + 1,
+                          validation_error = 'reported by an install'
+                    WHERE username = $1
+                      AND (validation_status IS NULL OR validation_status = 'pending')""",
+                seed_results)
+
     # Honest deception: return the SAME shape regardless. Bad actor can't
     # tell their submission was caught — they just see normal-looking counts.
     return {"status": "ok", "accepted": accepted, "rejected": rejected,
@@ -957,8 +1035,12 @@ async def channel_resources(request: Request):
     lets a client rehydrate its local index after a post-leave purge so grab
     / download works again without re-crawling the whole history from TG.
     """
+    # Clients send this request gzip-compressed, like the other POSTs.
+    # request.json() does not decompress: every call was answered 400 and no
+    # install ever got a channel's list back.
+    raw = await _read_body(request)
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception:
         raise HTTPException(400, "invalid json body")
     ip_hash = _ip_hash(request)
@@ -967,19 +1049,58 @@ async def channel_resources(request: Request):
     if not channel or not USERNAME_RX.match(channel):
         raise HTTPException(400, "invalid channel_username")
     try:
-        limit = min(int(body.get("limit") or 50000), 100000)
+        limit = min(int(body.get("limit") or CHANNEL_LIST_MAX), CHANNEL_LIST_MAX)
     except (TypeError, ValueError):
-        limit = 50000
+        limit = CHANNEL_LIST_MAX
+    return await _channel_file_list(channel, limit)
+
+
+# How many files one answer may carry. The median channel has ~1,400; a few
+# have over 100,000, and one such answer is ~20 MB. The newest few thousand
+# are what a new follower looks at; the rest arrives when the channel is read.
+CHANNEL_LIST_MAX = int(os.environ.get("CHANNEL_LIST_MAX", "5000"))
+
+
+# How many lists one address may fetch in a day. An install asks once per
+# channel it follows, then once a day for what is new; a few hundred covers
+# anybody. Without a ceiling one address could walk every channel in a loop
+# - the web server's 10 requests a second would let it pull tens of GB a day.
+CHANNEL_LIST_PER_IP_DAY = int(os.environ.get("CHANNEL_LIST_PER_IP_DAY", "600"))
+_chlist_day: list = ["", {}]
+
+
+def _chlist_allow(ip_hash: str) -> bool:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    if _chlist_day[0] != day:
+        _chlist_day[0], _chlist_day[1] = day, {}
+    seen = _chlist_day[1]
+    seen[ip_hash] = seen.get(ip_hash, 0) + 1
+    return seen[ip_hash] <= CHANNEL_LIST_PER_IP_DAY
+
+
+async def _channel_file_list(channel: str, limit: int, after: int = 0) -> dict:
+    """The newest files installs have reported for a public channel - only
+    those posted after message `after`, when the caller already holds the
+    rest. Nothing from a blocked channel, and no blocked file, is ever
+    handed out."""
+    limit = max(1, min(int(limit), CHANNEL_LIST_MAX))
+    after = max(0, int(after or 0))
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT rc.file_unique_id, rc.msg_id, rc.posted_at,
-                   r.file_name, r.file_size, r.mime_type, r.media_type
-            FROM registry_resource_channels rc
-            JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
-            WHERE rc.channel_username = $1 AND rc.msg_id IS NOT NULL
-            ORDER BY rc.msg_id DESC
-            LIMIT $2
-        """, channel, limit)
+        if await conn.fetchval(
+                "SELECT 1 FROM registry_channels WHERE lower(username) = lower($1) "
+                "AND (blocked OR audience = 'blocked_csam')", channel):
+            rows = []
+        else:
+            rows = await conn.fetch("""
+                SELECT rc.file_unique_id, rc.msg_id, rc.posted_at,
+                       r.file_name, r.file_size, r.mime_type, r.media_type
+                FROM registry_resource_channels rc
+                JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
+                WHERE rc.channel_username = $1 AND rc.msg_id IS NOT NULL AND NOT r.blocked
+                  AND rc.msg_id > $3
+                ORDER BY rc.msg_id DESC
+                LIMIT $2
+            """, channel, limit, after)
     return {"status": "ok", "channel_username": channel, "count": len(rows),
             "resources": [{
                 "file_unique_id": r["file_unique_id"],
@@ -992,6 +1113,27 @@ async def channel_resources(request: Request):
             } for r in rows]}
 
 
+@app.get("/api/v1/channel_resources")
+async def channel_resources_get(request: Request, channel: str = Query(""), limit: int = Query(0),
+                                after: int = Query(0)):
+    """The same list as a plain GET: no body, nothing about the caller, so
+    the CDN in front of the registry can answer it. A popular channel is then
+    read from the database a few times a day however many installs follow it,
+    instead of once per install."""
+    channel = (channel or "").strip().lstrip("@")
+    if not channel or not USERNAME_RX.match(channel):
+        raise HTTPException(400, "invalid channel")
+    if not _chlist_allow(_ip_hash(request)):
+        raise HTTPException(429, f"daily limit of {CHANNEL_LIST_PER_IP_DAY} channel lists reached",
+                            headers={"Retry-After": "3600"})
+    data = await _channel_file_list(channel, limit or CHANNEL_LIST_MAX, after)
+    # the whole list changes slowly and is the same for everybody: 6 hours.
+    # "what is newer than message N" differs per caller: one hour.
+    return JSONResponse(data, headers={
+        "Cache-Control": ("public, max-age=3600" if after else
+                          "public, max-age=21600, stale-while-revalidate=86400")})
+
+
 
 # ====================================================================
 # GET /api/v1/seeds
@@ -1001,6 +1143,49 @@ async def channel_resources(request: Request):
 # because /contribute is idempotent + distinct_contributors aggregation
 # naturally dedupes consensus.
 # ====================================================================
+# An install asks about once an hour. This used to be counted against the
+# channel-list allowance (24 a day), which it used up entirely by itself.
+SEEDS_PULLS_PER_IP_DAY = int(os.environ.get("SEEDS_PULLS_PER_IP_DAY", "48"))
+_seeds_day: list = ["", {}]
+
+
+def _seeds_allow(ip_hash: str) -> bool:
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    if _seeds_day[0] != day:
+        _seeds_day[0], _seeds_day[1] = day, {}
+    seen = _seeds_day[1]
+    seen[ip_hash] = seen.get(ip_hash, 0) + 1
+    return seen[ip_hash] <= SEEDS_PULLS_PER_IP_DAY
+
+
+def _seed_kind_sql(kind: str) -> str:
+    """Which candidates an install is given. Names are read from t.me's public
+    preview by the registry itself (webcrawl.py) - an install would spend one
+    of its ~200 daily name lookups on each. Invite links cannot be read from
+    the web, so they are the work that needs an account. 'any' therefore
+    means invite links; only an explicit kind=username returns names."""
+    return "invite_link IS NULL" if kind == "username" else "invite_link IS NOT NULL"
+
+
+_SEED_RESULT = {"alive": "alive", "dead": "dead", "private": "forbidden"}
+
+
+def _seed_results_clean(items) -> list:
+    """(candidate key, status) pairs from an install's report: what it found
+    for the candidates it was given. At most 100, known statuses only."""
+    out = []
+    if not isinstance(items, list):
+        return out
+    for it in items[:100]:
+        if not isinstance(it, dict):
+            continue
+        key = it.get("username")
+        st = _SEED_RESULT.get(it.get("status"))
+        if isinstance(key, str) and 5 <= len(key) <= 80 and st:
+            out.append((key.strip(), st))
+    return out
+
+
 @app.get("/api/v1/seeds")
 async def get_seeds(
     request: Request,
@@ -1019,27 +1204,21 @@ async def get_seeds(
     _test_ips = [s.strip() for s in (os.getenv("TGARR_TEST_SHOWCASE_IPS") or "").split(",") if s.strip()]
     _bypass_rate_limit = ip_hash in _test_ips
 
+    if not _bypass_rate_limit and not _seeds_allow(ip_hash):
+        raise HTTPException(
+            429, f"daily seeds-pull limit exceeded ({SEEDS_PULLS_PER_IP_DAY}/day)",
+            headers={"Retry-After": "3600"})
     async with db_pool.acquire() as conn:
-        if not _bypass_rate_limit:
-            # Rate limit: same registry_pulls counter as /api/v1/registry
-            today_pulls = await conn.fetchval(
-                """SELECT count(*) FROM registry_pulls
-                   WHERE ip_hash = $1
-                     AND pulled_at > NOW() - INTERVAL '24 hours'""", ip_hash)
-            if today_pulls and today_pulls >= PULL_LIMIT_FREE_PER_DAY:
-                raise HTTPException(
-                    429, f"daily seeds-pull limit exceeded ({PULL_LIMIT_FREE_PER_DAY}/day free)")
 
         # Apply suspicion gate (same as /registry)
         susp = await _suspicion_score(ip_hash)
         if susp >= 60:
             raise HTTPException(403, "suspicion-blocked")
 
-        where_clauses = ["validation_status = 'pending'"]
-        if kind == "username":
-            where_clauses.append("invite_link IS NULL")
-        elif kind == "invite":
-            where_clauses.append("invite_link IS NOT NULL")
+        # not looked at yet: 'pending', or never given a status at all
+        # (invite links reported by installs arrive that way)
+        where_clauses = ["(validation_status = 'pending' OR validation_status IS NULL)",
+                         _seed_kind_sql(kind)]
 
         sql = f"""SELECT username, invite_link, source, category,
                          audience_hint, language, region
@@ -1048,11 +1227,6 @@ async def get_seeds(
                   ORDER BY RANDOM()
                   LIMIT $1"""
         rows = await conn.fetch(sql, batch)
-
-        # Log the pull (same registry_pulls table used for /registry)
-        await conn.execute(
-            "INSERT INTO registry_pulls (ip_hash, api_key_set) VALUES ($1, FALSE)",
-            ip_hash)
 
     return {
         "version": VERSION,
@@ -1230,7 +1404,8 @@ async def get_registry(
     limit = max(1, min(limit, 20000))
     base_cols = ("username, title, members_count, media_count, audience, "
                 "language, category, distinct_contributors, verified, "
-                "last_seen_at, release_files, video_files, book_files, audio_files")
+                "last_seen_at, release_files, video_files, book_files, audio_files, "
+                "last_file_at")
     async with db_pool.acquire() as conn:
         if honeypot_ratio > 0:
             # Suspicious tier: poison the well. Compute split, fetch separately,
@@ -1261,8 +1436,9 @@ async def get_registry(
                 f"COALESCE(members_count,0) DESC LIMIT {limit}")
     def _row_json(r):
         d = dict(r)
-        if d.get("last_seen_at"):
-            d["last_seen_at"] = d["last_seen_at"].isoformat()
+        for k in ("last_seen_at", "last_file_at"):
+            if d.get(k):
+                d[k] = d[k].isoformat()
         return d
     body = {"version": VERSION,
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1503,3 +1679,8 @@ Each instance POSTs eligible channels here; clients pull a deduped, contributor-
 <table><thead><tr><th>username</th><th>title</th><th>members</th><th>distinct contributors</th></tr></thead>
 <tbody>{rows or '<tr><td colspan="4" style="text-align:center;color:#94a3b8">no contributions yet</td></tr>'}</tbody></table>
 </body></html>"""
+
+
+# Operator panel at /admin/ - off unless registry/admin.json exists.
+import admin as _admin  # noqa: E402
+_admin.setup(app, lambda: db_pool, VERSION, _ip_hash)

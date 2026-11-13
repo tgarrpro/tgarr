@@ -67,6 +67,7 @@ services:
         condition: service_started
     labels:
       com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: tgarr
     environment:
       TG_API_ID: ${TG_API_ID}
       TG_API_HASH: ${TG_API_HASH}
@@ -91,6 +92,7 @@ services:
         condition: service_healthy
     labels:
       com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: tgarr
     # an init process reaps what a stopped e-book conversion leaves behind
     init: true
     # Sonarr / Radarr published on this same host are reachable as
@@ -106,6 +108,9 @@ services:
       TGARR_BASE_URL: ${TGARR_BASE_URL:-}
       TMDB_API_KEY: ${TMDB_API_KEY:-}
       TGARR_API_KEY: ${TGARR_API_KEY:-}
+      # lets the Dashboard say "you pinned this version" instead of "your updater is broken"
+      TGARR_PINNED_TAG: ${TGARR_TAG:-}
+      TGARR_UPDATE_CHECK: ${TGARR_UPDATE_CHECK:-true}
       TGARR_UI_PASSWORD: ${TGARR_UI_PASSWORD:-}
     volumes:
       - ./_data/session:/app/session
@@ -122,7 +127,19 @@ services:
     container_name: tgarr-watchtower
     restart: unless-stopped
     logging: *tgarr-logging
+    # Keeping this updater and a watchtower of your own apart. A watchtower
+    # that starts up stops every other watchtower it can see, as "an old
+    # copy of itself" - so tgarr's updater and yours used to kill each other.
+    # Two things prevent it: the scope makes this one look only at tgarr's
+    # containers, and the first label below makes it invisible to yours as a
+    # watchtower (the image marks itself with ...watchtower=true; a scope
+    # alone does not stop an unscoped watchtower from finding it).
+    labels:
+      com.centurylinklabs.watchtower: "false"
+      com.centurylinklabs.watchtower.enable: "false"
+      com.centurylinklabs.watchtower.scope: tgarr
     environment:
+      WATCHTOWER_SCOPE: tgarr
       # watchtower speaks Docker API 1.25 unless told otherwise, and Docker
       # engines from 2025 on refuse anything that old: without this line the
       # updater crashes at start and nothing is ever updated. 1.40 is

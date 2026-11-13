@@ -113,3 +113,30 @@ ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS book_files INTEGER;
 ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS audio_files INTEGER;
 ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS files_stats_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_reg_release_files ON registry_channels (release_files DESC NULLS LAST);
+
+-- When the newest file installs have reported for this channel was posted:
+-- how active the channel is, as far as the federation has seen.
+ALTER TABLE registry_channels ADD COLUMN IF NOT EXISTS last_file_at TIMESTAMPTZ;
+
+-- One row a minute: how busy the server was and what the registry sent and
+-- received. Kept so that capacity can be judged from history, not guessed.
+CREATE TABLE IF NOT EXISTS registry_metrics (
+    ts            TIMESTAMPTZ PRIMARY KEY DEFAULT NOW(),
+    cpu_busy      REAL,          -- % of all cores busy during the minute
+    load1         REAL,
+    cores         INTEGER,
+    mem_avail     BIGINT,
+    mem_total     BIGINT,
+    disk_free     BIGINT,
+    disk_total    BIGINT,
+    requests      INTEGER,       -- answered by the registry in the minute
+    bytes_out     BIGINT,        -- response bodies, before the web server compresses them
+    bytes_in      BIGINT,
+    inflight_peak INTEGER,       -- most requests being answered at one moment
+    errors        INTEGER,       -- 5xx
+    db_conns      INTEGER,
+    by_path       JSONB          -- {"GET /api/v1/x": [requests, bytes_out], ...}
+);
+
+-- A day's additions to the dedup summary are read by first_seen_at.
+CREATE INDEX IF NOT EXISTS idx_rsrc_first_seen ON registry_resources (first_seen_at);
