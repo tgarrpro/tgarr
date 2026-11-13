@@ -7199,7 +7199,7 @@ def _friendly_name(file_name, caption) -> str:
 _MEDIACENTER_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
-<title>Media Center</title>
+<title>tgarr Media Center</title>
 <link rel="icon" href="/favicon.svg"/>
 <style>
 :root{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--accent:__COLOR__;
@@ -7211,8 +7211,13 @@ html,body{margin:0;background:var(--bg);color:var(--ink);
   font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
 a{color:inherit;text-decoration:none}
 .top{display:flex;align-items:center;gap:14px;padding:18px clamp(16px,4vw,44px) 6px}
-.logo{font-size:26px;font-weight:800;letter-spacing:-.5px;display:flex;align-items:center;gap:10px;flex:1;min-width:0}
-.logo i{font-style:normal;font-size:30px}
+.logo{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+/* tgarr's own mark and wordmark, as in the side menu of the main pages */
+.logo .mark{width:34px;height:34px;flex:none;color:#229ED9}
+.logo .wm{font-size:34px;font-weight:900;letter-spacing:-1.8px;line-height:.9;color:#229ED9}
+.logo .wm b{font-weight:900;color:var(--ink)}
+.logo .mc{font-size:21px;font-weight:700;color:var(--soft);padding-left:12px;margin-left:4px;border-left:2px solid var(--line);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .grown{font-size:13px;color:var(--soft);padding:9px 14px;border-radius:999px;border:1.5px solid var(--line);
   background:var(--card);white-space:nowrap}
 .grown:hover{border-color:var(--accent);color:var(--ink)}
@@ -7263,11 +7268,13 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
 .lb.on{display:flex}.lb img{max-width:96vw;max-height:92vh;border-radius:12px}
 .lb button{position:fixed;top:14px;right:16px;width:50px;height:50px;border-radius:50%;border:0;font-size:24px;cursor:pointer}
 .lb .nv{top:50%;transform:translateY(-50%)}.lb .pv{left:14px;right:auto}.lb .nx{right:14px}
-@media (max-width:560px){.cats{grid-template-columns:repeat(4,1fr);gap:8px}.cat small{display:none}.logo{font-size:22px}}
+@media (max-width:560px){.cats{grid-template-columns:repeat(4,1fr);gap:8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
 </style></head>
 <body>
 <div class="top">
-  <a class="logo" href="/mediacenter"><i>🌈</i><span>Media Center</span></a>
+  <a class="logo" href="/mediacenter" aria-label="tgarr Media Center">
+    <svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    <span class="wm">tg<b>arr</b></span><span class="mc">Media Center</span></a>
   __GROWN__
 </div>
 <nav class="cats">__CATS__</nav>
