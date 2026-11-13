@@ -5011,6 +5011,8 @@ div.ub { cursor:default; }
            text-decoration:none; cursor:pointer; }
 .ub-menu a:hover, .ub-menu button:hover { background:rgba(127,127,127,.1); }
 .ub-menu button { color:#dc2626; border-top:1px solid var(--border); border-radius:0 0 7px 7px; margin-top:4px; }
+.user a.ub-lk { display:block; text-align:center; margin:2px 10px 4px; padding:7px 12px; font-size:13px; color:var(--muted);
+                border:1px solid var(--border); border-radius:8px; }
 .user .ub-menu a { color:var(--fg); font-weight:400; }
 .user a.ub-in { color:#fff; }
 .ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
@@ -5405,7 +5407,8 @@ def _user_block() -> str:
     if not _signed_in():
         return ('<div class="ub"><div class="ub-av none">?</div>'
                 '<div class="ub-txt"><b>Not signed in</b><small>browsing what is already indexed</small></div></div>'
-                '<a class="ub-in" href="/login">Sign in to Telegram</a>')
+                '<a class="ub-in" href="/login">Sign in to Telegram</a>'
+                + ('<a class="ub-lk" href="/lock">🔒 Lock</a>' if _ACCESS["pin"] else ''))
     user = login.ensure_user_info() or {}
     uname = user.get("username")
     name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or "Telegram account"
@@ -5423,6 +5426,7 @@ def _user_block() -> str:
         '<a href="/mediacenter/manage">Media Center &amp; PIN</a>'
         + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
            if uname else '')
+        + ('<a href="/lock">🔒 Lock (back to the Media Center)</a>' if _ACCESS["pin"] else '')
         + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
         '<button type="button" class="ub" onclick="tgUserMenu(event)" title="account">'
         f'{av}<span class="ub-txt"><b>{html.escape(name)}</b>'
@@ -7585,6 +7589,15 @@ async def api_unlock(request: Request):
     return _unlock_cookie(JSONResponse({"status": "ok"}), cfg["secret"], bool(body.get("remember")))
 
 
+@app.get("/lock")
+async def page_lock():
+    """Lock this browser again: forget that the PIN was entered here, and go
+    to the Media Center. A plain address, so that it can be a link anywhere."""
+    resp = RedirectResponse("/mediacenter", status_code=303)
+    resp.delete_cookie(access.COOKIE, path="/")
+    return resp
+
+
 @app.post("/api/lock")
 async def api_lock():
     resp = JSONResponse({"status": "ok"})
@@ -7968,7 +7981,8 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
                + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">More →</a>' if more else "")
                + "</div>")
     grown = ('<a class="grown" href="/unlock" title="for grown-ups">🔒 Grown-ups</a>' if locked else
-             '<a class="grown" href="/mediacenter/manage">⚙ Choose what is shown</a>'
+             ('<a class="grown" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
+             + '<a class="grown" href="/mediacenter/manage">⚙ Choose what is shown</a>'
              '<a class="grown" href="/">← Back to tgarr</a>')
     heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
     page = (_MEDIACENTER_HTML.replace("__COLOR__", colour).replace("__GROWN__", grown).replace("__CATS__", cats)
