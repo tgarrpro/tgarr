@@ -2958,12 +2958,13 @@ function collect(){
 // the pages a paragraph starts and ends on: one that runs over a page break
 // has a piece in each column
 function pagesOf(el){
-  // measured against where the page will rest: a sideways slide still in
-  // flight gives positions that do not add up, so finish it first
-  if (Math.abs(doc.body.scrollLeft - page * W) > 1) doc.body.scrollLeft = page * W;
-  const at = x => Math.max(0, Math.min(pages - 1, Math.floor((x + doc.body.scrollLeft + 2) / W)));
-  const rs = el.getClientRects();
-  if (!rs.length) { const p = at(el.getBoundingClientRect().left); return [p, p]; }
+  // Measured against the first thing in the chapter, not against how far the
+  // text is scrolled: while a page is sliding the two do not add up, and a
+  // paragraph on this page was taken for one on the next.
+  const first = doc.body.firstElementChild || el, ref = first.getClientRects()[0], rs = el.getClientRects();
+  if (!ref || !rs.length) return [page, page];
+  // columns start a whole screen apart (half a screen with two pages)
+  const at = x => Math.max(0, Math.min(pages - 1, Math.floor((x - ref.left + W * 0.2) / W)));
   return [at(rs[0].left), at(rs[rs.length - 1].left)];
 }
 function turnTo(p){ if (p !== page) { page = p; slide(); ui(); } }
