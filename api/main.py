@@ -7787,6 +7787,10 @@ function tgChGone(b, note) {
   b.disabled = true; b.textContent = note;
   if (row) { row.style.transition = "opacity .5s"; row.style.opacity = "0.35";
              setTimeout(function () { row.remove(); }, 900); }
+  // the numbers in the heading and on the chips are from when the page was made: once the
+  // last of a run of clicks has settled, read the page again so that they are right
+  clearTimeout(window.tgChAgain);
+  window.tgChAgain = setTimeout(function () { location.reload(); }, 1800);
 }
 function tgChSet(b, following) {
   // unfollowed: it has left the list. Followed again from "being cleared": it has left that view.
