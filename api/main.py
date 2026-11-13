@@ -7206,6 +7206,39 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 if len(_uniq) == 12:
                     break
             latest = _uniq
+            # A tile says how many items the page behind it lists when it is opened -
+            # the same filters, in the same words. Counting every row instead gave
+            # "116,411 videos" over a page of ten: the page leaves out 18+ channels,
+            # clips under 50 MB and second copies of the same file, the tile did not.
+            _vis = "" if _signed_in() else " AND (c.username IS NOT NULL OR c.local_root IS NOT NULL)"
+            tile = {}
+            try:
+                for _cat in ("movie", "tv"):
+                    tile[_cat] = await conn.fetchval(
+                        f"""WITH base AS (SELECT r.id, {_WORK_KEY_SQL} AS wk FROM releases r
+                              LEFT JOIN messages m ON m.id = r.primary_msg_id
+                              LEFT JOIN channels c ON c.id = m.channel_id
+                              WHERE r.category = $1 AND COALESCE(r.size_bytes, 0) >= 100 * 1024 * 1024
+                                AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis})
+                            SELECT count(DISTINCT COALESCE(wk, 'id:' || id::text)) FROM base""", _cat)
+                tile["video"] = await conn.fetchval(
+                    f"""SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE m.media_type = 'video' AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis}
+                          AND (COALESCE(m.file_size, 0) >= 50 * 1024 * 1024 OR c.local_root IS NOT NULL)
+                          AND NOT EXISTS (SELECT 1 FROM messages o JOIN channels oc ON oc.id = o.channel_id
+                                          WHERE o.file_unique_id = m.file_unique_id AND o.id > m.id AND o.media_type = 'video'
+                                            AND COALESCE(oc.audience, 'sfw') = COALESCE(c.audience, 'sfw'){_pub("oc")})""")
+                _adult = "" if await _is_nsfw_enabled() else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"
+                tile["photo"] = await conn.fetchval(
+                    f"""SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+                        FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE (m.media_type = 'photo' OR (m.media_type IS NULL AND m.file_name IS NULL
+                                 AND COALESCE(m.mime_type, '') = '' AND m.file_unique_id IS NOT NULL))
+                          AND COALESCE(m.thumb_path, '') <> '__failed__' AND COALESCE(m.thumb_path, '') <> '__deleted__'
+                          AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'{_adult}{_vis}""")
+            except Exception as _e:
+                log.warning("[dashboard] tile counts: %s", _e)      # fall back to the plain totals below
+            lib = dict(lib, tile=tile)
             try:
                 hb = await conn.fetchval("SELECT max(last_seen) FROM worker_status")
             except Exception:
@@ -7278,13 +7311,19 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 f'<div class="tn">{n:,}</div><div class="tl">{label}</div>'
                 + (f'<div class="tp">+{_fmt_count(plus)} today</div>' if plus else '<div class="tp">&nbsp;</div>')
                 + '</a>')
+    _tn = lib.get("tile") or {}
+
+    def _shown(key, fallback):
+        return _tn[key] if _tn.get(key) is not None else fallback
+    # ("+N today" counts everything that arrived; it is left off where the page lists a
+    # selection of it, so that a tile never says "10" with "+2.3K today" under it)
     tiles = (
-        _tile("/releases?cat=movie", "🎬", lib["films"], "films", 0)
-        + _tile("/releases?cat=tv", "📺", lib["episodes"], "episodes", 0)
-        + _tile("/videos", "▶", st["videos"], "videos", new_today.get("video", 0))
+        _tile("/releases?cat=movie", "🎬", _shown("movie", lib["films"]), "films", 0)
+        + _tile("/releases?cat=tv", "📺", _shown("tv", lib["episodes"]), "episodes", 0)
+        + _tile("/videos", "▶", _shown("video", st["videos"]), "videos", 0 if "video" in _tn else new_today.get("video", 0))
         + _tile("/music", "🎵", st["audio"], "songs", new_today.get("audio", 0))
         + _tile("/library", "📚", st["books"], "books", 0)
-        + _tile("/gallery", "🖼", st["photos"], "photos", new_today.get("photo", 0))
+        + _tile("/gallery", "🖼", _shown("photo", st["photos"]), "photos", 0 if "photo" in _tn else new_today.get("photo", 0))
         + _tile("/channels", "📡", st["channels"], "channels", 0))
 
     # ── now ──
