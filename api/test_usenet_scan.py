@@ -424,4 +424,8 @@ ok(sk2.cards(detail=0) == [], "nothing read in a group named for it makes a card
 # the registry's copy of the rules and this one must be the same text
 ok("FORBIDDEN_SQL" in dir(R) and R.FORBIDDEN_RX.pattern == R.FORBIDDEN_SQL and R.MINOR_RX.pattern == R.MINOR_SQL, "the patterns Postgres is given are the ones Python uses")
 
+ok(R.group_never("alt.binaries.pictures.erotica.teenfemale") and R.group_never("alt.binaries.pictures.erotica.teensex")
+   and R.group_never("alt.binaries.erotica.youngmen") and not R.group_never("alt.binaries.tv.teen") and not R.group_never("alt.binaries.sounds.mp3.youngsters"),
+   "an adult group named for the young, also when the word runs on; a group for the young that is not adult is an ordinary group")
+
 print(f"ok - {n} checks")

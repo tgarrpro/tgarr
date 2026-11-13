@@ -8260,10 +8260,11 @@ async def _usenet_cfg(fresh: bool = False) -> dict:
             "port": int(d.get("port") or 563), "ssl": d.get("ssl", "1") != "0",
             "user": d.get("user") or "", "pass": d.get("pass") or "",
             "per_day": max(0, int(d.get("per_day") or 2_000_000)),
-            # taking part in the shared index (off unless switched on). "conns" is the most this
-            # install is willing to use; the registry says how many it may (one for an ordinary
-            # install), and the smaller of the two is used
-            "index": d.get("index") == "1", "conns": max(1, min(int(d.get("conns") or 12), 20))})
+            # With Usenet on, this install takes part in the shared index - as with Telegram,
+            # what it finds is shared: names and pointers, never files. There is no switch for
+            # that alone. "conns" is the most it is willing to use for reading the index; the
+            # registry says how many it may (one for an ordinary install): the smaller is used.
+            "index": d.get("enabled") == "1", "conns": max(1, min(int(d.get("conns") or 12), 20))})
     return _USENET["cfg"]
 
 
@@ -8559,7 +8560,7 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
 # ════════════════════════════════════════════════════════════════════
 # Taking part in the shared Usenet index (docs/USENET_INDEX.md).
 #
-# Off unless switched on (config usenet_index = 1). When on: the registry
+# On whenever Usenet is on - there is no switch of its own. The registry
 # leases this install a window - a group and a stretch of time - and says
 # how to read it (sparsely at first: a few headers every couple of thousand
 # articles). The window is read over several connections, the releases seen
@@ -8772,32 +8773,12 @@ async def _usenet_from_registry(q: str) -> int:
 
 @app.get("/api/usenet/index")
 async def api_usenet_index():
-    """What the index worker is doing (for the settings page and for looking)."""
+    """What the index worker is doing (for looking; there is nothing to switch)."""
     cfg = await _usenet_cfg()
     async with db_pool.acquire() as conn:
         kept = await conn.fetchval("SELECT count(*) FROM usenet_cards WHERE sketch")
     return {"on": bool(cfg.get("index")), "conns": cfg.get("conns", 1), "state": _UN_INDEX["state"],
             "window": _UN_INDEX["window"], "last": _UN_INDEX["last"], "cards": kept}
-
-
-@app.post("/api/usenet/index")
-async def api_usenet_index_set(request: Request):
-    try:
-        b = await request.json()
-    except Exception:
-        b = {}
-    vals = {"usenet_index": "1" if b.get("on") else "0"}
-    try:
-        if b.get("conns"):
-            vals["usenet_conns"] = str(max(1, min(int(b["conns"]), 20)))
-    except (TypeError, ValueError):
-        return JSONResponse({"status": "error", "message": "connections must be a number"}, status_code=400)
-    async with db_pool.acquire() as conn:
-        for k, v in vals.items():
-            await conn.execute("""INSERT INTO config (key, value) VALUES ($1, $2)
-                                  ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
-    await _usenet_cfg(fresh=True)
-    return {"status": "ok"}
 
 
 @app.post("/api/usenet/settings")
@@ -8863,6 +8844,10 @@ async def page_settings_usenet(request: Request):
 <p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
 card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
 tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet).</p>
+<p style="color:var(--muted);margin:6px 0 4px">Newsgroups hold fifteen years of posts, far more than one account reads in a lifetime, so the
+reading is shared, as it is for Telegram: tgarr.me hands every install a different stretch of a group, takes back the cards found
+there - a name, who posted it, where it lies - and a search here also finds what the others found. No file, no NZB and nothing
+about your account or your provider's name is sent. Reading the index uses one connection, so that your downloader keeps the rest.</p>
 <div class="un-grid">
 <label>News server<input id="unHost" value="{html.escape(cfg.get("host") or "", quote=True)}" placeholder="news.example.com"/></label>
 <label>Port<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
@@ -8873,22 +8858,6 @@ tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet 
 <label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
 <div style="height:8px"></div>
 <button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span></div>
-<div class="un-box"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px">
-<h3 style="margin:0;flex:1">Shared index</h3>
-<label class="un-sw" title="take part in the shared index"><input type="checkbox" id="unIdx" {"checked" if cfg.get("index") else ""} onchange="unIdxSave()"/><span></span><b>{"On" if cfg.get("index") else "Off"}</b></label></div>
-<p style="color:var(--muted);margin:0 0 4px">Newsgroups hold fifteen years of posts: far more than one account reads in a lifetime.
-With this on, tgarr.me hands this install a stretch of a group to read - headers only - and takes back one small card per film,
-episode, album or book found there: its name, who posted it and where it lies. Every install taking part reads a different
-stretch, and a search here also finds what the others found. No file, no NZB and nothing about your account or your provider's
-name is sent; nothing is downloaded.</p>
-<div class="un-grid">
-<label>Connections it may use<input id="unConns" type="number" min="1" max="20" value="{cfg.get("conns", 1)}" onchange="unIdxSave()"/></label>
-</div>
-<p style="color:var(--muted);margin:0 0 6px;font-size:13px">This is for reading the index, and tgarr.me says how many an install may
-use - one, as a rule - so that your downloader keeps the rest. Making an NZB when Sonarr asks for one is another matter: somebody is
-waiting, so for those few seconds tgarr uses as many connections as your provider gives (sixteen to begin with, more if there was
-room, fewer if the provider refused).</p>
-<div id="unIdxState" style="font-size:14px;line-height:1.7"></div></div>
 <h2 class="section">In Sonarr and Radarr</h2>
 <div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
 <p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
@@ -8900,33 +8869,6 @@ function unToggle(el){{
     body: JSON.stringify({{on: el.checked}})}}).then(r => r.json()).then(() => location.reload())
     .catch(() => {{ el.checked = !el.checked; }});
 }}
-function unIdxSave(){{
-  fetch("/api/usenet/index", {{method: "POST", headers: {{"Content-Type": "application/json"}},
-    body: JSON.stringify({{on: document.getElementById("unIdx").checked, conns: +document.getElementById("unConns").value}})}})
-    .then(r => r.json()).then(j => {{ if (j.status === "ok") location.reload(); else unIdxShow({{state: j.message || "could not save"}}); }})
-    .catch(() => unIdxShow({{state: "could not save"}}));
-}}
-function unIdxShow(j){{
-  const el = document.getElementById("unIdxState"), n = x => (x || 0).toLocaleString(), esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
-  const day = t => new Date(t * 1000).toISOString().slice(0, 10);
-  let out = [];
-  if (j.on === false) {{ el.innerHTML = '<span style="color:var(--muted)">Not taking part.</span>'; return; }}
-  let what = esc(j.state || "");
-  if (j.state === "reading" && j.window)
-    what = "reading <b>" + esc(j.window.grp) + "</b>, " + day(j.window.t_from) + " to " + day(j.window.t_to) + " (" + esc(j.window.mode) + ", " + n(j.window.connections) + " connection" + (j.window.connections === 1 ? "" : "s") + " allowed)";
-  out.push("Now: " + what);
-  if (j.last) {{
-    const s = j.last.stats || {{}};
-    out.push("Last: <b>" + esc(j.last.grp) + "</b> - " + n(s.headers) + " headers in " + n(Math.round(s.seconds || 0)) + " s (" + ((s.bytes || 0) / 1e6).toFixed(1) + " MB), "
-      + n(j.last.cards) + " cards found, " + n(j.last.accepted) + " taken by tgarr.me" + (s.unread ? ", " + n(s.unread) + " stretches unread" : ""));
-  }}
-  if (j.cards != null) out.push(n(j.cards) + " cards from the index are kept here and offered to Sonarr and Radarr.");
-  el.innerHTML = out.join("<br/>");
-}}
-function unIdxPoll(){{
-  fetch("/api/usenet/index").then(r => r.json()).then(unIdxShow).catch(() => {{}});
-}}
-unIdxPoll(); setInterval(unIdxPoll, 15000);
 function unSave(){{
   const m = document.getElementById("unMsg"); m.textContent = "testing…";
   fetch("/api/usenet/settings", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{

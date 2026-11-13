@@ -35,7 +35,8 @@ GROUP_FORBIDDEN_SQL = _B0 + (r"(pre.?teens?|lolitas?|loli|p[ae]do[a-z]*|pthc|jai
 # not read, but a card found elsewhere and merely cross-posted there is an ordinary card:
 # the Disney Channel's series were posted to "multimedia.teen-idols" too
 GROUP_NOT_READ_SQL = _B0 + (r"(teen.?idols?|child.?(models?|stars?))") + _B1
-GROUP_YOUNG_SQL = _B0 + (r"(teens?|young|youth|child(ren)?|kids?|school.?(girls?|boys?)|early.?teens?|under.?age)") + _B1
+# ("teen" and "young" also as the start of a longer word: erotica.teenfemale, erotica.teensex)
+GROUP_YOUNG_SQL = _B0 + (r"(teen[a-z]*|young[a-z]*|youth|child(ren)?|kids?|school.?(girls?|boys?)|early.?teens?|under.?age)") + _B1
 FORBIDDEN_RX, MINOR_RX = re.compile(FORBIDDEN_SQL, re.I), re.compile(MINOR_SQL, re.I)
 ADULT_GROUP_RX, ADULT_NAME_RX = re.compile(ADULT_GROUP_SQL, re.I), re.compile(ADULT_NAME_SQL, re.I)
 GROUP_FORBIDDEN_RX, GROUP_YOUNG_RX = re.compile(GROUP_FORBIDDEN_SQL, re.I), re.compile(GROUP_YOUNG_SQL, re.I)
