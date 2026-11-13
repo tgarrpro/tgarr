@@ -63,4 +63,10 @@ ok("(True, None) if is_private else _quality_check(" in src, "no size floor or a
 ok('st["noise"] and not st["followed"] and not is_private' in src,
    "a chat judged noise is not indexed, unless it is followed or private")
 
+# history requests keep a gap, for every reader
+ok("await _hist_gap()        # the next item costs a request" in src and "_HIST_SLOT[0] = slot" in src,
+   "no two history requests closer than the gap, whoever asks")
+ok("AND tg_chat_id > -100000000000000000" in src, "own files are never turned into releases")
+ok('return {"kept": "by the api"}' in src, "a revoked session deletes no private chat")
+
 print(f"ok - {n} checks")

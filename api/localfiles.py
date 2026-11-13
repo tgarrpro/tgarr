@@ -19,9 +19,10 @@ import os
 import re
 import zlib
 
-# Telegram's chat ids are at most 13-14 digits. Everything at or below this
+# Telegram chat ids have at most 13-14 digits, and the placeholders this program
+# makes up for channels it has not resolved yet stay above -1e16. Everything at or below this
 # is ours.
-LOCAL_CHAT_MAX = -8_000_000_000_000_000
+LOCAL_CHAT_MAX = -100_000_000_000_000_000
 MINE = "mine"
 EXTERNAL = "external"
 

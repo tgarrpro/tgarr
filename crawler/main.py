@@ -583,6 +583,25 @@ async def _mtproto_wait_clearance(method_name: str = "get_chat_history"):
         return
 
 
+# History comes a page (100 messages) per request, and a generator asks for
+# the next page the moment the last message of the previous one is taken.
+# Reading several chats at start-up was therefore dozens of requests back to
+# back, which Telegram answers with "wait 11-26 seconds". The gap is kept
+# here, for every reader at once (start-up backfill, following a channel,
+# the deep backfill): no two history requests closer than this, whoever asks.
+HISTORY_GAP_SEC = float(os.environ.get("TGARR_HISTORY_GAP_SEC", "2"))
+HISTORY_PAGE = 100
+_HIST_SLOT = [0.0]
+
+
+async def _hist_gap() -> None:
+    now = time.monotonic()
+    slot = max(now, _HIST_SLOT[0] + HISTORY_GAP_SEC)
+    _HIST_SLOT[0] = slot                 # taken before sleeping: two readers never share a slot
+    if slot > now:
+        await asyncio.sleep(slot - now)
+
+
 async def _mtproto_aiter(method_name: str, agen):
     """Drive a Pyrogram async generator (get_chat_history / get_dialogs) under
     the same FloodWait discipline as _mtproto(): wait out an existing halt
@@ -592,9 +611,16 @@ async def _mtproto_aiter(method_name: str, agen):
     generic error and the caller moved straight on to hit the next channel.
     """
     await _mtproto_wait_clearance(method_name)
+    paced = method_name == "get_chat_history"
+    seen = 0
     try:
+        if paced:
+            await _hist_gap()
         async for item in agen:
             yield item
+            seen += 1
+            if paced and seen % HISTORY_PAGE == 0:
+                await _hist_gap()        # the next item costs a request
     except _REVOKED_AUTH_ERRORS as e:
         await _mark_revoked(type(e).__name__)
         raise
@@ -1669,7 +1695,7 @@ async def _heartbeat(worker: str, action: str = "", error: str | None = None,
 # Pure database work: no Telegram calls, nothing is downloaded, nothing is
 # auto-grabbed. A release someone has downloaded or grabbed is never removed.
 # ════════════════════════════════════════════════════════
-RELEASE_JUDGE_VER = 1            # bump when the rules change: everything is re-judged
+RELEASE_JUDGE_VER = 2            # bump when the rules change: everything is re-judged
 RELEASE_JUDGE_BATCH = 300
 CONTEXT_WINDOW = 12              # messages back from a file to look for its poster
 
@@ -1861,7 +1887,7 @@ async def release_judge_worker():
                        FROM (SELECT * FROM messages
                              WHERE rel_ver IS NULL AND media_type IN ('video', 'document')
                                AND indexed_at < NOW() - INTERVAL '2 minutes'
-                               AND tg_chat_id > -8000000000000000   -- not the household's own files
+                               AND tg_chat_id > -100000000000000000   -- not the household's own files
                              ORDER BY id LIMIT $1) m
                        LEFT JOIN releases r ON r.primary_msg_id = m.id
                        ORDER BY m.id""", RELEASE_JUDGE_BATCH)

@@ -451,6 +451,21 @@ ANY_API_KEY_ACCEPTED = True
 
 app = FastAPI(title="tgarr", version=TGARR_VERSION)
 app.middleware("http")(_request_guard)   # defined above, next to its helpers
+
+
+async def _safe_headers(request: Request, call_next):
+    """Three headers every answer carries: a file is what its type says (no
+    guessing a script out of an upload), these pages are not shown inside
+    another site's frame (no invisible-button tricks), and the address of a
+    page here is not passed on to sites it links to."""
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    return resp
+
+
+app.middleware("http")(_safe_headers)
 # The module-level logger. It was missing: the cache cleanup removed files and
 # then died on its own log line (NameError), once, for good - and the
 # "clear everything" button answered 500 after doing its work.
@@ -7221,6 +7236,11 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
 
     # ── now ──
     now_bits = []
+    # out of the box anyone on the same network opens this page as the owner
+    if _signed_in() and not _ACCESS["pin"] and not _UI_PASSWORD:
+        now_bits.append('<a class="now-pill" href="/mediacenter/manage" title="with a PIN, other browsers get only '
+                        'the Media Center and what you allow there">🔓 No PIN yet: anyone on your network '
+                        'opens this page as you — set one</a>')
     arriving = [f for f in fetches if f["state"] in ("queued", "fetching")]
     if arriving:
         now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {len(arriving)} arriving for a player</a>')
@@ -10292,12 +10312,22 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
     elif aud == "nsfw":
         where.append("c.audience = 'nsfw'")
     if min_mb and min_mb > 0:
-        where.append(f"COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024}")
+        # (the floor keeps clips and adverts out; a family's own short films are neither)
+        where.append(f"(COALESCE(m.file_size,0) >= {min_mb * 1024 * 1024} OR c.local_root IS NOT NULL)")
     if local:
         where.append(_LOCAL_SQL)
     if fav:
         where.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
 
+    # One card per file. The same film posted to five channels is one file
+    # (Telegram gives it one id) and was five cards. Only while browsing:
+    # a search, favourites, or "saved here" look at each post on its own,
+    # where hiding four of five could hide the one that matched.
+    if not (q or fav or local):
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM messages o JOIN channels oc ON oc.id = o.channel_id "
+            "WHERE o.file_unique_id = m.file_unique_id AND o.id > m.id AND o.media_type = 'video' "
+            "AND COALESCE(oc.audience, 'sfw') = COALESCE(c.audience, 'sfw')" + _pub("oc") + ")")
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
     where_sql = " AND ".join(where)
@@ -10910,7 +10940,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             '.sv-list .ck{width:30px}.sv-list .ic{width:30px}.sv-list .num{white-space:nowrap;color:var(--muted);'
             'font-size:13px}.sv-list .ac{white-space:nowrap;text-align:right}'
             '.sv-list .nm a{color:var(--fg);text-decoration:none;word-break:break-all}'
-            '.sv-list .nm a:hover{color:var(--accent)}</style>'
+            '.sv-list .nm a:hover{color:var(--accent)}'
+            # a phone has no room for six columns: name on top, size under it, the
+            # tick box in front, the two buttons behind; "last opened" is left out
+            '@media (max-width:640px){.sv-list thead{display:none}.sv-list,.sv-list tbody{display:block}'
+            '.sv-list tr{display:grid;grid-template-columns:30px minmax(0,1fr) auto;align-items:center;'
+            'border-bottom:1px solid var(--border);padding:6px 4px}.sv-list tr:last-child{border-bottom:none}'
+            '.sv-list td{border:none;padding:2px 6px}.sv-list td.ic,.sv-list td:nth-child(5){display:none}'
+            '.sv-list td.ck{grid-column:1;grid-row:1 / span 2;width:auto}.sv-list td.nm{grid-column:2;grid-row:1}'
+            '.sv-list td:nth-child(4){grid-column:2;grid-row:2;font-size:12px}'
+            '.sv-list td.ac{grid-column:3;grid-row:1 / span 2}.sv-list .dl-ctrls{flex-wrap:nowrap}}</style>'
             + ('' if ro else
                '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
                '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
