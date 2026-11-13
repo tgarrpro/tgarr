@@ -1861,9 +1861,32 @@ async def _judge_message(conn, m, gone: list) -> str:
     return "created"
 
 
+async def _drop_releases_of_songs() -> int:
+    """Take out releases whose file is audio (made before that was checked when a file
+    is first read). One with a grab, a download or a watch-list entry on it is left."""
+    async with db_pool.acquire() as conn:
+        gone = [r["id"] for r in await conn.fetch(
+            """DELETE FROM releases r USING messages m
+               WHERE m.id = r.primary_msg_id
+                 AND (m.media_type = 'audio' OR m.mime_type ILIKE 'audio/%')
+                 AND COALESCE(r.grab_count, 0) = 0
+                 AND NOT EXISTS (SELECT 1 FROM downloads d WHERE d.release_id = r.id)
+                 AND NOT EXISTS (SELECT 1 FROM monitored_movies mm WHERE mm.grabbed_release_id = r.id)
+               RETURNING r.id""")]
+    if gone:
+        for i in range(0, len(gone), 1000):
+            await _meili_delete("releases", gone[i:i + 1000])
+        log.info("[judge] %d release(s) that were songs, not films, taken out", len(gone))
+    return len(gone)
+
+
 async def release_judge_worker():
     await asyncio.sleep(90)
     log.info("[judge] release re-judgement started (rules v%d)", RELEASE_JUDGE_VER)
+    try:
+        await _drop_releases_of_songs()
+    except Exception as e:
+        log.warning("[judge] taking out song releases: %s", e)
     totals: dict = {}
     while True:
         try:
@@ -1933,6 +1956,12 @@ async def maybe_create_release(conn, msg_row_id, file_name, file_size, posted_at
     """Parse the file name and insert a release row if it qualifies. The
     decision (see parser.decide_release) also weighs the running time and
     frame size Telegram reported, when it did."""
+    # Only video can be a film or an episode. The re-judgement has this rule, but it
+    # never looks at audio - so a DJ set called "Something.2026" (audio/mpeg, 300 MB)
+    # was filed as a film when it was first read and stayed one.
+    kind = await conn.fetchrow("SELECT media_type, mime_type FROM messages WHERE id = $1", msg_row_id)
+    if kind is not None and not is_video_file(file_name, kind["mime_type"], kind["media_type"]):
+        return None
     parsed = parse_filename(file_name or "")
     verdict = decide_release(parsed, file_size=file_size, duration=duration,
                              width=width, height=height,
