@@ -89,7 +89,7 @@ BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 # Single source for the version this crawler reports to the registry.
-TGARR_VERSION = "0.5.7"
+TGARR_VERSION = "0.5.8"
 TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
