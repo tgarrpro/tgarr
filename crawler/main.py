@@ -1165,6 +1165,15 @@ _MIN_SIZES = {
 }
 
 
+# A private chat: no public @name and small. Telegram's ordinary groups hold
+# at most 200 people; a "group" of thousands that simply has no public name
+# (search-bot groups, advert groups) is not somebody's private chat. What is
+# in a private chat is the person's own - family photos, short clips, notes -
+# and none of the rules written to keep public-channel junk out of the index
+# apply to it: no size floors, no advert keywords, no noise verdict, no sweep.
+PRIVATE_CHAT_SQL = "username IS NULL AND COALESCE(members_count, 0) < 200"
+
+
 def _quality_check(file_name: str | None, file_size: int | None,
                    media_type: str | None, caption: str | None) -> tuple[bool, str | None]:
     """Multi-signal quality gate. Returns (keep?, reject_reason_if_drop).
@@ -1485,6 +1494,38 @@ async def init_db() -> None:
         log.warning("[boot] the API has not reported the database ready after 3 min — going on")
     # Crawl-and-release columns (also created by api _migrate_schema; ensure
     # here so crawler workers can query them regardless of migration order).
+    # 0.5.8, once: private chats are kept whole. Until now the rules meant for
+    # public-channel junk applied to them too - small photos and short clips
+    # were dropped or swept, and a chatty group could be judged "noise" and
+    # left unread. Lift the verdict and read each of them again. And remove
+    # what a large no-name group judged noise had kept sending in.
+    try:
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT 1 FROM config WHERE key = 'private_kept_whole_0_5_8'"):
+                r = await conn.execute(
+                    f"""UPDATE channels
+                           SET backfilled = FALSE, enabled = TRUE,
+                               category = NULLIF(category, 'noise'),
+                               content_category = CASE WHEN content_category = 'noise' THEN 'mixed'
+                                                       ELSE content_category END
+                         WHERE {PRIVATE_CHAT_SQL} AND COALESCE(is_joined, FALSE)""")
+                d = await conn.execute(
+                    f"""DELETE FROM messages
+                         WHERE channel_id IN (
+                               SELECT id FROM channels
+                               WHERE username IS NULL AND NOT ({PRIVATE_CHAT_SQL})
+                                 AND (COALESCE(category, '') = 'noise' OR COALESCE(content_category, '') = 'noise')
+                                 AND NOT COALESCE(subscribed, FALSE))
+                           AND COALESCE(local_path, '') = ''
+                           AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)""")
+                await conn.execute(
+                    "INSERT INTO config (key, value) VALUES ('private_kept_whole_0_5_8', 'done') "
+                    "ON CONFLICT (key) DO NOTHING")
+                log.info("[private] kept whole from now on: %s to be read again, %s from large no-name noise groups",
+                         r, d)
+    except Exception as e:
+        log.warning("[private] one-time re-read not scheduled: %s", e)
+
     async with db_pool.acquire() as conn:
         await conn.execute(
             "ALTER TABLE worker_status ADD COLUMN IF NOT EXISTS quiet_for_s INTEGER NOT NULL DEFAULT 0")
@@ -2005,15 +2046,24 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
     chat_id = msg.chat.id
     msg_id = msg.id
 
-    if not live:
-        async with db_pool.acquire() as conn:
-            allowed = await conn.fetchval(
-                """SELECT 1 FROM channels
-                   WHERE tg_chat_id=$1
-                     AND (is_joined=TRUE OR subscribed=TRUE)""",
-                chat_id)
-        if not allowed:
-            return False
+    async with db_pool.acquire() as conn:
+        st = await conn.fetchrow(
+            f"""SELECT (is_joined = TRUE OR subscribed = TRUE) AS known,
+                       COALESCE(subscribed, FALSE) AS followed,
+                       (COALESCE(category, '') = 'noise'
+                        OR COALESCE(content_category, '') = 'noise') AS noise,
+                       ({PRIVATE_CHAT_SQL}) AS private
+                FROM channels WHERE tg_chat_id = $1""", chat_id)
+    if not live and not (st and st["known"]):
+        return False
+    # a chat not seen before arrives live: private until its size is known
+    is_private = bool(st["private"]) if st else not getattr(msg.chat, "username", None)
+    # A chat judged to be noise is not indexed - not its history, and not what
+    # it posts from now on (a notice re-posted every few minutes by a
+    # 17,000-member group used to keep arriving). Followed channels and
+    # private chats are never treated as noise.
+    if st and st["noise"] and not st["followed"] and not is_private:
+        return False
 
     file_name = None
     file_size = None
@@ -2125,7 +2175,8 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
         if media is None:
             return False
         # QUALITY GATE: ad-keyword / micro-size junk rejected before persist.
-        keep, reason = _quality_check(file_name, file_size, media_type, caption)
+        keep, reason = (True, None) if is_private else _quality_check(
+            file_name, file_size, media_type, caption)
         if not keep:
             return False
         # Caption = the human-written description of the resource (title,
@@ -2220,7 +2271,8 @@ async def backfill_channel(chat_id: int, title: str, username: str | None = None
     # Title/username gate: reject news/TV up front (see _is_noise_title).
     async with db_pool.acquire() as conn:
         _followed = await conn.fetchval(
-            "SELECT COALESCE(subscribed, FALSE) FROM channels WHERE tg_chat_id = $1", chat_id)
+            f"""SELECT COALESCE(subscribed, FALSE) OR ({PRIVATE_CHAT_SQL})
+                FROM channels WHERE tg_chat_id = $1""", chat_id)
     noise_hit, noise_kw = (False, None) if _followed else _is_noise_title(title, username)
     if noise_hit:
         log.info("[backfill] chat_id=%s NOISE-TITLE kw=%r title=%s — abort",
@@ -2245,7 +2297,7 @@ async def backfill_channel(chat_id: int, title: str, username: str | None = None
             if count % 200 == 0:
                 log.info("[backfill] chat_id=%s progress=%s media=%s",
                          chat_id, count, media_count)
-            if count == NOISE_SAMPLE_AT:
+            if count == NOISE_SAMPLE_AT and not _followed:
                 pct = media_count * 100 // count
                 if pct < NOISE_THRESHOLD_PCT:
                     log.info("[backfill] NOISE chat_id=%s title=%s "
@@ -6115,11 +6167,12 @@ async def decay_eviction_worker() -> None:
                     # Don't delete rows that user has grabbed (local_path set)
                     # — those are local cache the user is using.
                     result = await conn.execute(
-                        """DELETE FROM messages
+                        f"""DELETE FROM messages
                            WHERE channel_id IN (
                              SELECT id FROM channels WHERE content_category = $1
                            )
                            AND posted_at < NOW() - ($2 || ' days')::INTERVAL
+                           AND channel_id NOT IN (SELECT id FROM channels WHERE {PRIVATE_CHAT_SQL})
                            AND COALESCE(local_path, '') = ''
                            AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)""",
                         category, str(cutoff_days))
@@ -6145,6 +6198,7 @@ async def decay_eviction_worker() -> None:
                         OR COALESCE(caption, '') ~* $1
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """, r'(\bcrypto\b|\bnft\b|\busdt\b|赌博|博彩|casino|gamble|gambling|'
                      r'投资理财|做单|赚钱|月入|代理|代充|代购|刷单|'
@@ -6162,6 +6216,7 @@ async def decay_eviction_worker() -> None:
                         OR COALESCE(caption, '') ~* $1
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """, r'(qrcode|qr[\s_]*code|二维码|'
                      r'微信号|wechat[\s_]*id|加微信|加[\s_]*wx|'
@@ -6186,6 +6241,7 @@ async def decay_eviction_worker() -> None:
                         -- mid/large (>=5k): 10KB (baseline, matches ingest gate)
                         (COALESCE(c.members_count, 0) >= 5000 AND m.file_size < 10000)
                       )
+                      AND NOT (c.username IS NULL AND COALESCE(c.members_count, 0) < 200)
                       AND COALESCE(m.local_path, '') = ''
                       AND m.id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
@@ -6200,6 +6256,7 @@ async def decay_eviction_worker() -> None:
                       (media_type='document' AND file_size < 10000)
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
                 micro_n = (int(r2b.split()[-1]) if r2b.startswith("DELETE") else 0) + photo_n
@@ -6216,6 +6273,7 @@ async def decay_eviction_worker() -> None:
                         HAVING count(DISTINCT channel_id) > 10
                     )
                     AND COALESCE(local_path, '') = ''
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
                 spam_n = int(r3.split()[-1]) if r3.startswith("DELETE") else 0

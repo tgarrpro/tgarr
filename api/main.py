@@ -6930,6 +6930,12 @@ async def api_registry_pull_now():
 # ════════════════════════════════════════════════════════════════════
 # Page: Gallery (Telegram-shared photos)
 # ════════════════════════════════════════════════════════════════════
+# A private chat: no public @name and small (see the crawler's
+# PRIVATE_CHAT_SQL). A group of thousands that merely has no public name is
+# not "my private chats".
+_PRIVATE_CHAT = "(c.username IS NULL AND COALESCE(c.members_count, 0) < 200)"
+
+
 @app.get("/gallery", response_class=HTMLResponse)
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        q: Optional[str] = None, dc: Optional[str] = None,
@@ -6961,7 +6967,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         private = 0                       # no account, no private chats
         where.append("c.username IS NOT NULL")
     if private:
-        where.append("c.username IS NULL")
+        where.append(_PRIVATE_CHAT)
     if q:
         for w in q.split():
             params.append(f"%{w}%")
@@ -7005,7 +7011,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         # with the most photos, shown as unexplained chips; a chat without a
         # @username could not be chosen at all.)
         all_channels = await conn.fetch(
-            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, count(*) AS n
+            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, count(*) AS n,
+                      {_PRIVATE_CHAT} AS private
                FROM messages m JOIN channels c ON c.id = m.channel_id
                WHERE m.media_type = 'photo'
                  AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
@@ -7017,6 +7024,15 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
             FROM messages m JOIN channels c ON c.id = m.channel_id
             WHERE {' AND '.join(where)}""", *params)
+        # the number beside "My private chats" is the number of pictures that
+        # choice shows: the same pictures counted the same way (one per image,
+        # not one per post), not a sum of posts
+        priv_n = 0 if not _in else await conn.fetchval(f"""
+            SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where[:3])} AND {_PRIVATE_CHAT}
+              AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+              {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}""")
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -7058,8 +7074,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         if (ch and r["id"] == ch) or (channel and r["username"] == channel):
             picked = r
             break
-    priv = [r for r in all_channels if not r["username"]]
-    priv_n = sum(r["n"] for r in priv)
+    priv = [r for r in all_channels if r["private"]]
 
     def _name(r):
         return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
@@ -7068,7 +7083,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
         f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
         + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
-           else '<small>🔒 private</small>')
+           else '<small>🔒 private</small>' if r["private"]
+           else '<small>group · no public name</small>')
         + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
         for r in all_channels)
     picker = (
