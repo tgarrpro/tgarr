@@ -5620,19 +5620,30 @@ async def page_files(offset: int = 0, kind: str = "", q: str = ""):
               'style="flex:1;max-width:420px"/><button class="btn" type="submit">Find</button>'
             + (f'<a class="btn ghost" href="/files{_fqs(q=None, offset=None)}">clear</a>' if q else '') + '</form>')
     rows = "".join(
-        '<label class="dl-item" style="cursor:pointer">'
-        f'<input type="checkbox" class="f-ck" value="{r["id"]}" style="margin-right:4px"/>'
-        f'<div class="icon" style="position:relative;overflow:hidden">{_FILE_ICON.get(r["media_type"], "📄")}'
-        f'<img src="/api/thumb/{r["id"]}" loading="lazy" alt="" onerror="this.remove()" '
-        'style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:6px"/></div><div class="info">'
-        f'<div class="name"><a href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a></div>'
-        f'<div class="meta">{export.human(r["file_size"])} · added {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
-        '</div></label>' for r in mine)
+        '<div class="f-card">'
+        f'<a class="f-pic" href="{_file_href(r)}" title="{html.escape(r["file_name"] or "file", quote=True)}">'
+        f'<span>{_FILE_ICON.get(r["media_type"], "📄")}</span>'
+        f'<img src="/api/thumb/{r["id"]}" loading="lazy" alt="" onerror="this.remove()"/></a>'
+        f'<label class="f-tick" title="tick to delete"><input type="checkbox" class="f-ck" value="{r["id"]}"/></label>'
+        f'<a class="f-name" href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a>'
+        f'<div class="f-meta">{export.human(r["file_size"])} · {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
+        '</div>' for r in mine)
     pager = _page_nav("/files", _fqs, offset, FILES_PAGE, len(mine), tot["n"])
     body = (
         '<style>.f-drop{border:2px dashed var(--border);border-radius:14px;padding:26px 18px;text-align:center;'
         'background:var(--surface);margin-bottom:10px}.f-drop.over{border-color:var(--accent);background:rgba(94,182,229,.10)}'
-        '.f-drop .btn{margin:8px 4px 0}</style>'
+        '.f-drop .btn{margin:8px 4px 0}'
+        '.f-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px}'
+        '.f-card{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}'
+        '.f-pic{display:flex;align-items:center;justify-content:center;position:relative;aspect-ratio:4/3;'
+        'background:rgba(127,127,127,.10);text-decoration:none;font-size:44px}'
+        '.f-pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}'
+        '.f-tick{position:absolute;top:6px;left:6px;width:26px;height:26px;display:flex;align-items:center;justify-content:center;'
+        'background:rgba(255,255,255,.85);border-radius:7px;cursor:pointer}.f-tick input{margin:0}'
+        '.f-name{display:block;padding:8px 10px 2px;font-size:13.5px;font-weight:600;color:var(--fg);text-decoration:none;'
+        'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.f-name:hover{color:var(--accent)}'
+        '.f-meta{padding:0 10px 9px;font-size:12px;color:var(--muted)}'
+        '@media (max-width:640px){.f-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}</style>'
         '<p style="color:var(--muted);margin-top:0">Your own films, music, photos and books, played and read here like '
         'everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.</p>'
         '<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">Drop files here</div>'
@@ -5649,7 +5660,7 @@ async def page_files(offset: int = 0, kind: str = "", q: str = ""):
         f'margin-left:10px">{export.human(tot["b"]) or "0 MB"}'
         + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
         + (find + tabs if (everything["n"] or q) else '')
-        + ('<div class="dl-list">' + rows + '</div>' + pager if mine else
+        + ('<div class="f-grid">' + rows + '</div>' + pager if mine else
            '<div class="empty-state"><div class="icon">📂</div><div>'
            + ('Nothing found by that name.' if q else 'Nothing of this kind uploaded yet.' if kind
               else 'Nothing uploaded yet.') + '</div></div>')
