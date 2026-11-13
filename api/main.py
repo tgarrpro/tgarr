@@ -2371,7 +2371,7 @@ def _ebook_safe_to_convert(src: str, ext: str) -> bool:
     handing the file to calibre. Caps total uncompressed size at 500MB
     and entry count at 20K. Non-zip formats pass through (calibre has
     its own format-specific limits)."""
-    if ext not in ("epub", "cbz", "cbr"):
+    if ext not in ("epub", "cbz", "cbr", "docx", "odt"):
         return True  # mobi/azw/djvu/etc. not zip-based; trust calibre
     import zipfile
     try:
@@ -2423,7 +2423,9 @@ def _ebook_lock(msg_id: int):
 
 
 _EBOOK_CONVERTIBLE = ("epub", "mobi", "azw", "azw3", "djvu", "fb2",
-                      "lit", "cbr", "cbz", "rtf", "lrf", "pdb")
+                      "lit", "cbr", "cbz", "rtf", "lrf", "pdb",
+                      # plain documents a household uploads: readable, and read aloud, like a book
+                      "txt", "docx", "odt")
 
 def _ebook_paths(local_path: str):
     """Return (source_abs, pdf_abs, cover_abs) for a cached ebook."""
@@ -3863,9 +3865,16 @@ async def pdf_reader(msg_id: int):
     """The PDF reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    if not _pdf_source(row) and row and _is_local(row["local_path"]):
+        # here, but not a PDF yet (a text file, a .docx, a book in another
+        # format opened straight from a list): make the PDF now, once
+        ext = (row["local_path"] or "").rsplit(".", 1)[-1].lower()
+        src, pdf, _ = _ebook_paths(row["local_path"])
+        if ext in _EBOOK_CONVERTIBLE and os.path.exists(src) and _ebook_safe_to_convert(src, ext):
+            await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not _pdf_source(row):
         return HTMLResponse(
-            f'<p>This file is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            f'<p>This file cannot be shown here. <a href="/media/{msg_id}">Download it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
     return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
@@ -5469,10 +5478,11 @@ async def api_files_delete(request: Request):
         for r in rows:
             path = os.path.normpath(os.path.join("/downloads", r["local_path"] or ""))
             if path.startswith(f"/downloads/{localfiles.MINE}/"):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                for suf in ("", ".pdf", ".cover.jpg"):
+                    try:
+                        os.unlink(path + suf)
+                    except OSError:
+                        pass
         if rows:
             await _local_forget(conn, rows[0]["channel_id"], [r["local_path"] for r in rows])
     return {"status": "ok", "removed": len(rows)}
@@ -5508,10 +5518,10 @@ def _file_href(r) -> str:
     e = localfiles.ext(r["file_name"] or "")
     if r["media_type"] == "video":
         return f'/watch/{r["id"]}'
-    if e == "pdf":
-        return f'/pdf/{r["id"]}'
     if e == "epub":
         return f'/epub/{r["id"]}'
+    if e == "pdf" or e in _EBOOK_CONVERTIBLE:
+        return f'/pdf/{r["id"]}'          # read here (anything else is converted on first opening)
     return f'/media/{r["id"]}'
 
 
