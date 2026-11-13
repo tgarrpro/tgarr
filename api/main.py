@@ -5501,6 +5501,7 @@ _FILES_JS = (
     'dz.addEventListener("drop",function(e){e.preventDefault();dz.classList.remove("over");fAdd(e.dataTransfer.files)})}'
     '</script>')
 _FILE_ICON = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
+_FILE_TABS = {"": "All", "video": "🎬 Videos", "audio": "🎵 Music", "photo": "🖼 Photos", "document": "📄 Documents"}
 
 
 def _file_href(r) -> str:
@@ -5515,16 +5516,27 @@ def _file_href(r) -> str:
 
 
 @app.get("/files", response_class=HTMLResponse)
-async def page_files(offset: int = 0):
+async def page_files(offset: int = 0, kind: str = ""):
     offset = max(0, int(offset))
+    kind = kind if kind in _FILE_TABS else ""
     async with db_pool.acquire() as conn:
         mine = await conn.fetch(
             """SELECT m.id, m.file_name, m.file_size, m.media_type, m.indexed_at
                FROM messages m JOIN channels c ON c.id = m.channel_id
-               WHERE c.local_root = $1 ORDER BY m.id DESC LIMIT 200 OFFSET $2""", localfiles.MINE, offset)
-        tot = await conn.fetchrow(
-            """SELECT count(*) AS n, COALESCE(sum(m.file_size), 0) AS b
-               FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.local_root = $1""", localfiles.MINE)
+               WHERE c.local_root = $1 AND ($3 = '' OR m.media_type = $3)
+               ORDER BY m.id DESC LIMIT 200 OFFSET $2""", localfiles.MINE, offset, kind)
+        per = {r["media_type"]: r for r in await conn.fetch(
+            """SELECT m.media_type, count(*) AS n, COALESCE(sum(m.file_size), 0) AS b
+               FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE c.local_root = $1 GROUP BY m.media_type""", localfiles.MINE)}
+    everything = {"n": sum(r["n"] for r in per.values()), "b": sum(r["b"] for r in per.values())}
+    tot = per.get(kind, {"n": 0, "b": 0}) if kind else everything
+    # one tab per kind: an upload goes to its tab by itself, by what the file is
+    tabs = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px">' + "".join(
+        _chip_link(f'{label} <span style="opacity:.6">{(per.get(k, {"n": 0})["n"] if k else everything["n"]):,}</span>',
+                   "/files" + (f"?kind={k}" if k else ""), k == kind)
+        for k, label in _FILE_TABS.items()) + '</div>'
+    kq = f"kind={kind}&" if kind else ""
     rows = "".join(
         '<label class="dl-item" style="cursor:pointer">'
         f'<input type="checkbox" class="f-ck" value="{r["id"]}" style="margin-right:4px"/>'
@@ -5535,8 +5547,8 @@ async def page_files(offset: int = 0):
     pager = ""
     if offset or len(mine) == 200:
         pager = ('<div style="display:flex;gap:10px;margin:14px 0">'
-                 + (f'<a class="btn ghost" href="/files?offset={max(0, offset - 200)}">← newer</a>' if offset else '')
-                 + (f'<a class="btn ghost" href="/files?offset={offset + 200}">older →</a>' if len(mine) == 200 else '')
+                 + (f'<a class="btn ghost" href="/files?{kq}offset={max(0, offset - 200)}">← newer</a>' if offset else '')
+                 + (f'<a class="btn ghost" href="/files?{kq}offset={offset + 200}">older →</a>' if len(mine) == 200 else '')
                  + '</div>')
     body = (
         '<style>.f-drop{border:2px dashed var(--border);border-radius:14px;padding:26px 18px;text-align:center;'
@@ -5557,8 +5569,10 @@ async def page_files(offset: int = 0):
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
         f'margin-left:10px">{export.human(tot["b"]) or "0 MB"}'
         + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
+        + (tabs if everything["n"] else '')
         + ('<div class="dl-list">' + rows + '</div>' + pager if mine else
-           '<div class="empty-state"><div class="icon">📂</div><div>Nothing uploaded yet.</div></div>')
+           '<div class="empty-state"><div class="icon">📂</div><div>'
+           + ('Nothing of this kind uploaded yet.' if kind else 'Nothing uploaded yet.') + '</div></div>')
         + _FILES_JS)
     return HTMLResponse(_layout("My files", "/files", body))
 
