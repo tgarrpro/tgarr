@@ -7360,6 +7360,21 @@ async def api_usenet_settings(request: Request):
     return {"status": "ok", "working": ready, "message": _USENET["msg"] if vals["usenet_enabled"] == "1" else "switched off"}
 
 
+@app.post("/api/usenet/enabled")
+async def api_usenet_enabled(request: Request):
+    """The on/off switch by itself: the account stays as it is."""
+    try:
+        on = bool((await request.json()).get("on"))
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('usenet_enabled', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", "1" if on else "0")
+    await _usenet_cfg(fresh=True)
+    _USENET.update(ok=None)
+    return {"status": "ok", "on": on, "working": await _usenet_ready(recheck=True) if on else False}
+
+
 @app.get("/settings/usenet", response_class=HTMLResponse)
 async def page_settings_usenet(request: Request):
     cfg = await _usenet_cfg(fresh=True)
@@ -7371,9 +7386,18 @@ async def page_settings_usenet(request: Request):
     body = f"""<style>.un-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
 .un-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0}}
 .un-grid label{{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--muted)}}
+.un-sw{{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}}
+.un-sw input{{position:absolute;opacity:0;width:0;height:0}}
+.un-sw span{{width:50px;height:28px;border-radius:999px;background:#cbd5e1;position:relative;transition:background .15s}}
+.un-sw span::after{{content:"";position:absolute;left:3px;top:3px;width:22px;height:22px;border-radius:50%;background:#fff;
+  box-shadow:0 1px 3px rgba(0,0,0,.3);transition:left .15s}}
+.un-sw input:checked + span{{background:#16a34a}}.un-sw input:checked + span::after{{left:25px}}
+.un-sw input:focus-visible + span{{outline:2px solid var(--accent);outline-offset:2px}}
 .un-grid input{{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
 </style>
-<div class="un-box"><h3 style="margin:0 0 6px">Usenet account {state}</h3>
+<div class="un-box"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px">
+<h3 style="margin:0;flex:1">Usenet {state}</h3>
+<label class="un-sw" title="switch Usenet on or off"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""} onchange="unToggle(this)"/><span></span><b>{"On" if cfg.get("enabled") else "Off"}</b></label></div>
 <p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
 card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
 tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet).</p>
@@ -7385,13 +7409,19 @@ tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet 
 <label>Data it may use per day, in MB<input id="unDay" type="number" step="100" min="0" value="{round(cfg.get("per_day", 2000000) * 350 / 1e6)}"/></label>
 </div>
 <label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
-<label style="display:flex;gap:8px;align-items:center;margin:6px 0 14px"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""}/> <b>Use Usenet</b></label>
+<div style="height:8px"></div>
 <button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span></div>
 <h2 class="section">In Sonarr and Radarr</h2>
 <div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
 <p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
 Download client: <b>SABnzbd</b> (or NZBGet) - not "tgarr". An indexer goes to one download client, which is why Usenet needs its own entry.</p></div>
 <script>
+function unToggle(el){{
+  // the switch works at once, without touching the account fields
+  fetch("/api/usenet/enabled", {{method: "POST", headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{on: el.checked}})}}).then(r => r.json()).then(() => location.reload())
+    .catch(() => {{ el.checked = !el.checked; }});
+}}
 function unSave(){{
   const m = document.getElementById("unMsg"); m.textContent = "testing…";
   fetch("/api/usenet/settings", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{
