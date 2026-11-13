@@ -6953,7 +6953,9 @@ async def contribute_resources_worker() -> None:
 # list, marked cleared. Private chats and KwickPOS* are never touched.
 # Nothing is sent to tgarr.me about the unfollow, and nothing is removed there.
 # ═════════════════════════════════════════════════
-UNFOLLOW_REPORT_GRACE_HOURS = int(os.environ.get("TGARR_UNFOLLOW_REPORT_GRACE_HOURS", "6"))
+# (one hour: long enough for a report that is already on its way, short enough that
+     # "remove" does not look as if nothing had happened; it was six)
+UNFOLLOW_REPORT_GRACE_HOURS = int(os.environ.get("TGARR_UNFOLLOW_REPORT_GRACE_HOURS", "1"))
 
 _UNFOLLOW_PICK_SQL = """
     SELECT c.id, c.username, c.title FROM channels c

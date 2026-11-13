@@ -37,7 +37,27 @@ RX_HELPER = re.compile(r"\.(par2|sfv|nfo|nzb|txt|md5|diz)$|\.vol\d+\+\d+\.par2$"
 VOWELS = set("aeiouAEIOU")
 
 
+# The request boards put their own name and the number of the request in front of the
+# release's: "a.b.mm@efnet - req 73838 - Criminal.Minds.S01.DVDRip", "[12345]-[#altbin@efnet]-
+# [FULL]-[Who.Do.You.Think.You.Are.S06E01.720p.HDTV.x264-GRP]". Sonarr matches a release by its
+# name; with that in front it matched nothing.
+RX_REQ_BRACKETS = re.compile(r"^\s*\[?\s*(?:\d{3,7}|x{3,7})\s*\]?\s*-\s*\[\s*#?[\w.-]+@[\w.-]+\s*\]\s*-\s*(?:\[\s*(?:full|req|part|repost)[^\]]*\]\s*-\s*)?\[\s*(.+?)\s*\]?\s*$", re.I)
+RX_REQ_LEAD = re.compile(r"^\s*\[?\s*#?[\w.-]*\.[\w.-]+@[\w.-]+\s*\]?\s*[-:]?\s*(?:\[?\s*req(?:uest)?\s*[#:]?\s*(?:\d{2,7}|x{2,7})\s*\]?\s*[-:]?\s*)?", re.I)
+RX_REQ_ONLY = re.compile(r"^\s*\[?\s*req(?:uest)?\s*[#:]?\s*(?:\d{3,7}|x{3,7})\s*\]?\s*[-:]\s*", re.I)
+
+
+def strip_request(text: str) -> str:
+    t = text or ""
+    m = RX_REQ_BRACKETS.match(t)
+    if m:
+        return m.group(1)
+    cut = RX_REQ_LEAD.sub("", t, count=1)
+    cut = RX_REQ_ONLY.sub("", cut, count=1)
+    return cut if len(re.sub(r"\W", "", cut)) >= 6 else t      # never down to nothing
+
+
 def strip_tags(text: str) -> str:
+    text = strip_request(text)
     t = RX_TAG.sub(" ", text or "")
     t = RX_BOARD.sub(" ", t)
     return re.sub(r"\s+", " ", t).strip(" -–—:|>*=#.<[]()")

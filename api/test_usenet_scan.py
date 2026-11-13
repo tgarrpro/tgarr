@@ -428,4 +428,27 @@ ok(R.group_never("alt.binaries.pictures.erotica.teenfemale") and R.group_never("
    and R.group_never("alt.binaries.erotica.youngmen") and not R.group_never("alt.binaries.tv.teen") and not R.group_never("alt.binaries.sounds.mp3.youngsters"),
    "an adult group named for the young, also when the word runs on; a group for the young that is not adult is an ordinary group")
 
+# ---- the request boards: the counter is read, the board's tag is not part of the name --------
+_r1 = ['a.b.mm@efnet - req 73838 - Criminal.Minds.S01.DVDRip - %03d/280 - "cm.s01.part%03d.rar" yEnc (%d/101)' % (f, f, p) for f in (1, 83, 280) for p in (1, 50)]
+_d = [S.describe(x) for x in _r1]
+ok(len({d[3] for d in _d}) == 1, f"every file of the release has the same key, whichever file it is: {sorted({d[3] for d in _d})}")
+ok(_d[0][2] == "Criminal.Minds.S01.DVDRip" and _d[0][6] == 280, f"its name without the board's tag and the counter, and 280 files expected: {_d[0][2]!r}, {_d[0][6]}")
+ok(U.parse_subject(_r1[2])["file_no"] == 83, "and which file this is")
+_b = S.describe('[12345]-[#altbin@efnet]-[FULL]-[Who.Do.You.Think.You.Are.S06E01.720p.HDTV.x264-GRP]-[03/41] - "wdytya.s06e01.r01" yEnc (5/66)')
+ok(_b[2] == "Who.Do.You.Think.You.Are.S06E01.720p.HDTV.x264-GRP" and _b[6] == 41, f"the bracketed form: {_b[2]!r}")
+ok(J.strip_request("a.b.mm@efnet - req xxxxx - Stargate.SG1.S01E01.AC3.DivX.DVDRip") == "Stargate.SG1.S01E01.AC3.DivX.DVDRip", "a request with its number crossed out")
+ok(J.strip_request("#a.b.teevee@EFNet - Some.Show.S02E03.HDTV.XviD-GRP") == "Some.Show.S02E03.HDTV.XviD-GRP", "a channel alone in front")
+for _plain in ("Some.Film.2010.1080p.BluRay.x264-GRP", "Miles Davis At Newport", "user@example.com wrote a long thing here", "Top Gear - 12/2009 Special"):
+    ok(J.strip_request(_plain) == _plain or len(J.strip_request(_plain)) >= 6, f"an ordinary name is left as it is, or nearly: {J.strip_request(_plain)!r}")
+ok(J.strip_request("Some.Film.2010.1080p.BluRay.x264-GRP") == "Some.Film.2010.1080p.BluRay.x264-GRP" and J.strip_request("Miles Davis At Newport") == "Miles Davis At Newport", "exactly as it is")
+_p = U.parse_subject('Some Show - 9/11 Special - "some.show.911.special.avi" yEnc (1/50)')
+ok(_p["title"].startswith("Some Show") and "9/11" in _p["title"] and _p["files"] is None, f"a date in the middle of a title is not a counter: {_p['title']!r}")
+_p = U.parse_subject('Big Set - 300/200 - "x.rar" yEnc (1/50)')
+ok(_p["files"] is None, "nor are two numbers the wrong way round")
+_sk = S.Sketch("alt.binaries.multimedia")
+_sk.add_rows([(k, x, POSTER, "Mon, 04 Jan 2010 10:00:00 +0000", f"<q{k}@t>", 700_000, ()) for k, x in enumerate(_r1, 1)])
+_cc = _sk.cards(detail=0)
+ok(len(_cc) == 1 and _cc[0]["files"] == 3 and _cc[0]["files_expected"] == 280 and _cc[0]["name"] == "Criminal.Minds.S01.DVDRip",
+   f"three files of one release seen: one card, not three ({[(c['name'], c['files']) for c in _cc]})")
+
 print(f"ok - {n} checks")

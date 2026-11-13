@@ -165,6 +165,12 @@ RX_QUOTED = re.compile(r'"([^"]{1,300})"')
 RX_YENC_TAIL = re.compile(r"\s*-?\s*yEnc(?:\s+\d+)?\s*$", re.I)
 RX_BARE_FILE = re.compile(r"(\S+\.[A-Za-z0-9]{2,5})\s*$")
 RX_COUNTER = re.compile(r"[\[(]\s*(\d{1,4})\s*(?:/|of)\s*(\d{1,4})\s*[\])]|\bFile\s+(\d{1,4})\s+of\s+(\d{1,4})\b", re.I)
+# The request boards write the counter bare, after a dash, as the last thing before the file
+# name: "a.b.mm@efnet - req 73838 - Criminal.Minds.S01.DVDRip - 083/280". Unread, it stayed in
+# the title, every file of the release had a title of its own, and each became a "release"
+# of one file. Only at the very end of the title and only when the first number is not the
+# larger: "Show - 9/11" as a title's last words is rare, a counter there is the rule.
+RX_COUNTER_BARE = re.compile(r"\s+-\s+(\d{1,4})\s*/\s*(\d{1,4})\s*$")
 RX_VOLUME = re.compile(
     r"(\.vol\d+\+\d+)?(\.part\d+)?(\.(rar|r\d{2,3}|s\d{2}|par2?|p\d{2}|7z|zip|\d{3}|nzb|nfo|sfv|md5|m3u|log|cue|txt|jpg|jpeg|png))*$",
     re.I)
@@ -192,6 +198,11 @@ def parse_subject(subject: str):
     if c:
         file_no, files = int(c.group(1) or c.group(3)), int(c.group(2) or c.group(4))
     title = RX_COUNTER.sub(" ", title)
+    bare = RX_COUNTER_BARE.search(title.rstrip(" -"))
+    if bare and 0 < int(bare.group(1)) <= int(bare.group(2)):
+        if files is None:
+            file_no, files = int(bare.group(1)), int(bare.group(2))
+        title = title.rstrip(" -")[:bare.start()]
     title = re.sub(r"\s+", " ", title).strip(" -–—:|>*=#")
     part, total = int(m["part"]), int(m["total"])
     if part < 0 or total < 1 or part > total:

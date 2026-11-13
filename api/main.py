@@ -7117,24 +7117,31 @@ async def health():
 
 
 _DASH_CACHE: dict = {"at": 0.0, "v": None}
+# A channel the user removed is cleared a little later (its files are reported to tgarr.me
+# first). Until then its rows are still in the tables - and the Dashboard went on counting
+# them: 130,000 items of five channels that had been removed hours before. For every number
+# on the Dashboard such a channel is gone the moment it is removed.
+_GOING = ("(SELECT id FROM channels WHERE unfollowed_at IS NOT NULL "
+          "AND NOT COALESCE(subscribed, FALSE) AND NOT COALESCE(is_joined, FALSE))")
 
 
 @app.get("/")
 async def root(request: Request, accept: Optional[str] = Header(None)):
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow(
-            """SELECT (SELECT count(*) FROM channels)                AS channels,
-                      (SELECT count(*) FROM messages)                AS messages,
+            f"""SELECT (SELECT count(*) FROM channels WHERE id NOT IN {_GOING}) AS channels,
+                      (SELECT count(*) FROM messages
+                         WHERE channel_id NOT IN {_GOING})           AS messages,
                       (SELECT count(*) FROM releases)                AS releases,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='video')                   AS videos,
+                         WHERE media_type='video' AND channel_id NOT IN {_GOING}) AS videos,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='photo')                   AS photos,
+                         WHERE media_type='photo' AND channel_id NOT IN {_GOING}) AS photos,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='audio')                   AS audio,
+                         WHERE media_type='audio' AND channel_id NOT IN {_GOING}) AS audio,
                       (SELECT count(*) FROM messages
-                         WHERE media_type='document'
-                           AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$') AS books,
+                         WHERE media_type='document' AND channel_id NOT IN {_GOING}
+                           AND file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$') AS books,
                       (SELECT count(*) FROM downloads
                          WHERE status='pending')                     AS pending,
                       (SELECT count(*) FROM downloads
@@ -7184,11 +7191,11 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                             WHERE category IN ('movie', 'tv')
                               AND created_at > NOW() - INTERVAL '24 hours')        AS rel_new""")
             new_today = {r["media_type"]: r["n"] for r in await conn.fetch(
-                """SELECT media_type, count(*) AS n FROM messages
-                   WHERE indexed_at > NOW() - INTERVAL '24 hours' GROUP BY 1""")}
+                f"""SELECT media_type, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '24 hours' AND channel_id NOT IN {_GOING} GROUP BY 1""")}
             per_day = await conn.fetch(
-                """SELECT date_trunc('day', indexed_at)::date AS d, count(*) AS n FROM messages
-                   WHERE indexed_at > NOW() - INTERVAL '14 days' GROUP BY 1 ORDER BY 1""")
+                f"""SELECT date_trunc('day', indexed_at)::date AS d, count(*) AS n FROM messages
+                   WHERE indexed_at > NOW() - INTERVAL '14 days' AND channel_id NOT IN {_GOING} GROUP BY 1 ORDER BY 1""")
             latest = await conn.fetch(
                 """SELECT r.primary_msg_id, r.poster_url, r.category, r.season, r.episode,
                           r.quality, r.movie_year,
@@ -7222,11 +7229,11 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                               LEFT JOIN messages m ON m.id = r.primary_msg_id
                               LEFT JOIN channels c ON c.id = m.channel_id
                               WHERE r.category = $1 AND COALESCE(r.size_bytes, 0) >= 100 * 1024 * 1024
-                                AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis})
+                                AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis} AND (c.id IS NULL OR c.id NOT IN {_GOING}))
                             SELECT count(DISTINCT COALESCE(wk, 'id:' || id::text)) FROM base""", _cat)
                 tile["video"] = await conn.fetchval(
                     f"""SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
-                        WHERE m.media_type = 'video' AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis}
+                        WHERE m.media_type = 'video' AND COALESCE(c.audience, 'sfw') = 'sfw'{_vis} AND c.id NOT IN {_GOING}
                           AND (COALESCE(m.file_size, 0) >= 50 * 1024 * 1024 OR c.local_root IS NOT NULL)
                           AND NOT EXISTS (SELECT 1 FROM messages o JOIN channels oc ON oc.id = o.channel_id
                                           WHERE o.file_unique_id = m.file_unique_id AND o.id > m.id AND o.media_type = 'video'
@@ -7238,7 +7245,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                         WHERE (m.media_type = 'photo' OR (m.media_type IS NULL AND m.file_name IS NULL
                                  AND COALESCE(m.mime_type, '') = '' AND m.file_unique_id IS NOT NULL))
                           AND COALESCE(m.thumb_path, '') <> '__failed__' AND COALESCE(m.thumb_path, '') <> '__deleted__'
-                          AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'{_adult}{_vis}""")
+                          AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'{_adult}{_vis} AND c.id NOT IN {_GOING}""")
             except Exception as _e:
                 log.warning("[dashboard] tile counts: %s", _e)      # fall back to the plain totals below
             lib = dict(lib, tile=tile)
@@ -7400,7 +7407,8 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         mix.append(("other files", other, "#cbd5e1"))
     tot = sum(v for _, v, _ in mix) or 1
     mix_html = (
-        '<div class="panel"><div class="ph"><span>What is indexed</span>'
+        '<div class="panel"><div class="ph"><span title="Every file in the index. The tiles above count what each page '
+        'lists when opened: no 18+ channels, no clips, one card per film - so they are smaller.">Everything in the index</span>'
         f'<span class="pn">{st["messages"]:,} items</span></div>'
         '<div class="mixbar">'
         + "".join(f'<div style="width:{v * 100 / tot:.2f}%;background:{c}" title="{k}: {v:,}"></div>'
