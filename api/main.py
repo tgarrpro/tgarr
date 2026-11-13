@@ -10329,7 +10329,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
             "        WHEN m.audio_duration_sec >= 20 THEN 0.5 ELSE 0.2 END "
             # Actual audio quality: lossless containers first, then the
             # average bitrate implied by size / duration (kbit/s).
-            " * CASE WHEN m.file_name ~* '\.(flac|ape|wav|alac|aiff?|dsf|wv)$' "
+            " * CASE WHEN m.file_name ~* '\\.(flac|ape|wav|alac|aiff?|dsf|wv)$' "
             "             OR m.mime_type ~* '(flac|wav|x-ape|aiff)' THEN 1.25 "
             "        WHEN COALESCE(m.audio_duration_sec, 0) < 20 "
             "             OR COALESCE(m.file_size, 0) = 0 THEN 1.0 "
