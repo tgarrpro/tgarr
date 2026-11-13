@@ -140,56 +140,19 @@ _REVOKED_FIRED = False
 
 
 async def wipe_private_channel_data() -> dict:
-    """Drop all channels with no public username (= private/invite-only) and
-    everything that depends on them — messages, releases, downloads, and the
-    auto_grab_log/Meili docs that follow. Returns counts for logging.
-
-    Rationale: private channels are reachable only via MTProto from the
-    account that joined them. Once that account is logged out / revoked,
-    the local rows are dead pointers (no client can fetch them). Central
-    federation already has the resources, so on next login the client can
-    pull a fresh snapshot.
-
-    Public channels (username IS NOT NULL) are kept — any new account can
-    re-join and re-index them, and the cached browse data stays useful in
-    read-only mode while logged out.
-    """
+    """The session is gone (signed out elsewhere, or revoked): keep the
+    account's private chats, marked as held, instead of deleting them. They
+    are hidden from every page until the same account signs in again, and
+    removed only after the keeping period (see the api's _private_keep_worker).
+    The name is historical - this used to delete them."""
     async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            target_ids = [r["id"] for r in await conn.fetch(
-                "SELECT id FROM channels WHERE username IS NULL")]
-            if not target_ids:
-                return {"channels": 0, "messages": 0, "releases": 0}
-            msg_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM messages WHERE channel_id = ANY($1::int[])",
-                target_ids)
-            rel_target_q = """
-                SELECT r.id FROM releases r
-                JOIN messages m ON m.id = r.primary_msg_id
-                WHERE m.channel_id = ANY($1::int[])"""
-            # Order matters — bottom-up so FK constraints don't fire:
-            # downloads → releases → monitored_movies-nullify → releases →
-            # (channels cascade messages, auto_grab_log cascades from releases).
-            await conn.execute(
-                f"DELETE FROM downloads WHERE release_id IN ({rel_target_q})",
-                target_ids)
-            await conn.execute(
-                f"UPDATE monitored_movies SET grabbed_release_id = NULL "
-                f"WHERE grabbed_release_id IN ({rel_target_q})",
-                target_ids)
-            rel_count = int((await conn.execute(
-                f"""DELETE FROM releases WHERE primary_msg_id IN (
-                       SELECT id FROM messages
-                       WHERE channel_id = ANY($1::int[]))""",
-                target_ids)).split()[-1])
-            await conn.execute(
-                "DELETE FROM channels WHERE id = ANY($1::int[])", target_ids)
-    log.warning("[wipe-private] removed %d channels + %d messages + %d releases",
-                len(target_ids), msg_count, rel_count)
-    # Meili will reconcile on next sync pass — its docs reference the now-gone
-    # message/release ids, those become stale until meili_sync_worker prunes.
-    return {"channels": len(target_ids), "messages": msg_count,
-            "releases": rel_count}
+        await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS held_at TIMESTAMPTZ")
+        r = await conn.execute(
+            """UPDATE channels SET held_at = NOW(), account_user_id = COALESCE(account_user_id, $1)
+               WHERE username IS NULL AND held_at IS NULL
+                 AND ($1::bigint IS NULL OR COALESCE(account_user_id, $1) = $1)""",
+            CURRENT_USER_ID or None)
+    return {"kept": int(r.split()[-1]) if r.startswith("UPDATE") else 0}
 
 
 async def _mark_revoked(reason: str) -> None:
@@ -7679,6 +7642,17 @@ async def main() -> None:
         CURRENT_DC = 0
     log.info("connected as @%s (id=%s) dc=%s",
              me.username or "-", me.id, CURRENT_DC)
+    # this account is back: its private chats, kept while it was signed out, show again
+    try:
+        async with db_pool.acquire() as conn:
+            back = await conn.execute(
+                """UPDATE channels SET held_at = NULL
+                   WHERE username IS NULL AND held_at IS NOT NULL
+                     AND COALESCE(account_user_id, $1) = $1""", me.id)
+        if back.split()[-1] != "0":
+            log.info("[sign-in] private chats kept from before are shown again: %s", back)
+    except Exception as _e:
+        log.debug("[sign-in] held chats: %s", _e)
     # Persist self-user beside the session (shared volume) so the API sidebar
     # shows the real username instead of @anonymous after a restart — the API
     # has no live client to get_me, so the crawler is the authoritative source.

@@ -216,6 +216,16 @@ def ensure_user_info() -> Optional[dict]:
     return state.user_info
 
 
+_last_uid = None
+
+
+def session_user_id():
+    """The Telegram id the live session belongs to (None when signed out).
+    Read from the session file itself, so it is right from the first second
+    after signing in - before anything else has been fetched."""
+    return _last_uid if session_exists() else None
+
+
 def session_exists() -> bool:
     """True only if Pyrogram session has a signed-in user_id, not just a handshake-only auth_key.
     Without this check, a half-finished login (token exported, never scanned) leaves
@@ -224,7 +234,7 @@ def session_exists() -> bool:
     A .revoked marker forces False — the session file may still parse fine
     but the upstream account is gone, so we must re-auth.
     """
-    global _last_authed
+    global _last_authed, _last_uid
     if os.path.exists(REVOKED_MARKER):
         _last_authed = False
         return False
@@ -240,6 +250,7 @@ def session_exists() -> bool:
         finally:
             con.close()
         _last_authed = bool(row and row[0])
+        _last_uid = int(row[0]) if _last_authed else None
         return _last_authed
     except sqlite3.OperationalError as e:
         # Busy/locked = the crawler is writing to it right now. That is not
