@@ -1251,11 +1251,9 @@ async def get_seeds(
 # GET /api/v1/registry
 # ════════════════════════════════════════════════════════════════════
 # Per-IP-hash pull rate limit (defense in depth — Cloudflare absorbs 99%
-# of legit traffic but origin still gets hit on cache misses). Free tier
-# gets a much lower budget than paid; API key passes mark the request as
-# paid and skip the free quota.
-PULL_LIMIT_FREE_PER_DAY = 24
-PULL_LIMIT_PAID_PER_DAY = 1000  # standard tier; plus tier currently same in code
+# of legit traffic but origin still gets hit on cache misses). One budget for
+# everybody: an install pulls about once an hour.
+PULL_LIMIT_PER_DAY = 24
 
 # Federation consensus gate: a channel must have N independent contributors
 # confirming "alive" before /api/v1/registry surfaces it to public consumers.
@@ -1328,12 +1326,12 @@ async def get_registry(
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "count": len(rows),
             "channels": [_row_json(r) for r in rows],
-            "tier": "free_showcase_test",
+            "mode": "showcase_test",
         }, headers={"Cache-Control": "no-store"})
     # === end showcase test-mode ===
-    # TODO v0.4: validate api_key against an auth table linked to Stripe.
-    # Today a non-empty api_key just unlocks the paid-tier cap.
-    daily_cap = PULL_LIMIT_PAID_PER_DAY if api_key else PULL_LIMIT_FREE_PER_DAY
+    # The api_key parameter is accepted and ignored: nothing issues keys. (It used
+    # to raise the cap for anyone who sent any value at all.)
+    daily_cap = PULL_LIMIT_PER_DAY
     async with db_pool.acquire() as conn:
         # Count this IP's pulls in the last 24h. Real query against pulls
         # table, not contributions.
@@ -1343,9 +1341,7 @@ async def get_registry(
                  AND pulled_at > NOW() - INTERVAL '24 hours'""", ip_hash)
         if today_pulls and today_pulls >= daily_cap:
             raise HTTPException(
-                429, f"daily registry-pull limit exceeded ({daily_cap} for "
-                     f"{'paid' if api_key else 'free'} tier — see "
-                     f"https://tgarr.me/docs/PRICING.md)")
+                429, f"daily registry-pull limit exceeded ({daily_cap} a day)")
         # Record this pull now (before serving) so concurrent pulls count.
         await conn.execute(
             "INSERT INTO registry_pulls (ip_hash, api_key_set) VALUES ($1, $2)",
