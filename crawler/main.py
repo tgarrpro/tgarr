@@ -6424,7 +6424,7 @@ async def deep_backfill_worker() -> None:
 
     For each subscribed channel that's not yet deep_backfilled:
       1. Find oldest tg_message_id we have locally (or use deep_oldest_tg_id cursor)
-      2. get_chat_history(offset_id=oldest, limit=DEEP_BACKFILL_PAGE_SIZE) →
+      2. get_chat_history(max_id=oldest - 1, limit=DEEP_BACKFILL_PAGE_SIZE) →
          returns messages OLDER than offset
       3. Ingest each, update cursor to new oldest seen
       4. If 0 returned → bottom reached, mark deep_backfilled=TRUE
@@ -6575,7 +6575,12 @@ async def deep_backfill_worker() -> None:
                     cutoff_date = _dt.now(_tz.utc) - _td(days=3 * hl)
             try:
                 await _mtproto_wait_clearance()
-                offset_kw = {"offset_id": cursor} if cursor else {}
+                # max_id, not offset_id: Kurigram ignores offset_id (it is
+                # deprecated there and silently replaced), so every "next
+                # page" was the channel's newest 200 messages again - the
+                # same page read over and over, for ever. max_id is
+                # inclusive, hence the - 1.
+                offset_kw = {"max_id": cursor - 1} if cursor and cursor > 1 else {}
                 async for msg in _hist(
                         row["tg_chat_id"],
                         limit=DEEP_BACKFILL_PAGE_SIZE,

@@ -24,7 +24,7 @@ jobs:
         run: python -W error::SyntaxWarning -m compileall -q api crawler registry tools || python -m compileall -q api crawler registry tools
       - name: Parser regression tests
         working-directory: crawler
-        run: python test_parser.py && python test_tme.py
+        run: python test_parser.py && python test_tme.py && python test_library.py
       - name: Update-notice and operator-panel tests
         run: |
           pip install -q fastapi==0.115.0 asyncpg==0.30.0 python-multipart==0.0.12 httpx
