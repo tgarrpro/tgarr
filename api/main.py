@@ -712,6 +712,14 @@ async def _migrate_schema():
               added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_alias_canon ON series_aliases (canonical_title);
+            -- Which series have been asked about (other-language names by
+            -- TVDB number), so each is asked once, not every hour.
+            CREATE TABLE IF NOT EXISTS series_alias_lookups (
+              tvdb_id BIGINT PRIMARY KEY,
+              looked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              names INT NOT NULL DEFAULT 0,
+              source TEXT
+            );
             CREATE TABLE IF NOT EXISTS stats_history (
               snapshot_at TIMESTAMPTZ NOT NULL,
               metric TEXT NOT NULL,
@@ -9321,6 +9329,61 @@ def _expand_inbound_query(q: str) -> list:
     return list(variants)
 
 
+ALIAS_LOOKUPS_PER_RUN = 40
+
+
+def _names_to_aliases(names, canonical: str) -> list:
+    """The names worth matching release names against: specific enough
+    (_alias_ok), not the canonical title itself, not absurdly long."""
+    canon = (canonical or "").strip().casefold()
+    out = []
+    for n in sorted(names):
+        n = (n or "").strip()
+        if n and n.casefold() != canon and len(n) <= 80 and _alias_ok(n):
+            out.append(n)
+    return out
+
+
+async def _alias_names_from_metadata(series: list) -> int:
+    """Other-language names for the series Sonarr tracks, by TVDB number.
+    Each series is asked about once (again after two weeks if nothing was
+    found, or sooner after a failed request). A name never replaces an alias
+    that came from Sonarr, Radarr or was entered by hand."""
+    # newest first: the series just added is the one being searched for now
+    known = [(int(s["tvdbId"]), s.get("title") or "")
+             for s in sorted(series, key=lambda s: s.get("id") or 0, reverse=True)
+             if s.get("tvdbId") and s.get("title")]
+    if not known:
+        return 0
+    async with db_pool.acquire() as conn:
+        done = {r["tvdb_id"] for r in await conn.fetch(
+            """SELECT tvdb_id FROM series_alias_lookups
+               WHERE names > 0 OR looked_at > NOW() - INTERVAL '14 days'""")}
+        key = await conn.fetchval("SELECT value FROM config WHERE key='tmdb_api_key'")
+    added = 0
+    for tvdb_id, canonical in [k for k in known if k[0] not in done][:ALIAS_LOOKUPS_PER_RUN]:
+        try:
+            names, source = await md.series_names(tvdb_id, key or None)
+        except Exception as e:
+            logging.getLogger("tgarr.alias").info("names for tvdb %s: %s - later", tvdb_id, str(e)[:80])
+            await asyncio.sleep(2)
+            continue
+        aliases = _names_to_aliases(names, canonical)
+        async with db_pool.acquire() as conn:
+            for a in aliases:
+                r = await conn.execute(
+                    """INSERT INTO series_aliases (alias_text, canonical_title, season, kind, source, external_id)
+                       VALUES ($1, $2, NULL, 'tv', $3, $4) ON CONFLICT (alias_text) DO NOTHING""",
+                    a, canonical, source, tvdb_id)
+                added += r.endswith("1")
+            await conn.execute(
+                """INSERT INTO series_alias_lookups (tvdb_id, names, source) VALUES ($1, $2, $3)
+                   ON CONFLICT (tvdb_id) DO UPDATE SET looked_at = NOW(), names = $2, source = $3""",
+                tvdb_id, len(aliases), source)
+        await asyncio.sleep(0.4)
+    return added
+
+
 async def _arr_alias_sync_worker():
     """Pull Sonarr+Radarr series + alternateTitles, UPSERT into series_aliases.
     Runs hourly. Endpoints + keys from env. Failures non-fatal — manual
@@ -9352,6 +9415,16 @@ async def _arr_alias_sync_worker():
                             "%s fetch failed: %s", app_name, e)
                         return []
                 items = await asyncio.to_thread(_fetch)
+                if kind == "tv" and items:
+                    try:
+                        n_meta = await _alias_names_from_metadata(items)
+                        if n_meta:
+                            logging.getLogger("tgarr.alias").info(
+                                "%d other-language series names added", n_meta)
+                            global _series_aliases_loaded_at
+                            _series_aliases_loaded_at = 0.0      # use them at once
+                    except Exception as e:
+                        logging.getLogger("tgarr.alias").warning("series names: %s", e)
                 aliases = []
                 for it in items:
                     canonical = it.get("title") or ""

@@ -108,6 +108,22 @@ ok(L(0, 0) == "off", "unknown disk")
 ok(main._fmt_uptime(12 * 86400 + 21 * 3600) == "12 d 21 h" and main._fmt_uptime(3 * 3600 + 120) == "3 h 2 min",
    "uptime wording")
 
+# ---- other-language names of a series -----------------------------------
+import metadata as _md  # noqa: E402
+
+_names = _md.names_from_tmdb(
+    {"tv_results": [{"id": 1, "name": "Cases Between Us", "original_name": "京城奇探"}]},
+    {"results": [{"iso_3166_1": "CN", "title": "京城奇探 "}, {"iso_3166_1": "US", "title": "CBU"}, {"title": ""}]},
+    {"translations": [{"iso_639_1": "ko", "data": {"name": "경성기탐"}}, {"iso_639_1": "fr", "data": {"name": ""}},
+                      {"iso_639_1": "en", "data": {"name": "Cases Between Us"}}]})
+ok(_names == {"Cases Between Us", "京城奇探", "CBU", "경성기탐"}, "original, alternative and translated names, trimmed, no blanks")
+ok(_md.names_from_tmdb({}, {}, {}) == set(), "nothing found: no names")
+_al = main._names_to_aliases(_names | {"1", "Ov", "x" * 90}, "Cases Between Us")
+ok(_al == ["京城奇探", "경성기탐"],
+   "kept: the names that differ from the title and are specific enough (not 'CBU', '1', 'Ov', or 90 characters)")
+ok(main._names_to_aliases({"cases between us", "CASES BETWEEN US"}, "Cases Between Us") == [],
+   "the title itself in another case is not an alias")
+
 # ---- the season a release is offered under (Newznab TV search) ----------
 _saved_aliases = main._series_aliases_cache
 main._series_aliases_cache = [("舌尖上的中国第三季", "A Bite of China", 3, "tv"),

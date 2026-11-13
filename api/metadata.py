@@ -335,6 +335,49 @@ async def _wikidata_resolve(category: str, title: str, year: int | None) -> dict
     return UNMATCHED
 
 
+# ─────────────── a series' names in other languages ──────────────────
+# Sonarr knows a series by its English name and gives no translations, so a
+# release named in Chinese, Japanese or Korean could never be matched to it.
+_WD_NAMES_Q = """SELECT ?l WHERE { ?item wdt:P4835 "%d" .
+  { ?item rdfs:label ?l } UNION { ?item skos:altLabel ?l } } LIMIT 400"""
+
+
+def names_from_tmdb(found: dict, alt: dict, trans: dict) -> set:
+    """Every name TMDB holds for a series: the original one, the alternative
+    titles and each translation's name."""
+    out = set()
+    for hit in (found.get("tv_results") or [])[:1]:
+        out.update(x for x in (hit.get("original_name"), hit.get("name")) if x)
+    out.update(x.get("title") for x in (alt.get("results") or []) if x.get("title"))
+    out.update((x.get("data") or {}).get("name") for x in (trans.get("translations") or [])
+               if (x.get("data") or {}).get("name"))
+    return {n.strip() for n in out if n and n.strip()}
+
+
+def _series_names_sync(tvdb_id: int, key: str | None):
+    if key:
+        found = _fetch(f"{TMDB_BASE}/find/{int(tvdb_id)}",
+                       {"external_source": "tvdb_id", "api_key": key})
+        hits = found.get("tv_results") or []
+        if hits:
+            base = f"{TMDB_BASE}/tv/{int(hits[0]['id'])}"
+            return names_from_tmdb(found, _fetch(base + "/alternative_titles", {"api_key": key}),
+                                   _fetch(base + "/translations", {"api_key": key})), "tmdb"
+    data = _fetch("https://query.wikidata.org/sparql",
+                  {"format": "json", "query": _WD_NAMES_Q % int(tvdb_id)}, timeout=25)
+    names = {b["l"]["value"].strip() for b in data.get("results", {}).get("bindings", [])
+             if b.get("l", {}).get("value", "").strip()}
+    return names, "wikidata"
+
+
+async def series_names(tvdb_id: int, key: str | None):
+    """(names, source) for a series known by its TVDB number. TMDB when a key
+    is set (it has nearly everything, new series included); Wikidata
+    otherwise (older and better-known series). Raises on a failed request so
+    the caller can try again later instead of recording 'no names'."""
+    return await asyncio.to_thread(_series_names_sync, tvdb_id, key)
+
+
 async def _tmdb_by_id(kind: str, tmdb_id, key: str, lang) -> dict | None:
     """Details of a known TMDB id (no searching, so no wrong match)."""
     path = f"/{'tv' if kind == 'tv' else 'movie'}/{tmdb_id}"
