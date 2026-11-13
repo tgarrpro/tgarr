@@ -7820,12 +7820,13 @@ _KIDS_CSS = """<style>
 .km-row:last-child{border-bottom:none}.km-row span.n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .km-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:22px;overflow:hidden}
 .km-pad{padding:16px 18px}.km-row small{color:var(--muted)}
+.km-chip.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .km-in{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}
 </style>"""
 
 
 @app.get("/mediacenter/manage", response_class=HTMLResponse)
-async def page_kids_manage(q: Optional[str] = None):
+async def page_kids_manage():
     cfg = await _access_cfg(fresh=True)
     async with db_pool.acquire() as conn:
         chans = await conn.fetch("""
@@ -7835,19 +7836,21 @@ async def page_kids_manage(q: Optional[str] = None):
             FROM channels c
             WHERE EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = c.id)
             ORDER BY allowed DESC, n DESC LIMIT 400""")
-        allowed_items = await conn.fetch("""
-            SELECT m.id, m.file_name, m.media_type FROM kids_allow k JOIN messages m ON m.id = k.ref
-            WHERE k.kind = 'message' ORDER BY k.added_at DESC LIMIT 200""")
-        found = []
-        if q and q.strip():
-            ps = [f"%{w}%" for w in q.split()[:6]]
-            found = await conn.fetch(f"""
-                SELECT m.id, m.file_name, m.media_type, c.title,
-                       EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'message' AND k.ref = m.id) AS allowed
-                FROM messages m JOIN channels c ON c.id = m.channel_id
-                WHERE m.file_name IS NOT NULL AND COALESCE(c.audience, 'sfw') = 'sfw'
-                  AND {' AND '.join(f'm.file_name ILIKE ${i + 1}' for i in range(len(ps)))}
-                ORDER BY (m.local_path IS NOT NULL) DESC, m.posted_at DESC NULLS LAST LIMIT 60""", *ps)
+        # The files already saved on this machine (opened in a player, or
+        # grabbed), newest use first - plus anything ticked earlier that has
+        # since been cleared from disk, so that it can still be unticked.
+        items = await conn.fetch("""
+            SELECT m.id, m.file_name, m.media_type, m.file_size, c.title,
+                   (m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__') AS saved,
+                   EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'message' AND k.ref = m.id) AS allowed,
+                   EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'channel' AND k.ref = m.channel_id) AS by_channel
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE COALESCE(c.audience, 'sfw') = 'sfw'
+              AND ((m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
+                    AND split_part(m.local_path, '/', 1) IN ('video', 'audio', 'library'))
+                   OR m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message'))
+            ORDER BY COALESCE(m.local_accessed_at, m.indexed_at) DESC NULLS LAST, m.id DESC
+            LIMIT 2000""")
 
     def box(kind, ref, on, dis=""):
         return (f'<input type="checkbox" {"checked" if on else ""} {dis} '
@@ -7874,25 +7877,37 @@ async def page_kids_manage(q: Optional[str] = None):
         + (' <small>· 18+, never shown there</small>' if c["audience"] != "sfw" else "")
         + f'</span><small>{c["n"]:,} items</small></label>' for c in chans)
     ico = {"video": "🎬", "audio": "🎵", "photo": "🖼"}
+
+    def kind_of(r):
+        if r["media_type"] in ("video", "audio"):
+            return r["media_type"]
+        return "book"
     item_rows = "".join(
-        f'<label class="km-row">{box("message", r["id"], True)}<span class="n">{ico.get(r["media_type"], "📄")} '
-        f'{html.escape(r["file_name"] or "item " + str(r["id"]))}</span></label>' for r in allowed_items)
-    found_rows = "".join(
-        f'<label class="km-row">{box("message", r["id"], r["allowed"])}<span class="n">{ico.get(r["media_type"], "📄")} '
-        f'{html.escape(r["file_name"])} <small>{html.escape(r["title"] or "")}</small></span></label>' for r in found)
+        f'<label class="km-row" data-k="{kind_of(r)}">'
+        + (box("message", r["id"], True, "disabled") if r["by_channel"] and not r["allowed"]
+           else box("message", r["id"], r["allowed"]))
+        + f'<span class="n">{ico.get(r["media_type"], "📄")} '
+          f'{html.escape(r["file_name"] or "item " + str(r["id"]))} <small>{html.escape(r["title"] or "")}</small>'
+        + (' <small>· shown already: its channel is ticked</small>' if r["by_channel"] and not r["allowed"] else "")
+        + ("" if r["saved"] else ' <small>· no longer saved here</small>')
+        + f'</span><small>{_fmt_size(r["file_size"]) or ""}</small></label>' for r in items)
+    n_kind = {k: sum(1 for r in items if kind_of(r) == k) for k in ("video", "audio", "book")}
+    chips = "".join(
+        f'<button type="button" class="btn ghost km-chip{" on" if k == "all" else ""}" data-k="{k}" onclick="kmShow(this)">{lbl} '
+        f'<span style="opacity:.6">{n:,}</span></button>'
+        for k, lbl, n in (("all", "All", len(items)), ("video", "🎬 Videos", n_kind["video"]),
+                          ("audio", "🎵 Music", n_kind["audio"]), ("book", "📄 Books", n_kind["book"])))
     body = (
         _KIDS_CSS + pin_box
         + '<h2 class="section">Whole channels in the Media Center</h2>'
           '<p style="color:var(--muted);margin:-6px 0 12px">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
         + f'<div class="km-box" style="max-height:420px;overflow:auto">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div>'
-        + '<h2 class="section">Single items</h2>'
-        + f'<form method="GET" action="/mediacenter/manage" style="display:flex;gap:8px;margin-bottom:12px">'
-          f'<input class="km-in" type="text" name="q" value="{html.escape(q or "", quote=True)}" placeholder="find a file by name…" style="flex:1;max-width:420px"/>'
-          '<button class="btn" type="submit">Search</button></form>'
-        + (f'<div class="km-box">{found_rows}</div>' if found else
-           ('<div class="km-box"><div class="km-pad" style="color:var(--muted)">nothing found</div></div>' if q else ""))
-        + (f'<p style="color:var(--muted);margin:14px 0 8px">On the list now ({len(allowed_items)}):</p>'
-           f'<div class="km-box">{item_rows}</div>' if allowed_items else "")
+        + '<h2 class="section">Single files</h2>'
+          '<p style="color:var(--muted);margin:-6px 0 12px">The files already saved on this machine. Tick the ones to show in the Media Center.</p>'
+        + (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">{chips}</div>'
+           f'<div class="km-box" id="kmItems" style="max-height:560px;overflow:auto">{item_rows}</div>' if items else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing is saved yet. Files you open in a player '
+           'are kept and appear here.</div></div>')
         + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
         + """<script>
 function kmAllow(kind, ref, el){
@@ -7906,6 +7921,10 @@ function kmPin(remove){
   fetch("/api/kids/pin", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({pin: remove ? "" : nw.value, current: cur ? cur.value : ""})}).then(r => r.json())
     .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "that did not work"; });
+}
+function kmShow(b){
+  document.querySelectorAll(".km-chip").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("#kmItems .km-row").forEach(r => { r.style.display = (b.dataset.k === "all" || r.dataset.k === b.dataset.k) ? "" : "none"; });
 }
 function kmLock(){ fetch("/api/lock", {method: "POST"}).then(() => { location.href = "/mediacenter"; }); }
 </script>""")
