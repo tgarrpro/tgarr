@@ -140,19 +140,11 @@ _REVOKED_FIRED = False
 
 
 async def wipe_private_channel_data() -> dict:
-    """The session is gone (signed out elsewhere, or revoked): keep the
-    account's private chats, marked as held, instead of deleting them. They
-    are hidden from every page until the same account signs in again, and
-    removed only after the keeping period (see the api's _private_keep_worker).
-    The name is historical - this used to delete them."""
-    async with db_pool.acquire() as conn:
-        await conn.execute("ALTER TABLE channels ADD COLUMN IF NOT EXISTS held_at TIMESTAMPTZ")
-        r = await conn.execute(
-            """UPDATE channels SET held_at = NOW(), account_user_id = COALESCE(account_user_id, $1)
-               WHERE username IS NULL AND held_at IS NULL
-                 AND ($1::bigint IS NULL OR COALESCE(account_user_id, $1) = $1)""",
-            CURRENT_USER_ID or None)
-    return {"kept": int(r.split()[-1]) if r.startswith("UPDATE") else 0}
+    """The session is gone (signed out elsewhere, or revoked). This used to
+    delete the account's private chats; they are kept now. The api moves
+    them into its keeping tables (see _private_keep_worker there) and gives
+    them back when the same account signs in again - nothing to do here."""
+    return {"kept": "by the api"}
 
 
 async def _mark_revoked(reason: str) -> None:
@@ -169,7 +161,7 @@ async def _mark_revoked(reason: str) -> None:
     try:
         if db_pool is not None:
             counts = await wipe_private_channel_data()
-            log.warning("[revoked] wiped private slice: %s", counts)
+            log.warning("[revoked] private chats are kept for the account: %s", counts)
     except Exception as e:
         log.exception("[revoked] wipe failed (continuing): %s", e)
     try:
@@ -7642,17 +7634,6 @@ async def main() -> None:
         CURRENT_DC = 0
     log.info("connected as @%s (id=%s) dc=%s",
              me.username or "-", me.id, CURRENT_DC)
-    # this account is back: its private chats, kept while it was signed out, show again
-    try:
-        async with db_pool.acquire() as conn:
-            back = await conn.execute(
-                """UPDATE channels SET held_at = NULL
-                   WHERE username IS NULL AND held_at IS NOT NULL
-                     AND COALESCE(account_user_id, $1) = $1""", me.id)
-        if back.split()[-1] != "0":
-            log.info("[sign-in] private chats kept from before are shown again: %s", back)
-    except Exception as _e:
-        log.debug("[sign-in] held chats: %s", _e)
     # Persist self-user beside the session (shared volume) so the API sidebar
     # shows the real username instead of @anonymous after a restart — the API
     # has no live client to get_me, so the crawler is the authoritative source.

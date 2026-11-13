@@ -134,25 +134,15 @@ def _me_id():
 
 
 def _pub(alias: str = "c") -> str:
-    """SQL to append to a WHERE: what the person at the keyboard may see.
-    Nobody signed in: public channels only. Somebody signed in: public
-    channels and that account's own private chats - not the private chats
-    another account left behind on this install (they are kept for it, see
-    PRIVATE_KEEP_DAYS, and are nobody else's business)."""
-    uid = _me_id()
-    if uid is None:
-        return f" AND {alias}.username IS NOT NULL"
-    return f" AND ({alias}.username IS NOT NULL OR COALESCE({alias}.account_user_id, {uid}) = {uid})"
+    """SQL to append to a WHERE: public channels only, when nobody is signed in."""
+    return "" if _signed_in() else f" AND {alias}.username IS NOT NULL"
 
 
 def _pub_m(alias: str = "m") -> str:
     """The same for a query on messages that may not join channels at all (a
     page's count and facet queries reuse its filter without the join)."""
-    uid = _me_id()
-    if uid is None:
-        return f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL)"
-    return (f" AND {alias}.channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL "
-            f"AND COALESCE(account_user_id, {uid}) <> {uid})")
+    return "" if _signed_in() else (
+        f" AND {alias}.channel_id IN (SELECT id FROM channels WHERE username IS NOT NULL)")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -288,10 +278,9 @@ async def _locked_block(request: Request):
 
 
 async def _signed_out_block(request: Request):
-    uid = _me_id()
-    path = request.url.path
-    if _signed_in() and request.method not in ("GET", "HEAD", "OPTIONS"):
+    if _signed_in():
         return None
+    path = request.url.path
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         # the PIN and the kids' list belong to this install, not to the
         # Telegram account: they work whether or not anybody is signed in
@@ -303,17 +292,15 @@ async def _signed_out_block(request: Request):
     m = _PRIVATE_ID_RX.match(path)
     if m and db_pool is not None:
         mid = int(m.group(1))
-        ok = _PUBLIC_MSG.get((mid, uid))
+        ok = _PUBLIC_MSG.get(mid)
         if ok is None:
             async with db_pool.acquire() as conn:
-                # public, or a private chat of the account signed in right now
                 ok = bool(await conn.fetchval(
-                    """SELECT c.username IS NOT NULL
-                              OR ($2::bigint IS NOT NULL AND COALESCE(c.account_user_id, $2) = $2)
-                       FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.id = $1""", mid, uid))
+                    """SELECT c.username IS NOT NULL FROM messages m
+                       JOIN channels c ON c.id = m.channel_id WHERE m.id = $1""", mid))
             if len(_PUBLIC_MSG) > 20000:
                 _PUBLIC_MSG.clear()
-            _PUBLIC_MSG[(mid, uid)] = ok
+            _PUBLIC_MSG[mid] = ok
         if not ok:
             return PlainTextResponse("not found", status_code=404)
     return None
@@ -326,6 +313,10 @@ def _ct_equal(a: str, b: str) -> bool:
 
 async def _request_guard(request: Request, call_next):
     path = request.url.path
+    # a different account than a moment ago: put the other one's private
+    # chats into keeping (and take this one's out) before anything is shown
+    if db_pool is not None and _me_id() != _PRIVATE_FOR[0]:
+        await _private_reconcile()
     if path in _GUARD_OPEN_PATHS:
         return await call_next(request)
     if _cross_site(request):
@@ -780,8 +771,6 @@ async def _migrate_schema():
             -- to this channel. Crawler workers filter by current account so an
             -- account switch doesn't try to access channels it can't reach.
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS account_user_id BIGINT;
-            -- set when the owning account signs out: kept, hidden, until it returns
-            ALTER TABLE channels ADD COLUMN IF NOT EXISTS held_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS is_joined BOOLEAN NOT NULL DEFAULT FALSE;
             CREATE INDEX IF NOT EXISTS idx_channels_account ON channels (account_user_id);
             -- NULL account_user_id = "not yet claimed by an account"; the crawler
@@ -4684,47 +4673,238 @@ async def api_login_sms_verify(code: str = Form(...), password: Optional[str] = 
     return await login.sms_verify(code, password)
 
 
+# ════════════════════════════════════════════════════════════════════
+# Private chats belong to the Telegram account that is in them.
+#
+# Signing out used to delete them. Now they are KEPT: moved out of the live
+# tables into "held_*" tables. Moved out rather than flagged, because a flag
+# would have to be honoured by every query on every page, in the search
+# index, by the crawler - and one forgotten place shows one person's family
+# photos to the next person who signs in here. What is not in the live
+# tables cannot be shown by anything.
+#
+# The same account signing in again gets everything back exactly as it was
+# (same ids, same progress marks), so only what is new has to be fetched.
+# Another account never sees it. Kept for PRIVATE_KEEP_DAYS without a
+# sign-in, then removed for good, files included.
+# ════════════════════════════════════════════════════════════════════
 PRIVATE_KEEP_DAYS = 365
+_HELD = (("channels", "held_channels"), ("messages", "held_messages"),
+         ("releases", "held_releases"), ("favorites", "held_favorites"))
+_PRIVATE_FOR = [object()]          # the account the live tables are arranged for
+_PRIVATE_LOCK = asyncio.Lock()
+_PRIVATE_RETRY = [0.0]
+
+
+async def _table_cols(conn, table: str) -> list:
+    return await conn.fetch(
+        """SELECT a.attname AS n, format_type(a.atttypid, a.atttypmod) AS t,
+                  a.attgenerated <> '' AS gen
+           FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+           WHERE c.relname = $1 AND pg_table_is_visible(c.oid)
+             AND a.attnum > 0 AND NOT a.attisdropped
+           ORDER BY a.attnum""", table)
+
+
+async def _held_prepare(conn) -> dict:
+    """The keeping tables exist and have every column the live ones have
+    (an update may have added some since the chats were put away).
+    Returns, per live table, the columns that are copied both ways."""
+    cols = {}
+    for live, held in _HELD:
+        await conn.execute(f"CREATE TABLE IF NOT EXISTS {held} (LIKE {live})")
+        have = {r["n"] for r in await _table_cols(conn, held)}
+        names = []
+        for r in await _table_cols(conn, live):
+            if r["n"] not in have:
+                await conn.execute(f'ALTER TABLE {held} ADD COLUMN "{r["n"]}" {r["t"]}')
+            if not r["gen"]:
+                names.append(r["n"])
+        cols[live] = names
+    await conn.execute("ALTER TABLE held_channels ADD COLUMN IF NOT EXISTS held_at TIMESTAMPTZ")
+    await conn.execute("CREATE INDEX IF NOT EXISTS held_messages_channel ON held_messages (channel_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS held_releases_msg ON held_releases (primary_msg_id)")
+    return cols
+
+
+def _q(names, prefix="") -> str:
+    return ", ".join(f'{prefix}"{n}"' for n in names)
+
+
+async def _hold_channels(conn, cols: dict, ids: list, owner) -> int:
+    """Move these private chats, and all that hangs on them, into keeping."""
+    if not ids:
+        return 0
+    await conn.execute(
+        "UPDATE channels SET account_user_id = COALESCE(account_user_id, $2) WHERE id = ANY($1::bigint[])",
+        ids, owner)
+    msgs = "SELECT id FROM messages WHERE channel_id = ANY($1::bigint[])"
+    # A chat that is already in keeping (a message arrived in the seconds
+    # between putting it away and the session ending) is added to, never
+    # replaced: its kept history stays, the new messages join it.
+    c = cols["channels"]
+    await conn.execute(
+        f"""INSERT INTO held_channels ({_q(c)}, held_at) SELECT {_q(c)}, NOW() FROM channels ch
+            WHERE ch.id = ANY($1::bigint[])
+              AND NOT EXISTS (SELECT 1 FROM held_channels hc WHERE hc.tg_chat_id = ch.tg_chat_id)""", ids)
+    c = cols["messages"]
+    sel = ", ".join("hc.id" if n == "channel_id" else f'm."{n}"' for n in c)
+    await conn.execute(
+        f"""INSERT INTO held_messages ({_q(c)})
+            SELECT {sel} FROM messages m
+            JOIN channels ch ON ch.id = m.channel_id
+            JOIN held_channels hc ON hc.tg_chat_id = ch.tg_chat_id
+            WHERE m.channel_id = ANY($1::bigint[])
+              AND NOT EXISTS (SELECT 1 FROM held_messages o
+                              WHERE o.channel_id = hc.id AND o.tg_message_id = m.tg_message_id)""", ids)
+    c = cols["releases"]
+    await conn.execute(
+        f"INSERT INTO held_releases ({_q(c)}) SELECT {_q(c)} FROM releases WHERE primary_msg_id IN ({msgs})", ids)
+    c = cols["favorites"]
+    await conn.execute(
+        f"INSERT INTO held_favorites ({_q(c)}) SELECT {_q(c)} FROM favorites WHERE msg_id IN ({msgs})", ids)
+    # and out of the live tables (downloads -> releases -> channels; messages
+    # and favourites follow their channel)
+    rels = f"SELECT id FROM releases WHERE primary_msg_id IN ({msgs})"
+    await conn.execute(f"DELETE FROM downloads WHERE release_id IN ({rels})", ids)
+    await conn.execute(
+        f"UPDATE monitored_movies SET grabbed_release_id = NULL WHERE grabbed_release_id IN ({rels})", ids)
+    await conn.execute(f"DELETE FROM releases WHERE primary_msg_id IN ({msgs})", ids)
+    await conn.execute("DELETE FROM channels WHERE id = ANY($1::bigint[])", ids)
+    return len(ids)
+
+
+async def _restore_channels(conn, cols: dict, uid: int) -> list:
+    """Give this account its chats back. Returns the live channel ids."""
+    ids = [r["id"] for r in await conn.fetch(
+        "SELECT id FROM held_channels WHERE account_user_id = $1", uid)]
+    if not ids:
+        return []
+    c = cols["channels"]
+    # (the crawler may already have listed a chat again in the seconds since
+    # signing in: then that row stays and the kept messages join it)
+    await conn.execute(
+        f"""INSERT INTO channels ({_q(c)}) SELECT {_q(c)} FROM held_channels
+            WHERE id = ANY($1::bigint[]) ON CONFLICT DO NOTHING""", ids)
+    c = cols["messages"]
+    sel = ", ".join("c.id" if n == "channel_id" else f'h."{n}"' for n in c)
+    await conn.execute(
+        f"""INSERT INTO messages ({_q(c)})
+            SELECT {sel} FROM held_messages h
+            JOIN held_channels hc ON hc.id = h.channel_id
+            JOIN channels c ON c.tg_chat_id = hc.tg_chat_id
+            WHERE hc.id = ANY($1::bigint[]) ON CONFLICT DO NOTHING""", ids)
+    c = cols["releases"]
+    await conn.execute(
+        f"""INSERT INTO releases ({_q(c)}) SELECT {_q(c)} FROM held_releases h
+            WHERE h.primary_msg_id IN (SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[]))
+              AND h.primary_msg_id IN (SELECT id FROM messages)
+            ON CONFLICT DO NOTHING""", ids)
+    c = cols["favorites"]
+    await conn.execute(
+        f"""INSERT INTO favorites ({_q(c)}) SELECT {_q(c)} FROM held_favorites h
+            WHERE h.msg_id IN (SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[]))
+              AND h.msg_id IN (SELECT id FROM messages)
+            ON CONFLICT DO NOTHING""", ids)
+    live = [r["id"] for r in await conn.fetch(
+        """SELECT c.id FROM channels c JOIN held_channels hc ON hc.tg_chat_id = c.tg_chat_id
+           WHERE hc.id = ANY($1::bigint[])""", ids)]
+    await _held_delete(conn, ids)
+    return live
+
+
+async def _held_delete(conn, ids: list) -> None:
+    held_msgs = "SELECT id FROM held_messages WHERE channel_id = ANY($1::bigint[])"
+    await conn.execute(f"DELETE FROM held_favorites WHERE msg_id IN ({held_msgs})", ids)
+    await conn.execute(f"DELETE FROM held_releases WHERE primary_msg_id IN ({held_msgs})", ids)
+    await conn.execute("DELETE FROM held_messages WHERE channel_id = ANY($1::bigint[])", ids)
+    await conn.execute("DELETE FROM held_channels WHERE id = ANY($1::bigint[])", ids)
+
+
+_HELD_FILES = (("thumb_path", THUMBS_DIR), ("preview_path", PREVIEWS_DIR), ("local_path", "/downloads"))
+
+
+async def _restored_files_check(live_ids: list) -> None:
+    """Thumbnails and previews are a short-lived cache and may have been
+    cleared while the chats were away: forget the ones that are gone, so
+    that they are fetched again when looked at, instead of showing a hole."""
+    for col, folder in _HELD_FILES:
+        async with db_pool.acquire() as conn:
+            paths = [r[0] for r in await conn.fetch(
+                f"""SELECT DISTINCT {col} FROM messages WHERE channel_id = ANY($1::bigint[])
+                    AND {col} IS NOT NULL AND left({col}, 2) <> '__'""", live_ids)]
+        gone = await asyncio.to_thread(
+            lambda: [x for x in paths if not os.path.exists(os.path.join(folder, x))])
+        if gone:
+            extra = ", thumb_md5 = NULL" if col == "thumb_path" else ""
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE messages SET {col} = NULL{extra} "
+                    f"WHERE channel_id = ANY($1::bigint[]) AND {col} = ANY($2::text[])", live_ids, gone)
 
 
 async def hold_private_channel_data(uid) -> dict:
-    """Signing out: keep the account's private chats instead of deleting them.
-    They are marked as held for that account and disappear from every page
-    and address until the same account signs in again - then they are simply
-    there, and only what is new has to be fetched. Another account signing in
-    here does not see them. Nothing held longer than the keeping period
-    (config 'private_keep_days', a year unless changed) survives."""
-    async with db_pool.acquire() as conn:
-        r = await conn.execute(
-            """UPDATE channels SET held_at = NOW(), account_user_id = COALESCE(account_user_id, $1)
-               WHERE username IS NULL AND held_at IS NULL
-                 AND ($1::bigint IS NULL OR COALESCE(account_user_id, $1) = $1)""", uid)
-    n = int(r.split()[-1]) if r.startswith("UPDATE") else 0
-    _PUBLIC_MSG.clear()
-    logging.getLogger("tgarr").info("[sign-out] %d private chats kept for the account", n)
+    """Signing out: every private chat in the live tables goes into keeping,
+    for the account it belongs to."""
+    async with _PRIVATE_LOCK:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                cols = await _held_prepare(conn)
+                if uid is None:
+                    v = await conn.fetchval("SELECT value FROM config WHERE key = 'last_account_id'")
+                    uid = int(v) if v and v.lstrip("-").isdigit() else None
+                ids = [r["id"] for r in await conn.fetch("SELECT id FROM channels WHERE username IS NULL")]
+                n = await _hold_channels(conn, cols, ids, uid)
+        _PUBLIC_MSG.clear()
+    if n:
+        logging.getLogger("tgarr").info("[private] %d private chats put into keeping (signed out)", n)
     return {"kept": n}
 
 
-async def _purge_private_channels(target_ids: list) -> dict:
-    """Really remove private chats (their messages, releases, downloads)."""
-    if not target_ids:
-        return {"channels": 0}
-    async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            rel_target_q = """
-                SELECT r.id FROM releases r
-                JOIN messages m ON m.id = r.primary_msg_id
-                WHERE m.channel_id = ANY($1::int[])"""
-            await conn.execute(
-                f"DELETE FROM downloads WHERE release_id IN ({rel_target_q})", target_ids)
-            await conn.execute(
-                f"UPDATE monitored_movies SET grabbed_release_id = NULL "
-                f"WHERE grabbed_release_id IN ({rel_target_q})", target_ids)
-            await conn.execute(
-                """DELETE FROM releases WHERE primary_msg_id IN (
-                       SELECT id FROM messages WHERE channel_id = ANY($1::int[]))""", target_ids)
-            await conn.execute("DELETE FROM channels WHERE id = ANY($1::int[])", target_ids)
-    return {"channels": len(target_ids)}
+async def _private_reconcile() -> None:
+    """Arrange the live tables for whoever is signed in right now."""
+    if time.monotonic() < _PRIVATE_RETRY[0]:
+        return
+    async with _PRIVATE_LOCK:
+        uid = _me_id()
+        if uid == _PRIVATE_FOR[0]:
+            return
+        if uid is None:
+            # signed out. The sign-out button has already put the chats away;
+            # a session that ended some other way (revoked from the phone) is
+            # dealt with by the worker below, once it has stayed that way.
+            _PRIVATE_FOR[0] = None
+            return
+        log = logging.getLogger("tgarr")
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    cols = await _held_prepare(conn)
+                    v = await conn.fetchval("SELECT value FROM config WHERE key = 'last_account_id'")
+                    last = int(v) if v and v.lstrip("-").isdigit() else None
+                    if last is not None and last != uid:
+                        # chats nobody is marked on were the previous account's
+                        await conn.execute(
+                            "UPDATE channels SET account_user_id = $1 WHERE username IS NULL AND account_user_id IS NULL",
+                            last)
+                    others = [r["id"] for r in await conn.fetch(
+                        """SELECT id FROM channels WHERE username IS NULL
+                           AND account_user_id IS NOT NULL AND account_user_id <> $1""", uid)]
+                    put = await _hold_channels(conn, cols, others, None)
+                    back = await _restore_channels(conn, cols, uid)
+                    await conn.execute(
+                        """INSERT INTO config (key, value) VALUES ('last_account_id', $1)
+                           ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", str(uid))
+            _PRIVATE_FOR[0] = uid
+            _PUBLIC_MSG.clear()
+            if put:
+                log.info("[private] %d private chats of another account put into keeping", put)
+            if back:
+                log.info("[private] %d private chats given back to the account that signed in", len(back))
+                await _restored_files_check(back)
+        except Exception as e:
+            _PRIVATE_RETRY[0] = time.monotonic() + 20
+            log.exception("[private] arranging private chats failed: %s", e)
 
 
 async def _private_keep_days() -> int:
@@ -4736,33 +4916,70 @@ async def _private_keep_days() -> int:
         return PRIVATE_KEEP_DAYS
 
 
+async def _held_expire(days: int) -> dict:
+    """What has been in keeping longer than the keeping period goes for good:
+    the rows, and the files that belonged only to them."""
+    async with _PRIVATE_LOCK:
+        async with db_pool.acquire() as conn:
+            if not await conn.fetchval("SELECT to_regclass('held_channels') IS NOT NULL"):
+                return {"chats": 0, "files": 0}
+            ids = [r["id"] for r in await conn.fetch(
+                "SELECT id FROM held_channels WHERE held_at < NOW() - make_interval(days => $1)", days)]
+            if not ids:
+                return {"chats": 0, "files": 0}
+            files = []
+            for col, folder in _HELD_FILES:
+                rows = await conn.fetch(
+                    f"""SELECT DISTINCT h.{col} AS p FROM held_messages h
+                        WHERE h.channel_id = ANY($1::bigint[]) AND h.{col} IS NOT NULL AND left(h.{col}, 2) <> '__'
+                          AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.{col} = h.{col})
+                          AND NOT EXISTS (SELECT 1 FROM held_messages o WHERE o.{col} = h.{col}
+                                          AND o.channel_id <> ALL($1::bigint[]))""", ids)
+                files += [os.path.join(folder, r["p"]) for r in rows]
+            async with conn.transaction():
+                await _held_delete(conn, ids)
+
+    def _rm():
+        n = 0
+        for f in files:
+            # only ever inside the download folder
+            if os.path.realpath(f).startswith("/downloads/") and os.path.isfile(f):
+                try:
+                    os.remove(f)
+                    n += 1
+                except OSError:
+                    pass
+        return n
+    removed = await asyncio.to_thread(_rm)
+    logging.getLogger("tgarr").info(
+        "[private] %d chats kept longer than %d days removed, with %d files", len(ids), days, removed)
+    return {"chats": len(ids), "files": removed}
+
+
 async def _private_keep_worker():
-    """Every half hour: the account signed in gets its held chats back; what
-    another account left here longer ago than the keeping period is removed."""
-    await asyncio.sleep(120)
+    """Twice a minute: a session that ended without the sign-out button
+    (revoked from the phone, expired) - once it has stayed ended for two
+    looks, its private chats go into keeping too. Every half hour: clear
+    what has been kept too long."""
+    await asyncio.sleep(45)
+    out_seen = 0
+    tick = 0
     while True:
         try:
-            uid = _me_id()
-            days = await _private_keep_days()
-            async with db_pool.acquire() as conn:
-                if uid is not None:
-                    back = await conn.execute(
-                        """UPDATE channels SET held_at = NULL
-                           WHERE username IS NULL AND held_at IS NOT NULL
-                             AND COALESCE(account_user_id, $1) = $1""", uid)
-                    if back.split()[-1] != "0":
-                        _PUBLIC_MSG.clear()
-                        logging.getLogger("tgarr").info("[sign-in] private chats shown again: %s", back)
-                old = [r["id"] for r in await conn.fetch(
-                    """SELECT id FROM channels
-                       WHERE username IS NULL AND held_at < NOW() - make_interval(days => $1)""", days)]
-            if old:
-                await _purge_private_channels(old)
-                logging.getLogger("tgarr").info(
-                    "[private] %d chats held longer than %d days removed", len(old), days)
+            if _me_id() is None:
+                out_seen += 1
+                if out_seen == 2:
+                    await hold_private_channel_data(None)
+            else:
+                out_seen = 0
+                if _me_id() != _PRIVATE_FOR[0]:
+                    await _private_reconcile()
+            if tick % 60 == 0:
+                await _held_expire(await _private_keep_days())
+            tick += 1
         except Exception as e:
             logging.getLogger("tgarr").warning("[private] keep worker: %s", e)
-        await asyncio.sleep(1800)
+        await asyncio.sleep(30)
 
 
 @app.get("/api/settings/private_keep_days")
@@ -4784,15 +5001,19 @@ async def set_private_keep_days(request: Request):
 
 @app.post("/api/login/logout")
 async def api_login_logout():
-    # Keep, do not delete: the account's private chats stay on this machine,
-    # hidden, until it signs in again (or the keeping period runs out).
+    # Keep, do not delete: the account's private chats leave the live tables
+    # and wait for it (see the block above).
     uid = _me_id()
     try:
         wipe = await hold_private_channel_data(uid)
     except Exception as e:
         logging.getLogger("tgarr").exception("[logout] keeping private chats failed: %s", e)
         wipe = {"error": str(e)}
-    return {**login.logout(), "wiped": wipe}
+    out = login.logout()
+    _SIGNED_IN[0] = 0.0
+    _ME_ID[0] = 0.0
+    _PRIVATE_FOR[0] = None
+    return {**out, "wiped": wipe}
 
 
 @app.post("/api/photo/{msg_id}/delete")
@@ -5527,7 +5748,7 @@ def _user_block() -> str:
         '<script>'
         'function tgUserMenu(e){e.stopPropagation();var m=document.getElementById("tgUserMenu");m.hidden=!m.hidden}'
         'document.addEventListener("click",function(){var m=document.getElementById("tgUserMenu");if(m)m.hidden=true});'
-        'function tgSignOut(){if(!confirm("Sign out of Telegram on this tgarr?\\n\\nYour private chats stay on this machine, hidden, and come back when you sign in again. Public channels and saved files stay.")){return}'
+        'function tgSignOut(){if(!confirm("Sign out of Telegram on this tgarr?\\n\\nYour private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay.")){return}'
         'fetch("/api/login/logout",{method:"POST"}).then(function(){location.href="/"})}'
         '</script>')
 
@@ -10516,7 +10737,7 @@ async def page_settings(request: Request):
         f'<div class="acct-meta">API ID <code>{html.escape(str(login.API_ID or "-"))}</code> · '
         f'session at <code>_data/session/tgarr.session</code></div></div>'
         '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'Sign out of Telegram on this tgarr?'
-        '\\n\\nYour private chats stay on this machine, hidden, and come back when you sign in again. Public channels and saved files stay.\'))'
+        '\\n\\nYour private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay.\'))'
         'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">Sign out</button></div></div>')
 
     # ── this machine ──
@@ -10734,10 +10955,10 @@ async def page_settings(request: Request):
     <div class="icon">🔒</div>
     <div class="info">
       <div class="name">Private chats after signing out</div>
-      <div class="meta">Signing out hides your private chats and keeps them on this machine, so that signing in again brings them
-      straight back. Another Telegram account signing in here never sees them. Kept for
+      <div class="meta">Signing out puts your private chats away on this machine, so that signing in again brings them
+      straight back without fetching them a second time. Another Telegram account signing in here never sees them. Kept for
       <input id="pkDays" type="number" min="1" max="3650" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg)"/>
-      days without a sign-in, then removed. <span id="pkMsg" style="color:var(--muted)"></span></div>
+      days without a sign-in, then removed for good. <span id="pkMsg" style="color:var(--muted)"></span></div>
     </div>
     <div class="right"><button class="btn" onclick="pkSave()">Save</button></div>
   </div>
