@@ -5122,6 +5122,7 @@ function setStatus(tab, msg, cls) {
 }
 qrStart();
 </script>
+<a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">Not now - look around first &rarr;</a>
 </body></html>"""
 
 
@@ -5178,7 +5179,7 @@ document.getElementById("f").addEventListener("submit", async function (e) {
   } catch (x) { err.textContent = "Could not reach tgarr: " + x; }
   b.disabled = false;
 });
-</script></body></html>"""
+</script><a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">Not now - look around first &rarr;</a></body></html>"""
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -7676,13 +7677,10 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         return {"tgarr": TGARR_VERSION, "authed": authed,
                 "revoked": revoked, "browsable": browsable, **dict(stats)}
 
-    # Only bounce to /login when there is nothing to show AND nobody is signed
-    # in. Signed in with an empty index is the first minute of every new
-    # install (and the permanent state of an account that follows no
-    # channels): /login sends a signed-in visitor back here, so bouncing them
-    # was an endless redirect - the first thing a new user saw.
-    if not browsable and not authed:
-        return RedirectResponse("/login")
+    # Nobody is sent to the sign-in page from here. A new install used to land on a form
+    # asking for a Telegram app id before it had seen anything of tgarr; Telegram is one of
+    # three ways to fill it (a Usenet provider and one's own folders are the others, and
+    # neither needs an account), so the home page opens and says so (welcome_html below).
 
     async with db_pool.acquire() as conn:
         recent = await conn.fetch(
@@ -7817,7 +7815,27 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         _sto_lvl = "off"
     sto = _status(_sto_lvl, "Storage",
                   f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
-    status_html = f'<div class="st-row">{tg}{cr}{sh}{sto}</div>'
+    welcome_html = "" if authed else (
+        '<div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:18px">'
+        + ('<h2 style="margin:0 0 6px;font-size:19px">Signed out of Telegram</h2>'
+           '<p style="margin:0 0 12px;color:var(--muted)">What was indexed from public channels is still here to browse. Playing a file from Telegram, '
+           'or indexing more, needs the account again.</p>' if (revoked or browsable) else
+           '<h2 style="margin:0 0 6px;font-size:19px">Welcome to tgarr</h2>'
+           '<p style="margin:0 0 12px;color:var(--muted)">Nothing is indexed yet. There are three ways to fill this library - start with any of them, '
+           'the others can follow later:</p>')
+        + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">'
+        + "".join(
+            f'<a href="{href}" style="display:block;border:1px solid var(--border);border-radius:10px;padding:12px 14px;text-decoration:none;color:inherit">'
+            f'<b>{title}</b><div style="color:var(--muted);font-size:13px;margin-top:4px;line-height:1.45">{text}</div></a>'
+            for href, title, text in (
+                ("/login", "📨 Telegram", "Sign in with your account: tgarr indexes the films, music and books of the channels you follow. "
+                           "The first time, Telegram asks for a free app id - it takes a minute and tgarr shows how."),
+                ("/settings/usenet", "📰 Usenet", "Have a Usenet provider? Enter it and tgarr indexes newsgroups: films through your downloader, "
+                                     "books, comics, music and pictures directly. No Telegram account needed."),
+                ("/files", "📁 Your own files", "Add folders of films, music, books or photos you already have. They play here and in the "
+                           "Media Center. No account needed.")))
+        + '</div></div>')
+    status_html = f'{welcome_html}<div class="st-row">{tg}{cr}{sh}{sto}</div>'
     status_html = await _update_banner() + status_html
     if not browsable:
         status_html = (
@@ -8479,7 +8497,7 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
     async with db_pool.acquire() as conn:
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
         if not login.session_exists() and not n_channels:
-            return RedirectResponse("/login")
+            return RedirectResponse("/")
         # Telegram sometimes returns a differently-cased username
         # (eBookRoom vs ebookroom): match case-insensitively.
         known = {r["username"].lower(): (r["subscribed"] or r["is_joined"])
@@ -11203,7 +11221,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         async with db_pool.acquire() as conn:
             n = await conn.fetchval("SELECT count(*) FROM channels")
         if not n:
-            return RedirectResponse("/login")
+            return RedirectResponse("/")
 
     where = ["(m.media_type = 'photo'"
              " OR (m.media_type IS NULL AND m.file_name IS NULL"
@@ -12032,7 +12050,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
-        return RedirectResponse("/login")
+        return RedirectResponse("/")
 
     _music_my_dc = await _get_my_dc()
     book = 1 if book else 0
@@ -12244,7 +12262,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
-        return RedirectResponse("/login")
+        return RedirectResponse("/")
 
     _lib_my_dc = await _get_my_dc()
     # Composite book quality score:
@@ -12447,7 +12465,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         async with db_pool.acquire() as conn:
             n = await conn.fetchval("SELECT count(*) FROM channels")
         if not n:
-            return RedirectResponse("/login")
+            return RedirectResponse("/")
 
     where = ["m.media_type = 'video'" + _pub_m(),
              "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
@@ -12735,7 +12753,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         # readable without the account, as long as there is something to read
         async with db_pool.acquire() as conn:
             if not await conn.fetchval("SELECT 1 FROM channels LIMIT 1"):
-                return RedirectResponse("/login")
+                return RedirectResponse("/")
     _sorts = {"best": "composite_score DESC NULLS LAST, posted_at DESC NULLS LAST",
               "new": "posted_at DESC NULLS LAST, id DESC",
               "size": "size_bytes DESC NULLS LAST, id DESC",
@@ -13334,7 +13352,7 @@ async def page_search(q: Optional[str] = None,
     if not _signed_in():
         async with db_pool.acquire() as conn:
             if not await conn.fetchval("SELECT 1 FROM channels LIMIT 1"):
-                return RedirectResponse("/login")
+                return RedirectResponse("/")
     scope = scope if scope in ("releases", "messages", "channels") else "releases"
     nsfw_on = await _is_nsfw_enabled()
     # what may be shown: never the hard-blocked, adult only when switched on
