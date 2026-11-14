@@ -9174,8 +9174,6 @@ async def api_usenet_grab(request: Request):
         cid = ""
     if not re.fullmatch(r"[0-9a-f]{20}", cid):
         return no("which one?")
-    if not await _usenet_ready():
-        return no("Usenet is switched off or the news server is not answering", 503)
     async with db_pool.acquire() as conn:
         c = await conn.fetchrow("SELECT id, name, kind, size, grp, audience FROM usenet_cards WHERE id = $1", cid)
         if not c or CSAM_RX.search(c["name"]) or usenet_rules.forbidden({"name": c["name"], "groups": [c["grp"]], "audience": c["audience"]}):
@@ -9189,6 +9187,10 @@ async def api_usenet_grab(request: Request):
         had = await conn.fetchrow("SELECT id, state FROM usenet_grabs WHERE card_id = $1 AND state IN ('queued', 'working', 'done') ORDER BY id DESC LIMIT 1", cid)
         if had:
             return {"status": "ok", "job": had["id"], "state": had["state"]}
+    cfg = await _usenet_cfg()
+    if not (cfg.get("enabled") and cfg.get("host")) or _USENET.get("ok") is False:     # asked here only what is already known:
+        return no("Usenet is switched off or the news server is not answering", 503)   # the fetch itself finds out the rest
+    async with db_pool.acquire() as conn:
         job = await conn.fetchval("INSERT INTO usenet_grabs (card_id, name, kind) VALUES ($1, $2, $3) RETURNING id", cid, c["name"], c["kind"])
     return {"status": "ok", "job": job, "state": "queued"}
 
