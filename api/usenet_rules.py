@@ -49,6 +49,24 @@ def group_forbidden(grp: str) -> bool:
     return bool(GROUP_FORBIDDEN_RX.search(grp or ""))
 
 
+def never_kept(names, groups=(), adult: bool = False) -> str:
+    """'' - or why a file is never fetched and never kept. `names` is everything that names
+    it: the file's name, its subject line, the name inside the post, its release, its
+    folder. `adult`: it is known to be adult some other way (the card's label, the folder
+    it lies in, a picture found to be adult by looking at it). The same three rules as for
+    a card, applied to a file."""
+    names = [x for x in names if x]
+    groups = [g for g in groups or () if g]
+    if any(group_forbidden(g) for g in groups):
+        return "posted to a group named for it"
+    if any(FORBIDDEN_RX.search(x) for x in names):
+        return "a term for it in its name"
+    adult = adult or any(ADULT_GROUP_RX.search(g) for g in groups) or any(ADULT_NAME_RX.search(x) for x in names)
+    if adult and any(MINOR_RX.search(x) for x in names):
+        return "adult material named for the young"
+    return ""
+
+
 def group_never(grp: str) -> bool:
     """A group no window of which is handed out: those; an adult group named for the young
     ("erotica.teens" - what is posted there by name is of adults, and what is not cannot be

@@ -1010,6 +1010,11 @@ async def _migrate_schema():
               state TEXT NOT NULL DEFAULT 'queued', note TEXT, files INT, bytes BIGINT, msg_id BIGINT,
               added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), done_at TIMESTAMPTZ
             );
+            -- what the guard refused or removed (usenet_rules.never_kept): when, what kind of
+            -- thing, by which rule. The name is kept so that a wrong removal can be seen.
+            CREATE TABLE IF NOT EXISTS usenet_blocked (
+              id SERIAL PRIMARY KEY, at TIMESTAMPTZ NOT NULL DEFAULT NOW(), what TEXT NOT NULL, why TEXT NOT NULL, name TEXT
+            );
             CREATE TABLE IF NOT EXISTS usenet_progress (
               grp TEXT PRIMARY KEY, first_article BIGINT, last_article BIGINT, next_article BIGINT,
               headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
@@ -9188,9 +9193,11 @@ def _un_single_name(release: str, file_name: str) -> str:
 _UN_GRAB = {"now": None, "bytes": 0, "of": 0}
 
 
-def _usenet_grab_files(cfg: dict, take: list, folder: str, progress) -> list:
+def _usenet_grab_files(cfg: dict, take: list, folder: str, progress, refused=None) -> list:
     """In a thread: the files of one release over up to four connections.
-    [(path, size)] of those that arrived whole."""
+    [(path, size)] of those that arrived whole. `refused(name)`: asked with the name a post
+    gives its file inside (it can differ from the subject line) - true, and the file is
+    not kept."""
     import queue
     import threading
     todo = queue.Queue()
@@ -9215,6 +9222,9 @@ def _usenet_grab_files(cfg: dict, take: list, folder: str, progress) -> list:
                     names.add(name)
                 try:
                     got = usenet_fetch.fetch_file(nn.body, f, os.path.join(folder, name), progress)
+                    if refused and refused(got["name"]):
+                        os.unlink(os.path.join(folder, name))
+                        continue
                     with lock:
                         done.append((os.path.join(folder, name), got["size"]))
                 except usenet_fetch.Missing:
@@ -9258,14 +9268,23 @@ async def _usenet_grab_one(job) -> tuple:
             text = await asyncio.to_thread(_usenet_nzb, cfg, c)
         if not text:
             return "failed", "it is no longer on the news server", 0, 0, None
-        p = usenet_fetch.plan(usenet_fetch.parse_nzb(text))
-        take = [f for f in p["take"] if not usenet_judge.is_program(f["name"]) and not CSAM_RX.search(f["name"])]
+        inside = usenet_fetch.parse_nzb(text)
+        adult = c["audience"] == "nsfw"
+        # the guard, on everything the release holds - also what would not be taken: one
+        # file named for it and none of the release is fetched, and its card goes
+        why = next((w for w in (usenet_rules.never_kept([f["name"], f["subject"], c["name"]], [c["grp"]], adult) for f in inside) if w), "")
+        if why or any(CSAM_RX.search(f["name"] or "") or CSAM_RX.search(f["subject"] or "") for f in inside):
+            await _usenet_blocked("release", why or "a term for it in its name", c["name"])
+            async with db_pool.acquire() as conn:
+                await conn.execute("DELETE FROM usenet_cards WHERE id = $1", c["id"])
+            return "failed", "never fetched: the block list", 0, 0, None
+        p = usenet_fetch.plan(inside)
+        take = [f for f in p["take"] if not usenet_judge.is_program(f["name"])]
         if not take:
             return "failed", p["why"] or "nothing in it that can be opened as it is", 0, 0, None
         want = int(sum(f["bytes"] for f in take) * 0.97)
         if want > shutil.disk_usage("/downloads").free - (1 << 30):
             return "failed", "not enough room left on the disk", 0, 0, None
-        adult = c["audience"] == "nsfw"
         root = USENET_ROOT_ADULT if adult else USENET_ROOT
         kind = collections.Counter(f["kind"] for f in take).most_common(1)[0][0]
         base = f"/downloads/{root}/{_UN_FOLDER[_un_shelf(kind, c['grp'], c['name'])]}"
@@ -9280,7 +9299,16 @@ async def _usenet_grab_one(job) -> tuple:
 
         def progress(n):
             _UN_GRAB["bytes"] += n
-        done = await asyncio.to_thread(_usenet_grab_files, cfg, take, base, progress)
+        struck = []
+
+        def refused(inner):
+            if usenet_rules.never_kept([inner, c["name"]], [c["grp"]], adult) or CSAM_RX.search(inner or ""):
+                struck.append(inner)
+                return True
+            return False
+        done = await asyncio.to_thread(_usenet_grab_files, cfg, take, base, progress, refused)
+        for inner in struck:
+            await _usenet_blocked("file", "a name inside the post", inner)
     finally:
         _UN_INDEX["nzb"] -= 1
         _UN_GRAB["now"] = None
@@ -9304,6 +9332,57 @@ async def _usenet_grab_one(job) -> tuple:
     whole = len(done) == len(take)
     return ("done" if whole else "partial", "" if whole else f"{len(done)} of {len(take)} files arrived whole",
             len(done), sum(sz for _p, sz in done), mid)
+
+
+async def _usenet_blocked(what: str, why: str, name: str) -> None:
+    log.warning("[guard] %s refused or removed: %s", what, why)
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO usenet_blocked (what, why, name) VALUES ($1, $2, $3)", what, why, (name or "")[:300])
+    except Exception:
+        pass
+
+
+_UN_GUARD = {"at": 0.0}
+
+
+async def _usenet_guard_sweep() -> int:
+    """What was fetched before, held against the rules as they are now. Every name a file
+    has is read - its own, its folder, its caption (release, newsgroup) - and a picture
+    found to be adult by looking at it counts as adult whatever its folder says. What
+    fails is removed from the disk and from the library, and written down."""
+    _UN_GUARD["at"] = time.time()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT m.id, m.channel_id, m.file_name, m.caption, m.local_path, m.ai_adult, c.audience, c.local_root
+                FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE {_FROM_USENET} AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'""")
+    gone = []
+    for r in rows:
+        cap = [x.strip() for x in (r["caption"] or "").split(" · ")]
+        groups = [x for x in cap if re.match(r"^[a-z0-9+_-]+(\.[a-z0-9+_-]+){2,}$", x)]
+        adult = r["local_root"] == USENET_ROOT_ADULT or r["audience"] == "nsfw" or (r["ai_adult"] or 0) >= 0.9
+        why = usenet_rules.never_kept([r["file_name"], r["local_path"]] + [x for x in cap if x not in groups], groups, adult)
+        if not why and any(CSAM_RX.search(x or "") for x in (r["file_name"], r["caption"], r["local_path"])):
+            why = "a term for it in its name"
+        if why:
+            gone.append((r, why))
+    for r, why in gone:
+        path = os.path.join("/downloads", r["local_path"])
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        try:                                       # a folder left empty goes too
+            os.rmdir(os.path.dirname(path))
+        except OSError:
+            pass
+        async with db_pool.acquire() as conn:
+            await _local_forget(conn, r["channel_id"], [r["local_path"]])
+        await _usenet_blocked("kept file", why, r["local_path"])
+    if gone:
+        _KID_OK.clear()
+    return len(gone)
 
 
 def _un_caption(name, grp, posted) -> str:
@@ -9345,6 +9424,12 @@ async def _usenet_grab_worker():
                     """UPDATE usenet_grabs SET state = 'working' WHERE id =
                        (SELECT id FROM usenet_grabs WHERE state = 'queued' ORDER BY id LIMIT 1) RETURNING *""")
             if not job:
+                # at start, and every quarter of an hour after: pictures are looked at
+                # later than they are fetched, and a verdict changes what a name means
+                if time.time() - _UN_GUARD["at"] > 900:
+                    n_gone = await _usenet_guard_sweep()
+                    if n_gone:
+                        log.warning("[guard] the sweep removed %d kept file(s)", n_gone)
                 await asyncio.sleep(3)
                 continue
             try:
@@ -9357,6 +9442,7 @@ async def _usenet_grab_worker():
                 await conn.execute(
                     "UPDATE usenet_grabs SET state = $2, note = $3, files = $4, bytes = $5, msg_id = $6, done_at = NOW() WHERE id = $1",
                     job["id"], *res)
+            _UN_GUARD["at"] = 0.0                    # what just came in is swept at once
             log.info("[usenet] fetched %s (%s): %s%s, %s file(s), %s", job["card_id"], job["name"][:60], res[0],
                      f" - {res[1]}" if res[1] else "", res[2], _fmt_size(res[3]) or "0")
         except Exception as e:
