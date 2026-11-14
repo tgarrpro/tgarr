@@ -9295,6 +9295,8 @@ async def _usenet_grab_one(job) -> tuple:
     rels = [(os.path.relpath(path, "/downloads").replace(os.sep, "/"), size, now) for path, size in sorted(done)]
     async with db_pool.acquire() as conn:
         await _local_add(conn, root, rels)
+        await conn.execute("UPDATE messages SET caption = $2 WHERE local_path = ANY($1::text[])",
+                           [r[0] for r in rels], _un_caption(c["name"], c["grp"], c["posted_from"]))
         if adult:
             await conn.execute("UPDATE channels SET audience = 'nsfw', audience_manual = TRUE WHERE tg_chat_id = $1",
                                localfiles.chat_id(root))
@@ -9304,13 +9306,38 @@ async def _usenet_grab_one(job) -> tuple:
             len(done), sum(sz for _p, sz in done), mid)
 
 
+def _un_caption(name, grp, posted) -> str:
+    """What stands under a file fetched from Usenet: its release, its newsgroup, the day it
+    was posted. The file's own name is shown beside it."""
+    return " · ".join(x for x in ((name or "").strip()[:200], grp or "",
+                                  ("posted " + time.strftime("%Y-%m-%d", time.gmtime(posted))) if posted else "") if x)
+
+
+async def _usenet_captions_once() -> None:
+    """Fetches made before captions were written get theirs: the files of a release lie in
+    one folder (or it is one file), and the fetch knows one of them."""
+    async with db_pool.acquire() as conn:
+        for g in await conn.fetch(
+                """SELECT m.id, m.local_path, c.name, c.grp, c.posted_from FROM usenet_grabs g
+                   JOIN messages m ON m.id = g.msg_id JOIN usenet_cards c ON c.id = g.card_id
+                   WHERE g.state IN ('done', 'partial') AND m.caption IS NULL AND m.local_path IS NOT NULL"""):
+            cap = _un_caption(g["name"], g["grp"], g["posted_from"])
+            folder = os.path.dirname(g["local_path"])
+            if folder.count("/") >= 2:             # usenet/pictures/<release>/file
+                await conn.execute("UPDATE messages SET caption = $2 WHERE caption IS NULL AND left(local_path, $3) = $1",
+                                   folder + "/", cap, len(folder) + 1)
+            else:
+                await conn.execute("UPDATE messages SET caption = $2 WHERE id = $1", g["id"], cap)
+
+
 async def _usenet_grab_worker():
     await asyncio.sleep(40)
     try:
         async with db_pool.acquire() as conn:      # what a restart interrupted starts over
             await conn.execute("UPDATE usenet_grabs SET state = 'queued' WHERE state = 'working'")
+        await _usenet_captions_once()
     except Exception:
-        pass
+        log.exception("[usenet] could not tidy up after a restart")
     while True:
         try:
             async with db_pool.acquire() as conn:
@@ -10807,7 +10834,7 @@ _PRIVATE_CHAT = "(c.username IS NULL AND COALESCE(c.members_count, 0) < 200)"
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        q: Optional[str] = None, dc: Optional[str] = None,
                        ch: Optional[int] = None, private: int = 0,
-                       offset: int = 0, sort: str = "new"):
+                       offset: int = 0, sort: str = "new", rate: Optional[str] = None):
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -10844,6 +10871,13 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     if not _nsfw_on:
         where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
         where.append("COALESCE(m.ai_adult, 0) < 0.9")        # the picture itself, whatever its channel says
+    # With adult content shown, the choice of which: all-ages only, 18+ only, or both. A
+    # picture is 18+ when its channel is, or when it was itself found to be.
+    rate = rate if (_nsfw_on and rate in ("sfw", "adult")) else None
+    if rate == "adult":
+        where.append("(COALESCE(c.audience, 'sfw') = 'nsfw' OR COALESCE(m.ai_adult, 0) >= 0.9)")
+    elif rate == "sfw":
+        where.append("(COALESCE(c.audience, 'sfw') <> 'nsfw' AND COALESCE(m.ai_adult, 0) < 0.9)")
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
     # CSAM hard-block — overrides every setting, always.
@@ -10914,8 +10948,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             )
             SELECT * FROM (
               SELECT DISTINCT ON (COALESCE(m.thumb_md5, 'id-' || m.id::text))
-                     m.id, m.thumb_path, m.thumb_md5, m.caption, m.posted_at,
-                     c.title AS ch_title, c.username AS ch_user,
+                     m.id, m.thumb_path, m.thumb_md5, m.caption, m.posted_at, m.file_name, m.local_path,
+                     c.title AS ch_title, c.username AS ch_user, c.local_root,
                      COALESCE(d.dup_count, 0) AS dup_count
               FROM messages m
               JOIN channels c ON c.id = m.channel_id
@@ -10930,7 +10964,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     # ── which photos: all / my private chats / one chat ──────────────
     def _gqs(**over):
         cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "q": q,
-               "dc": "mine" if same_dc_only else None,
+               "dc": "mine" if same_dc_only else None, "rate": rate,
                "sort": sort if sort == "old" else None,
                "limit": limit if limit != 240 else None}
         cur.update(over)
@@ -10995,6 +11029,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
            else _export_btn({"scope": "private", "kind": "photo"}, "⬇ Download all") if (private and _in)
            else "")
+        + (('<span class="sep"></span>'
+            + _chip_link("all", "/gallery" + _gqs(rate=None, offset=None), not rate)
+            + _chip_link("SFW", "/gallery" + _gqs(rate="sfw", offset=None), rate == "sfw",
+                         "only pictures that are neither from an 18+ channel nor found to be adult")
+            + _chip_link("18+", "/gallery" + _gqs(rate="adult", offset=None), rate == "adult",
+                         "only pictures from an 18+ channel, or found to be adult")) if _nsfw_on else "")
         + '<span class="sep"></span><span class="lbl">Sort:</span>'
         + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
         + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
@@ -11023,7 +11063,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
-            + ('<div>No photo matches.</div>' if (picked or private or q or same_dc_only or page_offset) else
+            + ('<div>No photo matches.</div>' if (picked or private or q or same_dc_only or page_offset or rate) else
                '<div>No photos yet.</div>'
                f'<div style="margin-top:8px;font-size:13px">{pending:,} photos are indexed; their '
                'thumbnails are fetched as pages are opened.</div>')
@@ -11031,17 +11071,27 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         )
         return HTMLResponse(_layout("Gallery", "/gallery", body))
 
+    def _said(r):
+        """(the line above, the line below) a picture. One fetched from Usenet says what it
+        is - its file, its release, its newsgroup, the day it was posted - not only that
+        it came from Usenet."""
+        if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT):
+            folder = os.path.basename(os.path.dirname(r["local_path"] or ""))
+            return (r["file_name"] or r["ch_title"] or "",
+                    r["caption"] or (folder if folder not in _UN_FOLDER.values() else "") or r["ch_title"] or "")
+        return r["ch_title"] or r["ch_user"] or "", r["caption"] or ""
+
     items = "".join(
         f'<figure class="item" data-id="{r["id"]}" '
         f'data-src="/api/thumb/{r["id"]}" '
-        f'data-cap="{html.escape((r["caption"] or "")[:300])}" '
-        f'data-ch="{html.escape(r["ch_title"] or r["ch_user"] or "")}">'
+        f'data-cap="{html.escape(_said(r)[1][:300])}" '
+        f'data-ch="{html.escape(_said(r)[0])}">'
         f'<img src="/api/thumb/{r["id"]}" loading="lazy" data-mid="{r["id"]}" class="lazy-thumb" />'
         + (f'<div class="dup-badge" title="shared across {r["dup_count"]} channels">×{r["dup_count"]}</div>'
            if r.get("dup_count") and r["dup_count"] > 1 else '')
         + f'<figcaption class="meta">'
-        f'<div class="ch">{html.escape(r["ch_title"] or "")}</div>'
-        f'<div class="cap">{html.escape((r["caption"] or "")[:200])}</div>'
+        f'<div class="ch">{html.escape(_said(r)[0] if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT) else (r["ch_title"] or ""))}</div>'
+        f'<div class="cap">{html.escape(_said(r)[1][:200])}</div>'
         f'</figcaption>'
         f'</figure>'
         for r in rows

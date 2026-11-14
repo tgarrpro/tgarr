@@ -9,8 +9,9 @@ import zipfile
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read()
 tree = ast.parse(src)
 want = {"_UN_SHELVES", "_UN_AUDIOBOOK_GRP", "_UN_COMIC_GRP", "_UN_SHELF_SQL", "_UN_FOLDER", "_un_shelf", "_un_single_name",
-        "_AUDIOBOOK_WORDS", "_AUDIOBOOK_PATH", "_AUDIOBOOK_SQL", "_is_audiobook", "_COMIC_PAGE_RX", "_COMIC_PAGE_MOST", "_COMIC_CACHE", "_comic_pages"}
-ns = {"re": re, "os": os, "_zipfile": zipfile}
+        "_AUDIOBOOK_WORDS", "_AUDIOBOOK_PATH", "_AUDIOBOOK_SQL", "_is_audiobook", "_un_caption", "_COMIC_PAGE_RX", "_COMIC_PAGE_MOST", "_COMIC_CACHE", "_comic_pages"}
+import time  # noqa: E402
+ns = {"re": re, "os": os, "_zipfile": zipfile, "time": time}
 for node in tree.body:
     names = []
     if isinstance(node, ast.FunctionDef):
@@ -66,6 +67,11 @@ check("in Chinese", A("三体 有声书 第01集.mp3"), True)
 check("an hour of dance music is not one", A("DJ - House Mix vol.9.mp3", "", "House Mix", ""), False)
 check("a song about books is not one", A("Paperback Writer.flac", "usenet/music/The Beatles/Paperback Writer.flac", "Paperback Writer", "1"), False)
 check("the SQL has the same three ways", [x in ns["_AUDIOBOOK_SQL"] for x in (ns["_AUDIOBOOK_WORDS"], ns["_AUDIOBOOK_PATH"], "m4b")], [True] * 3)
+
+C = ns["_un_caption"]
+check("what a fetch says of itself", C("Top Set 18", "alt.binaries.pictures.x", 1450915200), "Top Set 18 · alt.binaries.pictures.x · posted 2015-12-24")
+check("no day known", C("Top Set", "a.b.c", None), "Top Set · a.b.c")
+check("nothing known", C("", "", 0), "")
 
 tmp = tempfile.mkdtemp()
 z = os.path.join(tmp, "c.cbz")
