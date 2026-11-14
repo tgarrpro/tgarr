@@ -28,7 +28,7 @@ jobs:
       - name: Update-notice and operator-panel tests
         run: |
           pip install -q fastapi==0.115.0 asyncpg==0.30.0 python-multipart==0.0.12 httpx
-          (cd api && python test_update.py && python test_access.py && python test_usenet.py && python test_screentime.py && python test_export.py && python test_localfiles.py && python test_names.py && python test_usenet_scan.py)
+          (cd api && python test_update.py && python test_access.py && python test_usenet.py && python test_screentime.py && python test_export.py && python test_localfiles.py && python test_names.py && python test_usenet_scan.py && python test_tts_text.py)
           (cd registry && python test_admin.py && python test_webcrawl.py && python test_seeds.py)
 
   build:

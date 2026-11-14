@@ -165,7 +165,8 @@ _KID_OK: dict = {}                     # message id / thumb file -> (allowed, ch
 _KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw'
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
                     OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
-_LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock")
+_LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock",
+                "/api/tts/say")           # a book read aloud in the Media Center
 # open even when the Media Center itself is closed for the moment (time rules)
 _LOCKED_ALWAYS = ("/unlock", "/api/unlock", "/lock", "/mediacenter/rest", "/api/mc/ping", "/mc/ping.js")
 _MC = {"at": 0.0, "rules": screentime.clean(None)}
@@ -289,7 +290,7 @@ async def _signed_out_block(request: Request):
         # the PIN and the kids' list belong to this install, not to the
         # Telegram account: they work whether or not anybody is signed in
         if path.startswith("/api/") and not path.startswith(
-                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/")):
+                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/")):
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -398,6 +399,7 @@ import usenet  # local module
 import usenet_scan  # local module
 import usenet_client  # local module
 import usenet_rules  # local module
+import tts  # local module
 
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
@@ -588,6 +590,7 @@ async def _startup():
     asyncio.create_task(_private_keep_worker())
     asyncio.create_task(_export_worker())
     asyncio.create_task(_cache_gc_worker())
+    asyncio.create_task(_tts_housekeeping())
     asyncio.create_task(_update_check_worker())
 
 
@@ -2971,11 +2974,74 @@ async def epub_chapter(msg_id: int, n: int):
                  "Cache-Control": "private, max-age=3600"})
 
 
-# What both readers need to read aloud: the browser's own voices (Edge offers
-# Microsoft's natural ones), a voice chosen for the text's language, the text
-# cut into short pieces (some voices stop on long passages), and a toast.
+# What both readers need to read aloud. Two kinds of voice:
+#   - this machine's own (tts.py), when it is installed: the server makes the audio, so every
+#     browser in the house hears the same natural voice. It speaks Chinese and English.
+#   - the browser's (Edge offers Microsoft's natural ones; Chrome on most systems a robot):
+#     used when no voice is installed here, and for every other language.
+# The readers talk to one object, `synth`, that looks like the browser's speechSynthesis and
+# decides piece by piece which of the two reads it. The text is cut into short pieces (some
+# browser voices stop on long passages; ours is asked for the next piece while this one plays).
 _SPEECH_JS = r"""
-const synth = window.speechSynthesis;
+const bsynth = window.speechSynthesis || null;
+const TG_VOICE = __TG_VOICE__;
+function mkUtter(text){ return {text: text, voice: null, lang: "", onstart: null, onend: null, onerror: null}; }
+const player = new Audio(); player.preload = "auto";
+const synth = (bsynth || TG_VOICE) ? {
+  q: [], run: 0, cur: null, clips: new Map(),
+  getVoices(){ return bsynth ? bsynth.getVoices() : []; },
+  cancel(){
+    this.run++; this.q = []; this.cur = null;
+    try { player.pause(); player.onended = null; player.onerror = null; } catch (e) {}
+    if (bsynth) bsynth.cancel();
+  },
+  speak(u){ this.q.push(u); if (!this.cur) this.next(); else this.ahead(); },
+  // what our own voice can read: Chinese and English - not kana, hangul, Cyrillic, Arabic,
+  // Thai, and not a Latin text thick with accents (French, German, Spanish ...)
+  ours(text){
+    if (!TG_VOICE) return false;
+    if (/[぀-ヿ가-힯Ѐ-ӿ؀-ۿ฀-๿]/.test(text)) return false;
+    return (text.match(/[À-ÖØ-öø-ÿĀ-ſ]/g) || []).length <= text.length * 0.01;
+  },
+  clip(text){
+    let p = this.clips.get(text);
+    if (!p) {
+      p = fetch("/api/tts/say", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text: text})})
+        .then(r => { if (!r.ok) throw new Error("tts " + r.status); return r.blob(); }).then(b => URL.createObjectURL(b));
+      this.clips.set(text, p);
+      if (this.clips.size > 12) {
+        const old = this.clips.keys().next().value, was = this.clips.get(old);
+        this.clips.delete(old); was.then(u => URL.revokeObjectURL(u)).catch(() => {});
+      }
+    }
+    return p;
+  },
+  ahead(){ this.q.slice(0, 2).forEach(u => { if (this.ours(u.text)) this.clip(u.text).catch(() => {}); }); },
+  next(){
+    const u = this.q.shift();
+    if (!u) { this.cur = null; return; }
+    const run = this.run; this.cur = u; this.ahead();
+    const done = () => { if (run !== this.run) return; if (u.onend) u.onend(); if (run === this.run) this.next(); };
+    const fail = why => { if (run !== this.run) return; this.cur = null; if (u.onerror) u.onerror({error: why}); };
+    const byBrowser = () => {
+      if (!bsynth) { fail("no-voice"); return; }
+      const b = new SpeechSynthesisUtterance(u.text);
+      if (u.voice) b.voice = u.voice; if (u.lang) b.lang = u.lang;
+      b.onstart = () => { if (run === this.run && u.onstart) u.onstart(); };
+      b.onend = done; b.onerror = e => fail(e.error);
+      bsynth.speak(b);
+    };
+    if (!this.ours(u.text)) { byBrowser(); return; }
+    this.clip(u.text).then(url => {
+      if (run !== this.run) return;
+      player.onended = done;
+      player.onerror = () => { if (run === this.run) { this.clips.delete(u.text); byBrowser(); } };
+      player.src = url;
+      if (u.onstart) u.onstart();
+      return player.play();
+    }).catch(() => { if (run === this.run) { this.clips.delete(u.text); byBrowser(); } });
+  }
+} : null;
 function toast(text, ms){
   let t = document.getElementById("toast");
   if (!t) { t = document.createElement("div"); t.id = "toast"; t.className = "toast"; document.body.appendChild(t); }
@@ -3002,6 +3068,15 @@ function chunks(text){
   return out.map(x => x.trim()).filter(Boolean);
 }
 """
+
+
+def _speech_js() -> str:
+    try:
+        on = tts.available()
+    except Exception:
+        on = False
+    return _SPEECH_JS.replace("__TG_VOICE__", "true" if on else "false")
+
 
 _EPUB_READER_HTML = r"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -3308,7 +3383,7 @@ function readBlock(i){
   const parts = chunks(text), v = voiceFor(text);
   if (!parts.length) { readBlock(i + 1); return; }
   parts.forEach((part, k) => {
-    const u = new SpeechSynthesisUtterance(part);
+    const u = mkUtter(part);
     if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
     // a paragraph that runs over the page: turn when the voice gets that far
     if (span && span[1] > span[0]) u.onstart = () => {
@@ -3399,7 +3474,7 @@ async def epub_render(msg_id: int):
             f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.epub$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
-    return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -3850,7 +3925,7 @@ async function readFrom(n){
   blanks = 0;
   const parts = chunks(text), v = voiceFor(text);
   parts.forEach((part, i) => {
-    const u = new SpeechSynthesisUtterance(part);
+    const u = mkUtter(part);
     if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
     if (i === parts.length - 1) u.onend = nextPage;
     u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
@@ -3943,7 +4018,7 @@ async def pdf_reader(msg_id: int):
             f'<p>This file cannot be shown here. <a href="/media/{msg_id}">Download it</a>.</p>',
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
-    return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _SPEECH_JS).replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -8890,6 +8965,170 @@ async def api_usenet_enabled(request: Request):
     return {"status": "ok", "on": on, "working": await _usenet_ready(recheck=True) if on else False}
 
 
+# ════════════════════════════════════════════════════════════════════
+# Reading aloud with this machine's own voice (tts.py)
+# ════════════════════════════════════════════════════════════════════
+async def _tts_pronunciation_on() -> bool:
+    async with db_pool.acquire() as conn:
+        return (await conn.fetchval("SELECT value FROM config WHERE key = 'tts_pronunciation'")) != "0"
+
+
+async def _tts_housekeeping():
+    """A voice nobody has used for a while is let go (it holds memory); now and then the
+    clips that were kept are thinned to their size."""
+    n = 0
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await asyncio.to_thread(tts.unload_if_idle)
+            n += 1
+            if n % 12 == 0:
+                gone = await asyncio.to_thread(tts.trim_cache)
+                if gone:
+                    log.info("[tts] %d old clips removed", gone)
+        except Exception as e:
+            log.warning("[tts] housekeeping: %s", e)
+
+
+@app.post("/api/tts/say")
+async def api_tts_say(request: Request):
+    """One piece of text as audio (WAV). The readers ask for it piece by piece."""
+    try:
+        text = str((await request.json()).get("text") or "")
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    text = text.strip()
+    if not text or len(text) > tts.TEXT_MAX:
+        return JSONResponse({"status": "error", "message": f"between 1 and {tts.TEXT_MAX} characters"}, status_code=400)
+    try:
+        data = await asyncio.to_thread(tts.say, text, await _tts_pronunciation_on())
+    except RuntimeError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=503)
+    except Exception as e:
+        log.warning("[tts] %s: %s", type(e).__name__, str(e)[:200])
+        return JSONResponse({"status": "error", "message": "the voice could not say this"}, status_code=503)
+    return Response(data, media_type="audio/wav", headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/api/tts/status")
+async def api_tts_status():
+    st = await asyncio.to_thread(tts.status)
+    st["pronunciation"]["on"] = await _tts_pronunciation_on()
+    return st
+
+
+@app.post("/api/tts/install")
+async def api_tts_install(request: Request):
+    try:
+        what = (await request.json()).get("what")
+    except Exception:
+        what = None
+    if what not in tts.FILES:
+        return JSONResponse({"status": "error", "message": "voice or pronunciation"}, status_code=400)
+    if what == "pronunciation" and not tts.installed("voice"):
+        return JSONResponse({"status": "error", "message": "install the voice first"}, status_code=400)
+    return {"status": "ok", "started": tts.install(what)}
+
+
+@app.post("/api/tts/remove")
+async def api_tts_remove(request: Request):
+    try:
+        what = (await request.json()).get("what")
+    except Exception:
+        what = None
+    if what not in tts.FILES:
+        return JSONResponse({"status": "error", "message": "voice or pronunciation"}, status_code=400)
+    await asyncio.to_thread(tts.remove, what)
+    if what == "voice":
+        await asyncio.to_thread(tts.remove, "pronunciation")
+    return {"status": "ok"}
+
+
+@app.post("/api/tts/pronunciation")
+async def api_tts_pronunciation(request: Request):
+    try:
+        on = bool((await request.json()).get("on"))
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('tts_pronunciation', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", "1" if on else "0")
+    await asyncio.to_thread(tts.unload)
+    return {"status": "ok", "on": on}
+
+
+@app.get("/settings/voice", response_class=HTMLResponse)
+async def page_settings_voice():
+    mb = lambda n: f"{n / 1e6:.0f} MB"
+    body = f"""<style>.vo-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
+.vo-box h3{{margin:0 0 6px}}.vo-box p{{color:var(--muted);margin:0 0 10px}}
+.vo-row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}}
+.vo-bar{{flex:1;min-width:160px;max-width:360px;height:8px;border-radius:999px;background:var(--border);overflow:hidden}}
+.vo-bar i{{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}}
+.vo-in{{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
+</style>
+<div class="vo-box"><h3>A voice of this machine's own <span id="voState"></span></h3>
+<p>A browser reads a book aloud with whatever voices it happens to have: natural ones in Edge, a robot in most others. With this
+voice installed, tgarr makes the audio itself - on this machine's processor, nothing is sent anywhere - and every browser, phone and
+television at home hears the same natural voice. It reads Chinese and English; for other languages the browser's voice is used.</p>
+<p>The voice is not part of tgarr: it is fetched once, {mb(tts.SIZES["voice"])}, from GitHub (the sherpa-onnx project's files), checked,
+and kept in the downloads folder. It needs about 300 MB of memory while a book is being read, and lets go of it a quarter of an hour after.</p>
+<div class="vo-row" id="voVoice"></div></div>
+<div class="vo-box"><h3>Hard Chinese pronunciations <span id="prState"></span></h3>
+<p>长 in 路还长着呢, 得 in 你得去: which reading a character has depends on the sentence. tgarr decides the common cases by rules of
+its own. A second model that reads the whole sentence gets more of them right. It is large - {mb(tts.SIZES["pronunciation"])}, from Hugging Face
+(the g2pW project) - and needs about a gigabyte of memory while reading.</p>
+<div class="vo-row" id="voPron"></div></div>
+<div class="vo-box"><h3>Try it</h3>
+<div class="vo-row"><input class="vo-in" id="voText" value="路还长着呢，孩子，不着急，慢慢走。 It was nearly midnight on platform 9." />
+<button class="btn" onclick="voTry()">Say it</button><span id="voMsg" style="color:var(--muted);font-size:13px"></span></div></div>
+<script>
+const SZ = {{voice: {tts.SIZES["voice"]}, pronunciation: {tts.SIZES["pronunciation"]}}};
+const post = (path, body) => fetch(path, {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify(body)}}).then(r => r.json());
+const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
+const esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
+function part(el, what, st, extra){{
+  if (st.installing) {{
+    const pc = Math.min(100, Math.round(st.done * 100 / SZ[what]));
+    el.innerHTML = '<div class="vo-bar"><i style="width:' + pc + '%"></i></div><span>fetching, ' + pc + '%</span>';
+  }} else if (st.installed) {{
+    el.innerHTML = (extra || "") + '<button class="btn ghost" data-w="' + what + '" onclick="voRemove(this.dataset.w)">Remove</button>';
+  }} else {{
+    el.innerHTML = '<button class="btn" data-w="' + what + '" onclick="voInstall(this.dataset.w)">Install (' + Math.round(SZ[what] / 1e6) + ' MB)</button>'
+      + (st.error ? '<span style="color:#b45309">' + esc(st.error) + '</span>' : "");
+  }}
+}}
+function show(j){{
+  document.getElementById("voState").innerHTML = j.voice.installed ? (j.available ? pill("ok", "installed") : pill("bad", "installed, but this build cannot run it")) : pill("muted", "not installed");
+  document.getElementById("prState").innerHTML = j.pronunciation.installed ? pill(j.pronunciation.on ? "ok" : "muted", j.pronunciation.on ? "in use" : "installed, switched off") : pill("muted", "not installed");
+  part(document.getElementById("voVoice"), "voice", j.voice,
+    '<span style="color:var(--muted)">' + (j.loaded ? "in memory now" : "not in memory") + ' · ' + j.cache.clips.toLocaleString() + ' clips kept, ' + (j.cache.bytes / 1e6).toFixed(0) + ' MB</span>');
+  const pr = document.getElementById("voPron");
+  if (!j.voice.installed && !j.pronunciation.installing) {{ pr.innerHTML = '<span style="color:var(--muted)">Install the voice first.</span>'; }}
+  else part(pr, "pronunciation", j.pronunciation,
+    '<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" ' + (j.pronunciation.on ? "checked" : "") + ' onchange="voPron(this.checked)"/> use it</label>');
+  return j.voice.installing || j.pronunciation.installing;
+}}
+let timer = null;
+function poll(){{ fetch("/api/tts/status").then(r => r.json()).then(j => {{ clearTimeout(timer); timer = setTimeout(poll, show(j) ? 1500 : 15000); }}).catch(() => {{ timer = setTimeout(poll, 5000); }}); }}
+function voInstall(what){{ post("/api/tts/install", {{what: what}}).then(j => {{ if (j.status !== "ok") alert(j.message || "could not start"); poll(); }}); }}
+function voRemove(what){{
+  if (!confirm(what === "voice" ? "Remove the voice (and the pronunciation model with it)? The browser's own voice will read again." : "Remove the pronunciation model?")) return;
+  post("/api/tts/remove", {{what: what}}).then(poll);
+}}
+function voPron(on){{ post("/api/tts/pronunciation", {{on: on}}).then(poll); }}
+function voTry(){{
+  const m = document.getElementById("voMsg"), t0 = Date.now(); m.textContent = "making it…";
+  fetch("/api/tts/say", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{text: document.getElementById("voText").value}})}})
+    .then(r => r.ok ? r.blob() : r.json().then(j => {{ throw new Error(j.message || "could not"); }}))
+    .then(b => {{ m.textContent = "made in " + ((Date.now() - t0) / 1000).toFixed(1) + " s"; new Audio(URL.createObjectURL(b)).play(); poll(); }})
+    .catch(e => {{ m.textContent = e.message; }});
+}}
+poll();
+</script>"""
+    return HTMLResponse(_layout("Voice", "/settings", body, page_title="Reading aloud", top_actions_html=""))
+
+
 @app.get("/settings/usenet", response_class=HTMLResponse)
 async def page_settings_usenet(request: Request):
     cfg = await _usenet_cfg(fresh=True)
@@ -12154,6 +12393,14 @@ function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", h
       <div class="meta">With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.</div>
     </div>
     <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">🔊</div>
+    <div class="info">
+      <div class="name">Reading aloud</div>
+      <div class="meta">A natural voice of this machine's own for books, in every browser - Chinese and English. Fetched when you ask for it.</div>
+    </div>
+    <div class="right"><a class="btn" href="/settings/voice">Set up</a></div>
   </div>
 </div>
 <h2 class="section">Metadata sources</h2>
