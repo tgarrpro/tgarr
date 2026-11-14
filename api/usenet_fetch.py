@@ -25,7 +25,7 @@ _KIND = {e: k for k, v in TAKEN.items() for e in v}
 MB = 1024 * 1024
 MOST = {"ebook": 400 * MB, "audio": 600 * MB, "photo": 60 * MB}      # one file
 MOST_ALL = 2048 * MB                                                  # one release
-MOST_FILES = 400
+MOST_FILES = 2000                                                     # a large set of pictures; the size above is the real bound
 _HELPER = re.compile(r"\.(par2|nfo|sfv|nzb|md5|txt|url|diz)$", re.I)
 _PACKED = re.compile(r"\.(rar|r\d\d|zip|7z|\d{3}|tar|gz|iso|bin)$", re.I)
 # one piece of something cut up: "x.part003.jpg", "x.7z.004", "x.jpg.012" - whatever it ends in

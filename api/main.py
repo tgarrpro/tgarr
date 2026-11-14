@@ -9477,7 +9477,9 @@ function ugShow(g){
   else if (g.state === "working") e.innerHTML = '<small>fetching' + (g.percent != null ? " " + g.percent + "%" : "") + '</small>';
   else if (g.state === "done") e.innerHTML = '<small>fetched</small> ' + open;
   else if (g.state === "partial") e.innerHTML = '<small>' + ugEsc(g.note) + '</small> ' + open;
-  else e.innerHTML = '<small style="color:#b45309">' + ugEsc(g.note || "that did not work") + '</small> ' + again;
+  // "try again" only where trying again can help: not for what is refused for what it is
+  else e.innerHTML = '<small style="color:#b45309">' + ugEsc(g.note || "that did not work") + '</small> '
+    + (!g.note || /try again|room left/.test(g.note) ? again : "");
   return g.state === "queued" || g.state === "working";
 }
 function ugPoll(){
@@ -10827,14 +10829,16 @@ window.addEventListener("hashchange", () => kmTab((location.hash || "#pin").slic
 # A private chat: no public @name and small (see the crawler's
 # PRIVATE_CHAT_SQL). A group of thousands that merely has no public name is
 # not "my private chats".
-_PRIVATE_CHAT = "(c.username IS NULL AND COALESCE(c.members_count, 0) < 200)"
+# What was fetched from Usenet has no @username either, but it is nobody's chat.
+_FROM_USENET = "(COALESCE(c.local_root, '') IN ('usenet', 'usenet18'))"
+_PRIVATE_CHAT = f"(c.username IS NULL AND COALESCE(c.members_count, 0) < 200 AND NOT {_FROM_USENET})"
 
 
 @app.get("/gallery", response_class=HTMLResponse)
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        q: Optional[str] = None, dc: Optional[str] = None,
                        ch: Optional[int] = None, private: int = 0,
-                       offset: int = 0, sort: str = "new", rate: Optional[str] = None):
+                       offset: int = 0, sort: str = "new", rate: Optional[str] = None, usenet: int = 0):
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -10862,6 +10866,9 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         where.append("(c.username IS NOT NULL OR c.local_root IS NOT NULL)")
     if private:
         where.append(_PRIVATE_CHAT)
+    usenet = 0 if private else (1 if usenet else 0)
+    if usenet:
+        where.append(_FROM_USENET)
     if q:
         for w in q.split():
             params.append(f"%{w}%")
@@ -10913,7 +10920,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         # with the most photos, shown as unexplained chips; a chat without a
         # @username could not be chosen at all.)
         all_channels = await conn.fetch(
-            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, count(*) AS n,
+            f"""SELECT c.id, c.username, c.title, c.is_joined, c.subscribed, c.local_root, count(*) AS n,
                       {_PRIVATE_CHAT} AS private
                FROM messages m JOIN channels c ON c.id = m.channel_id
                WHERE m.media_type = 'photo'
@@ -10935,6 +10942,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             WHERE {' AND '.join(where[:3])} AND {_PRIVATE_CHAT}
               AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
               {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}""")
+        usenet_n = await conn.fetchval(f"""
+            SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where[:3])} AND {_FROM_USENET}
+              AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+              {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw' AND COALESCE(m.ai_adult, 0) < 0.9"}""")
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -10963,7 +10976,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
 
     # ── which photos: all / my private chats / one chat ──────────────
     def _gqs(**over):
-        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "q": q,
+        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "usenet": usenet or None, "q": q,
                "dc": "mine" if same_dc_only else None, "rate": rate,
                "sort": sort if sort == "old" else None,
                "limit": limit if limit != 240 else None}
@@ -10986,6 +10999,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
         + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
            else '<small>🔒 private</small>' if r["private"]
+           else '<small>📰 from the newsgroups</small>' if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT)
            else '<small>group · no public name</small>')
         + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
         for r in all_channels)
@@ -11018,12 +11032,16 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '.gp-c{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}'
         '</style>'
         '<div class="bar-tools" style="margin-bottom:16px">'
-        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, offset=None),
-                     not (picked or private))
+        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, offset=None),
+                     not (picked or private or usenet))
         + (_chip_link(f'🔒 My private chats <span style="opacity:.6">{priv_n:,}</span>',
-                      "/gallery" + _gqs(ch=None, channel=None, private=1, offset=None), bool(private),
+                      "/gallery" + _gqs(ch=None, channel=None, private=1, usenet=None, offset=None), bool(private),
                       "photos from chats and groups that have no public @username - yours alone")
            if priv else "")
+        + (_chip_link(f'📰 Usenet <span style="opacity:.6">{usenet_n:,}</span>',
+                      "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=1, offset=None), bool(usenet),
+                      "pictures fetched from the newsgroups")
+           if usenet_n else "")
         + picker
         + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
                        "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
@@ -11055,7 +11073,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         'if(e.key==="Enter"){const f=[...document.querySelectorAll("#gpList .gp-opt")].find(o=>o.style.display!=="none");'
         'if(f)location.href=f.href}})})()</script>')
     _where_txt = (f'in {html.escape(_name(picked))}' if picked else
-                  'in my private chats' if private else '')
+                  'in my private chats' if private else 'fetched from Usenet' if usenet else '')
 
     if not rows:
         body = (
@@ -11063,7 +11081,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
-            + ('<div>No photo matches.</div>' if (picked or private or q or same_dc_only or page_offset or rate) else
+            + ('<div>No photo matches.</div>' if (picked or private or usenet or q or same_dc_only or page_offset or rate) else
                '<div>No photos yet.</div>'
                f'<div style="margin-top:8px;font-size:13px">{pending:,} photos are indexed; their '
                'thumbnails are fetched as pages are opened.</div>')
