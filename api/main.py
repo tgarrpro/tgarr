@@ -8995,10 +8995,10 @@ async def _vision_relabel() -> None:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """UPDATE channels c SET audience = 'nsfw'
-               FROM (SELECT channel_id, count(*) AS n, count(*) FILTER (WHERE ai_adult >= 0.5) AS adult
+               FROM (SELECT channel_id, count(DISTINCT thumb_path) AS n, count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.5) AS adult
                      FROM messages WHERE ai_ver IS NOT NULL AND ai_adult IS NOT NULL GROUP BY 1) x
                WHERE x.channel_id = c.id AND COALESCE(c.audience, 'sfw') = 'sfw' AND NOT COALESCE(c.audience_manual, FALSE)
-                 AND x.n >= $1 AND x.adult >= x.n * $2
+                 AND x.n >= $1::int AND x.adult >= x.n * $2::float8
                RETURNING c.id, COALESCE(c.title, c.username, 'a chat') AS name, x.n, x.adult""",
             VISION_CHANNEL_MIN, VISION_CHANNEL_SHARE)
     for r in rows:
