@@ -1702,6 +1702,19 @@ async def serve_media(msg_id: int, request: Request):
 _CACHE_PREFIXES = ("video/", "audio/", "library/")
 _CACHE_SIDECARS = ("", ".tail", ".pdf", ".cover.jpg", ".queue", ".pdf.inprogress.pdf")
 _LOCAL_SQL = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
+# What makes a sound file an audiobook. Not its length: an hour is as often a DJ set (of
+# 7,300 files over twenty minutes in one library, none was a book). It is the kind of file
+# (.m4b is made for books), the folder a fetch put it in, or the word for it in its name,
+# title or album. One rule, in SQL for the pages and in Python for the test.
+_AUDIOBOOK_WORDS = r"有声书|有聲書|有声小说|有聲小說|听书|聽書|评书|評書|audio ?books?|unabridged"
+_AUDIOBOOK_PATH = r"^usenet(18)?/audiobooks/|(^|/)audio ?books?/"
+_AUDIOBOOK_SQL = ("(m.file_name ~* '\\.m4b$' OR COALESCE(m.local_path, '') ~* '" + _AUDIOBOOK_PATH + "'"
+                  " OR concat_ws(' ', m.file_name, m.audio_title, m.audio_album) ~* '" + _AUDIOBOOK_WORDS + "')")
+
+
+def _is_audiobook(file_name, local_path="", title="", album="") -> bool:
+    return bool(re.search(r"\.m4b$", file_name or "", re.I) or re.search(_AUDIOBOOK_PATH, local_path or "", re.I)
+                or re.search(_AUDIOBOOK_WORDS, " ".join(x for x in (file_name, title, album) if x), re.I))
 CACHE_TTL_DAYS_DEFAULT = 30
 CACHE_MAX_GB_DEFAULT = 50
 
@@ -9531,6 +9544,9 @@ async def _vision_relabel() -> None:
                FROM (SELECT channel_id, count(DISTINCT thumb_path) AS n, count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.9) AS adult
                      FROM messages WHERE ai_ver IS NOT NULL AND ai_adult IS NOT NULL GROUP BY 1) x
                WHERE x.channel_id = c.id AND COALESCE(c.audience, 'sfw') = 'sfw' AND NOT COALESCE(c.audience_manual, FALSE)
+                 -- a folder on this machine (one's own files, what was fetched from Usenet) is a
+                 -- mix by nature: its pictures are hidden one by one, never the whole folder
+                 AND c.local_root IS NULL
                  AND x.n >= $1::int AND x.adult >= x.n * $2::float8
                RETURNING c.id, COALESCE(c.title, c.username, 'a chat') AS name, x.n, x.adult""",
             VISION_CHANNEL_MIN, VISION_CHANNEL_SHARE)
@@ -11518,6 +11534,21 @@ _MUSIC_PLAYER_HTML = r"""
     else if (e.key === " ") { e.preventDefault(); toggle(); }
   });
   vizUi(); lyrUi();
+  if (window.tgBook) {
+    let kept = -9;
+    audio.addEventListener("timeupdate", () => {
+      if (cur < 0 || Math.abs(audio.currentTime - kept) < 5) return;
+      kept = audio.currentTime;
+      try { localStorage.setItem("tgarr.book", JSON.stringify({id: rows[cur].dataset.id, t: kept})); } catch (e) {}
+    });
+    let at = null; try { at = JSON.parse(localStorage.getItem("tgarr.book") || "null"); } catch (e) {}
+    const row = at && rows.find(r => r.dataset.id === String(at.id));
+    if (row) {
+      audio.addEventListener("loadedmetadata", () => { if (at.t > 5) audio.currentTime = at.t; }, {once: true});
+      tgMusicPlay(row);                     // a browser may hold it until play is pressed: the place is kept either way
+      row.scrollIntoView({block: "center"});
+    }
+  }
   // /music#now opens the now-playing view on the first track
   if (location.hash === "#now" && rows.length) { tgMusicPlay(rows[0]); panel(true); }
 })();
@@ -11528,13 +11559,15 @@ _MUSIC_PLAYER_HTML = r"""
 @app.get("/music", response_class=HTMLResponse)
 async def page_music(limit: int = 100, q: Optional[str] = None,
                      lang: Optional[str] = None, sort: str = "quality",
-                     offset: int = 0, local: int = 0, fav: int = 0):
+                     offset: int = 0, local: int = 0, fav: int = 0, book: int = 0):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
         return RedirectResponse("/login")
 
     _music_my_dc = await _get_my_dc()
+    book = 1 if book else 0
+    what = "Audiobooks" if book else "Music"
     # Composite quality: MB-canonical hit + has cover + duration > 1min
     sort_clause = {
         "quality": (
@@ -11558,8 +11591,13 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         "longest":  "m.audio_duration_sec DESC NULLS LAST",
         "size":     "m.file_size DESC NULLS LAST",
     }.get(sort, "m.posted_at DESC NULLS LAST")
+    if book and sort == "quality":
+        # a book is heard in order: book by book (its album, else its folder), chapter by
+        # chapter (the first number in the file's name, else the name)
+        sort_clause = ("COALESCE(NULLIF(m.audio_album, ''), regexp_replace(COALESCE(m.local_path, ''), '/[^/]*$', '')), "
+                       "left(substring(m.file_name from '[0-9]+'), 9)::int NULLS LAST, m.file_name")
 
-    where_parts = ["m.media_type = 'audio'" + _pub_m()]
+    where_parts = ["m.media_type = 'audio'" + _pub_m(), _AUDIOBOOK_SQL if book else f"NOT {_AUDIOBOOK_SQL}"]
     params = []
     if q:
         params.append(f"%{q}%")
@@ -11580,12 +11618,13 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
             f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
-        pending_n = await conn.fetchval(
-            "SELECT count(*) FROM messages WHERE media_type='audio' AND local_path IS NULL")
+        shelf = f"m.media_type = 'audio' AND {'' if book else 'NOT '}{_AUDIOBOOK_SQL}"
+        pending_n = await conn.fetchval(f"SELECT count(*) FROM messages m WHERE {shelf} AND m.local_path IS NULL")
+        books_n = await conn.fetchval(f"SELECT count(*) FROM messages m WHERE m.media_type = 'audio'{_pub_m()} AND {_AUDIOBOOK_SQL}")
         lang_dist = await conn.fetch(
-            "SELECT COALESCE(detected_lang,'unknown') AS lang, count(*) AS n "
-            "FROM messages WHERE media_type='audio' "
-            "GROUP BY detected_lang ORDER BY count(*) DESC")
+            "SELECT COALESCE(m.detected_lang,'unknown') AS lang, count(*) AS n "
+            f"FROM messages m WHERE {shelf} "
+            "GROUP BY m.detected_lang ORDER BY count(*) DESC")
         rows = await conn.fetch(f"""
             SELECT m.id, m.audio_title, m.audio_performer, m.audio_duration_sec,
                    m.file_name, m.file_size, m.posted_at, m.file_dc,
@@ -11602,7 +11641,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
 
     def _music_qs(**overrides):
         defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None,
-                    "local": 1 if local else None, "fav": 1 if fav else None,
+                    "local": 1 if local else None, "fav": 1 if fav else None, "book": book or None,
                     "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
@@ -11621,7 +11660,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
                 f'{label} <span style="opacity:0.6">{count:,}</span></a>')
 
     lang_chips_html = (
-        '<a class="btn ghost" href="/music" style="' +
+        f'<a class="btn ghost" href="/music{"?book=1" if book else ""}" style="' +
         ('background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);' if not lang else '') +
         'padding:5px 12px;font-size:12px">all</a>' +
         "".join(_music_lang_chip(r["lang"], r["n"]) for r in lang_dist if r["lang"] != 'unknown' and r["n"] > 0)
@@ -11634,7 +11673,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips_html = (
-        _music_sort_chip("quality", "★ Best") +
+        _music_sort_chip("quality", "In order" if book else "★ Best") +
         _music_sort_chip("recent",  "Recent") +
         _music_sort_chip("longest", "Longest") +
         _music_sort_chip("size",    "Largest") +
@@ -11642,10 +11681,14 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         f'<a class="btn ghost" href="/music{_music_qs(fav=None if fav else 1)}" '
         f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
         f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>')
+    # the other shelf: books that are listened to stand apart from songs
+    shelf_chip = (f'<a class="btn ghost" href="/music{"" if book else "?book=1"}" style="padding:5px 12px;font-size:12px;margin-left:auto" '
+                  f'title="{"back to the songs" if book else "books that are listened to"}">'
+                  + ("🎵 Music" if book else f'🎧 Audiobooks <span style="opacity:.6">{books_n:,}</span>') + '</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
-        + lang_chips_html + '</div>'
+        + lang_chips_html + shelf_chip + '</div>'
         '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;align-items:center">'
         '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>'
         + sort_chips_html + '</div>'
@@ -11653,20 +11696,23 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
 
     if not rows:
         body = (
-            f'<h2 class="section">Music <span class="count">0</span></h2>'
+            f'<h2 class="section">{what} <span class="count">0</span></h2>'
             f'{toolbar}'
             '<div class="empty-state">'
-            '<div class="icon">🎵</div>'
-            '<div>No audio matches these filters.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio indexed — click to fetch.</div>'
-            '</div>'
+            f'<div class="icon">{"🎧" if book else "🎵"}</div>'
+            + ('<div>No audiobooks here yet.</div><div style="margin-top:8px;font-size:13px">A sound file stands here when it is an '
+               '.m4b, when its name, title or album calls it an audiobook, or when it was fetched from the Audiobooks shelf of '
+               '<a href="/usenet?kind=audiobook">Usenet</a>.</div>' if book and not (q or lang or local or fav) else
+               '<div>No audio matches these filters.</div>'
+               f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio indexed — click to fetch.</div>')
+            + '</div>'
         )
-        return HTMLResponse(_layout("Music", "/music", body))
+        return HTMLResponse(_layout(what, "/music", body))
 
     def _row(r):
         title = r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)"
         artist = r["audio_performer"] or ""
-        album = r["audio_album"] or r["ch_title"] or ""
+        album = r["audio_album"] or (os.path.basename(os.path.dirname(r["local_path"] or "")) if book else "") or r["ch_title"] or ""
         sub = artist + ((" · " + album) if album else "") + \
             ((" · " + str(r["audio_year"])) if r.get("audio_year") else "")
         return (
@@ -11695,7 +11741,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     rows_html = "".join(_row(r) for r in rows)
 
     body = (
-        f'<h2 class="section">Music <span class="count">{len(rows)} of {total:,}</span>'
+        f'<h2 class="section">{what} <span class="count">{len(rows)} of {total:,}</span>'
         + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
            if pending_n else '')
         + '</h2>'
@@ -11705,9 +11751,10 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         '<th>posted</th><th style="width:84px"></th></tr></thead>'
         f'<tbody>{rows_html}</tbody></table>'
         + _page_nav("/music", _music_qs, page_offset, page_size, len(rows), total)
+        + ('<script>window.tgBook=1</script>' if book else '')
         + _MUSIC_PLAYER_HTML
     )
-    return HTMLResponse(_layout("Music", "/music", body))
+    return HTMLResponse(_layout(what, "/music", body))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -11851,7 +11898,9 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         _sort_chip("recent",  "Recent") +
         _sort_chip("size",    "Largest") +
         _sort_chip("title",   "Title") +
-        '<span style="margin-left:10px"></span>' + _saved_chip("/library", _qs, local))
+        '<span style="margin-left:10px"></span>' + _saved_chip("/library", _qs, local) +
+        '<a class="btn ghost" href="/music?book=1" style="padding:5px 12px;font-size:12px;margin-left:auto" '
+        'title="books that are listened to">🎧 Audiobooks</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">' +
