@@ -28,6 +28,12 @@ MOST_ALL = 2048 * MB                                                  # one rele
 MOST_FILES = 400
 _HELPER = re.compile(r"\.(par2|nfo|sfv|nzb|md5|txt|url|diz)$", re.I)
 _PACKED = re.compile(r"\.(rar|r\d\d|zip|7z|\d{3}|tar|gz|iso|bin)$", re.I)
+# one piece of something cut up: "x.part003.jpg", "x.7z.004", "x.jpg.012" - whatever it ends in
+_PIECE = re.compile(r"\.part\d+\.[a-z0-9]{2,5}$|\.[a-z0-9]{2,5}\.\d{3}$|\.\d{3}\.[a-z0-9]{2,5}$", re.I)
+# first bytes that are never a book, a song or a picture, whatever the name says
+_NOT_IT = ((b"Rar!", "an archive"), (b"7z\xbc\xaf", "an archive"), (b"\x1f\x8b", "an archive"), (b"PAR2", "a repair file"),
+           (b"MZ", "a program"), (b"\x7fELF", "a program"), (b"PK\x03\x04", "an archive"))
+_ZIPPED = ("epub", "cbz", "cbr")                    # these are archives, and meant to be
 _VIDEO = re.compile(r"\.(mkv|mp4|avi|m4v|ts|m2ts|wmv|mpg|mpeg|vob|mov|divx|flv|webm)$", re.I)
 _MID = re.compile(r"^[^\s<>]{3,250}$")
 _T = bytes((i - 42) & 255 for i in range(256))
@@ -79,6 +85,9 @@ def plan(files: list) -> dict:
     """{"take": [file, ...] each with "kind", "why": ''} - or nothing to take and why, in words
     for the person who asked."""
     payload = [f for f in files if not _HELPER.search(f["name"] or "")]
+    if sum(1 for f in payload if _PIECE.search(f["name"] or "") and kind_of(f["name"])) > len(payload) / 2:
+        return {"take": [], "why": "cut into pieces under another name: it needs a real downloader to join and unpack"}
+    payload = [f for f in payload if not (_PIECE.search(f["name"] or "") and kind_of(f["name"]))]
     take = []
     for f in payload:
         k = kind_of(f["name"])
@@ -99,6 +108,17 @@ def plan(files: list) -> dict:
     if sum(f["bytes"] for f in take) * 0.97 > MOST_ALL:
         return {"take": [], "why": "too large to fetch here"}
     return {"take": take, "why": ""}
+
+
+def wrong_inside(head: bytes, name: str) -> str:
+    """'' when the first bytes of a file may be what its name says; else what they are."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in (name or "") else ""
+    for magic, what in _NOT_IT:
+        if head.startswith(magic):
+            if ext in _ZIPPED and magic in (b"PK\x03\x04", b"Rar!", b"7z\xbc\xaf"):
+                return ""
+            return what
+    return ""
 
 
 def _fields(line: bytes) -> dict:
@@ -173,6 +193,10 @@ def fetch_file(body, f: dict, path: str, on_bytes=None) -> dict:
                 data, info = decode(lines)
                 size = info["size"] if info["size"] is not None else size
                 name = name or info["name"]
+                if (info["begin"] or 1) == 1:
+                    what = wrong_inside(data[:8], path)
+                    if what:
+                        raise Missing(f"it is {what} under another name")
                 if info["begin"] is not None:
                     out.seek(info["begin"] - 1)
                 out.write(data)

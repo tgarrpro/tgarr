@@ -100,7 +100,7 @@ def _cross_site(request) -> bool:
 #     settings. The pages hide those buttons; this refuses the requests.
 _PRIVATE_ID_RX = re.compile(
     r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/lyrics|api/fav|"
-    r"ebook-pdf|ebook-cover|epub|pdf)/(\d+)(?:/|$)")
+    r"ebook-pdf|ebook-cover|epub|comic|pdf)/(\d+)(?:/|$)")
 _PUBLIC_MSG: dict = {}
 
 
@@ -3013,6 +3013,115 @@ def _epub_row_sql():
     return "SELECT local_path, file_name FROM messages WHERE id=$1"
 
 
+# ── comics ─────────────────────────────────────────────────────────────────────────────
+# A .cbz (and many a .cbr) is a zip of pictures. Converting one means unpacking every page
+# into memory at once - a 160 MB scan of a newspaper needs gigabytes. Reading one needs a
+# page at a time, so that is what is done: the pages are served as they lie in the zip.
+_COMIC_PAGE_RX = re.compile(r"\.(jpe?g|png|gif|webp)$", re.I)
+_COMIC_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+_COMIC_PAGE_MOST = 80 * 1024 * 1024
+_COMIC_CACHE: dict = {}           # path -> (mtime, [names in reading order])
+
+
+def _comic_pages(path: str) -> list:
+    """The pictures of a comic in reading order. Raises when the file is not a zip."""
+    mtime = os.path.getmtime(path)
+    hit = _COMIC_CACHE.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    with _zipfile.ZipFile(path) as zf:
+        names = [i.filename for i in zf.infolist()
+                 if not i.is_dir() and _COMIC_PAGE_RX.search(i.filename) and i.file_size <= _COMIC_PAGE_MOST
+                 and "__MACOSX" not in i.filename and not os.path.basename(i.filename).startswith(".")]
+    names.sort(key=lambda s: [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", s)])
+    if len(_COMIC_CACHE) > 200:
+        _COMIC_CACHE.clear()
+    _COMIC_CACHE[path] = (mtime, names)
+    return names
+
+
+async def _comic_of(msg_id: int):
+    """(path, title, pages) of a comic that can be read as it is, or None."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    path = _epub_locate(msg_id, row)
+    if not path or not re.search(r"\.cb[zr]$", row["file_name"] or path, re.I):
+        return None
+    try:
+        pages = await asyncio.to_thread(_comic_pages, path)
+    except Exception:
+        return None
+    return (path, re.sub(r"\.cb[zr]$", "", row["file_name"] or "", flags=re.I), pages) if pages else None
+
+
+@app.get("/comic/{msg_id}/info")
+async def comic_info(msg_id: int):
+    c = await _comic_of(msg_id)
+    if not c:
+        return JSONResponse({"error": "not a comic that can be read as it is"}, status_code=404)
+    return {"title": c[1], "pages": len(c[2])}
+
+
+@app.get("/comic/{msg_id}/page/{n}")
+async def comic_page(msg_id: int, n: int):
+    c = await _comic_of(msg_id)
+    if not c or not 0 <= n < len(c[2]):
+        return JSONResponse({"error": "no such page"}, status_code=404)
+    name = c[2][n]
+
+    def _read():
+        with _zipfile.ZipFile(c[0]) as zf:
+            return zf.read(name)
+    try:
+        data = await asyncio.to_thread(_read)
+    except Exception:
+        return JSONResponse({"error": "this page cannot be read"}, status_code=422)
+    if n == 0:
+        await _touch_local(msg_id)
+    from fastapi.responses import Response
+    return Response(data, media_type=_COMIC_TYPES[name.rsplit(".", 1)[-1].lower()],
+                    headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400",
+                             "Content-Security-Policy": "default-src 'none'"})
+
+
+@app.get("/comic/{msg_id}", response_class=HTMLResponse)
+async def comic_render(msg_id: int):
+    c = await _comic_of(msg_id)
+    if not c:
+        return HTMLResponse(f'<p>This comic cannot be shown as it is. <a href="/watch/{int(msg_id)}">Open it</a>.</p>', status_code=404)
+    n = len(c[2])
+    mid = int(msg_id)
+    pages = "".join(f'<img id="p{i}" data-n="{i}" loading="lazy" decoding="async" src="/comic/{mid}/page/{i}" alt="page {i + 1}"/>'
+                    for i in range(n))
+    return HTMLResponse(
+        '<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>'
+        f'<title>{html.escape(c[1])}</title><style>'
+        'html,body{margin:0;background:#111;color:#ddd;font-family:system-ui,sans-serif}'
+        '.bar{position:sticky;top:0;z-index:5;display:flex;gap:14px;align-items:center;padding:10px 16px;background:rgba(17,17,17,.94);'
+        'border-bottom:1px solid #2a2a2a;font-size:14px}.bar a,.bar button{color:#9cc8ff;text-decoration:none;background:none;border:0;'
+        'font:inherit;cursor:pointer;padding:0}.bar .t{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
+        'main{display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 0 40px}'
+        'main img{display:block;max-width:100%;min-height:70vh;background:#1b1b1b}main img.ok{min-height:0}'
+        'main.fit img{max-width:min(100%,1100px)}main.wide img{width:100%;max-width:none}'
+        '</style></head><body><div class="bar"><a href="#" id="back">&larr; back</a>'
+        f'<div class="t">{html.escape(c[1])}</div><span id="at">1 / {n}</span>'
+        '<button id="w" title="fit the width of the window">wider</button>'
+        f'<a href="/media/{mid}" download>&#11015; download</a></div><main id="m" class="fit">{pages}</main><script>'
+        f'const ID={mid},N={n},KEY="comic-"+ID;'
+        'const m=document.getElementById("m"),at=document.getElementById("at");'
+        'document.getElementById("back").onclick=e=>{e.preventDefault();if(history.length>1)history.back();else location.href="/library";};'
+        'document.getElementById("w").onclick=()=>{m.className=m.className==="fit"?"wide":"fit";};'
+        'for(const i of m.children){i.onload=()=>i.classList.add("ok");if(i.complete&&i.naturalWidth)i.classList.add("ok");}'
+        'const io=new IntersectionObserver(es=>{for(const e of es)if(e.isIntersecting){const n=+e.target.dataset.n;at.textContent=(n+1)+" / "+N;'
+        'try{localStorage.setItem(KEY,n)}catch(x){}}},{rootMargin:"-45% 0px -45% 0px"});'
+        'for(const i of m.children)io.observe(i);'
+        'let s=0;try{s=+localStorage.getItem(KEY)||0}catch(x){}'
+        'if(s>0&&s<N)document.getElementById("p"+s).scrollIntoView();'
+        '</script></body></html>',
+        headers={"Content-Security-Policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+                 "X-Content-Type-Options": "nosniff"})
+
+
 @app.get("/epub/{msg_id}/toc")
 async def epub_toc(msg_id: int):
     async with db_pool.acquire() as conn:
@@ -4523,7 +4632,7 @@ const MEDIA_TYPE = {_js_str(mt)};
 const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
 {_WATCH_PLAYER_JS}
 tgFavBtn();
-let started = false;
+let started = false, comicTried = false;
 function fmtBytes(b) {{
   if (!b) return "0 B";
   const u = ["B","KB","MB","GB"]; let i = 0; let v = b;
@@ -4550,6 +4659,16 @@ function renderPlayer() {{
   if (ext === "epub") {{
     // Read in the built-in reader: instant, and no conversion to run.
     location.replace("/epub/" + MSG_ID);
+    return;
+  }}
+  if ((ext === "cbz" || ext === "cbr") && !comicTried) {{
+    // pictures in a zip: shown page by page as they are. Only what is not a zip (a real
+    // RAR) goes on to be converted.
+    comicTried = true;
+    fetch("/comic/" + MSG_ID + "/info").then(r => {{
+      if (r.ok) location.replace("/comic/" + MSG_ID);
+      else {{ started = false; renderPlayer(); }}
+    }}).catch(() => {{ started = false; renderPlayer(); }});
     return;
   }}
   if (["mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
@@ -9013,7 +9132,46 @@ async def _usenet_from_registry(q: str) -> int:
 # ════════════════════════════════════════════════════════════════════
 USENET_ROOT, USENET_ROOT_ADULT = "usenet", "usenet18"
 _UN_GRAB_KINDS = ("ebook", "audio", "photo")
-_UN_FOLDER = {"ebook": "books", "audio": "music", "photo": "pictures"}
+# The shelves of the Usenet page. A card only knows "ebook" or "audio"; which shelf it stands
+# on is read from where it was posted and what it is called. One rule, in SQL for the page
+# and in Python for the folder a fetch lands in - test_usenet_shelf keeps them the same.
+_UN_SHELVES = (("ebook", "📖", "Books"), ("comic", "💬", "Comics"), ("magazine", "📰", "Magazines"),
+               ("audiobook", "🎧", "Audiobooks"), ("audio", "🎵", "Music"), ("photo", "🖼", "Pictures"))
+_UN_AUDIOBOOK_GRP, _UN_AUDIOBOOK_NAME = r"audiobook|\.books$|hoorspel", r"audio ?book|unabridged|\.m4b"
+_UN_COMIC_GRP, _UN_COMIC_NAME, _UN_MAGAZINE_GRP = r"comic", r"\.cb[zr]", r"magazine"
+_UN_SHELF_SQL = f"""CASE
+    WHEN c.kind = 'audio' AND (c.grp ~ '{_UN_AUDIOBOOK_GRP}' OR c.name ~* '{_UN_AUDIOBOOK_NAME}') THEN 'audiobook'
+    WHEN c.kind = 'ebook' AND (c.grp ~ '{_UN_COMIC_GRP}' OR c.name ~* '{_UN_COMIC_NAME}') THEN 'comic'
+    WHEN c.kind = 'ebook' AND c.grp ~ '{_UN_MAGAZINE_GRP}' THEN 'magazine'
+    ELSE c.kind END"""
+
+
+def _un_shelf(kind: str, grp: str, name: str) -> str:
+    grp, name = grp or "", name or ""
+    if kind == "audio" and (re.search(_UN_AUDIOBOOK_GRP, grp) or re.search(_UN_AUDIOBOOK_NAME, name, re.I)):
+        return "audiobook"
+    if kind == "ebook" and (re.search(_UN_COMIC_GRP, grp) or re.search(_UN_COMIC_NAME, name, re.I)):
+        return "comic"
+    if kind == "ebook" and re.search(_UN_MAGAZINE_GRP, grp):
+        return "magazine"
+    return kind
+_UN_FOLDER = {"ebook": "books", "audio": "music", "photo": "pictures",
+              "comic": "comics", "magazine": "magazines", "audiobook": "audiobooks"}
+
+
+def _un_single_name(release: str, file_name: str) -> str:
+    """The name one file alone is kept under. A post often calls its file something that
+    says nothing by itself ("AlbumArtLarge.jpg", "(1975-04-28)(c2c).cbz"): then the name of
+    the release goes in front."""
+    def flat(s):
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    stem, dot, ext = (file_name or "").rpartition(".")
+    if not dot:
+        stem, ext = file_name or "", ""
+    rel = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", (release or "").strip())
+    if not flat(rel) or flat(rel) in flat(stem) or (len(flat(stem)) >= 8 and flat(stem) in flat(rel)):
+        return file_name
+    return f"{rel} {stem}"[:150].strip() + (("." + ext) if ext else "")
 _UN_GRAB = {"now": None, "bytes": 0, "of": 0}
 
 
@@ -9097,8 +9255,10 @@ async def _usenet_grab_one(job) -> tuple:
         adult = c["audience"] == "nsfw"
         root = USENET_ROOT_ADULT if adult else USENET_ROOT
         kind = collections.Counter(f["kind"] for f in take).most_common(1)[0][0]
-        base = f"/downloads/{root}/{_UN_FOLDER[kind]}"
+        base = f"/downloads/{root}/{_UN_FOLDER[_un_shelf(kind, c['grp'], c['name'])]}"
         os.makedirs(base, exist_ok=True)
+        if len(take) == 1:
+            take = [dict(take[0], name=_un_single_name(c["name"], take[0]["name"]))]
         if len(take) > 1:                          # an album, a set of pictures: a folder of its own
             base = os.path.join(base, localfiles.free_name(lambda x: os.path.exists(os.path.join(base, x)),
                                                            localfiles.safe_name(c["name"])[:120].strip(" .") or "release"))
@@ -9218,37 +9378,41 @@ async def page_usenet(q: Optional[str] = None, kind: str = ""):
                 'for Sonarr and Radarr, and books, songs and pictures it can fetch itself, straight into the Library, Music and the Gallery.</p>'
                 '<a class="btn" href="/settings/usenet">Set up</a></div></div>')
         return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=""))
-    kind = kind if kind in _UN_GRAB_KINDS else ""
+    kind = kind if kind in [s[0] for s in _UN_SHELVES] else ""
     q = (q or "").strip()
     if q:
         await _usenet_from_registry(q)
     where = ["c.alive >= 0.5", "c.kind = ANY($1::text[])", "COALESCE(c.size, 0) <= $2"]
-    params = [[kind] if kind else list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL]
+    params = [list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL]
     if not await _is_nsfw_enabled():
         where.append("c.audience <> 'nsfw'")
+    counted = " AND ".join(where)                  # the numbers on the shelves: before the search and the shelf
+    if kind:
+        params.append(kind)
+        where.append(f"({_UN_SHELF_SQL}) = ${len(params)}")
     for w in re.split(r"[\s.]+", q)[:8]:
         if w:
             params.append("%" + w.replace("%", "").replace("_", r"\_") + "%")
             where.append(f"c.name ILIKE ${len(params)}")
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            f"""SELECT c.id, c.name, c.kind, c.size, c.grp, c.posted_from, c.files, c.audience
+            f"""SELECT c.id, c.name, c.kind, c.size, c.grp, c.posted_from, c.files, c.audience, c.sketch, ({_UN_SHELF_SQL}) AS shelf
                 FROM usenet_cards c WHERE {' AND '.join(where)}
                 ORDER BY c.posted_from DESC NULLS LAST LIMIT 150""", *params)
         counts = dict(await conn.fetch(
-            "SELECT kind, count(*) FROM usenet_cards WHERE alive >= 0.5 AND kind = ANY($1::text[]) AND COALESCE(size, 0) <= $2 GROUP BY 1",
-            list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL))
-    ico = {"ebook": "📖", "audio": "🎵", "photo": "🖼"}
+            f"SELECT ({_UN_SHELF_SQL}), count(*) FROM usenet_cards c WHERE {counted} GROUP BY 1", list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL))
+    ico = {s[0]: s[1] for s in _UN_SHELVES}
     qs = f"&q={_q(q)}" if q else ""
     chips = "".join(
         f'<a class="btn ghost km-chip{" on" if k == kind else ""}" href="/usenet?kind={k}{qs}">{lbl} <span style="opacity:.6">{n:,}</span></a>'
-        for k, lbl, n in (("", "All", sum(counts.values())), ("ebook", "📖 Books", counts.get("ebook", 0)),
-                          ("audio", "🎵 Music", counts.get("audio", 0)), ("photo", "🖼 Pictures", counts.get("photo", 0))))
+        for k, lbl, n in [("", "All", sum(counts.values()))] + [(s[0], f"{s[1]} {s[2]}", counts.get(s[0], 0)) for s in _UN_SHELVES])
     items = "".join(
-        f'<div class="km-row"><span class="n">{ico.get(r["kind"], "")} {html.escape(r["name"])}'
+        f'<div class="km-row"><span class="n">{ico.get(r["shelf"], "")} {html.escape(r["name"])}'
         + (' <small>· 18+</small>' if r["audience"] == "nsfw" else "")
-        + f'<br/><small>{_fmt_size(r["size"]) or "?"}'
-        + (f' · {r["files"]} files' if (r["files"] or 0) > 1 else "")
+        # a card from a sparse reading saw only some of a release: one file is measured,
+        # several are an estimate, and the count is of those seen
+        + f'<br/><small>{"about " if r["sketch"] and (r["files"] or 0) > 1 else ""}{_fmt_size(r["size"]) or "?"}'
+        + (f' · {r["files"]}{"+" if r["sketch"] else ""} files' if (r["files"] or 0) > 1 else "")
         + f' · {html.escape(r["grp"])} · {time.strftime("%Y-%m-%d", time.gmtime(r["posted_from"] or 0))}</small></span>'
         f'<span id="ug-{r["id"]}" style="white-space:nowrap"><button class="btn" onclick="ugGet(&quot;{r["id"]}&quot;,this)">Get</button></span></div>'
         for r in rows)
