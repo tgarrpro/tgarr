@@ -162,7 +162,7 @@ _LOCKED = contextvars.ContextVar("tgarr_locked", default=False)
 _ACCESS = {"at": 0.0, "pin": None, "secret": None}
 _GUESSES = access.Guesses()
 _KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
-_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw'
+_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.5
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
                     OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
 _LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock",
@@ -290,7 +290,7 @@ async def _signed_out_block(request: Request):
         # the PIN and the kids' list belong to this install, not to the
         # Telegram account: they work whether or not anybody is signed in
         if path.startswith("/api/") and not path.startswith(
-                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/")):
+                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/")):
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -400,6 +400,7 @@ import usenet_scan  # local module
 import usenet_client  # local module
 import usenet_rules  # local module
 import tts  # local module
+import vision  # local module
 
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
@@ -591,6 +592,7 @@ async def _startup():
     asyncio.create_task(_export_worker())
     asyncio.create_task(_cache_gc_worker())
     asyncio.create_task(_tts_housekeeping())
+    asyncio.create_task(_vision_worker())
     asyncio.create_task(_update_check_worker())
 
 
@@ -611,6 +613,12 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_path TEXT;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_md5 TEXT;
+            -- what the picture itself was found to be (vision.py): how likely adult, how likely
+            -- drawn, and by which version of the looking (NULL: not looked at yet)
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_adult REAL;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_drawn REAL;
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_ver SMALLINT;
+            CREATE INDEX IF NOT EXISTS idx_messages_ai_todo ON messages (id DESC) WHERE thumb_path IS NOT NULL AND ai_ver IS NULL;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS members_count INTEGER;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS meta_updated_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS audience TEXT;
@@ -8966,6 +8974,177 @@ async def api_usenet_enabled(request: Request):
 
 
 # ════════════════════════════════════════════════════════════════════
+# Looking at pictures (vision.py): adult or not, drawn or not
+#
+# The worker goes through the thumbnails, newest first, a picture at a time and without
+# hurry (a picture takes most of a second on four cores; ten thousand are an afternoon,
+# once - after that only what is new). The answer is kept on every row that shows that
+# picture. It counts in two places: the Media Center never shows a picture found adult,
+# whatever was ticked; the gallery leaves it out unless adult content is switched on.
+# And a channel that calls itself harmless and is mostly adult pictures is relabelled -
+# which takes its videos out of the default pages too - unless its label was set by hand.
+# ════════════════════════════════════════════════════════════════════
+VISION_CHANNEL_MIN = 30                # pictures of a channel looked at before it is judged
+VISION_CHANNEL_SHARE = 0.4             # of them adult: the channel is
+_VISION = {"state": "off", "looked": 0, "at": 0.0, "relabelled": []}
+
+
+async def _vision_relabel() -> None:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """UPDATE channels c SET audience = 'nsfw'
+               FROM (SELECT channel_id, count(*) AS n, count(*) FILTER (WHERE ai_adult >= 0.5) AS adult
+                     FROM messages WHERE ai_ver IS NOT NULL AND ai_adult IS NOT NULL GROUP BY 1) x
+               WHERE x.channel_id = c.id AND COALESCE(c.audience, 'sfw') = 'sfw' AND NOT COALESCE(c.audience_manual, FALSE)
+                 AND x.n >= $1 AND x.adult >= x.n * $2
+               RETURNING c.id, COALESCE(c.title, c.username, 'a chat') AS name, x.n, x.adult""",
+            VISION_CHANNEL_MIN, VISION_CHANNEL_SHARE)
+    for r in rows:
+        log.info("[vision] channel %s: %d of %d pictures looked at are adult - labelled 18+", r["id"], r["adult"], r["n"])
+        _VISION["relabelled"] = (_VISION["relabelled"] + [{"name": r["name"], "n": r["n"], "adult": r["adult"], "at": time.time()}])[-20:]
+    if rows:
+        _KID_OK.clear()
+
+
+async def _vision_worker():
+    await asyncio.sleep(75)
+    since_relabel = 0
+    while True:
+        try:
+            if not await asyncio.to_thread(vision.available):
+                _VISION["state"] = "off"
+                await asyncio.sleep(120)
+                continue
+            async with db_pool.acquire() as conn:
+                todo = await conn.fetch(
+                    """SELECT thumb_path FROM messages
+                       WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__' AND (ai_ver IS NULL OR ai_ver < $1)
+                       GROUP BY thumb_path ORDER BY max(id) DESC LIMIT 40""", vision.VERSION)
+            if not todo:
+                _VISION["state"] = "idle"
+                if since_relabel:
+                    await _vision_relabel()
+                    since_relabel = 0
+                await asyncio.to_thread(vision.unload_if_idle)
+                await asyncio.sleep(60)
+                continue
+            _VISION["state"] = "looking"
+            for r in todo:
+                tp = r["thumb_path"]
+                got = None
+                if ".." not in tp and not tp.startswith("/"):
+                    try:
+                        got = await asyncio.to_thread(vision.look, os.path.join(THUMBS_DIR, tp))
+                    except RuntimeError:
+                        break                           # the models went away: start over
+                    except Exception:
+                        got = None                      # a file that is gone or is no picture: marked as looked at
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE messages SET ai_adult = $2, ai_drawn = $3, ai_ver = $4 WHERE thumb_path = $1",
+                        tp, got and got["adult"], got and got["drawn"], vision.VERSION)
+                _VISION["looked"] += 1
+                _VISION["at"] = time.time()
+                since_relabel += 1
+                await asyncio.sleep(0.25)               # without hurry: the machine has other things to do
+            if since_relabel >= 200:
+                await _vision_relabel()
+                since_relabel = 0
+        except Exception as e:
+            log.warning("[vision] %s: %s", type(e).__name__, str(e)[:200])
+            await asyncio.sleep(120)
+
+
+@app.get("/api/vision/status")
+async def api_vision_status():
+    st = await asyncio.to_thread(vision.status)
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow(
+            """SELECT count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NOT NULL) AS looked,
+                      count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NULL) AS waiting,
+                      count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.5) AS adult,
+                      count(DISTINCT thumb_path) FILTER (WHERE ai_drawn >= 0.5) AS drawn
+               FROM messages WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__'""")
+    st.update(dict(c), state=_VISION["state"], relabelled=_VISION["relabelled"])
+    return st
+
+
+@app.post("/api/vision/install")
+async def api_vision_install():
+    return {"status": "ok", "started": vision.install()}
+
+
+@app.post("/api/vision/remove")
+async def api_vision_remove(request: Request):
+    """Remove the models. With {"forget": true} what they found is forgotten too."""
+    try:
+        forget = bool((await request.json()).get("forget"))
+    except Exception:
+        forget = False
+    await asyncio.to_thread(vision.remove)
+    if forget:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE messages SET ai_adult = NULL, ai_drawn = NULL, ai_ver = NULL WHERE ai_ver IS NOT NULL")
+        _KID_OK.clear()
+    return {"status": "ok"}
+
+
+@app.get("/settings/pictures", response_class=HTMLResponse)
+async def page_settings_pictures():
+    mb = f"{vision.SIZE / 1e6:.0f} MB"
+    body = f"""<style>.vi-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
+.vi-box h3{{margin:0 0 6px}}.vi-box p{{color:var(--muted);margin:0 0 10px}}
+.vi-row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}}
+.vi-bar{{flex:1;min-width:160px;max-width:360px;height:8px;border-radius:999px;background:var(--border);overflow:hidden}}
+.vi-bar i{{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}}
+.vi-n{{display:flex;gap:26px;flex-wrap:wrap;margin-top:6px}}.vi-n div b{{display:block;font-size:24px;line-height:1.2}}
+.vi-n div{{color:var(--muted);font-size:13px}}.vi-n div b{{color:var(--fg)}}
+</style>
+<div class="vi-box"><h3>Looking at the pictures themselves <span id="viState"></span></h3>
+<p>Whether something is adult has so far been a matter of what its channel is called. With this installed, tgarr looks at every
+picture - at the picture, not its name - and decides for itself: adult or not, drawn or photographed. A picture found adult is never
+shown in the Media Center, whatever was ticked, and is left out of the gallery unless adult content is switched on. A channel that
+calls itself harmless and turns out to be mostly adult pictures is labelled 18+.</p>
+<p>Three small models do it, on this machine's processor; nothing is sent anywhere. They are fetched once, {mb}, from Hugging Face,
+and checked. A picture takes most of a second, so a large library is gone through once over some hours, quietly, newest first.
+What they cannot do is tell a person's age.</p>
+<div class="vi-row" id="viRow"></div></div>
+<div class="vi-box"><h3>So far</h3><div class="vi-n" id="viNum"></div><div id="viCh" style="margin-top:12px;font-size:14px"></div></div>
+<script>
+const SZ = {vision.SIZE};
+const post = (path, body) => fetch(path, {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify(body || {{}})}}).then(r => r.json());
+const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
+const esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
+const n = x => (x || 0).toLocaleString();
+function show(j){{
+  document.getElementById("viState").innerHTML = j.installed ? (j.available ? pill("ok", j.state === "looking" ? "looking" : "installed") : pill("bad", "installed, but this build cannot run it")) : pill("muted", "not installed");
+  const row = document.getElementById("viRow");
+  if (j.installing) {{
+    const pc = Math.min(100, Math.round(j.done * 100 / SZ));
+    row.innerHTML = '<div class="vi-bar"><i style="width:' + pc + '%"></i></div><span>fetching, ' + pc + '%</span>';
+  }} else if (j.installed) {{
+    row.innerHTML = '<button class="btn ghost" onclick="viRemove(false)">Remove the models</button><button class="btn ghost" onclick="viRemove(true)">Remove, and forget what they found</button>';
+  }} else {{
+    row.innerHTML = '<button class="btn" onclick="viInstall()">Install (' + Math.round(SZ / 1e6) + ' MB)</button>' + (j.error ? '<span style="color:#b45309">' + esc(j.error) + '</span>' : "");
+  }}
+  document.getElementById("viNum").innerHTML = '<div><b>' + n(j.looked) + '</b>pictures looked at</div><div><b>' + n(j.waiting) + '</b>waiting</div>'
+    + '<div><b>' + n(j.adult) + '</b>found adult</div><div><b>' + n(j.drawn) + '</b>drawn, not photographed</div>';
+  document.getElementById("viCh").innerHTML = (j.relabelled || []).map(c => 'Labelled 18+: <b>' + esc(c.name) + '</b> - ' + n(c.adult) + ' of ' + n(c.n) + ' pictures looked at were adult').join("<br/>");
+  return j.installing || j.state === "looking";
+}}
+let timer = null;
+function poll(){{ fetch("/api/vision/status").then(r => r.json()).then(j => {{ clearTimeout(timer); timer = setTimeout(poll, show(j) ? 2500 : 20000); }}).catch(() => {{ timer = setTimeout(poll, 6000); }}); }}
+function viInstall(){{ post("/api/vision/install").then(poll); }}
+function viRemove(forget){{
+  if (!confirm(forget ? "Remove the models and forget what they found? Pictures will again be judged by their channel alone." : "Remove the models? What they found so far is kept.")) return;
+  post("/api/vision/remove", {{forget: forget}}).then(poll);
+}}
+poll();
+</script>"""
+    return HTMLResponse(_layout("Pictures", "/settings", body, page_title="Looking at pictures", top_actions_html=""))
+
+
+# ════════════════════════════════════════════════════════════════════
 # Reading aloud with this machine's own voice (tts.py)
 # ════════════════════════════════════════════════════════════════════
 async def _tts_pronunciation_on() -> bool:
@@ -9916,6 +10095,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     _nsfw_on = await _is_nsfw_enabled()
     if not _nsfw_on:
         where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
+        where.append("COALESCE(m.ai_adult, 0) < 0.5")        # the picture itself, whatever its channel says
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
     # CSAM hard-block — overrides every setting, always.
@@ -12401,6 +12581,14 @@ function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", h
       <div class="meta">A natural voice of this machine's own for books, in every browser - Chinese and English. Fetched when you ask for it.</div>
     </div>
     <div class="right"><a class="btn" href="/settings/voice">Set up</a></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">🖼</div>
+    <div class="info">
+      <div class="name">Looking at pictures</div>
+      <div class="meta">tgarr looks at each picture itself - adult or not, drawn or photographed - instead of going by what its channel is called. Fetched when you ask for it.</div>
+    </div>
+    <div class="right"><a class="btn" href="/settings/pictures">Set up</a></div>
   </div>
 </div>
 <h2 class="section">Metadata sources</h2>
