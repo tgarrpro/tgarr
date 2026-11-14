@@ -1,5 +1,6 @@
 """The parts of vision.py that need no models: the verdict and how a picture is prepared."""
 import os
+import re
 import sys
 import tempfile
 
@@ -16,21 +17,17 @@ def check(what, got, want):
     assert got == want, f"{what}: {got!r}, wanted {want!r}"
 
 
-# the photo model's word counts whatever the picture is
-check("adult photo", vision.verdict(0.9, 0.1, 0.0) >= vision.ADULT_AT, True)
-check("plain photo", vision.verdict(0.1, 0.1, 0.0) >= vision.ADULT_AT, False)
-# the drawing model's word counts only for a drawing
-check("explicit drawing", vision.verdict(0.05, 0.9, 0.8) >= vision.ADULT_AT, True)
-check("harmless drawing", vision.verdict(0.05, 0.9, 0.1) >= vision.ADULT_AT, False)
-check("r18 said of a photograph is ignored", vision.verdict(0.05, 0.2, 0.95) >= vision.ADULT_AT, False)
-check("a drawing the photo model flags", vision.verdict(0.7, 0.9, 0.1) >= vision.ADULT_AT, True)
+# where adult starts: the same number in vision.py and in main.py's SQL
+main = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read()
+at = set(re.findall(r"ai_adult(?:, 0\))? (?:>=|<) ([0-9.]+)", main))
+check("one threshold in the SQL", at, {str(vision.ADULT_AT)})
 
 # nothing installed: says so, starts nothing by itself
 check("not installed", vision.installed(), False)
 check("not available", vision.available(), False)
 st = vision.status()
 check("status", (st["installed"], st["installing"], st["bytes"]), (False, False, vision.SIZE))
-check("three models", sorted(vision.FILES), ["adult", "drawn", "rating"])
+check("two models", sorted(vision.FILES), ["adult", "drawn"])
 check("every model has a checksum", all(len(f[2]) == 64 and f[1] > 0 for f in vision.FILES.values()), True)
 try:
     vision.look("/nowhere.jpg")

@@ -162,7 +162,7 @@ _LOCKED = contextvars.ContextVar("tgarr_locked", default=False)
 _ACCESS = {"at": 0.0, "pin": None, "secret": None}
 _GUESSES = access.Guesses()
 _KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
-_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.5
+_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
                     OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
 _LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock",
@@ -618,8 +618,10 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_adult REAL;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_drawn REAL;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_ver SMALLINT;
-            -- TRUE: ai_adult was set by the person, not by a model; never looked at again
+            -- TRUE: ai_adult was set by the person, not by a model, and stays
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_by_hand BOOLEAN;
+            -- what the model itself said, kept when the person says otherwise
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_model REAL;
             CREATE INDEX IF NOT EXISTS idx_messages_ai_todo ON messages (id DESC) WHERE thumb_path IS NOT NULL AND ai_ver IS NULL;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS members_count INTEGER;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS meta_updated_at TIMESTAMPTZ;
@@ -8995,7 +8997,7 @@ async def _vision_relabel() -> None:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """UPDATE channels c SET audience = 'nsfw'
-               FROM (SELECT channel_id, count(DISTINCT thumb_path) AS n, count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.5) AS adult
+               FROM (SELECT channel_id, count(DISTINCT thumb_path) AS n, count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.9) AS adult
                      FROM messages WHERE ai_ver IS NOT NULL AND ai_adult IS NOT NULL GROUP BY 1) x
                WHERE x.channel_id = c.id AND COALESCE(c.audience, 'sfw') = 'sfw' AND NOT COALESCE(c.audience_manual, FALSE)
                  AND x.n >= $1::int AND x.adult >= x.n * $2::float8
@@ -9020,7 +9022,7 @@ async def _vision_worker():
             async with db_pool.acquire() as conn:
                 todo = await conn.fetch(
                     """SELECT thumb_path FROM messages
-                       WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__' AND (ai_ver IS NULL OR ai_ver < $1) AND ai_by_hand IS NOT TRUE
+                       WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__' AND (ai_ver IS NULL OR ai_ver < $1)
                        GROUP BY thumb_path ORDER BY max(id) DESC LIMIT 40""", vision.VERSION)
             if not todo:
                 _VISION["state"] = "idle"
@@ -9043,7 +9045,8 @@ async def _vision_worker():
                         got = None                      # a file that is gone or is no picture: marked as looked at
                 async with db_pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE messages SET ai_adult = $2, ai_drawn = $3, ai_ver = $4 WHERE thumb_path = $1 AND ai_by_hand IS NOT TRUE",
+                        """UPDATE messages SET ai_adult = CASE WHEN ai_by_hand THEN ai_adult ELSE $2 END, ai_model = $2, ai_drawn = $3, ai_ver = $4
+                           WHERE thumb_path = $1""",
                         tp, got and got["adult"], got and got["drawn"], vision.VERSION)
                 _VISION["looked"] += 1
                 _VISION["at"] = time.time()
@@ -9062,11 +9065,11 @@ async def api_vision_status():
     st = await asyncio.to_thread(vision.status)
     async with db_pool.acquire() as conn:
         c = await conn.fetchrow(
-            """SELECT count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NOT NULL) AS looked,
-                      count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NULL AND ai_by_hand IS NOT TRUE) AS waiting,
-                      count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.5) AS adult,
+            """SELECT count(DISTINCT thumb_path) FILTER (WHERE ai_ver >= $1) AS looked,
+                      count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NULL OR ai_ver < $1) AS waiting,
+                      count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.9) AS adult,
                       count(DISTINCT thumb_path) FILTER (WHERE ai_drawn >= 0.5) AS drawn
-               FROM messages WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__'""")
+               FROM messages WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__'""", vision.VERSION)
     st.update(dict(c), state=_VISION["state"], relabelled=_VISION["relabelled"])
     return st
 
@@ -9086,7 +9089,7 @@ async def api_vision_remove(request: Request):
     await asyncio.to_thread(vision.remove)
     if forget:
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE messages SET ai_adult = NULL, ai_drawn = NULL, ai_ver = NULL WHERE ai_ver IS NOT NULL AND ai_by_hand IS NOT TRUE")
+            await conn.execute("UPDATE messages SET ai_adult = CASE WHEN ai_by_hand THEN ai_adult END, ai_model = NULL, ai_drawn = NULL, ai_ver = NULL WHERE ai_ver IS NOT NULL")
         _KID_OK.clear()
     return {"status": "ok"}
 
@@ -9096,10 +9099,10 @@ async def api_vision_flagged():
     """The pictures found adult, surest first, and after them the ones set by hand."""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT m.thumb_path AS thumb, max(m.ai_adult) AS adult, bool_or(COALESCE(m.ai_by_hand, FALSE)) AS by_hand,
+            """SELECT m.thumb_path AS thumb, max(m.ai_adult) AS adult, max(m.ai_model) AS model, bool_or(COALESCE(m.ai_by_hand, FALSE)) AS by_hand,
                       max(COALESCE(c.title, c.username, 'a chat')) AS channel
                FROM messages m JOIN channels c ON c.id = m.channel_id
-               WHERE m.thumb_path IS NOT NULL AND (m.ai_adult >= 0.5 OR m.ai_by_hand)
+               WHERE m.thumb_path IS NOT NULL AND (m.ai_adult >= 0.9 OR m.ai_by_hand)
                GROUP BY m.thumb_path
                ORDER BY bool_or(COALESCE(m.ai_by_hand, FALSE)), max(m.ai_adult) DESC, max(m.id) DESC LIMIT 300""")
     return {"pictures": [dict(r) for r in rows]}
@@ -9119,7 +9122,7 @@ async def api_vision_mark(request: Request):
     async with db_pool.acquire() as conn:
         if adult is None:
             await conn.execute(
-                "UPDATE messages SET ai_adult = NULL, ai_drawn = NULL, ai_ver = NULL, ai_by_hand = NULL WHERE thumb_path = $1", thumb)
+                "UPDATE messages SET ai_adult = ai_model, ai_by_hand = NULL WHERE thumb_path = $1", thumb)
         else:
             await conn.execute(
                 "UPDATE messages SET ai_adult = $2, ai_ver = COALESCE(ai_ver, 0), ai_by_hand = TRUE WHERE thumb_path = $1",
@@ -9151,13 +9154,13 @@ async def page_settings_pictures():
 picture - at the picture, not its name - and decides for itself: adult or not, drawn or photographed. A picture found adult is never
 shown in the Media Center, whatever was ticked, and is left out of the gallery unless adult content is switched on. A channel that
 calls itself harmless and turns out to be mostly adult pictures is labelled 18+.</p>
-<p>Three small models do it, on this machine's processor; nothing is sent anywhere. They are fetched once, {mb}, from Hugging Face,
+<p>Two small models do it, on this machine's processor; nothing is sent anywhere. They are fetched once, {mb}, from Hugging Face,
 and checked. A picture takes most of a second, so a large library is gone through once over some hours, quietly, newest first.
 What they cannot do is tell a person's age.</p>
 <div class="vi-row" id="viRow"></div></div>
 <div class="vi-box"><h3>So far</h3><div class="vi-n" id="viNum"></div><div id="viCh" style="margin-top:12px;font-size:14px"></div></div>
 <div class="vi-box"><h3>Found adult</h3>
-<p>Blurred until the pointer is on them. A model can be wrong: say so, and your word stands - the picture is shown again and is not looked at a second time.</p>
+<p>Blurred until the pointer is on them. Only what the model is very sure of (90% and up) is listed. It can still be wrong: say so, and your word stands, whatever a model says later.</p>
 <div class="vi-grid" id="viFlag"></div><p id="viFlagNone" style="margin-top:8px"></p>
 <h3 style="margin-top:18px" id="viHandH"></h3><div class="vi-grid" id="viHand"></div></div>
 <script>
@@ -9192,7 +9195,7 @@ function viRemove(forget){{
 function flagged(){{
   fetch("/api/vision/flagged").then(r => r.json()).then(j => {{
     const card = p => '<div class="vi-card' + (p.by_hand ? ' hand' : '') + '"><div class="vi-img"><img loading="lazy" src="/thumbs/' + encodeURIComponent(p.thumb) + '"/></div>'
-      + '<div class="vi-cap">' + esc(p.channel) + (p.by_hand ? (p.adult >= 0.5 ? ' - adult, you said' : ' - not adult, you said') : ' - ' + Math.round(p.adult * 100) + '%') + '</div>'
+      + '<div class="vi-cap">' + esc(p.channel) + (p.by_hand ? (p.adult >= 0.5 ? ' - adult, you said' : ' - not adult, you said') + (p.model != null ? ' (model: ' + Math.round(p.model * 100) + '%)' : '') : ' - ' + Math.round(p.adult * 100) + '%') + '</div>'
       + '<button class="btn ghost" data-t="' + encodeURIComponent(p.thumb) + '" data-a="' + (p.by_hand ? 'undo' : 'no') + '">' + (p.by_hand ? 'Take back' : 'Not adult') + '</button></div>';
     const ps = j.pictures || [], found = ps.filter(p => !p.by_hand), hand = ps.filter(p => p.by_hand);
     document.getElementById("viFlag").innerHTML = found.map(card).join("");
@@ -10165,7 +10168,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     _nsfw_on = await _is_nsfw_enabled()
     if not _nsfw_on:
         where.append("COALESCE(c.audience, 'sfw') <> 'nsfw'")
-        where.append("COALESCE(m.ai_adult, 0) < 0.5")        # the picture itself, whatever its channel says
+        where.append("COALESCE(m.ai_adult, 0) < 0.9")        # the picture itself, whatever its channel says
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
     # CSAM hard-block — overrides every setting, always.

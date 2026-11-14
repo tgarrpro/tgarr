@@ -3,19 +3,21 @@
 Until now "adult" was a property of a channel, decided from its name and what its owner said.
 A channel that calls itself harmless and is not, or one adult picture in a family chat, went
 straight through - also into the Media Center, which is the one place that must not show it.
-Here the picture itself is looked at, by three small open models on this machine's CPU:
+Here the picture itself is looked at, by two small open models on this machine's CPU:
 
     adult      a photo classifier (AdamCodd/vit-base-nsfw-detector, Apache-2.0), 88 MB
     drawn      drawing or photograph (deepghs/anime_real_cls, OpenRAIL), 17 MB
-    rating     how explicit a drawing is (deepghs/anime_rating, MIT), 17 MB
 
-The photo model does not flag drawings and the drawing model knows nothing of photographs
-(measured: of what the first called adult none was drawn; of the explicit drawings it
-flagged none), so the verdict takes both: adult = the photo model says so, or it is a drawing
-and the drawing model says "r18".
+Where adult starts was measured on a real library (643 pictures of all-ages channels, each
+verdict checked by its owner, and 100 left over from adult channels): at 0.5 the photo model
+called 24 harmless pictures adult - album covers, paintings, a letter B - at 0.9 four, while
+of the 30 it rightly found 27 stayed. So ADULT_AT is 0.9: what it says is then nearly always
+true, and it misses some. A third model, rating how explicit a drawing is
+(deepghs/anime_rating), was tried and left out: on book covers it was wrong every time.
+Drawings are therefore told apart but not judged; an explicit drawing passes.
 
 Pixels only - never a file name or a caption. Nothing leaves this machine. The models are
-not in the image: they are fetched when asked for (122 MB) and checked against a known
+not in the image: they are fetched when asked for (105 MB) and checked against a known
 SHA-256. What they cannot do: tell a person's age. Sexual material involving children is
 kept out by names and groups (usenet_rules, the registry's lists), not by these models.
 
@@ -32,8 +34,8 @@ import urllib.request
 log = logging.getLogger("tgarr")
 
 ROOT = os.environ.get("TGARR_VISION_DIR", "/downloads/.vision")
-VERSION = 1                       # of the verdict: raise it when models or the rule change, and everything is looked at again
-ADULT_AT = 0.5
+VERSION = 2                       # of the verdict: raise it when models or the rule change, and everything is looked at again
+ADULT_AT = 0.9                    # main.py's SQL carries the same number (test_vision checks)
 IDLE_UNLOAD_S = 10 * 60
 
 # name: (url, bytes, sha256)
@@ -42,11 +44,9 @@ FILES = {
               "432763a6899ebc418c55f784b98f90565e5fc694c778d2ffcb0294b12f6a7404"),
     "drawn": ("https://huggingface.co/deepghs/anime_real_cls/resolve/main/mobilenetv3_v1.4_dist/model.onnx", 16821153,
               "c02d68cc7f56dbcbcd4f41a10df190385c1f963f22c4eefb8d162869800ed3b0"),
-    "rating": ("https://huggingface.co/deepghs/anime_rating/resolve/main/mobilenetv3_sce_dist/model.onnx", 16827558,
-               "31814ba076d65d129b89322a767d55d0669c54015134c117da3cf2717defde4e"),
 }
 SIZE = sum(f[1] for f in FILES.values())
-LABELS = {"adult": ("sfw", "nsfw"), "drawn": ("anime", "real"), "rating": ("safe", "r15", "r18")}
+LABELS = {"adult": ("sfw", "nsfw"), "drawn": ("anime", "real")}
 READY = os.path.join(ROOT, ".ready")
 
 _state = {"doing": False, "done": 0, "error": ""}
@@ -119,7 +119,7 @@ def remove() -> None:
     if _state["doing"]:
         return
     unload()
-    for name in list(FILES) + [".ready"]:
+    for name in list(FILES) + ["rating", ".ready"]:        # "rating": left by version 1
         try:
             os.unlink(READY if name == ".ready" else _path(name))
         except OSError:
@@ -154,21 +154,20 @@ def pixels(img, size: int = 384):
 
 
 def _probs(session, x) -> list:
+    """The model's answer as probabilities. Some models give scores to be turned into them,
+    some (the deepghs ones) give probabilities already - taking those through softmax again
+    presses everything towards the middle."""
     import numpy as np
     out = session.run(None, {session.get_inputs()[0].name: x})[0][0]
+    if out.min() >= 0 and abs(float(out.sum()) - 1.0) < 0.01:
+        return out.tolist()
     e = np.exp(out - out.max())
     return (e / e.sum()).tolist()
 
 
-def verdict(adult_photo: float, drawn: float, r18: float) -> float:
-    """How likely adult, from the three answers: the photo model's word, or - for a drawing -
-    the drawing model's. (0..1; ADULT_AT and above is adult.)"""
-    return max(adult_photo, r18 if drawn >= 0.5 else 0.0)
-
-
 def look(path: str, threads: int = 2) -> dict:
-    """{"adult": 0..1, "drawn": 0..1} for the picture at `path`. Raises when it cannot be
-    opened or no models are installed."""
+    """{"adult": 0..1, "drawn": 0..1} for the picture at `path`; ADULT_AT and above is adult.
+    Raises when it cannot be opened or no models are installed."""
     if not available():
         raise RuntimeError("no models are installed")
     from PIL import Image
@@ -177,9 +176,7 @@ def look(path: str, threads: int = 2) -> dict:
         x = pixels(img)
     with _lock:
         s = _load(threads)
-        _models["used"] = time.time()
         drawn = _probs(s["drawn"], x)[LABELS["drawn"].index("anime")]
-        adult_photo = _probs(s["adult"], x)[LABELS["adult"].index("nsfw")]
-        r18 = _probs(s["rating"], x)[LABELS["rating"].index("r18")] if drawn >= 0.5 else 0.0
+        adult = _probs(s["adult"], x)[LABELS["adult"].index("nsfw")]
         _models["used"] = time.time()
-    return {"adult": round(verdict(adult_photo, drawn, r18), 4), "drawn": round(drawn, 4)}
+    return {"adult": round(adult, 4), "drawn": round(drawn, 4)}
