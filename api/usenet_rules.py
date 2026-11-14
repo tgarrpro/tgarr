@@ -25,7 +25,12 @@ _B0, _B1 = r"(^|[^a-z0-9])", r"($|[^a-z0-9])"
 FORBIDDEN_SQL = _B0 + (r"(pthc|ptsc|hussyfan|r@ygold|raygold|babyshivid|kingpass|jail.?bait|pre.?teens?|lolicon|loli|shotacon|shota|"
                        r"p[ae]doph[a-z]*|kiddie|kiddy|kinder.?(porn|sex)|child(ren)?[^a-z0-9]*(porn|sex|erotic[a-z]*|nude|rape)|"
                        r"kids?[^a-z0-9]*(porn|sex)|under.?age[a-z]*|cp[0-9]{3,})") + _B1
-MINOR_SQL = _B0 + (r"(lolitas?|p[ae]dos?|([1-9]|1[0-7])[^a-z0-9]?(yo|y[^a-z0-9]?o|yrs?|years?[^a-z0-9]?old|jahre|ans)|school.?girls?|school.?boys?|"
+# A number under eighteen where it reads as an age: "15yo", "age 14", "Anna (15)", "Anna, 15",
+# "12 girls". Not every number after a name: of 24,000 adult cards one in twenty-five has one
+# ("Babe 2", "Divx 11", a date as "17 10 12") and each of those looked at was a count.
+_AGE = (r"([1-9]|1[0-7])[^a-z0-9]?(yo|y[^a-z0-9]?o|yrs?|years?[^a-z0-9]?old|jahre|ans)|age[ds]?[^a-z0-9]{0,2}([1-9]|1[0-7])|"
+        r"[a-z]{3,}[^a-z0-9]?(\(|\[)([6-9]|1[0-7])(\)|\])|[a-z]{3,}, ?([6-9]|1[0-7])|([6-9]|1[0-7])[^a-z0-9]{0,2}(girls?|boys?|teens?)")
+MINOR_SQL = _B0 + (r"(lolitas?|p[ae]dos?|" + _AGE + r"|school.?girls?|school.?boys?|"
                    r"very.?young|tiny.?teens?|young.?(girls?|boys?)|little.?(girls?|boys?)|kids?|child(ren)?|minors?|prepubescent|toddlers?)") + _B1
 ADULT_GROUP_SQL = _B0 + (r"(erotic[a-z]*|sex|porn[a-z]*|xxx|nude[a-z]*|nudis[a-z]*|hentai|fetish[a-z]*|bdsm|bondage|playboy|penthouse|hustler|"
                          r"voyeur[a-z]*|incest|lingerie)") + _B1

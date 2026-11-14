@@ -1707,9 +1707,10 @@ async def serve_media(msg_id: int, request: Request):
 # Only these three folders are touched - never what Sonarr/Radarr grabbed.
 # ════════════════════════════════════════════════════════════════════
 _CACHE_PREFIXES = ("video/", "audio/", "library/")
-# What was fetched from Usenet takes room the same way and is held to the same two rules -
-# with one difference: there is no index entry to keep (the card on the Usenet page is the
-# way back, for as long as the post lasts), so the item goes with its file.
+# What was fetched from Usenet is not held to the two rules: a person asked for each of those
+# by hand, and there is no index entry to bring one back (the card on the Usenet page is the
+# way, for as long as the post lasts). They are removed by hand (/usenet?kind=have), and only
+# an entry whose file is no longer there is forgotten here.
 _FETCHED_PREFIXES = ("usenet/", "usenet18/")
 _CACHE_SIDECARS = ("", ".tail", ".pdf", ".cover.jpg", ".queue", ".pdf.inprogress.pdf")
 _LOCAL_SQL = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
@@ -1845,12 +1846,12 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
         lp = r["local_path"]
         if not lp.startswith(_CACHE_PREFIXES + _FETCHED_PREFIXES) or ".." in lp:
             continue
-        if clear_all and lp.startswith(_FETCHED_PREFIXES):
-            continue                        # "remove all downloaded files" is about Telegram; Usenet has its own button
         st = await asyncio.to_thread(_cache_stat, lp)
         if st is None:
             lost.append(lp)                 # the file is gone: forget the path
             continue
+        if lp.startswith(_FETCHED_PREFIXES):
+            continue                        # fetched by hand: removed by hand, never by a rule
         size, mtime = st
         if now - mtime < 180:
             continue                        # still arriving, or just finished
@@ -6332,6 +6333,28 @@ async def _is_nsfw_enabled() -> bool:
     return v == "true"
 
 
+# With adult content switched on, what the lists show before anybody chooses on the page:
+#   sfw (default)  all-ages only - adult material is one click away (the 18+ choice on Videos,
+#                  Releases and the Gallery), never the first thing on a screen;
+#   any            everything together;
+#   nsfw           adult only.
+# Pages without such a choice (the Usenet page, search, the count on the home page) simply
+# follow it. With adult content off it is always 'sfw'.
+_AUD = ("sfw", "any", "nsfw")
+
+
+async def _aud_default() -> str:
+    async with db_pool.acquire() as conn:
+        on = await conn.fetchval("SELECT value FROM config WHERE key='nsfw_enabled'")
+        v = await conn.fetchval("SELECT value FROM config WHERE key='adult_default'")
+    return v if (on == "true" and v in _AUD) else "sfw"
+
+
+def _aud_sql(aud: str, col: str = "c.audience") -> str:
+    """' AND ...' for a list that shows what `aud` says ('' for everything)."""
+    return (f" AND COALESCE({col}, 'sfw') <> 'nsfw'" if aud == "sfw" else f" AND {col} = 'nsfw'" if aud == "nsfw" else "")
+
+
 # Which copy of a work to show first when there are several.
 #   quality (default): the higher resolution wins; among equal resolutions the
 #                      copy on the account's own Telegram data center wins.
@@ -6392,6 +6415,16 @@ async def settings_nsfw_enabled(value: str = Form("false")):
                 """INSERT INTO config (key, value) VALUES ('registry_pull_force', $1)
                    ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""",
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    return RedirectResponse("/settings", status_code=302)
+
+
+@app.post("/api/settings/adult_default")
+async def settings_adult_default(value: str = Form("sfw")):
+    val = value if value in _AUD else "sfw"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('adult_default', $1)
+               ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()""", val)
     return RedirectResponse("/settings", status_code=302)
 
 
@@ -7719,7 +7752,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                           AND NOT EXISTS (SELECT 1 FROM messages o JOIN channels oc ON oc.id = o.channel_id
                                           WHERE o.file_unique_id = m.file_unique_id AND o.id > m.id AND o.media_type = 'video'
                                             AND COALESCE(oc.audience, 'sfw') = COALESCE(c.audience, 'sfw'){_pub("oc")})""")
-                _adult = "" if await _is_nsfw_enabled() else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'"
+                _adult = _aud_sql(await _aud_default())
                 tile["photo"] = await conn.fetchval(
                     f"""SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
                         FROM messages m JOIN channels c ON c.id = m.channel_id
@@ -9655,8 +9688,11 @@ async def page_usenet(q: Optional[str] = None, kind: str = ""):
         await _usenet_from_registry(q)
     where = ["c.alive >= 0.5", "c.kind = ANY($1::text[])", "COALESCE(c.size, 0) <= $2"]
     params = [list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL]
-    if not await _is_nsfw_enabled():
+    _aud0 = await _aud_default()                   # all-ages only, everything, or adult only: as the settings say
+    if _aud0 == "sfw":
         where.append("c.audience <> 'nsfw'")
+    elif _aud0 == "nsfw":
+        where.append("c.audience = 'nsfw'")
     counted = " AND ".join(where)                  # the numbers on the shelves: before the search and the shelf
     if kind:
         params.append(kind)
@@ -9790,7 +9826,6 @@ async def _usenet_have_page() -> HTMLResponse:
                 FROM messages m JOIN channels c ON c.id = m.channel_id
                 WHERE {_FROM_USENET} AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
                 GROUP BY 1 ORDER BY max(m.id) DESC LIMIT 500""")
-    ttl_days, max_gb = await _cache_settings()
     total = sum(r["bytes"] for r in rows)
     items = "".join(
         f'<div class="km-row"><span class="n">{html.escape((r["cap"] or "").split(" · ")[0] or os.path.basename(r["path"]))}'
@@ -9802,15 +9837,11 @@ async def _usenet_have_page() -> HTMLResponse:
         f'<a class="btn ghost" href="/watch/{r["first"]}">Open</a> '
         f'<button class="btn ghost" onclick="ugForget({{release:&quot;{r["key"]}&quot;}},&quot;this release&quot;,this)">Delete</button></span></div>'
         for r in rows)
-    rule = " and ".join(x for x in ((f"a file not opened for {ttl_days:g} days is removed" if ttl_days else ""),
-                                    (f"everything tgarr downloaded is kept under {max_gb:g} GB, the least recently opened going first" if max_gb else "")) if x)
     body = (
         _KIDS_CSS
         + f'<p style="color:var(--muted);margin:0 0 14px">What you fetched from Usenet: <b>{len(rows):,}</b> release{"s" if len(rows) != 1 else ""}, '
           f'<b>{_fmt_size(total) or "0 MB"}</b>. '
-        + (f'tgarr tidies up by itself: {rule}. A favourite (♥) is never removed that way. ' if rule else
-           'Nothing is removed automatically. ')
-        + '<a href="/settings#cache">Change the rules</a>.</p>'
+        + 'You asked for each of these, so tgarr never removes one by itself: they stay until you delete them here.</p>'
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
         '<a class="btn ghost km-chip" href="/usenet">← Find more</a>'
         + ('<button class="btn ghost" style="margin-left:auto" onclick="ugForget({all:true},&quot;everything fetched from Usenet&quot;,this)">'
@@ -11162,7 +11193,11 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        q: Optional[str] = None, dc: Optional[str] = None,
                        ch: Optional[int] = None, private: int = 0,
                        offset: int = 0, sort: str = "new", rate: Optional[str] = None, usenet: int = 0,
-                       grp: Optional[str] = None):
+                       grp: Optional[str] = None, art: Optional[str] = None):
+    try:
+        _looked = vision.available()            # the picture model is installed: pictures are told apart
+    except Exception:
+        _looked = False
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -11209,7 +11244,16 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         where.append("COALESCE(m.ai_adult, 0) < 0.9")        # the picture itself, whatever its channel says
     # With adult content shown, the choice of which: all-ages only, 18+ only, or both. A
     # picture is 18+ when its channel is, or when it was itself found to be.
-    rate = rate if (_nsfw_on and rate in ("sfw", "adult")) else None
+    # Nothing chosen on the page: what the settings say (all-ages only unless changed there).
+    _rate0 = {"sfw": "sfw", "nsfw": "adult"}.get(await _aud_default(), "all")
+    rate = (rate if rate in ("sfw", "adult", "all") else _rate0) if _nsfw_on else None
+    # Photographs or drawings, as the picture model told them apart (a picture it has not
+    # looked at is in neither).
+    art = art if art in ("photo", "drawn") else None
+    if art == "drawn":
+        where.append("m.ai_drawn >= 0.5")
+    elif art == "photo":
+        where.append("m.ai_drawn < 0.5")
     if rate == "adult":
         where.append("(COALESCE(c.audience, 'sfw') = 'nsfw' OR COALESCE(m.ai_adult, 0) >= 0.9)")
     elif rate == "sfw":
@@ -11313,7 +11357,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     # ── which photos: all / my private chats / one chat ──────────────
     def _gqs(**over):
         cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "usenet": (usenet or None) if not grp else None, "grp": grp, "q": q,
-               "dc": "mine" if same_dc_only else None, "rate": rate,
+               "dc": "mine" if same_dc_only else None, "rate": rate if rate != _rate0 else None, "art": art,
                "sort": sort if sort == "old" else None,
                "limit": limit if limit != 240 else None}
         cur.update(over)
@@ -11399,11 +11443,17 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
            else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 Manage…</a>' if usenet
            else "")
         + (('<span class="sep"></span>'
-            + _chip_link("all", "/gallery" + _gqs(rate=None, offset=None), not rate)
-            + _chip_link("SFW", "/gallery" + _gqs(rate="sfw", offset=None), rate == "sfw",
+            + _chip_link("all", "/gallery" + _gqs(rate=None if _rate0 == "all" else "all", offset=None), rate == "all")
+            + _chip_link("SFW", "/gallery" + _gqs(rate=None if _rate0 == "sfw" else "sfw", offset=None), rate == "sfw",
                          "only pictures that are neither from an 18+ channel nor found to be adult")
-            + _chip_link("18+", "/gallery" + _gqs(rate="adult", offset=None), rate == "adult",
+            + _chip_link("18+", "/gallery" + _gqs(rate=None if _rate0 == "adult" else "adult", offset=None), rate == "adult",
                          "only pictures from an 18+ channel, or found to be adult")) if _nsfw_on else "")
+        + (('<span class="sep"></span>'
+            + _chip_link("all", "/gallery" + _gqs(art=None, offset=None), not art)
+            + _chip_link("Photos", "/gallery" + _gqs(art="photo", offset=None), art == "photo",
+                         "only photographs - of the pictures that have been looked at")
+            + _chip_link("Drawings", "/gallery" + _gqs(art="drawn", offset=None), art == "drawn",
+                         "only drawings, comics and paintings - of the pictures that have been looked at")) if (_looked or art) else "")
         + '<span class="sep"></span><span class="lbl">Sort:</span>'
         + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
         + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
@@ -12389,8 +12439,10 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
 # ════════════════════════════════════════════════════════════════════
 @app.get("/videos", response_class=HTMLResponse)
 async def page_videos(q: Optional[str] = None, limit: int = 120,
-                      offset: int = 0, aud: str = "sfw",
+                      offset: int = 0, aud: Optional[str] = None,
                       min_mb: int = 50, local: int = 0, fav: int = 0, sort: str = "new"):
+    _aud0 = await _aud_default()                   # what opens when nothing was chosen on the page
+    aud = aud if (aud in _AUD and await _is_nsfw_enabled()) else _aud0
     if not login.session_exists():
         async with db_pool.acquire() as conn:
             n = await conn.fetchval("SELECT count(*) FROM channels")
@@ -12451,7 +12503,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
 
     def _qs(**overrides):
         defaults = {"q": q,
-                    "aud": aud if aud != "sfw" else None,
+                    "aud": aud if aud != _aud0 else None,
                     "min_mb": min_mb if min_mb != 50 else None,
                     "local": 1 if local else None, "fav": 1 if fav else None,
                     "sort": sort if sort != "new" else None,
@@ -12459,7 +12511,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
-            if v not in (None, "", "sfw") and not (v == 0 and k != "min_mb"):
+            if v not in (None, "") and not (v == 0 and k != "min_mb"):
                 bits.append(f"{k}={html.escape(str(v))}")
         return "?" + "&".join(bits) if bits else ""
 
@@ -12469,9 +12521,9 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         return _chip_link(label, "/videos" + href, on, tip)
     toolbar = (
         '<div class="bar-tools" style="margin-bottom:18px">'
-        + ((_vc("SFW", _qs(aud=None, offset=None), aud == "sfw")
-            + _vc("18+", _qs(aud="nsfw", offset=None), aud == "nsfw")
-            + _vc("both", _qs(aud="any", offset=None), aud == "any")
+        + ((_vc("SFW", _qs(aud=None if _aud0 == "sfw" else "sfw", offset=None), aud == "sfw")
+            + _vc("18+", _qs(aud=None if _aud0 == "nsfw" else "nsfw", offset=None), aud == "nsfw")
+            + _vc("both", _qs(aud=None if _aud0 == "any" else "any", offset=None), aud == "any")
             + '<span class="sep"></span>') if _nsfw_on else '')
         + '<span class="lbl">Size:</span>'
         + _vc("any", _qs(min_mb=0, offset=None), min_mb <= 0)
@@ -12675,8 +12727,10 @@ def _release_card(r, my_dc=None) -> str:
 async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                         view: str = "grid", limit: int = 120,
                         offset: int = 0,
-                        min_mb: int = 100, aud: str = "sfw",
+                        min_mb: int = 100, aud: Optional[str] = None,
                         work: Optional[str] = None, sort: str = "best"):
+    _aud0 = await _aud_default()                   # what opens when nothing was chosen on the page
+    aud = aud if (aud in _AUD and await _is_nsfw_enabled()) else _aud0
     if not _signed_in():
         # readable without the account, as long as there is something to read
         async with db_pool.acquire() as conn:
@@ -12772,14 +12826,14 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 
     def _qs(**overrides) -> str:
         defaults = {"q": q, "cat": cat, "view": view if view != "grid" else None,
-                    "aud": aud if aud != "sfw" else None,
+                    "aud": aud if aud != _aud0 else None,
                     "sort": sort if sort != "best" else None,
                     "min_mb": min_mb if min_mb != 100 else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
         bits = []
         for k, v in merged.items():
-            if v not in (None, "", "sfw") and not (v == 0 and k != "min_mb"):
+            if v not in (None, "") and not (v == 0 and k != "min_mb"):
                 bits.append(f"{k}={html.escape(str(v))}")
         return "?" + "&".join(bits) if bits else ""
 
@@ -12792,8 +12846,8 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
                f'style="{style}padding:5px 12px;font-size:12px">{label}</a>')
 
     def _aud_chip(val: str, label: str) -> str:
-        active = aud == val or (val == "sfw" and not aud)
-        href = f"/releases{_qs(aud=val if val != 'sfw' else None)}"
+        active = aud == val
+        href = f"/releases{_qs(aud=val if val != _aud0 else None)}"
         bg = "rgba(245,158,11,0.18)" if val == "nsfw" and active else "rgba(94,182,229,0.15)"
         fg = "var(--warn)" if val == "nsfw" else "var(--accent-hi)"
         style = (f'background:{bg};color:{fg};border-color:{fg};') if active else ''
@@ -13285,7 +13339,7 @@ async def page_search(q: Optional[str] = None,
     nsfw_on = await _is_nsfw_enabled()
     # what may be shown: never the hard-blocked, adult only when switched on
     gate = ("COALESCE(c.audience, 'sfw') <> 'blocked_csam'"
-            + ("" if nsfw_on else " AND COALESCE(c.audience, 'sfw') <> 'nsfw'") + _pub())
+            + _aud_sql(await _aud_default()) + _pub())
     results_html, elapsed_ms, found = "", 0, 0
     if q:
         t0 = time.time()
@@ -13504,6 +13558,7 @@ async def page_settings(request: Request):
         """)
     tmdb_masked = (tmdb_raw[:6] + "…" + tmdb_raw[-4:]) if tmdb_raw else ""
     nsfw_on = await _is_nsfw_enabled()
+    aud_default = await _aud_default()
     async with db_pool.acquire() as conn:
         version_pref = await conn.fetchval(
             "SELECT value FROM config WHERE key='version_preference'") or "quality"
@@ -13689,9 +13744,9 @@ async def page_settings(request: Request):
         tgarr tidies up by itself: a file nobody opened for a while is removed
         (it stays in the index; opening it again fetches it again). Files
         grabbed through Sonarr/Radarr are never touched.<br/>
-        What you fetched from <a href="/usenet?kind=have">Usenet</a> is held to the same two rules. It does
-        not stay in the index: once removed it has to be fetched again from the Usenet page, for as long as
-        the post lasts. A favourite is never removed by these rules.
+        What you fetched from <a href="/usenet?kind=have">Usenet</a> is not part of this: you asked for
+        each of those files by hand, and they stay until you delete them there. A favourite is never
+        removed by these rules.
       </div>
       <form method="POST" action="/api/settings/cache" style="margin-top:12px;font-size:14px;line-height:2.2">
         Remove a file not opened for
@@ -13726,6 +13781,12 @@ async def page_settings(request: Request):
             not the publisher.</span>
         </label>
       </form>
+      {('<form method="POST" action="/api/settings/adult_default" style="margin-top:10px;font-size:14px">'
+        'What the lists show first: <select name="value" onchange="this.form.submit()" style="padding:5px 8px;border-radius:6px">'
+        + "".join(f'<option value="{k}"{" selected" if aud_default == k else ""}>{label}</option>' for k, label in
+                  (("sfw", "All-ages only (default)"), ("any", "Everything"), ("nsfw", "18+ only")))
+        + '</select><div class="meta" style="margin-top:4px">Videos, Releases and the Gallery open this way and let you switch on the page; '
+          'the Usenet page, search and the home page follow it.</div></form>') if nsfw_on else ""}
     </div>
   </div>
   <div class="dl-item">

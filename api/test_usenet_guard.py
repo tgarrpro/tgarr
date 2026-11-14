@@ -32,4 +32,14 @@ check("the same, found to be adult by looking at it", K(["Stories for children.j
 check("a word that only contains one", K(["Lolita - Nabokov.epub", "a kidney.pdf", "shotgun.jpg"], ["alt.binaries.e-book"]), "")
 check("no names at all", K([None, ""], [None]), "")
 check("a term is a term whatever the group", K(["raygold.avi"], ["alt.binaries.e-book"], False), TERM)
+# a number under eighteen where it reads as an age - in an adult setting only
+EROT = ["alt.binaries.pictures.erotica"]
+for name in ("Anna (15) set", "Anna [12]", "Anna, 15", "age 14 pics", "aged 9", "ages 16", "12 girls", "Anna 15yo", "Anna 17 y.o"):
+    check("an age: " + name, K([name], EROT), YOUNG)
+for name in ("Naomi 18", "Anna (18)", "Anna, 21", "age 18", "18 teens", "21 girls",                  # eighteen and over
+             "Babe 2", "Divx 11 FP", "IKnowThatGirl 17 10 12 Brooke", "Melisa 10 - Round And Round",   # a count, a date: not an age
+             "stage 2", "Anna (2)", "page 12", "Set 05", "image 12.jpg"):
+    check("not an age: " + name, K([name], EROT), "")
+check("an age outside an adult setting is nobody's business here", K(["Anna (15) school play.jpg"], ["alt.binaries.pictures"]), "")
+check("cp and a number is a term whatever follows", K(["cp001.jpg"], ["alt.binaries.pictures"]), TERM)
 print(f"test_usenet_guard: {n} checks passed")
