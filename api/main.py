@@ -347,7 +347,9 @@ async def _signed_out_block(request: Request):
         # the PIN and the kids' list belong to this install, not to the
         # Telegram account: they work whether or not anybody is signed in
         if path.startswith("/api/") and not path.startswith(
-                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/")):
+                ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/",
+                 # a public channel is followed and read without an account (the crawler's guest workers)
+                 "/api/channel/subscribe", "/api/channel/unsubscribe/")):
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -7833,7 +7835,9 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 ("/settings/usenet", "📰 Usenet", "Have a Usenet provider? Enter it and tgarr indexes newsgroups: films through your downloader, "
                                      "books, comics, music and pictures directly. No Telegram account needed."),
                 ("/files", "📁 Your own files", "Add folders of films, music, books or photos you already have. They play here and in the "
-                           "Media Center. No account needed.")))
+                           "Media Center. No account needed."),
+                ("/discover", "🔭 Public channels", "Look through the public Telegram channels tgarr knows and follow some: what they hold is "
+                              "listed right away, without an account. Playing a file is when Telegram wants one.")))
         + '</div></div>')
     status_html = f'{welcome_html}<div class="st-row">{tg}{cr}{sh}{sto}</div>'
     status_html = await _update_banner() + status_html
@@ -8496,8 +8500,7 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
                         limit: int = 50):
     async with db_pool.acquire() as conn:
         n_channels = await conn.fetchval("SELECT count(*) FROM channels")
-        if not login.session_exists() and not n_channels:
-            return RedirectResponse("/")
+        # (no account and nothing indexed: Discover is exactly where such an install starts)
         # Telegram sometimes returns a differently-cased username
         # (eBookRoom vs ebookroom): match case-insensitively.
         known = {r["username"].lower(): (r["subscribed"] or r["is_joined"])
@@ -8610,12 +8613,11 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
     def _card(r):
         u = r["username"]
         mine_ = known.get(u.lower())
-        btn = ('<a class="abtn" href="/login" title="following a channel needs a Telegram account">'
-               'Sign in to follow</a>' if not _in else
-               '<button class="abtn" disabled>✓ Following</button>' if mine_ else
+        btn = ('<button class="abtn" disabled>✓ Following</button>' if mine_ else
                f'<button class="abtn pri" data-uname="{html.escape(u, quote=True)}" '
                f'onclick="tgDiscoverSubscribe(this)" '
-               f'title="tgarr reads this public channel without your account joining it">+ Follow</button>')
+               + ('title="tgarr reads this public channel without your account joining it">+ Follow</button>' if _in else
+                  'title="tgarr lists what this public channel holds without an account; playing a file needs one">+ Follow</button>'))
         title = r["title"] or ("@" + u)
         has = []
         for n, ico, word in ((r["release_files"], "🎬", "films"), (r["book_files"], "📚", "books"),
