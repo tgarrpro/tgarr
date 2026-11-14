@@ -54,7 +54,7 @@ def clean_query(q: str) -> str:
     """What somebody typed, as plain words: the Archive's search has a grammar of its own
     (field:value, AND, brackets) that nobody means when typing a title."""
     words = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", q or "", re.UNICODE)
-    return " ".join(w for w in words if w.upper() not in ("AND", "OR", "NOT"))[:200]
+    return " ".join(w for w in words if w not in ("AND", "OR", "NOT"))[:200]      # (in capitals only: "duck and cover" keeps its and)
 
 
 def search_url(q: str, shelf: str, page: int = 1, rows: int = ROWS) -> str:
@@ -129,8 +129,12 @@ def _usable(files) -> list:
         if (not name or size <= 0 or str(f.get("private") or "").lower() == "true" or _NOT_THE_THING.search(name)
                 or ext(name) in _PROGRAM or ".." in name or name.startswith("/")):
             continue
+        try:
+            height = int(float(f.get("height") or 0))
+        except (TypeError, ValueError):
+            height = 0
         out.append({"name": name, "size": size, "ext": ext(name), "original": str(f.get("source") or "") == "original",
-                    "of": str(f.get("original") or ""), "title": _one(f.get("title"))[:200]})
+                    "of": str(f.get("original") or ""), "title": _one(f.get("title"))[:200], "height": height})
     return out
 
 
@@ -196,7 +200,7 @@ def plan(meta: dict) -> dict:
     for f in take[:MOST_FILES]:
         if total + f["size"] > MOST_BYTES:
             break
-        kept.append({"name": f["name"], "size": f["size"], "title": f["title"]})
+        kept.append({"name": f["name"], "size": f["size"], "title": f["title"], "height": f["height"]})
         total += f["size"]
     if not kept:
         out["why"] = "too large to fetch here"
@@ -205,6 +209,47 @@ def plan(meta: dict) -> dict:
     if len(kept) < len(take):
         out["why"] = f"the first {len(kept)} of {len(take)} files: the rest is over what one fetch may be"
     return out
+
+
+# ───────────────────────── for Radarr ─────────────────────────
+# A film of the Archive offered to Radarr (through tgarr's own indexer and download client:
+# nobody needs an account for any of it). Radarr decides by the name of a release, so the
+# item gets one of the kind it reads: Title.Year.Quality.WEB-archive.org.
+
+def _words(text: str) -> list:
+    return [w.casefold() for w in re.findall(r"[^\W_]+", text or "", re.UNICODE)]
+
+
+def split_year(q: str) -> tuple:
+    """('night of the living dead', '1968') from what Radarr asks; no year: ''."""
+    words = clean_query(q).split()
+    if len(words) > 1 and re.fullmatch(r"(19|20)\d\d", words[-1]):
+        return " ".join(words[:-1]), words[-1]
+    return " ".join(words), ""
+
+
+def is_the_film(title: str, year: str, asked: str, asked_year: str) -> bool:
+    """Is an item what was asked for? Its title is the asked words and nothing more than a
+    few besides (the Archive's search also finds every talk ABOUT a film), and where both
+    name a year, the same one."""
+    have, want = _words(title), _words(asked)
+    if not want or any(w not in have for w in want):
+        return False
+    extra = [w for w in have if w not in want and not re.fullmatch(r"(19|20)\d\d", w)]
+    if len(extra) > 3:
+        return False
+    return not (year and asked_year and year != asked_year)
+
+
+def release_name(title: str, year: str, height: int) -> str:
+    quality = "1080p" if height >= 1000 else "720p" if height >= 700 else "480p" if height else "SD"
+    name = ".".join(re.findall(r"[^\W_]+", title or "", re.UNICODE))[:150] or "Untitled"
+    return f"{name}{'.' + year if year else ''}.{quality}.WEB-archive.org"
+
+
+def film_file(p: dict):
+    """Of a planned film, the one file Radarr gets: the largest (an item often holds two cuts)."""
+    return max(p["take"], key=lambda f: f["size"]) if p.get("shelf") == "film" and p.get("take") else None
 
 
 # ───────────────────────── the network ─────────────────────────

@@ -659,6 +659,7 @@ async def _startup():
     asyncio.create_task(_vision_worker())
     asyncio.create_task(_usenet_grab_worker())
     asyncio.create_task(_archive_grab_worker())
+    asyncio.create_task(_archive_arr_worker())
     asyncio.create_task(_update_check_worker())
 
 
@@ -1021,6 +1022,11 @@ async def _migrate_schema():
               id SERIAL PRIMARY KEY, item_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT,
               state TEXT NOT NULL DEFAULT 'queued', note TEXT, files INT, bytes BIGINT, msg_id BIGINT,
               added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), done_at TIMESTAMPTZ
+            );
+            -- films of the Internet Archive that were offered to Radarr: which item and file a guid stands for
+            CREATE TABLE IF NOT EXISTS archive_items (
+              guid UUID PRIMARY KEY, item_id TEXT NOT NULL, file TEXT NOT NULL, name TEXT NOT NULL,
+              size BIGINT, year TEXT, seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             -- what the guard refused or removed (usenet_rules.never_kept): when, what kind of
             -- thing, by which rule. The name is kept so that a wrong removal can be seen.
@@ -9949,6 +9955,179 @@ async def _archive_grab_worker():
             await asyncio.sleep(20)
 
 
+# ───────────────────────── the Internet Archive, for Radarr ─────────────────────────
+# Radarr asks tgarr's indexer for a film; beside what Telegram holds, the Archive is asked,
+# and what it has under that title is offered as a release ("Title.Year.480p.WEB-archive.org").
+# Grabbed, it is fetched over HTTPS by the worker below into the folder Radarr collects from,
+# and reported through the same download-client answers as a Telegram download. None of it
+# needs an account of any kind. Films only: a series at the Archive is one item of many files
+# with no season and episode in their names, and Sonarr could not tell them apart.
+# Switch: config key newznab_archive = 'false'.
+_AR_META = {}                            # item -> (when, what the Archive says of it)
+
+
+async def _archive_meta(ident: str):
+    hit = _AR_META.get(ident)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    try:
+        meta = await asyncio.to_thread(archive_org.fetch_json, archive_org.metadata_url(ident), 20)
+    except Exception:
+        return None
+    if len(_AR_META) > 500:
+        _AR_META.clear()
+    _AR_META[ident] = (time.time(), meta)
+    return meta
+
+
+async def _archive_for_arr(q: str) -> list:
+    """What the Archive has of a film Radarr asks for: [{guid, name, size, year, item_id, file}],
+    at most six, each remembered so that a grab finds it."""
+    import uuid
+    async with db_pool.acquire() as conn:
+        if ((await conn.fetchval("SELECT value FROM config WHERE key = 'newznab_archive'")) or "").lower() == "false":
+            return []
+    asked, asked_year = archive_org.split_year(q)
+    if len(asked) < 2:
+        return []
+    _total, found, _trouble = await _archive_search(asked, "film", 1)
+    picked = [i for i in found if archive_org.is_the_film(i["title"], i["year"], asked, asked_year) and not re.search(ADULT_RX, i["title"], re.I)][:6]
+    out = []
+    for i, meta in zip(picked, await asyncio.gather(*[_archive_meta(i["id"]) for i in picked])):
+        if not meta:
+            continue
+        p = archive_org.plan(meta)
+        f = archive_org.film_file(p)
+        if not f or not _archive_ok(p["title"], i["id"], f["name"]):
+            continue
+        year = p["year"] or i["year"]
+        if asked_year and year != asked_year:      # asked with a year: an item that names none is not offered
+            continue                               # (it could be the other film of that title)
+        out.append({"guid": str(uuid.uuid5(uuid.NAMESPACE_URL, "https://archive.org/details/" + i["id"])),
+                    "name": archive_org.release_name(p["title"], year, f["height"]), "size": f["size"], "year": year,
+                    "item_id": i["id"], "file": f["name"]})
+    if out:
+        async with db_pool.acquire() as conn:
+            await conn.executemany(
+                """INSERT INTO archive_items (guid, item_id, file, name, size, year) VALUES ($1::uuid, $2, $3, $4, $5, $6)
+                   ON CONFLICT (guid) DO UPDATE SET file = EXCLUDED.file, name = EXCLUDED.name, size = EXCLUDED.size, seen_at = NOW()""",
+                [(o["guid"], o["item_id"], o["file"], o["name"], o["size"], o["year"]) for o in out])
+    return out
+
+
+def _archive_item_xml(o: dict, base_url: str, apikey: str) -> str:
+    import calendar
+    link = html.escape(f"{base_url}/newznab/api?t=get&id={o['guid']}&apikey={apikey}", quote=True)
+    year = int(o["year"]) if (o["year"] or "").isdigit() else 1970
+    pub = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime(max(0, calendar.timegm((max(year, 1970), 1, 1, 0, 0, 0)))))
+    return (
+        f"    <item>\n"
+        f"      <title>{html.escape(o['name'])}</title>\n"
+        f"      <guid isPermaLink=\"false\">{o['guid']}</guid>\n"
+        f"      <link>{link}</link>\n"
+        f"      <comments>{html.escape('https://archive.org/details/' + o['item_id'], quote=True)}</comments>\n"
+        f"      <pubDate>{pub}</pubDate>\n"
+        f"      <category>2000</category>\n"
+        f"      <size>{o['size']}</size>\n"
+        f"      <description>from the Internet Archive, fetched by tgarr over HTTPS</description>\n"
+        f"      <enclosure url=\"{link}\" length=\"{o['size']}\" type=\"application/x-nzb\"/>\n"
+        f"      <newznab:attr name=\"category\" value=\"2000\"/>\n"
+        f"      <newznab:attr name=\"size\" value=\"{o['size']}\"/>\n"
+        f"      <newznab:attr name=\"guid\" value=\"{o['guid']}\"/>\n"
+        f"    </item>")
+
+
+async def _archive_release(conn, guid: str):
+    """The release row of an Archive film that was offered and is now grabbed (made at this
+    moment: what is only offered is not a release of this install). None: not one of them."""
+    it = await conn.fetchrow("SELECT * FROM archive_items WHERE guid = $1::uuid", guid)
+    if not it:
+        return None
+    rid = await conn.fetchval(
+        """INSERT INTO releases (guid, name, category, movie_title, movie_year, source, size_bytes, posted_at)
+           VALUES ($1::uuid, $2, 'movie', $3, $4, 'archive.org', $5, NOW())
+           ON CONFLICT (guid) DO UPDATE SET name = EXCLUDED.name, size_bytes = EXCLUDED.size_bytes RETURNING id""",
+        guid, it["name"], it["name"].split(".WEB-archive.org")[0], int(it["year"]) if (it["year"] or "").isdigit() else None, it["size"])
+    return {"id": rid, "name": it["name"]}
+
+
+async def _archive_arr_one(d) -> None:
+    import shutil
+    folder = os.path.join("/downloads/tgarr", localfiles.safe_name(d["name"])[:150])
+    dest = os.path.join(folder, localfiles.safe_name(f"{d['name']}.{archive_org.ext(d['file']) or 'mp4'}"))
+    if (d["size"] or 0) > shutil.disk_usage("/downloads").free - (1 << 30):
+        raise OSError("not enough room left on the disk")
+    os.makedirs(folder, exist_ok=True)
+    seen = {"n": 0, "at": time.time(), "last": 0}
+
+    async def pump():
+        while True:
+            await asyncio.sleep(3)
+            now = time.time()
+            kbps = int((seen["n"] - seen["last"]) / 1024 / max(0.5, now - seen["at"]))
+            seen.update(at=now, last=seen["n"])
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE downloads SET bytes_done = $2, speed_kbps = $3, last_progress_at = NOW() WHERE id = $1 AND status = 'downloading'",
+                    d["dl_id"], seen["n"], kbps)
+
+    def progress(n):
+        seen["n"] += n
+    pumping = asyncio.create_task(pump())
+    try:
+        size = await asyncio.to_thread(archive_org.download, archive_org.file_url(d["item_id"], d["file"]), dest, progress)
+    finally:
+        pumping.cancel()
+    try:
+        os.chmod(folder, 0o777)
+        os.chmod(dest, 0o666)
+    except OSError:
+        pass
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE downloads SET status = 'completed', finished_at = NOW(), local_path = $2, bytes_done = $3, speed_kbps = 0 WHERE id = $1 AND status <> 'cancelled'",
+            d["dl_id"], dest, size)
+        await conn.execute("UPDATE releases SET size_bytes = $2 WHERE id = $1", d["release_id"], size)
+    log.info("[archive] for Radarr: %s arrived, %s", d["name"][:80], _fmt_size(size) or "0")
+
+
+async def _archive_arr_worker():
+    """Downloads of Archive films that Radarr (or the Releases page) asked for. The crawler's
+    own worker never takes these: it claims what has a Telegram message behind it."""
+    await asyncio.sleep(50)
+    mine = "release_id IN (SELECT r.id FROM releases r JOIN archive_items a ON a.guid = r.guid)"
+    try:
+        async with db_pool.acquire() as conn:      # what a restart interrupted starts over
+            await conn.execute(f"UPDATE downloads SET status = 'pending' WHERE status = 'downloading' AND {mine}")
+    except Exception:
+        log.exception("[archive] could not tidy up after a restart")
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                d = await conn.fetchrow(
+                    f"""WITH claim AS (SELECT id FROM downloads WHERE status = 'pending' AND {mine}
+                                       ORDER BY requested_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+                        UPDATE downloads SET status = 'downloading' WHERE id IN (SELECT id FROM claim) RETURNING id AS dl_id, release_id""")
+                if d:
+                    d = await conn.fetchrow(
+                        """SELECT $1::bigint AS dl_id, r.id AS release_id, r.name, a.item_id, a.file, a.size
+                           FROM releases r JOIN archive_items a ON a.guid = r.guid WHERE r.id = $2""", d["dl_id"], d["release_id"])
+            if not d:
+                await asyncio.sleep(4)
+                continue
+            try:
+                await _archive_arr_one(d)
+            except Exception as e:
+                log.warning("[archive] for Radarr: %s: %s: %s", d["name"][:80], type(e).__name__, str(e)[:160])
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE downloads SET status = 'failed', finished_at = NOW(), error_message = $2 WHERE id = $1 AND status = 'downloading'",
+                        d["dl_id"], f"archive.org: {str(e)[:200]}")
+        except Exception as e:
+            log.warning("[archive] the Radarr fetching: %s: %s", type(e).__name__, str(e)[:160])
+            await asyncio.sleep(20)
+
+
 @app.post("/api/archive/grab")
 async def api_archive_grab(request: Request):
     def no(msg, code=400):
@@ -13121,6 +13300,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
         where.append(f"COALESCE(size_bytes,0) >= {min_mb * 1024 * 1024}")
     # CSAM is always hidden. SFW/NSFW chip filter — default sfw.
     where.append("COALESCE(c.audience, 'sfw') <> 'blocked_csam'")
+    where.append("r.primary_msg_id IS NOT NULL")       # (an Archive film grabbed for Radarr has no message: it is on the Downloads page)
     if aud == "sfw":
         where.append("COALESCE(c.audience, 'sfw') = 'sfw'")
     elif aud == "nsfw":
@@ -14786,7 +14966,7 @@ async def newznab_api(
                 media_type="application/xml")
         q = canonical
 
-    where_parts = ["1=1"]
+    where_parts = ["r.primary_msg_id IS NOT NULL"]       # (a grabbed Archive film has a release row and no message)
     params = []
 
     if q:
@@ -14868,6 +15048,15 @@ async def newznab_api(
         total = max(0, offset) + len(rows)
     items = "\n".join(_item_xml(r, base_url, apikey or "tgarr",
                                  my_dc=_release_my_dc) for r in rows)
+    if q and max(0, offset) == 0 and (t == "movie" or (t == "search" and (_cats_to_filter(cat) or (True, True, False))[0])):
+        try:                                   # films the Internet Archive has under this title
+            extra = await asyncio.wait_for(_archive_for_arr(q), timeout=25)
+        except Exception as e:
+            log.info("[archive] for Radarr: %s: %s", type(e).__name__, str(e)[:120])
+            extra = []
+        if extra:
+            items = "\n".join(x for x in [items] + [_archive_item_xml(o, base_url, apikey or "tgarr") for o in extra] if x)
+            total += len(extra)
     return Response(
         _feed_envelope(items, f"search t={t} q={q or ''}", base_url,
                        offset=max(0, offset), total=total),
@@ -14882,7 +15071,7 @@ async def _handle_grab(guid: Optional[str]) -> Response:
         return _newznab_error(300, "No such item", 404)
     async with db_pool.acquire() as conn:
         rel = await conn.fetchrow(
-            "SELECT id, name FROM releases WHERE guid = $1", guid)
+            "SELECT id, name FROM releases WHERE guid = $1", guid) or await _archive_release(conn, guid)
         if not rel:
             return _newznab_error(300, "No such item", 404)
         await conn.execute(
@@ -15114,7 +15303,7 @@ async def _sab_addurl(url: str, nzbname: Optional[str], cat: Optional[str]):
         return {"status": False, "error": "no guid in url"}
     sab_cat = (cat or "").strip()[:40] or None
     async with db_pool.acquire() as conn:
-        rel = await conn.fetchrow("SELECT id FROM releases WHERE guid = $1", guid)
+        rel = await conn.fetchrow("SELECT id FROM releases WHERE guid = $1", guid) or await _archive_release(conn, guid)
         if not rel:
             return {"status": False, "error": "release not found"}
         await conn.execute(
