@@ -13506,6 +13506,76 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 # ════════════════════════════════════════════════════════════════════
 # Page: Downloads (queue + history)
 # ════════════════════════════════════════════════════════════════════
+async def _archive_activity() -> tuple:
+    """(html, how many are under way): everything tgarr is fetching or has fetched from the
+    Internet Archive, whoever asked - the Get button or Radarr - newest first, the ones under
+    way with how far they are."""
+    async with db_pool.acquire() as conn:
+        grabs = await conn.fetch(
+            "SELECT id, item_id, name, kind, state, note, files, bytes, msg_id, added_at, done_at FROM archive_grabs ORDER BY id DESC LIMIT 100")
+        arr = await conn.fetch(
+            """SELECT d.id, d.status, d.bytes_done, d.speed_kbps, d.requested_at, d.finished_at, d.error_message, d.local_path,
+                      r.name, r.size_bytes, a.item_id
+               FROM downloads d JOIN releases r ON r.id = d.release_id JOIN archive_items a ON a.guid = r.guid
+               ORDER BY d.id DESC LIMIT 100""")
+    rows = []
+    for g in grabs:
+        state = {"queued": "waiting", "working": "arriving", "done": "arrived", "partial": "arrived in part", "failed": "did not arrive"}.get(g["state"], g["state"])
+        pct = None
+        if g["state"] == "working":
+            pct = min(99, int(_AR_GRAB["bytes"] * 100 / _AR_GRAB["of"])) if (_AR_GRAB["now"] == g["id"] and _AR_GRAB["of"]) else 0
+        sign = archive_org.SHELF[g["kind"]][1] if g["kind"] in archive_org.SHELF else "🏛"
+        rows.append({"at": g["added_at"], "busy": g["state"] in ("queued", "working"), "sign": sign, "name": g["name"], "who": "Get",
+                     "state": state, "bad": g["state"] == "failed", "pct": pct, "speed": 0,
+                     "size": (_AR_GRAB["of"] if (pct is not None and _AR_GRAB["now"] == g["id"]) else g["bytes"]) or 0,
+                     "files": g["files"] or 0, "note": g["note"] or "", "done": g["done_at"], "item": g["item_id"],
+                     "open": f"/watch/{g['msg_id']}" if g["msg_id"] and g["state"] in ("done", "partial") else ""})
+    for d in arr:
+        st = d["status"]
+        state = {"pending": "waiting", "downloading": "arriving", "completed": "arrived, handed to Radarr", "failed": "did not arrive",
+                 "cancelled": "cancelled", "paused": "paused"}.get(st, st)
+        size = d["size_bytes"] or 0
+        rows.append({"at": d["requested_at"], "busy": st in ("pending", "downloading"), "sign": "🎬", "name": d["name"], "who": "Radarr",
+                     "state": state, "bad": st == "failed", "speed": d["speed_kbps"] or 0,
+                     "pct": (min(99, int((d["bytes_done"] or 0) * 100 / size)) if size else 0) if st == "downloading" else None,
+                     "size": size, "files": 1, "note": d["error_message"] or "", "done": d["finished_at"], "item": d["item_id"], "open": ""})
+    rows.sort(key=lambda r: (not r["busy"], -(r["at"].timestamp() if r["at"] else 0)))
+    busy = sum(1 for r in rows if r["busy"])
+
+    def one(r):
+        bar = ""
+        if r["pct"] is not None:
+            bar = (f'<div style="height:6px;border-radius:999px;background:var(--border);overflow:hidden;margin-top:8px;max-width:520px">'
+                   f'<div style="height:100%;width:{r["pct"]}%;background:var(--accent)"></div></div>'
+                   f'<div style="font-size:12px;color:var(--muted);margin-top:4px">{r["pct"]}%'
+                   + (f' of {_fmt_size(r["size"])}' if r["size"] else "")
+                   + (f' · {r["speed"] / 1024:.1f} MB/s' if r["speed"] >= 1024 else f' · {r["speed"]} kB/s' if r["speed"] else "") + '</div>')
+        note = f'<div style="font-size:12.5px;color:#b45309;margin-top:4px">{html.escape(r["note"])}</div>' if r["note"] else ""
+        return (
+            f'<div class="dl-item"><div class="icon">{r["sign"]}</div><div class="info">'
+            f'<div class="name">{html.escape(r["name"])}</div><div class="meta">'
+            f'<span class="pill {"bad" if r["bad"] else "accent" if r["busy"] else "ok"}">{r["state"]}</span>'
+            f'<span class="pill muted" title="who asked for it">{r["who"]}</span>'
+            + (f'<span>· {_fmt_size(r["size"])}</span>' if r["size"] and r["pct"] is None else "")
+            + (f'<span>· {r["files"]} files</span>' if r["files"] > 1 else "")
+            + f'<span>· asked {_ago(r["at"])}</span>'
+            + f'<span>· <a href="https://archive.org/details/{html.escape(r["item"], quote=True)}" target="_blank" rel="noopener noreferrer">archive.org ↗</a></span>'
+            + f'</div>{bar}{note}</div><div class="right">'
+            + (f'<a class="dl-btn" href="{r["open"]}">Open</a>' if r["open"] else "")
+            + (f'<div class="dl-time">{_fmt_time(r["done"])}</div>' if r["done"] and not r["busy"] else "")
+            + '</div></div>')
+    under = [r for r in rows if r["busy"]]
+    past = [r for r in rows if not r["busy"]]
+    out = (f'<h2 class="section">Under way <span class="count">{len(under)}</span></h2>'
+           + (f'<div class="dl-list">{"".join(one(r) for r in under)}</div>' if under else
+              '<div style="color:var(--muted);margin-bottom:22px">Nothing is being fetched from the Internet Archive right now. '
+              'Find something on the <a href="/archive">Archive</a> page and press Get - or let Radarr ask.</div>')
+           + f'<h2 class="section">Arrived, or not <span class="count">last {len(past)}</span></h2>'
+           + (f'<div class="dl-list">{"".join(one(r) for r in past)}</div>' if past else
+              '<div style="color:var(--muted)">Nothing yet.</div>'))
+    return out, busy
+
+
 @app.get("/downloads", response_class=HTMLResponse)
 async def page_downloads(tab: str = "players", q: Optional[str] = None,
                          kind: Optional[str] = None, sort: str = "recent",
@@ -13513,7 +13583,9 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
     # signed out: what is already saved from public channels can still be
     # opened; nothing can be fetched, paused or removed
     ro = not _signed_in()
-    tab = "grabs" if (tab == "grabs" and not ro) else "players"
+    tab = "archive" if tab == "archive" else "grabs" if (tab == "grabs" and not ro) else "players"
+    # (the Internet Archive needs no account: its tab is there signed in or not)
+    ar_html, ar_busy = await _archive_activity()
     page_size = max(10, min(limit, 200))
     page_offset = max(0, offset)
     _my_dc = await _get_my_dc()
@@ -13806,7 +13878,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
     # Auto-refresh while any download is in flight, so progress bar updates
     # without manual reload. Stops refreshing when queue empties.
     refresh_js = ('<script>setTimeout(()=>location.reload(),5000)</script>'
-                  if ((tab == "grabs" and active) or
+                  if ((tab == "archive" and ar_busy) or (tab == "grabs" and active) or
                       (tab == "players" and any(f["state"] != "stopped" for f in fetches)
                        and not page_offset and not q)) else '')
     ctrl_js = '''<script>
@@ -13843,19 +13915,24 @@ function dlAct(id, action){
         on = tab == key
         style = ("border-bottom:2px solid var(--accent);color:var(--accent-hi);font-weight:600;"
                  if on else "border-bottom:2px solid transparent;color:var(--muted);")
-        href = "/downloads" if key == "players" else "/downloads?tab=grabs"
+        href = "/downloads" if key == "players" else f"/downloads?tab={key}"
         return (f'<a href="{href}" style="{style}padding:8px 4px;margin-right:22px;'
                 f'text-decoration:none;font-size:15px">{label}'
                 + (f' <span style="font-size:12px;opacity:.7">{n}</span>' if n else '') + '</a>')
     tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
             + _tab("players", "Opened in players", len(fetches))
-            + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active)) + '</div>')
+            + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active))
+            + _tab("archive", "🏛 Internet Archive", ar_busy) + '</div>')
     if ro:
-        tabs = ('<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;'
+        tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
+                + _tab("players", "Opened in players", len(fetches)) + _tab("archive", "🏛 Internet Archive", ar_busy) + '</div>'
+                '<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;'
                 'padding:12px 16px;margin-bottom:20px;color:var(--muted);font-size:14px">'
                 'Not signed in: files already saved from public channels can be opened and downloaded. '
                 '<a href="/login">Sign in to Telegram</a> to fetch more or to remove any.</div>')
-    if tab == "players":
+    if tab == "archive":
+        body = f'{dl_css}{tabs}{ar_html}{refresh_js}'
+    elif tab == "players":
         body = f'{dl_css}{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
     else:
         body = (f'{dl_css}{tabs}'
