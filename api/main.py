@@ -618,6 +618,8 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_adult REAL;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_drawn REAL;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_ver SMALLINT;
+            -- TRUE: ai_adult was set by the person, not by a model; never looked at again
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_by_hand BOOLEAN;
             CREATE INDEX IF NOT EXISTS idx_messages_ai_todo ON messages (id DESC) WHERE thumb_path IS NOT NULL AND ai_ver IS NULL;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS members_count INTEGER;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS meta_updated_at TIMESTAMPTZ;
@@ -9018,7 +9020,7 @@ async def _vision_worker():
             async with db_pool.acquire() as conn:
                 todo = await conn.fetch(
                     """SELECT thumb_path FROM messages
-                       WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__' AND (ai_ver IS NULL OR ai_ver < $1)
+                       WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__' AND (ai_ver IS NULL OR ai_ver < $1) AND ai_by_hand IS NOT TRUE
                        GROUP BY thumb_path ORDER BY max(id) DESC LIMIT 40""", vision.VERSION)
             if not todo:
                 _VISION["state"] = "idle"
@@ -9041,7 +9043,7 @@ async def _vision_worker():
                         got = None                      # a file that is gone or is no picture: marked as looked at
                 async with db_pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE messages SET ai_adult = $2, ai_drawn = $3, ai_ver = $4 WHERE thumb_path = $1",
+                        "UPDATE messages SET ai_adult = $2, ai_drawn = $3, ai_ver = $4 WHERE thumb_path = $1 AND ai_by_hand IS NOT TRUE",
                         tp, got and got["adult"], got and got["drawn"], vision.VERSION)
                 _VISION["looked"] += 1
                 _VISION["at"] = time.time()
@@ -9061,7 +9063,7 @@ async def api_vision_status():
     async with db_pool.acquire() as conn:
         c = await conn.fetchrow(
             """SELECT count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NOT NULL) AS looked,
-                      count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NULL) AS waiting,
+                      count(DISTINCT thumb_path) FILTER (WHERE ai_ver IS NULL AND ai_by_hand IS NOT TRUE) AS waiting,
                       count(DISTINCT thumb_path) FILTER (WHERE ai_adult >= 0.5) AS adult,
                       count(DISTINCT thumb_path) FILTER (WHERE ai_drawn >= 0.5) AS drawn
                FROM messages WHERE thumb_path IS NOT NULL AND left(thumb_path, 2) <> '__'""")
@@ -9084,8 +9086,45 @@ async def api_vision_remove(request: Request):
     await asyncio.to_thread(vision.remove)
     if forget:
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE messages SET ai_adult = NULL, ai_drawn = NULL, ai_ver = NULL WHERE ai_ver IS NOT NULL")
+            await conn.execute("UPDATE messages SET ai_adult = NULL, ai_drawn = NULL, ai_ver = NULL WHERE ai_ver IS NOT NULL AND ai_by_hand IS NOT TRUE")
         _KID_OK.clear()
+    return {"status": "ok"}
+
+
+@app.get("/api/vision/flagged")
+async def api_vision_flagged():
+    """The pictures found adult, surest first, and after them the ones set by hand."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT m.thumb_path AS thumb, max(m.ai_adult) AS adult, bool_or(COALESCE(m.ai_by_hand, FALSE)) AS by_hand,
+                      max(COALESCE(c.title, c.username, 'a chat')) AS channel
+               FROM messages m JOIN channels c ON c.id = m.channel_id
+               WHERE m.thumb_path IS NOT NULL AND (m.ai_adult >= 0.5 OR m.ai_by_hand)
+               GROUP BY m.thumb_path
+               ORDER BY bool_or(COALESCE(m.ai_by_hand, FALSE)), max(m.ai_adult) DESC, max(m.id) DESC LIMIT 300""")
+    return {"pictures": [dict(r) for r in rows]}
+
+
+@app.post("/api/vision/mark")
+async def api_vision_mark(request: Request):
+    """{"thumb": name, "adult": false | true} - the person's word, which stands whatever a
+    model says later. {"adult": null} takes it back: the picture is looked at again."""
+    try:
+        d = await request.json()
+    except Exception:
+        d = {}
+    thumb, adult = str(d.get("thumb") or ""), d.get("adult")
+    if not thumb:
+        return {"status": "error", "error": "which picture?"}
+    async with db_pool.acquire() as conn:
+        if adult is None:
+            await conn.execute(
+                "UPDATE messages SET ai_adult = NULL, ai_drawn = NULL, ai_ver = NULL, ai_by_hand = NULL WHERE thumb_path = $1", thumb)
+        else:
+            await conn.execute(
+                "UPDATE messages SET ai_adult = $2, ai_ver = COALESCE(ai_ver, 0), ai_by_hand = TRUE WHERE thumb_path = $1",
+                thumb, 1.0 if adult else 0.0)
+    _KID_OK.clear()
     return {"status": "ok"}
 
 
@@ -9099,6 +9138,13 @@ async def page_settings_pictures():
 .vi-bar i{{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}}
 .vi-n{{display:flex;gap:26px;flex-wrap:wrap;margin-top:6px}}.vi-n div b{{display:block;font-size:24px;line-height:1.2}}
 .vi-n div{{color:var(--muted);font-size:13px}}.vi-n div b{{color:var(--fg)}}
+.vi-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-top:10px}}
+.vi-card{{border:1px solid var(--border);border-radius:10px;overflow:hidden;background:var(--bg)}}
+.vi-card .vi-img{{aspect-ratio:1;overflow:hidden}}
+.vi-card img{{width:100%;height:100%;object-fit:cover;display:block;filter:blur(16px);transition:filter .15s}}
+.vi-card:hover img,.vi-card.hand img{{filter:none}}
+.vi-cap{{padding:6px 8px 0;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.vi-card button{{margin:6px 8px 8px;font-size:12px;padding:4px 10px}}
 </style>
 <div class="vi-box"><h3>Looking at the pictures themselves <span id="viState"></span></h3>
 <p>Whether something is adult has so far been a matter of what its channel is called. With this installed, tgarr looks at every
@@ -9110,6 +9156,10 @@ and checked. A picture takes most of a second, so a large library is gone throug
 What they cannot do is tell a person's age.</p>
 <div class="vi-row" id="viRow"></div></div>
 <div class="vi-box"><h3>So far</h3><div class="vi-n" id="viNum"></div><div id="viCh" style="margin-top:12px;font-size:14px"></div></div>
+<div class="vi-box"><h3>Found adult</h3>
+<p>Blurred until the pointer is on them. A model can be wrong: say so, and your word stands - the picture is shown again and is not looked at a second time.</p>
+<div class="vi-grid" id="viFlag"></div><p id="viFlagNone" style="margin-top:8px"></p>
+<h3 style="margin-top:18px" id="viHandH"></h3><div class="vi-grid" id="viHand"></div></div>
 <script>
 const SZ = {vision.SIZE};
 const post = (path, body) => fetch(path, {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify(body || {{}})}}).then(r => r.json());
@@ -9139,7 +9189,27 @@ function viRemove(forget){{
   if (!confirm(forget ? "Remove the models and forget what they found? Pictures will again be judged by their channel alone." : "Remove the models? What they found so far is kept.")) return;
   post("/api/vision/remove", {{forget: forget}}).then(poll);
 }}
+function flagged(){{
+  fetch("/api/vision/flagged").then(r => r.json()).then(j => {{
+    const card = p => '<div class="vi-card' + (p.by_hand ? ' hand' : '') + '"><div class="vi-img"><img loading="lazy" src="/thumbs/' + encodeURIComponent(p.thumb) + '"/></div>'
+      + '<div class="vi-cap">' + esc(p.channel) + (p.by_hand ? (p.adult >= 0.5 ? ' - adult, you said' : ' - not adult, you said') : ' - ' + Math.round(p.adult * 100) + '%') + '</div>'
+      + '<button class="btn ghost" data-t="' + encodeURIComponent(p.thumb) + '" data-a="' + (p.by_hand ? 'undo' : 'no') + '">' + (p.by_hand ? 'Take back' : 'Not adult') + '</button></div>';
+    const ps = j.pictures || [], found = ps.filter(p => !p.by_hand), hand = ps.filter(p => p.by_hand);
+    document.getElementById("viFlag").innerHTML = found.map(card).join("");
+    document.getElementById("viFlagNone").textContent = found.length ? (found.length >= 300 ? "The first 300." : "") : "None.";
+    document.getElementById("viHandH").textContent = hand.length ? "Decided by you" : "";
+    document.getElementById("viHand").innerHTML = hand.map(card).join("");
+  }}).catch(() => {{}});
+}}
+document.addEventListener("click", e => {{
+  const b = e.target.closest("button[data-t]");
+  if (!b) return;
+  b.disabled = true;
+  post("/api/vision/mark", {{thumb: decodeURIComponent(b.dataset.t), adult: b.dataset.a === "undo" ? null : false}}).then(() => {{ flagged(); poll(); }});
+}});
 poll();
+flagged();
+setInterval(flagged, 30000);
 </script>"""
     return HTMLResponse(_layout("Pictures", "/settings", body, page_title="Looking at pictures", top_actions_html=""))
 
