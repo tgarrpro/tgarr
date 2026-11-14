@@ -252,16 +252,54 @@ def rules(text: str, py: list) -> list:
     return py
 
 
-def decide(text: str, lex: Lexicon, word_spans=None, model=None) -> list:
+def spans_of(words: list) -> set:
+    """{(start, end)} of a sentence's words, given the words in order."""
+    out, at = set(), 0
+    for w in words:
+        w = w[0] if isinstance(w, tuple) else w
+        out.add((at, at + len(w)))
+        at += len(w)
+    return out
+
+
+def particles(words: list) -> dict:
+    """得 and 地, the two that every page is full of, from where they stand among the words
+    of the sentence ({position: syllable}). The big model does this better; this is for an
+    install without it, where the voice says de2 and di4 every time.
+    `words`: [(word, part of speech)] as a word splitter gives them ('v' verb, 'a' adjective,
+    'd' adverb, 'r' pronoun, 'n' noun, 'p' preposition ...)."""
+    out, at = {}, 0
+    for k, (w, flag) in enumerate(words):
+        prev = words[k - 1] if k else ("", "x")
+        nxt = words[k + 1] if k + 1 < len(words) else ("", "x")
+        if w == "得":
+            if prev[1][:1] in ("v", "a", "z", "i", "l", "m", "q", "b") and prev[0] not in ("还", "就", "都", "也", "总", "非", "必", "只"):
+                out[at] = "de5"                    # 跑得快, 长得很长, 种得深: after what is done or how it is
+            elif nxt[0] and nxt[0][0] not in "了到过着" and nxt[1][:1] in ("v", "p", "d", "r", "a", "n", "t", "m"):
+                out[at] = "dei3"                   # 你得去, 我们得在…, 还得等: must
+        elif w == "地":
+            if prev[1][:1] in ("a", "d", "z", "i", "l", "v", "b") and nxt[1][:1] in ("v", "p", "d", "a"):
+                out[at] = "de5"                    # 乐呵呵地说, 慢慢地走 - not 这块地很肥
+        elif len(w) == 3 and w[1] == "得":
+            out[at + 1] = "de5"                    # 说得对, 来得及, 跑得快 taken as one word
+        at += len(w)
+    return out
+
+
+def decide(text: str, lex: Lexicon, word_spans=None, model=None, hints=None) -> list:
     """How every character of `text` should sound: a syllable, or None for what is not a
     Chinese character the voice knows.
     word_spans: {(start, end)} of the sentence's real words (a word splitter's answer), so
         that an entry of the voice's list counts only where it is a word of this sentence -
         the voice takes the longest entry at each place and finds "着数" (a move in chess) in
         数着数. None: every entry counts.
-    model: one reading per character from a model that read the whole sentence, or None."""
+    model: one reading per character from a model that read the whole sentence, or None.
+    hints: {position: syllable} from particles(); they stand where the model says nothing."""
     said = lex.said(text)
     py = list(said)
+    for i, p in (hints or {}).items():
+        if 0 <= i < len(py) and said[i] and p in lex.standin:
+            py[i] = p
     if model is not None:
         for i, ch in enumerate(text):
             m = model[i] if i < len(model) else None
@@ -283,16 +321,17 @@ def stand_in(text: str, lex: Lexicon, want: list) -> str:
                    for i, ch in enumerate(text))
 
 
-def prepare(text: str, lex: Lexicon, word_spans_of=None, model_of=None) -> str:
+def prepare(text: str, lex: Lexicon, words_of=None, model_of=None) -> str:
     """Everything, for one piece of text: tidied, decided, stood in. The two helpers are
-    optional (a word splitter, the sentence model); without them the rules and the voice's
+    optional - words_of(text) -> [(word, part of speech)], a word splitter; model_of(text) ->
+    one reading per character, the sentence model. Without them the rules and the voice's
     own words decide."""
     t = tidy(text)
     if not t or not HAN.search(t):
         return t
-    spans = word_spans_of(t) if word_spans_of else None
+    words = words_of(t) if words_of else None
     model = model_of(t) if model_of else None
-    return stand_in(t, lex, decide(t, lex, spans, model))
+    return stand_in(t, lex, decide(t, lex, spans_of(words) if words else None, model, particles(words) if words else None))
 
 
 def split(text: str, limit: int = 260) -> list:

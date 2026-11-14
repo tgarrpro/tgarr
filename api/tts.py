@@ -232,15 +232,13 @@ def _load(pronunciation: bool) -> None:
     words = None
     try:
         import jieba
+        import jieba.posseg
         jieba.setLogLevel(logging.WARNING)
         jieba.initialize()
 
-        def words(text, _cut=jieba.cut):
-            spans, at = set(), 0
-            for w in _cut(text, HMM=False):
-                spans.add((at, at + len(w)))
-                at += len(w)
-            return spans
+        def words(text, _cut=jieba.posseg.cut):
+            return [(w, flag) for w, flag in _cut(text, HMM=False)]
+        words("好。")                               # the splitter loads its tables on first use
     except Exception as e:                       # without the word splitter every entry of the voice's list counts
         log.warning("[tts] no word splitter: %s", e)
     reader = None

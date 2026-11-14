@@ -112,6 +112,44 @@ called = []
 T.prepare("no chinese", L, lambda t: called.append(1), lambda t: called.append(2))
 ok(called == [], "and neither the word splitter nor the model is asked about it")
 
+# ---- 得 and 地 without the big model: from where they stand among the words ------------------
+# (the words and their parts of speech exactly as the word splitter gives them)
+def P(tagged):
+    text = "".join(w for w, _ in tagged)
+    return {text[i - 1:i + 2] if i else text[:2]: v for i, v in T.particles(tagged).items()}
+
+
+ok(P([("你", "r"), ("得", "ud"), ("去一趟", "v")]) == {"你得去": "dei3"}, "你得去: must")
+ok(P([("我们", "r"), ("得", "ud"), ("在", "p"), ("月底", "t")]) == {"们得在": "dei3"}, "我们得在月底…: must")
+ok(P([("还", "d"), ("得", "ud"), ("等", "u"), ("一会儿", "m")]) == {}, "an unusual tag after it: left alone rather than guessed")
+ok(P([("这事", "r"), ("得", "ud"), ("你", "r"), ("来", "v")]) == {"事得你": "dei3"}, "这事得你来办")
+ok(P([("头发", "n"), ("长", "a"), ("得", "ud"), ("很", "zg"), ("长", "a")]) == {"长得很": "de5"}, "长得很长: how it is")
+ok(P([("种子", "n"), ("要", "v"), ("种", "m"), ("得", "ud"), ("深", "a")]) == {"种得深": "de5"}, "种得深, though the splitter calls 种 a measure word")
+ok(P([("他", "r"), ("得", "ud"), ("了", "ul"), ("第一名", "m")]) == {}, "他得了第一名: he got it - the voice's own reading stands")
+ok(P([("我", "r"), ("觉得", "v"), ("他", "r"), ("说得对", "v")]) == {"说得对": "de5"}, "说得对 taken as one word: the 得 in its middle")
+ok(P([("她", "r"), ("乐呵呵", "z"), ("地", "uv"), ("说", "v")]) == {"呵地说": "de5"} and P([("慢慢", "d"), ("地", "uv"), ("走", "v")]) == {"慢地走": "de5"},
+   "乐呵呵地说, 慢慢地走: the way it is done")
+ok(P([("这块", "r"), ("地", "uv"), ("很", "zg"), ("肥", "n")]) == {} and P([("土地", "n"), ("辽阔", "a")]) == {} and P([("他", "r"), ("地位", "n"), ("很", "d"), ("高", "a")]) == {},
+   "这块地很肥, 土地, 地位: land and standing, left alone")
+ok(T.spans_of([("我们", "r"), ("得", "ud"), ("走", "v")]) == {(0, 2), (2, 3), (3, 4)} and T.spans_of(["我们", "走"]) == {(0, 2), (2, 3)}, "where each word of a sentence lies")
+# a hint stands where the model says nothing, and gives way where it speaks
+ok(T.decide("我们得走", L, None, None, {2: "dei3"})[2] == "dei3", "without the model the hint decides")
+ok(T.decide("我们得走", L, None, [None, None, "de5", None], {2: "dei3"})[2] == "de5", "with it, the model does")
+ok(T.decide("我们得走", L, None, None, {2: "nope1", 9: "de5"})[2] == "de2", "a hint that makes no sense changes nothing")
+ok(T.prepare("你得去", L, lambda t: [("你", "r"), ("得", "ud"), ("去", "v")]) == "你" + L.standin["dei3"] + "去", "all of it together, from the splitter's words")
+try:
+    import logging
+    import jieba
+    import jieba.posseg
+    jieba.setLogLevel(logging.WARNING)
+    cut = lambda t: [(w, f) for w, f in jieba.posseg.cut(t, HMM=False)]
+    for s, want in (("我觉得他说得对，你得去一趟。", {"说得对": "de5", "你得去": "dei3"}), ("她乐呵呵地说，慢慢地走。", {"呵地说": "de5", "慢地走": "de5"}),
+                    ("这块地很肥，土地辽阔。", {}), ("头发长得很长。", {"长得很": "de5"})):
+        got = {s[i - 1:i + 2]: v for i, v in T.particles(cut(s)).items()}
+        ok(got == want, f"with the real word splitter: {s} -> {got}")
+except ImportError:
+    pass                               # the splitter is not installed where this runs: the cases above stand in for it
+
 # ---- the sentence model's own arithmetic: pieces of words as BERT cuts them ----------------
 V = {t: i for i, t in enumerate(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "他", "打", "开", "iphone", "wi", "##fi", "ok", "，", "了", "play", "##ing", "3"])}
 ok(G.wordpieces("playing", V) == [("play", 4), ("##ing", 3)] and G.wordpieces("zzz", V) == [("[UNK]", 3)], "longest pieces first; an unknown word is one unknown")
