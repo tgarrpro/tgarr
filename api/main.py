@@ -165,6 +165,24 @@ _KID_OK: dict = {}                     # message id / thumb file -> (allowed, ch
 _KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
                     OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+# An older child: everything all-ages from public channels and the folders of this machine -
+# not the owner's private chats, unless ticked - and never a picture found adult.
+_TEEN_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
+               AND (c.username IS NOT NULL OR c.local_root IS NOT NULL
+                    OR m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
+                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+# The people the owner has added (table profiles): each a PIN of their own and a level,
+# 'kid' (only what is ticked - as a browser with no PIN at all) or 'teen'. Their browsers
+# stay LOCKED; the PIN only says whose it is, so that time is counted per person, on
+# whatever device, and the older ones get more.
+_PROFILE = contextvars.ContextVar("tgarr_profile", default=None)
+_PROFILES = {"at": 0.0, "by": {}}
+PROFILES_MAX = 12
+
+
+def _kid_sql() -> str:
+    p = _PROFILE.get()
+    return _TEEN_SQL if p and p["level"] == "teen" else _KID_SQL
 _LOCKED_OPEN = ("/mediacenter", "/kids", "/unlock", "/api/unlock",
                 "/api/tts/say")           # a book read aloud in the Media Center
 # open even when the Media Center itself is closed for the moment (time rules)
@@ -187,7 +205,17 @@ async def _mc_rules(fresh: bool = False) -> dict:
 
 
 def _mc_who(request: Request) -> str:
+    """Whose time it is: the person's when the browser has their PIN, otherwise the device's."""
+    p = _PROFILE.get()
+    if p:
+        return f"p{p['id']}"
     return request.client.host if request.client else "?"
+
+
+async def _rules_now() -> dict:
+    """The time rules for this request: the person's own when they have some, otherwise everybody's."""
+    p = _PROFILE.get()
+    return p["rules"] if p and p["rules"] else await _mc_rules()
 
 
 async def _mc_device(who: str, rules: dict) -> None:
@@ -224,7 +252,36 @@ async def _is_locked(request: Request) -> bool:
     return not access.token_ok(cfg["secret"], request.cookies.get(access.COOKIE))
 
 
+async def _profiles(fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if (fresh or now - _PROFILES["at"] > 5) and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT id, name, level, pin, rules FROM profiles ORDER BY id")
+            by = {}
+            for r in rows:
+                try:
+                    rules = screentime.clean(_json.loads(r["rules"])) if r["rules"] else None
+                except Exception:
+                    rules = None
+                by[r["id"]] = {"id": r["id"], "name": r["name"], "level": r["level"], "pin": r["pin"], "rules": rules}
+            _PROFILES.update(at=now, by=by)
+        except Exception:
+            pass                       # e.g. the very first start, before the tables exist
+    return _PROFILES["by"]
+
+
+async def _profile_of(request: Request):
+    cfg = await _access_cfg()
+    who = access.token_who(cfg["secret"], request.cookies.get(access.COOKIE))
+    if not who or who[0] != "p" or not who[1:].isdigit():
+        return None
+    return (await _profiles()).get(int(who[1:]))
+
+
 async def _kid_ok(key, sql: str, arg) -> bool:
+    p = _PROFILE.get()
+    key = (p["level"] if p else "kid", key)
     hit = _KID_OK.get(key)
     if hit and time.monotonic() - hit[1] < 30:
         return hit[0]
@@ -245,7 +302,7 @@ async def _locked_block(request: Request):
         return None
     # Opening hours, minutes a day, breaks. Decided here as well as in the
     # page, so that closing time cannot be got round by typing an address.
-    rules = await _mc_rules()
+    rules = await _rules_now()
     if rules["on"]:
         who = _mc_who(request)
         await _mc_device(who, rules)
@@ -271,11 +328,11 @@ async def _locked_block(request: Request):
                     pass
         if m and await _kid_ok(int(m.group(1)), f"""
                 SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
-                WHERE m.id = $1 AND {_KID_SQL}""", int(m.group(1))):
+                WHERE m.id = $1 AND {_kid_sql()}""", int(m.group(1))):
             return None
         if path.startswith("/thumbs/") and await _kid_ok(path, f"""
                 SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
-                WHERE m.thumb_path = $1 AND {_KID_SQL} LIMIT 1""", path[len("/thumbs/"):]):
+                WHERE m.thumb_path = $1 AND {_kid_sql()} LIMIT 1""", path[len("/thumbs/"):]):
             return None
         if "text/html" in (request.headers.get("accept") or "") and not path.startswith("/api/"):
             return RedirectResponse("/mediacenter", status_code=303)
@@ -352,6 +409,7 @@ async def _request_guard(request: Request, call_next):
     # carry no browser cookie: the PIN is not for them
     locked = (not _is_arr_path(path)) and await _is_locked(request)
     _LOCKED.set(locked)
+    _PROFILE.set(await _profile_of(request) if locked else None)
     if locked:
         blocked = await _locked_block(request)
         if blocked is not None:
@@ -950,6 +1008,9 @@ async def _migrate_schema():
             );
             -- Media Center: seconds used per device per day (day = days since
             -- 1970 in the owner's time zone), and which items were opened.
+            CREATE TABLE IF NOT EXISTS profiles (
+                id SERIAL PRIMARY KEY, name TEXT NOT NULL, level TEXT NOT NULL DEFAULT 'kid',
+                pin TEXT NOT NULL, rules TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
             CREATE TABLE IF NOT EXISTS mc_usage (
               day INT NOT NULL, who TEXT NOT NULL, seconds INT NOT NULL DEFAULT 0, PRIMARY KEY (day, who)
             );
@@ -9518,7 +9579,17 @@ async def api_unlock(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    if not access.check_pin(str(body.get("pin") or ""), cfg["pin"]):
+    pin = str(body.get("pin") or "")
+    if not access.check_pin(pin, cfg["pin"]):
+        # not the owner's: one of the people's? Their browser stays locked, it is now known whose it is.
+        for p in (await _profiles(fresh=True)).values():
+            if access.check_pin(pin, p["pin"]):
+                _GUESSES.right(who)
+                seconds = access.REMEMBER_SECONDS if body.get("remember") else access.UNLOCK_SECONDS
+                resp = JSONResponse({"status": "ok", "profile": p["name"]})
+                resp.set_cookie(access.COOKIE, access.make_token(cfg["secret"], seconds, who=f"p{p['id']}"), max_age=seconds,
+                                httponly=True, samesite="lax", path="/")
+                return resp
         earned = _GUESSES.wrong(who)
         return JSONResponse({"status": "wrong", "message": "That is not the PIN." + (
             f" Too many wrong tries - wait {earned // 60} min." if earned else "")}, status_code=403)
@@ -9572,7 +9643,7 @@ async def api_mc_ping(request: Request):
     install with no PIN) is not counted and never told to stop."""
     if not await _is_locked(request):
         return {"ok": True, "free": True}
-    rules = await _mc_rules()
+    rules = await _rules_now()
     who, now = _mc_who(request), time.time()
     await _mc_device(who, rules)
     v = _DEVICES.ping(who, rules, now)
@@ -9606,7 +9677,7 @@ setInterval(function(){ fetch("/api/mc/ping").then(function(r){ return r.json();
 
 @app.get("/mediacenter/rest", response_class=HTMLResponse)
 async def page_mc_rest(request: Request):
-    rules = await _mc_rules()
+    rules = await _rules_now()
     who = _mc_who(request)
     await _mc_device(who, rules)
     v = _DEVICES.check(who, rules, time.time())
@@ -9660,6 +9731,63 @@ async def api_kids_pin(request: Request):
     await _access_cfg(fresh=True)
     # the browser that set the PIN stays unlocked
     return _unlock_cookie(JSONResponse({"status": "ok", "pin": True}), secret, False)
+
+
+@app.post("/api/kids/profile")
+async def api_kids_profile(request: Request):
+    """Add a person ({name, level, pin}), change one ({id, name? level? pin? rules?}; rules
+    null = the same time rules as everybody) or remove one ({id, delete: true}). A locked
+    browser never reaches this."""
+    def no(msg, code=400):
+        return JSONResponse({"status": "error", "message": msg}, status_code=code)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cfg = await _access_cfg(fresh=True)
+    if not cfg["pin"]:
+        return no("Set the PIN first: without it every browser sees everything anyway.")
+    profs = await _profiles(fresh=True)
+    pid = body.get("id")
+    pid = int(pid) if str(pid if pid is not None else "").isdigit() else None
+    if pid is not None and pid not in profs:
+        return no("no such person", 404)
+    name = " ".join(str(body.get("name") or "").split())[:40]
+    level = body.get("level") if body.get("level") in ("kid", "teen") else None
+    pin = str(body.get("pin") or "")
+    if pid is None:
+        if body.get("delete"):
+            return no("no such person", 404)
+        if not name:
+            return no("A name, please.")
+        if len(profs) >= PROFILES_MAX:
+            return no(f"At most {PROFILES_MAX} people.")
+        if not pin:
+            return no("A PIN of their own, 4 to 12 digits.")
+    if pin:
+        if not access.valid_pin(pin):
+            return no("A PIN is 4 to 12 digits.")
+        if access.check_pin(pin, cfg["pin"]) or any(access.check_pin(pin, p["pin"]) for i, p in profs.items() if i != pid):
+            return no("That PIN is taken. Each person needs one of their own, different from yours.")
+    async with db_pool.acquire() as conn:
+        if pid is not None and body.get("delete"):
+            await conn.execute("DELETE FROM profiles WHERE id = $1", pid)
+        elif pid is None:
+            await conn.execute("INSERT INTO profiles (name, level, pin) VALUES ($1, $2, $3)", name, level or "kid", access.hash_pin(pin))
+        else:
+            if name:
+                await conn.execute("UPDATE profiles SET name = $2 WHERE id = $1", pid, name)
+            if level:
+                await conn.execute("UPDATE profiles SET level = $2 WHERE id = $1", pid, level)
+            if pin:
+                await conn.execute("UPDATE profiles SET pin = $2 WHERE id = $1", pid, access.hash_pin(pin))
+            if "rules" in body:
+                r = body["rules"]
+                await conn.execute("UPDATE profiles SET rules = $2 WHERE id = $1", pid,
+                                   _json.dumps(screentime.clean(r)) if isinstance(r, dict) else None)
+    await _profiles(fresh=True)
+    _KID_OK.clear()
+    return {"status": "ok"}
 
 
 @app.post("/api/kids/allow")
@@ -9865,7 +9993,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
     kind = kind if kind in _MC_KINDS else "video"
     offset, per = max(0, int(offset)), 48
     label, icon, colour, cond = _MC_KINDS[kind]
-    where, params = [_KID_SQL, cond], []
+    where, params = [_kid_sql(), cond], []
     for w in (q or "").split()[:6]:
         params.append(f"%{w}%")
         where.append(f"COALESCE(m.file_name, m.caption, '') ILIKE ${len(params)}")
@@ -9878,7 +10006,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
             ORDER BY saved DESC, m.posted_at DESC NULLS LAST LIMIT {per + 1} OFFSET {offset}""", *params)
         counts = {k: await conn.fetchval(f"""
             SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
-            WHERE {_KID_SQL} AND {v[3]}""") for k, v in _MC_KINDS.items()}
+            WHERE {_kid_sql()} AND {v[3]}""") for k, v in _MC_KINDS.items()}
     more, rows = len(rows) > per, rows[:per]
     locked = _LOCKED.get()
     cats = "".join(
@@ -9917,7 +10045,10 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
                + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← Back</a>' if offset else "")
                + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">More →</a>' if more else "")
                + "</div>")
-    top_right = ('<a class="pill" href="/unlock" title="open all of tgarr">🔒 Enter PIN</a>' if locked else
+    prof = _PROFILE.get()
+    whose = (f'<span class="pill">👤 {html.escape(prof["name"])}</span>'
+             '<a class="pill" href="/lock" title="this is not me">Leave</a>') if prof else ""
+    top_right = (whose + '<a class="pill" href="/unlock" title="your own PIN, or the one that opens all of tgarr">🔒 Enter PIN</a>' if locked else
              ('<a class="pill" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
              + '<a class="pill" href="/mediacenter/manage">⚙ Choose what is shown</a>'
              '<a class="pill" href="/">← Back to tgarr</a>')
@@ -9953,6 +10084,7 @@ _KIDS_CSS = """<style>
 async def page_kids_manage():
     cfg = await _access_cfg(fresh=True)
     rules = await _mc_rules(fresh=True)
+    profs = await _profiles(fresh=True)
     today = screentime.local(time.time(), rules.get("tz", 0))[0]
     async with db_pool.acquire() as conn:
         usage = await conn.fetch(
@@ -10036,7 +10168,7 @@ async def page_kids_manage():
         '<div class="km-box"><div class="km-pad">'
         '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><h3 style="margin:0;flex:1">Time</h3>'
         f'<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="mcOn" {"checked" if rules["on"] else ""}/> <b>use time rules</b></label></div>'
-        '<p style="color:var(--muted);margin:0 0 12px">For browsers that have not entered the PIN. Counted per device, '
+        '<p style="color:var(--muted);margin:0 0 12px">For browsers that have not entered your PIN. Counted per person where a child has entered their own, otherwise per device; '
         'only while a page is in front or something is playing.</p>'
         '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
         '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
@@ -10050,14 +10182,56 @@ async def page_kids_manage():
         f'after <input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/> minutes in one go</span>'
         '<button class="btn" onclick="mcSave()">Save</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
         '</div></div>')
+    def who_label(w):
+        if w[:1] == "p" and w[1:].isdigit():
+            p = profs.get(int(w[1:]))
+            return "👤 " + html.escape(p["name"] if p else "someone since removed")
+        return "📱 " + html.escape(w)
+    used_today = {u["who"]: u["today"] for u in usage}
+    levels = (("kid", "Little: only what is ticked"), ("teen", "Older: everything from all-ages channels"))
+
+    def person(p):
+        r, i = p["rules"] or rules, p["id"]
+        return (
+            f'<div class="km-row"><span class="n">👤 <b>{html.escape(p["name"])}</b> <small>today {mins(used_today.get("p" + str(i)))}'
+            + (" · own time rules" if p["rules"] else "") + '</small></span>'
+            + f'<select class="km-in" onchange="kpPost({{id:{i},level:this.value}})">'
+            + "".join(f'<option value="{k}"{" selected" if p["level"] == k else ""}>{lbl}</option>' for k, lbl in levels)
+            + f'</select><button class="btn ghost" onclick="kpTime({i})">Time</button>'
+              f'<button class="btn ghost" onclick="kpPin({i})">New PIN</button>'
+              f'<button class="btn ghost" onclick="kpDel({i})">Remove</button></div>'
+            + f'<div class="km-pad" id="kpT{i}" hidden style="border-bottom:1px solid var(--border)">'
+              f'<label style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><input type="checkbox" id="kp{i}_own" {"checked" if p["rules"] else ""}/> '
+              f'<b>{html.escape(p["name"])} has time rules of their own</b> <small style="color:var(--muted)">(otherwise the ones under PIN &amp; time; breaks are always those)</small></label>'
+              '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
+              '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
+            + "".join(
+                f'<b>{lbl}</b><input class="km-in" type="time" id="kp{i}_{k}_from" value="{r[k]["from"]}"/>'
+                f'<input class="km-in" type="time" id="kp{i}_{k}_to" value="{r[k]["to"]}"/>'
+                f'<input class="km-in" type="number" min="0" max="1440" id="kp{i}_{k}_limit" value="{r[k]["limit"]}"/>'
+                for k, lbl in (("wd", "Monday to Friday"), ("we", "Saturday, Sunday")))
+            + f'</div><div style="margin-top:12px"><button class="btn" onclick="kpSave({i})">Save</button></div></div>')
+    people_box = (
+        '<p class="note">Give each child a PIN of their own. A browser where it is entered still shows only the Media Center, but tgarr '
+        'knows whose it is: time is counted per person, on whatever device, and an older child gets more than what is ticked - everything '
+        'from all-ages public channels and the folders of this machine, never your private chats, never a picture found adult. '
+        'A browser with no PIN at all stays as it was: only what is ticked.</p>'
+        + ('<div class="km-box">' + "".join(person(p) for p in profs.values()) + '</div>' if profs else "")
+        + ('<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 10px">Add a person</h3>'
+           '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+           '<input class="km-in" id="kpName" maxlength="40" placeholder="name" style="width:150px"/>'
+           '<select class="km-in" id="kpLevel">' + "".join(f'<option value="{k}">{lbl}</option>' for k, lbl in levels) + '</select>'
+           '<input class="km-in" id="kpNewPin" type="password" inputmode="numeric" maxlength="12" placeholder="their PIN, 4 to 12 digits" style="width:200px"/>'
+           '<button class="btn" onclick="kpAdd()">Add</button></div></div></div>' if cfg["pin"] else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Set your own PIN first (under PIN &amp; time).</div></div>'))
     used_rows = (
-        "".join(f'<div class="km-row"><span class="n">📱 {html.escape(u["who"])}</span>'
+        "".join(f'<div class="km-row"><span class="n">{who_label(u["who"])}</span>'
                 f'<small>today {mins(u["today"])} · last 7 days {mins(u["week"])}</small></div>' for u in usage)
         + "".join(f'<div class="km-row"><span class="n">{html.escape(_friendly_name(o["file_name"], o["caption"]))}</span>'
-                  f'<small>{_fmt_time(o["at"])} · {html.escape(o["who"])}</small></div>' for o in opened))
+                  f'<small>{_fmt_time(o["at"])} · {who_label(o["who"])}</small></div>' for o in opened))
     n_chan = sum(1 for c in chans if c["allowed"])
     n_file = sum(1 for r in items if r["allowed"])
-    tabs = (("pin", "PIN &amp; time", ""), ("channels", "Channels", f"{n_chan:,} shown" if n_chan else ""),
+    tabs = (("pin", "PIN &amp; time", ""), ("people", "People", f"{len(profs)}" if profs else ""), ("channels", "Channels", f"{n_chan:,} shown" if n_chan else ""),
             ("files", "Files", f"{n_file:,} shown" if n_file else ""), ("usage", "Usage", ""))
     body = (
         _KIDS_CSS
@@ -10066,6 +10240,7 @@ async def page_kids_manage():
                   f'{lbl}{f"<span class=c>{c}</span>" if c else ""}</button>' for k, lbl, c in tabs)
         + '</div>'
         + f'<div class="km-pane" id="km-pin">{pin_box}{time_box}</div>'
+        + f'<div class="km-pane" id="km-people" hidden>{people_box}</div>'
         + '<div class="km-pane" id="km-channels" hidden>'
           '<p class="note">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
         + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div></div>'
@@ -10077,13 +10252,27 @@ async def page_kids_manage():
            'are kept and appear here.</div></div>')
         + '</div>'
         + '<div class="km-pane" id="km-usage" hidden>'
-          '<p class="note">Kept on this machine only: time per device, and what was opened in the Media Center.</p>'
+          '<p class="note">Kept on this machine only: time per person or device, and what was opened in the Media Center.</p>'
         + (f'<div class="km-box km-list">{used_rows}</div>' if used_rows else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing yet. Time and what was opened are listed '
            'here once a browser without the PIN has used the Media Center.</div></div>')
         + '</div>'
         + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
         + """<script>
+const G = id => document.getElementById(id);
+function kpPost(b){
+  return fetch("/api/kids/profile", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(b)})
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "that did not work"); });
+}
+function kpAdd(){ kpPost({name: G("kpName").value, level: G("kpLevel").value, pin: G("kpNewPin").value}); }
+function kpPin(id){ const p = prompt("A new PIN for this person, 4 to 12 digits"); if (p) kpPost({id: id, pin: p}); }
+function kpDel(id){ if (confirm("Remove this person? Their PIN stops working; what they used stays in the record.")) kpPost({id: id, delete: true}); }
+function kpTime(id){ const e = G("kpT" + id); e.hidden = !e.hidden; }
+function kpSave(id){
+  const part = k => ({from: G("kp" + id + "_" + k + "_from").value, to: G("kp" + id + "_" + k + "_to").value, limit: +G("kp" + id + "_" + k + "_limit").value});
+  kpPost({id: id, rules: G("kp" + id + "_own").checked ? {on: true, wd: part("wd"), we: part("we"),
+    session: +G("mcSession").value, rest: +G("mcRest").value, tz: -new Date().getTimezoneOffset()} : null});
+}
 function kmAllow(kind, ref, el){
   fetch("/api/kids/allow", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({kind: kind, ref: ref, on: el.checked})}).then(r => r.json())
