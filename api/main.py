@@ -349,7 +349,8 @@ async def _signed_out_block(request: Request):
         if path.startswith("/api/") and not path.startswith(
                 ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/",
                  # a public channel is followed and read without an account (the crawler's guest workers)
-                 "/api/channel/subscribe", "/api/channel/unsubscribe/")):
+                 "/api/channel/subscribe", "/api/channel/unsubscribe/",
+                 "/api/archive/")):                  # the Internet Archive asks nobody for an account
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -459,6 +460,7 @@ import usenet  # local module
 import usenet_scan  # local module
 import usenet_client  # local module
 import usenet_rules  # local module
+import archive_org  # local module
 import usenet_fetch  # local module
 import usenet_judge  # local module
 import tts  # local module
@@ -656,6 +658,7 @@ async def _startup():
     asyncio.create_task(_tts_housekeeping())
     asyncio.create_task(_vision_worker())
     asyncio.create_task(_usenet_grab_worker())
+    asyncio.create_task(_archive_grab_worker())
     asyncio.create_task(_update_check_worker())
 
 
@@ -1011,6 +1014,11 @@ async def _migrate_schema():
             -- small things fetched from Usenet by tgarr itself (usenet_fetch.py): one row per asking
             CREATE TABLE IF NOT EXISTS usenet_grabs (
               id SERIAL PRIMARY KEY, card_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT,
+              state TEXT NOT NULL DEFAULT 'queued', note TEXT, files INT, bytes BIGINT, msg_id BIGINT,
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), done_at TIMESTAMPTZ
+            );
+            CREATE TABLE IF NOT EXISTS archive_grabs (
+              id SERIAL PRIMARY KEY, item_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT,
               state TEXT NOT NULL DEFAULT 'queued', note TEXT, files INT, bytes BIGINT, msg_id BIGINT,
               added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), done_at TIMESTAMPTZ
             );
@@ -1713,7 +1721,7 @@ _CACHE_PREFIXES = ("video/", "audio/", "library/")
 # by hand, and there is no index entry to bring one back (the card on the Usenet page is the
 # way, for as long as the post lasts). They are removed by hand (/usenet?kind=have), and only
 # an entry whose file is no longer there is forgotten here.
-_FETCHED_PREFIXES = ("usenet/", "usenet18/")
+_FETCHED_PREFIXES = ("usenet/", "usenet18/", "archive/")
 _CACHE_SIDECARS = ("", ".tail", ".pdf", ".cover.jpg", ".queue", ".pdf.inprogress.pdf")
 _LOCAL_SQL = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
 # What makes a sound file an audiobook. Not its length: an hour is as often a DJ set (of
@@ -1721,7 +1729,7 @@ _LOCAL_SQL = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
 # (.m4b is made for books), the folder a fetch put it in, or the word for it in its name,
 # title or album. One rule, in SQL for the pages and in Python for the test.
 _AUDIOBOOK_WORDS = r"有声书|有聲書|有声小说|有聲小說|听书|聽書|评书|評書|audio ?books?|unabridged"
-_AUDIOBOOK_PATH = r"^usenet(18)?/audiobooks/|(^|/)audio ?books?/"
+_AUDIOBOOK_PATH = r"^(usenet(18)?|archive)/audiobooks/|(^|/)audio ?books?/"
 _AUDIOBOOK_SQL = ("(m.file_name ~* '\\.m4b$' OR COALESCE(m.local_path, '') ~* '" + _AUDIOBOOK_PATH + "'"
                   " OR concat_ws(' ', m.file_name, m.audio_title, m.audio_album) ~* '" + _AUDIOBOOK_WORDS + "')")
 
@@ -6739,6 +6747,7 @@ NAV_ITEMS = [
     ("/library",   "Library",   "M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 18H6V4h7v6l2-1 2 1V4h1v16z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
     ("/usenet",    "Usenet",    "M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z"),
+    ("/archive",   "Archive",   "M4 10h3v7H4zm6.5 0h3v7h-3zM2 19h20v3H2zm15-9h3v7h-3zM12 1 2 6v2h20V6z"),
     ("/files",     "My files",  "M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"),
     # /system page still accessible by URL, just hidden from nav (admin only).
     ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
@@ -7836,6 +7845,8 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                                      "books, comics, music and pictures directly. No Telegram account needed."),
                 ("/files", "📁 Your own files", "Add folders of films, music, books or photos you already have. They play here and in the "
                            "Media Center. No account needed."),
+                ("/archive", "🏛 Internet Archive", "Old films, radio plays, audiobooks, books and magazines that anybody may download. "
+                             "Search, press Get, and it is in your library. No account needed."),
                 ("/discover", "🔭 Public channels", "Look through the public Telegram channels tgarr knows and follow some: what they hold is "
                               "listed right away, without an account. Playing a file is when Telegram wants one.")))
         + '</div></div>')
@@ -9793,6 +9804,338 @@ ugPoll();
            + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else "")
            + f'<input type="text" name="q" class="search" placeholder="Search books, songs, pictures on Usenet…" value="{html.escape(q, quote=True)}"/></form>')
     return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=top))
+
+
+# ════════════════════════════════════════════════════════════════════
+# The Internet Archive (archive_org.py)
+#
+# A third source beside Telegram and Usenet, and the one that needs nothing: no account, no
+# provider. Nothing of it is indexed here - the page asks archive.org when somebody searches -
+# and Get fetches an item over HTTPS into /downloads/archive/<shelf>/, where it is a file of
+# this install like any other: it plays in Videos, Music, the Library, the Gallery, the Media
+# Center. Fetched by hand, so removed by hand (the cache rules leave it alone).
+# ════════════════════════════════════════════════════════════════════
+ARCHIVE_ROOT = "archive"
+_AR_GRAB = {"now": None, "bytes": 0, "of": 0}
+_AR_CACHE = {}                           # (words, shelf, page) -> (when, how many in all, items)
+
+
+def _archive_ok(*names) -> bool:
+    """Not something the guard refuses by its name."""
+    return not (any(CSAM_RX.search(x or "") for x in names) or usenet_rules.never_kept(list(names), [], False))
+
+
+async def _archive_search(q: str, shelf: str, page: int) -> tuple:
+    key = (archive_org.clean_query(q), shelf, page)
+    hit = _AR_CACHE.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1], hit[2], ""
+    try:
+        body = await asyncio.to_thread(archive_org.fetch_json, archive_org.search_url(q, shelf, page))
+    except Exception as e:
+        log.info("[archive] search: %s: %s", type(e).__name__, str(e)[:120])
+        return 0, [], "archive.org did not answer - try again in a moment"
+    total, items = archive_org.parse_search(body)
+    items = [i for i in items if _archive_ok(i["title"], i["id"], i["creator"])]
+    if len(_AR_CACHE) > 300:
+        _AR_CACHE.clear()
+    _AR_CACHE[key] = (time.time(), total, items)
+    return total, items, ""
+
+
+def _archive_fetch_files(ident: str, take: list, folder: str, single_name: str, progress) -> list:
+    """In a thread: the files, one after another. [(path, size, title)] of those that arrived whole."""
+    done, names = [], set()
+    for f in take:
+        base = single_name if (single_name and len(take) == 1) else os.path.basename(f["name"])
+        name = localfiles.free_name(lambda x: x in names or os.path.exists(os.path.join(folder, x)), localfiles.safe_name(base))
+        names.add(name)
+        for attempt in (1, 2):
+            try:
+                size = archive_org.download(archive_org.file_url(ident, f["name"]), os.path.join(folder, name), progress, f["size"])
+                done.append((os.path.join(folder, name), size, f.get("title") or ""))
+                break
+            except Exception as e:
+                log.info("[archive] %s / %s (try %d): %s: %s", ident, f["name"][:80], attempt, type(e).__name__, str(e)[:120])
+    return done
+
+
+async def _archive_grab_one(job) -> tuple:
+    """(state, note, files, bytes, message id of the first file)."""
+    import shutil
+    ident = job["item_id"]
+    try:
+        meta = await asyncio.to_thread(archive_org.fetch_json, archive_org.metadata_url(ident))
+    except Exception:
+        return "failed", "archive.org did not answer - try again later", 0, 0, None
+    p = archive_org.plan(meta)
+    if not p["take"]:
+        return "failed", p["why"], 0, 0, None
+    if not _archive_ok(p["title"], ident, *[f["name"] for f in p["take"]]):
+        await _usenet_blocked("archive item", "a term for it in its name", p["title"])
+        return "failed", "never fetched: the block list", 0, 0, None
+    if p["bytes"] > shutil.disk_usage("/downloads").free - (1 << 30):
+        return "failed", "not enough room left on the disk", 0, 0, None
+    label = (localfiles.safe_name(p["title"])[:110].strip(" .") or ident) + (f" ({p['year']})" if p["year"] else "")
+    base = f"/downloads/{ARCHIVE_ROOT}/{archive_org.SHELF[p['shelf']][4]}"
+    single = ""
+    if len(p["take"]) == 1:
+        single = f"{label}.{archive_org.ext(p['take'][0]['name'])}"
+    else:
+        base = os.path.join(base, localfiles.free_name(lambda x: os.path.exists(os.path.join(base, x)), label))
+    os.makedirs(base, exist_ok=True)
+    _AR_GRAB.update(now=job["id"], bytes=0, of=p["bytes"])
+
+    def progress(n):
+        _AR_GRAB["bytes"] += n
+    try:
+        done = await asyncio.to_thread(_archive_fetch_files, ident, p["take"], base, single, progress)
+    finally:
+        _AR_GRAB["now"] = None
+    if not done:
+        if not single:
+            try:
+                os.rmdir(base)
+            except OSError:
+                pass
+        return "failed", "it did not arrive from archive.org - try again later", 0, 0, None
+    now = int(time.time())
+    rels = [(os.path.relpath(path, "/downloads").replace(os.sep, "/"), size, now) for path, size, _t in sorted(done)]
+    caption = f"{p['title']} · archive.org/details/{ident}" + (f" · {p['year']}" if p["year"] else "")
+    async with db_pool.acquire() as conn:
+        await _local_add(conn, ARCHIVE_ROOT, rels)
+        await conn.execute("UPDATE messages SET caption = $2 WHERE local_path = ANY($1::text[])", [r[0] for r in rels], caption)
+        if p["shelf"] in ("audio", "audiobook"):           # a chapter's or a song's own title, and what it belongs to
+            for path, _size, title in done:
+                await conn.execute("UPDATE messages SET audio_title = COALESCE(NULLIF($2, ''), audio_title), audio_album = $3 WHERE local_path = $1",
+                                   os.path.relpath(path, "/downloads").replace(os.sep, "/"), title, p["title"][:200])
+        mid = await conn.fetchval("SELECT id FROM messages WHERE local_path = $1 ORDER BY id DESC LIMIT 1", rels[0][0])
+    whole = len(done) == len(p["take"])
+    note = "" if whole else f"{len(done)} of {len(p['take'])} files arrived whole"
+    if p["why"]:
+        note = (note + "; " if note else "") + p["why"]
+    return ("done" if whole and not p["why"] else "partial", note, len(done), sum(sz for _p, sz, _t in done), mid)
+
+
+async def _archive_grab_worker():
+    await asyncio.sleep(45)
+    try:
+        async with db_pool.acquire() as conn:      # what a restart interrupted starts over
+            await conn.execute("UPDATE archive_grabs SET state = 'queued' WHERE state = 'working'")
+    except Exception:
+        log.exception("[archive] could not tidy up after a restart")
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                job = await conn.fetchrow(
+                    """UPDATE archive_grabs SET state = 'working' WHERE id =
+                       (SELECT id FROM archive_grabs WHERE state = 'queued' ORDER BY id LIMIT 1) RETURNING *""")
+            if not job:
+                await asyncio.sleep(3)
+                continue
+            try:
+                res = await _archive_grab_one(job)
+            except Exception as e:
+                log.warning("[archive] fetching %s: %s: %s", job["item_id"], type(e).__name__, str(e)[:160])
+                res = ("failed", "that did not work - try again later", 0, 0, None)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE archive_grabs SET state = $2, note = $3, files = $4, bytes = $5, msg_id = $6, done_at = NOW() WHERE id = $1",
+                    job["id"], *res)
+            log.info("[archive] fetched %s (%s): %s%s, %s file(s), %s", job["item_id"], job["name"][:60], res[0],
+                     f" - {res[1]}" if res[1] else "", res[2], _fmt_size(res[3]) or "0")
+        except Exception as e:
+            log.warning("[archive] the fetching: %s: %s", type(e).__name__, str(e)[:160])
+            await asyncio.sleep(20)
+
+
+@app.post("/api/archive/grab")
+async def api_archive_grab(request: Request):
+    def no(msg, code=400):
+        return JSONResponse({"status": "error", "message": msg}, status_code=code)
+    try:
+        b = await request.json()
+        ident, name, shelf = str(b.get("id") or ""), str(b.get("name") or "")[:300], str(b.get("shelf") or "")
+    except Exception:
+        ident, name, shelf = "", "", ""
+    if not archive_org.ID_RX.fullmatch(ident):
+        return no("which one?")
+    if not _archive_ok(name, ident):
+        return no("no such item", 404)
+    async with db_pool.acquire() as conn:
+        had = await conn.fetchrow("SELECT id, state FROM archive_grabs WHERE item_id = $1 AND state IN ('queued', 'working', 'done') ORDER BY id DESC LIMIT 1", ident)
+        if had:
+            return {"status": "ok", "job": had["id"], "state": had["state"]}
+        if await conn.fetchval("SELECT count(*) FROM archive_grabs WHERE state IN ('queued', 'working')") >= 50:
+            return no("fifty are waiting already - let some arrive first", 429)
+        job = await conn.fetchval("INSERT INTO archive_grabs (item_id, name, kind) VALUES ($1, $2, $3) RETURNING id",
+                                  ident, name or ident, shelf if shelf in archive_org.SHELF else None)
+    return {"status": "ok", "job": job, "state": "queued"}
+
+
+@app.get("/api/archive/grabs")
+async def api_archive_grabs():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, item_id, name, kind, state, note, files, bytes, msg_id FROM archive_grabs ORDER BY id DESC LIMIT 60")
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d["state"] == "working" and _AR_GRAB["now"] == d["id"] and _AR_GRAB["of"]:
+            d["percent"] = min(99, int(_AR_GRAB["bytes"] * 100 / _AR_GRAB["of"]))
+        out.append(d)
+    return {"grabs": out}
+
+
+@app.post("/api/archive/forget")
+async def api_archive_forget(request: Request):
+    """Remove what was fetched: {"release": key} one item, {"all": true} everything."""
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    cond, params = None, []
+    if b.get("all") is True:
+        cond = "TRUE"
+    elif isinstance(b.get("release"), str) and re.fullmatch(r"[0-9a-f]{32}", b["release"]):
+        cond, params = "md5(COALESCE(m.caption, m.local_path)) = $1", [b["release"]]
+    if not cond:
+        return JSONResponse({"status": "error", "message": "what to remove?"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT m.local_path, COALESCE(m.file_size, 0) AS sz, m.caption FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE c.local_root = '{ARCHIVE_ROOT}' AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__' AND {cond}""", *params)
+        paths = [r["local_path"] for r in rows if r["local_path"].startswith(ARCHIVE_ROOT + "/")]
+        if paths:                                  # so that Get offers it again
+            idents = {m.group(1) for m in (re.search(r"archive\.org/details/([A-Za-z0-9._-]+)", r["caption"] or "") for r in rows) if m}
+            await conn.execute("DELETE FROM archive_grabs WHERE item_id = ANY($1::text[])", list(idents))
+    if paths:
+        await _fetched_forget(paths)
+        log.info("[archive] removed by hand: %d file(s), %s", len(paths), _fmt_size(sum(r["sz"] for r in rows)) or "0")
+    return {"status": "ok", "removed": len(paths), "freed": _fmt_size(sum(r["sz"] for r in rows)) or "0 MB"}
+
+
+_AR_JS = """<script>
+const agEsc = t => String(t || "").replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
+function agShow(g){
+  const e = document.querySelector('[data-ag="' + CSS.escape(g.item_id) + '"]');
+  if (!e) return false;
+  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">Open</a>' : "";
+  if (g.state === "queued") e.innerHTML = '<small>waiting</small>';
+  else if (g.state === "working") e.innerHTML = '<small>fetching' + (g.percent != null ? " " + g.percent + "%" : "") + '</small>';
+  else if (g.state === "done") e.innerHTML = '<small>fetched</small> ' + open;
+  else if (g.state === "partial") e.innerHTML = '<small>' + agEsc(g.note) + '</small> ' + open;
+  else e.innerHTML = '<small style="color:#b45309">' + agEsc(g.note || "that did not work") + '</small> '
+    + (!g.note || /try again|room left/.test(g.note) ? '<button class="btn ghost" data-again="1">Try again</button>' : "");
+  const again = e.querySelector("[data-again]");
+  if (again) again.onclick = () => agGet(e, again);
+  return g.state === "queued" || g.state === "working";
+}
+function agPoll(){
+  fetch("/api/archive/grabs").then(r => r.json()).then(j => {
+    const seen = new Set(); let busy = false;
+    (j.grabs || []).forEach(g => { if (seen.has(g.item_id)) return; seen.add(g.item_id); if (agShow(g)) busy = true; });
+    if (busy) setTimeout(agPoll, 2500);
+  }).catch(() => setTimeout(agPoll, 8000));
+}
+function agGet(e, b){
+  b.disabled = true;
+  fetch("/api/archive/grab", {method: "POST", headers: {"Content-Type": "application/json"},
+                              body: JSON.stringify({id: e.dataset.ag, name: e.dataset.name, shelf: e.dataset.shelf})})
+    .then(r => r.json()).then(j => { if (j.status === "ok") agPoll(); else { b.disabled = false; alert(j.message || "that did not work"); } })
+    .catch(() => { b.disabled = false; });
+}
+function agForget(body, what, b){
+  if (!confirm("Remove " + what + " from this server? The files are deleted; they can be fetched again from the Internet Archive.")) return;
+  if (b) b.disabled = true;
+  fetch("/api/archive/forget", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "that did not work"); } })
+    .catch(() => { if (b) b.disabled = false; });
+}
+document.querySelectorAll("[data-ag] button").forEach(b => { b.onclick = () => agGet(b.parentElement, b); });
+agPoll();
+</script>"""
+
+
+@app.get("/archive", response_class=HTMLResponse)
+async def page_archive(q: Optional[str] = None, shelf: str = "film", page: int = 1, kind: str = ""):
+    q = (q or "").strip()[:200]
+    shelf = shelf if shelf in archive_org.SHELF else "film"
+    page = max(1, min(int(page or 1), 250))
+    async with db_pool.acquire() as conn:
+        have = await conn.fetch(
+            f"""SELECT md5(COALESCE(m.caption, m.local_path)) AS key, max(m.caption) AS cap, count(*) AS files,
+                       sum(COALESCE(m.file_size, 0)) AS bytes, min(m.id) AS first, max(m.posted_at) AS fetched
+                FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE c.local_root = '{ARCHIVE_ROOT}' AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
+                GROUP BY 1 ORDER BY max(m.id) DESC LIMIT 500""")
+    have_bytes = sum(r["bytes"] for r in have)
+
+    from urllib.parse import quote as _q
+
+    def link(**over):
+        cur = {"q": q, "shelf": shelf if shelf != "film" else None, "page": None, "kind": None}
+        cur.update(over)
+        bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
+        return "/archive" + ("?" + "&".join(bits) if bits else "")
+    chips = ("".join(_chip_link(f"{s[1]} {s[2]}", link(shelf=s[0] if s[0] != "film" else None), kind != "have" and shelf == s[0])
+                     for s in archive_org.SHELVES)
+             + (_chip_link(f"📥 Fetched {_fmt_size(have_bytes) or ''}".strip(), link(kind="have", q=None, shelf=None), kind == "have",
+                           "what you fetched from the Internet Archive, and the way to remove it") if have else ""))
+    if kind == "have":
+        items = "".join(
+            f'<div class="km-row"><span class="n">{html.escape((r["cap"] or "").split(" · ")[0])}'
+            f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {r["files"]} file{"s" if r["files"] != 1 else ""} · fetched {_ago(r["fetched"])}</small></span>'
+            '<span style="white-space:nowrap">'
+            f'<a class="btn ghost" href="/watch/{r["first"]}">Open</a> '
+            f'<button class="btn ghost" onclick="agForget({{release:&quot;{r["key"]}&quot;}},&quot;this item&quot;,this)">Delete</button></span></div>'
+            for r in have)
+        body = (_KIDS_CSS
+                + f'<p style="color:var(--muted);margin:0 0 14px">What you fetched from the Internet Archive: <b>{len(have):,}</b> item{"s" if len(have) != 1 else ""}, '
+                  f'<b>{_fmt_size(have_bytes) or "0 MB"}</b>. You asked for each of these, so tgarr never removes one by itself.</p>'
+                + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}'
+                + ('<button class="btn ghost" style="margin-left:auto" onclick="agForget({all:true},&quot;everything fetched from the Internet Archive&quot;,this)">'
+                   f'🗑 Delete all ({_fmt_size(have_bytes) or "0"})</button>' if have else "")
+                + '</div>'
+                + (f'<div class="km-box">{items}</div>' if items else '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing fetched yet.</div></div>')
+                + _AR_JS)
+        return HTMLResponse(_layout("Archive", "/archive", body, page_title="Fetched from the Internet Archive", top_actions_html=""))
+    total, found, trouble = await _archive_search(q, shelf, page)
+    sign = archive_org.SHELF[shelf][1]
+    items = "".join(
+        f'<div class="km-row"><span class="n">{sign} {html.escape(i["title"])}'
+        + (f' <small>({html.escape(i["year"])})</small>' if i["year"] else "")
+        + '<br/><small>'
+        + " · ".join(x for x in ((html.escape(i["creator"]) if i["creator"] else ""),
+                                 (f'up to {_fmt_size(i["size"])}' if i["size"] else ""),
+                                 f'{i["downloads"]:,} downloads',
+                                 f'<a href="https://archive.org/details/{html.escape(i["id"], quote=True)}" target="_blank" rel="noopener noreferrer">archive.org ↗</a>') if x)
+        + '</small></span>'
+        f'<span data-ag="{html.escape(i["id"], quote=True)}" data-name="{html.escape(i["title"], quote=True)}" data-shelf="{shelf}" style="white-space:nowrap">'
+        '<button class="btn">Get</button></span></div>'
+        for i in found)
+    pages = ""
+    if total > archive_org.ROWS or page > 1:
+        last = min(250, (total + archive_org.ROWS - 1) // archive_org.ROWS)
+        pages = ('<div style="display:flex;gap:8px;align-items:center;margin-top:14px">'
+                 + (f'<a class="btn ghost" href="{html.escape(link(page=page - 1 if page > 2 else None), quote=True)}">← Earlier</a>' if page > 1 else "")
+                 + f'<span style="color:var(--muted);font-size:13px">page {page} of {max(last, 1):,} · {total:,} found</span>'
+                 + (f'<a class="btn ghost" href="{html.escape(link(page=page + 1), quote=True)}">More →</a>' if page < last else "")
+                 + '</div>')
+    body = (
+        _KIDS_CSS
+        + '<p style="color:var(--muted);margin:0 0 14px">The <a href="https://archive.org" target="_blank" rel="noopener noreferrer">Internet Archive</a> keeps '
+          'films, radio plays, audiobooks, books, magazines and recordings that anybody may download - no account, no provider. '
+          '<b>Get</b> fetches an item to this server and puts it in Videos, Music or the Library: one playable copy of it, never a program. '
+          'Without words, a shelf shows what is downloaded most.</p>'
+        + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}</div>'
+        + (f'<div class="km-box">{items}</div>' if items else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
+           + (html.escape(trouble) if trouble else "Nothing found for these words on this shelf.") + '</div></div>')
+        + pages + _AR_JS)
+    top = ('<form action="/archive" method="GET" style="margin-left:auto">'
+           + (f'<input type="hidden" name="shelf" value="{shelf}"/>' if shelf != "film" else "")
+           + f'<input type="text" name="q" class="search" placeholder="Search the Internet Archive…" value="{html.escape(q, quote=True)}"/></form>')
+    return HTMLResponse(_layout("Archive", "/archive", body, page_title="Internet Archive", top_actions_html=top))
 
 
 @app.post("/api/usenet/forget")
