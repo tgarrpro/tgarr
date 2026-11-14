@@ -683,6 +683,8 @@ async def _migrate_schema():
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_by_hand BOOLEAN;
             -- what the model itself said, kept when the person says otherwise
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS ai_model REAL;
+            -- the newsgroup a file fetched from Usenet was posted to
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS usenet_grp TEXT;
             CREATE INDEX IF NOT EXISTS idx_messages_ai_todo ON messages (id DESC) WHERE thumb_path IS NOT NULL AND ai_ver IS NULL;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS members_count INTEGER;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS meta_updated_at TIMESTAMPTZ;
@@ -9323,8 +9325,8 @@ async def _usenet_grab_one(job) -> tuple:
     rels = [(os.path.relpath(path, "/downloads").replace(os.sep, "/"), size, now) for path, size in sorted(done)]
     async with db_pool.acquire() as conn:
         await _local_add(conn, root, rels)
-        await conn.execute("UPDATE messages SET caption = $2 WHERE local_path = ANY($1::text[])",
-                           [r[0] for r in rels], _un_caption(c["name"], c["grp"], c["posted_from"]))
+        await conn.execute("UPDATE messages SET caption = $2, usenet_grp = $3 WHERE local_path = ANY($1::text[])",
+                           [r[0] for r in rels], _un_caption(c["name"], c["grp"], c["posted_from"]), c["grp"])
         if adult:
             await conn.execute("UPDATE channels SET audience = 'nsfw', audience_manual = TRUE WHERE tg_chat_id = $1",
                                localfiles.chat_id(root))
@@ -9407,6 +9409,15 @@ async def _usenet_captions_once() -> None:
                                    folder + "/", cap, len(folder) + 1)
             else:
                 await conn.execute("UPDATE messages SET caption = $2 WHERE id = $1", g["id"], cap)
+        # and the newsgroup, for those fetched before it was written down: it is the part
+        # of the caption that reads like one ("alt.binaries.pictures.x")
+        await conn.execute(
+            f"""UPDATE messages m SET usenet_grp = x.g FROM
+                  (SELECT m2.id, (SELECT s FROM unnest(string_to_array(m2.caption, ' · ')) s
+                                  WHERE s ~ '^[a-z0-9+_-]+(\\.[a-z0-9+_-]+){{2,}}$' LIMIT 1) AS g
+                   FROM messages m2 JOIN channels c ON c.id = m2.channel_id
+                   WHERE {_FROM_USENET} AND m2.usenet_grp IS NULL AND m2.caption IS NOT NULL) x
+                WHERE x.id = m.id AND x.g IS NOT NULL""")
 
 
 async def _usenet_grab_worker():
@@ -10924,7 +10935,8 @@ _PRIVATE_CHAT = f"(c.username IS NULL AND COALESCE(c.members_count, 0) < 200 AND
 async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        q: Optional[str] = None, dc: Optional[str] = None,
                        ch: Optional[int] = None, private: int = 0,
-                       offset: int = 0, sort: str = "new", rate: Optional[str] = None, usenet: int = 0):
+                       offset: int = 0, sort: str = "new", rate: Optional[str] = None, usenet: int = 0,
+                       grp: Optional[str] = None):
     if not login.session_exists():
         # Skip redirect if we have data — crawler may be authed in-memory
         async with db_pool.acquire() as conn:
@@ -10952,9 +10964,14 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         where.append("(c.username IS NOT NULL OR c.local_root IS NOT NULL)")
     if private:
         where.append(_PRIVATE_CHAT)
-    usenet = 0 if private else (1 if usenet else 0)
+    grp = (grp or "").strip()[:200] or None
+    usenet = 0 if private else (1 if (usenet or grp) else 0)
+    grp = grp if usenet else None
     if usenet:
         where.append(_FROM_USENET)
+    if grp:
+        params.append(grp)
+        where.append(f"m.usenet_grp = ${len(params)}")
     if q:
         for w in q.split():
             params.append(f"%{w}%")
@@ -11034,6 +11051,13 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             WHERE {' AND '.join(where[:3])} AND {_FROM_USENET}
               AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
               {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw' AND COALESCE(m.ai_adult, 0) < 0.9"}""")
+        usenet_groups = await conn.fetch(f"""
+            SELECT m.usenet_grp AS g, count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text)) AS n
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where[:3])} AND {_FROM_USENET} AND m.usenet_grp IS NOT NULL
+              AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
+              {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw' AND COALESCE(m.ai_adult, 0) < 0.9"}
+            GROUP BY 1 ORDER BY 2 DESC, 1""") if usenet_n else []
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -11062,7 +11086,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
 
     # ── which photos: all / my private chats / one chat ──────────────
     def _gqs(**over):
-        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "usenet": usenet or None, "q": q,
+        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "usenet": (usenet or None) if not grp else None, "grp": grp, "q": q,
                "dc": "mine" if same_dc_only else None, "rate": rate,
                "sort": sort if sort == "old" else None,
                "limit": limit if limit != 240 else None}
@@ -11080,7 +11104,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     def _name(r):
         return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
     opts = "".join(
-        f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, offset=None)}" '
+        f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, usenet=None, grp=None, offset=None)}" '
         f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
         f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
         + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
@@ -11107,6 +11131,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         'background:var(--surface);border:1px solid var(--border);border-radius:10px;'
         'box-shadow:0 14px 40px rgba(15,23,42,.18);padding:10px}'
         '.gp.open .gp-pop{display:block}'
+        '.gu{display:inline-block}.gu>summary{list-style:none;cursor:pointer}.gu>summary::-webkit-details-marker{display:none}'
+        '.gu[open] .gp-pop{display:block}'
         '.gp-pop input{width:100%;box-sizing:border-box;margin-bottom:8px}'
         '.gp-list{max-height:52vh;overflow:auto}'
         '.gp-opt{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:8px;'
@@ -11118,15 +11144,24 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '.gp-c{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}'
         '</style>'
         '<div class="bar-tools" style="margin-bottom:16px">'
-        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, offset=None),
+        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, grp=None, offset=None),
                      not (picked or private or usenet))
         + (_chip_link(f'🔒 My private chats <span style="opacity:.6">{priv_n:,}</span>',
-                      "/gallery" + _gqs(ch=None, channel=None, private=1, usenet=None, offset=None), bool(private),
+                      "/gallery" + _gqs(ch=None, channel=None, private=1, usenet=None, grp=None, offset=None), bool(private),
                       "photos from chats and groups that have no public @username - yours alone")
            if priv else "")
-        + (_chip_link(f'📰 Usenet <span style="opacity:.6">{usenet_n:,}</span>',
-                      "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=1, offset=None), bool(usenet),
-                      "pictures fetched from the newsgroups")
+        # Usenet opens into its newsgroups, as "Choose a channel" opens into the chats
+        + (('<details class="gp gu"><summary class="btn ghost gp-btn' + (" on" if usenet else "") + '" '
+            'title="pictures fetched from the newsgroups">📰 '
+            + (html.escape(grp[:34]) if grp else "Usenet")
+            + f' <span style="opacity:.6">{(next((r["n"] for r in usenet_groups if r["g"] == grp), 0) if grp else usenet_n):,}</span> ▾</summary>'
+            '<div class="gp-pop"><div class="gp-list">'
+            f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=1, grp=None, offset=None)}">'
+            f'<span class="gp-n">All of Usenet</span><span class="gp-c">{usenet_n:,}</span></a>'
+            + "".join(
+                f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=r["g"], offset=None)}">'
+                f'<span class="gp-n">{html.escape(r["g"])}</span><span class="gp-c">{r["n"]:,}</span></a>' for r in usenet_groups)
+            + '</div></div></details>')
            if usenet_n else "")
         + picker
         + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
@@ -11159,7 +11194,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         'if(e.key==="Enter"){const f=[...document.querySelectorAll("#gpList .gp-opt")].find(o=>o.style.display!=="none");'
         'if(f)location.href=f.href}})})()</script>')
     _where_txt = (f'in {html.escape(_name(picked))}' if picked else
-                  'in my private chats' if private else 'fetched from Usenet' if usenet else '')
+                  'in my private chats' if private else f'from {html.escape(grp)}' if grp else 'fetched from Usenet' if usenet else '')
 
     if not rows:
         body = (
