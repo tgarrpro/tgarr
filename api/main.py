@@ -3238,16 +3238,20 @@ async def epub_chapter(msg_id: int, n: int):
 
 
 # What both readers need to read aloud. Two kinds of voice:
-#   - this machine's own (tts.py), when it is installed: the server makes the audio, so every
-#     browser in the house hears the same natural voice. It speaks Chinese and English.
-#   - the browser's (Edge offers Microsoft's natural ones; Chrome on most systems a robot):
-#     used when no voice is installed here, and for every other language.
+#   - the browser's, where it is a natural one (Edge offers Microsoft's, and they are better
+#     than ours), when no voice is installed here, and for every language but Chinese and English.
+#   - this machine's own (tts.py, Kokoro), when it is installed: the server makes the audio, so
+#     a browser with a robot's voice or none (Chrome on most systems, a television) reads well.
 # The readers talk to one object, `synth`, that looks like the browser's speechSynthesis and
 # decides piece by piece which of the two reads it. The text is cut into short pieces (some
-# browser voices stop on long passages; ours is asked for the next piece while this one plays).
+# browser voices stop on long passages; ours is asked for the next piece while this one plays,
+# and its pieces are shorter still: a piece takes a third of its length to make).
 _SPEECH_JS = r"""
 const bsynth = window.speechSynthesis || null;
-const TG_VOICE = __TG_VOICE__;
+const TG_VOICE = __TG_VOICE__, TG_VOICES = __TG_VOICES__;
+// what this person chose in this browser: who reads, with which voice, how fast
+const PREF = (() => { try { return JSON.parse(localStorage.getItem("tgarr.voice") || "{}") || {}; } catch (e) { return {}; } })();
+function rateNow(){ const r = parseFloat(PREF.rate); return r >= 0.5 && r <= 2.5 ? r : 1; }
 function mkUtter(text){ return {text: text, voice: null, lang: "", onstart: null, onend: null, onerror: null}; }
 const player = new Audio(); player.preload = "auto";
 const synth = (bsynth || TG_VOICE) ? {
@@ -3262,16 +3266,25 @@ const synth = (bsynth || TG_VOICE) ? {
   // what our own voice can read: Chinese and English - not kana, hangul, Cyrillic, Arabic,
   // Thai, and not a Latin text thick with accents (French, German, Spanish ...)
   ours(text){
-    if (!TG_VOICE) return false;
+    if (!TG_VOICE || (PREF.mode === "browser" && bsynth)) return false;
     if (/[぀-ヿ가-힯Ѐ-ӿ؀-ۿ฀-๿]/.test(text)) return false;
-    return (text.match(/[À-ÖØ-öø-ÿĀ-ſ]/g) || []).length <= text.length * 0.01;
+    if ((text.match(/[À-ÖØ-öø-ÿĀ-ſ]/g) || []).length > text.length * 0.01) return false;
+    return PREF.mode === "own" || !this.natural(text);
+  },
+  key(text){ return (PREF.zh || "") + "|" + (PREF.en || "") + "|" + text; },
+  // has this browser a natural voice of its own for this text? Then that one reads.
+  natural(text){
+    if (!bsynth) return false;
+    const v = voiceFor(text).voice;
+    return !!(v && /natural|neural/i.test(v.name));
   },
   clip(text){
-    let p = this.clips.get(text);
+    const key = this.key(text);
+    let p = this.clips.get(key);
     if (!p) {
-      p = fetch("/api/tts/say", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text: text})})
+      p = fetch("/api/tts/say", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text: text, zh: PREF.zh || "", en: PREF.en || ""})})
         .then(r => { if (!r.ok) throw new Error("tts " + r.status); return r.blob(); }).then(b => URL.createObjectURL(b));
-      this.clips.set(text, p);
+      this.clips.set(key, p);
       if (this.clips.size > 12) {
         const old = this.clips.keys().next().value, was = this.clips.get(old);
         this.clips.delete(old); was.then(u => URL.revokeObjectURL(u)).catch(() => {});
@@ -3290,6 +3303,7 @@ const synth = (bsynth || TG_VOICE) ? {
       if (!bsynth) { fail("no-voice"); return; }
       const b = new SpeechSynthesisUtterance(u.text);
       if (u.voice) b.voice = u.voice; if (u.lang) b.lang = u.lang;
+      b.rate = rateNow();
       b.onstart = () => { if (run === this.run && u.onstart) u.onstart(); };
       b.onend = done; b.onerror = e => fail(e.error);
       bsynth.speak(b);
@@ -3298,11 +3312,11 @@ const synth = (bsynth || TG_VOICE) ? {
     this.clip(u.text).then(url => {
       if (run !== this.run) return;
       player.onended = done;
-      player.onerror = () => { if (run === this.run) { this.clips.delete(u.text); byBrowser(); } };
-      player.src = url;
+      player.onerror = () => { if (run === this.run) { this.clips.delete(this.key(u.text)); byBrowser(); } };
+      player.src = url; player.defaultPlaybackRate = player.playbackRate = rateNow();
       if (u.onstart) u.onstart();
       return player.play();
-    }).catch(() => { if (run === this.run) { this.clips.delete(u.text); byBrowser(); } });
+    }).catch(() => { if (run === this.run) { this.clips.delete(this.key(u.text)); byBrowser(); } });
   }
 } : null;
 function toast(text, ms){
@@ -3317,15 +3331,78 @@ function voiceFor(text){
   const vs = synth.getVoices().filter(v => v.lang && v.lang.toLowerCase().startsWith(lang));
   const score = v => (/natural|neural/i.test(v.name) ? 8 : 0) + (/online/i.test(v.name) ? 4 : 0) + (/microsoft|google/i.test(v.name) ? 2 : 0)
     + (lang === "zh" && /zh[-_]cn|hans/i.test(v.lang) ? 1 : 0);
-  return {voice: vs.sort((a, b) => score(b) - score(a))[0] || null, lang: lang === "zh" ? "zh-CN" : lang};
+  const chosen = PREF["b" + lang] && vs.find(v => v.name === PREF["b" + lang]);      // the one picked in the menu, if this browser still has it
+  return {voice: chosen || vs.sort((a, b) => score(b) - score(a))[0] || null, lang: lang === "zh" ? "zh-CN" : lang};
 }
+// The menu beside "Read aloud": who reads (the browser, this machine), which voice for Chinese
+// and for English, how fast. Kept in this browser. A new voice is heard from the next paragraph
+// (the reader starts it again), a new speed at once.
+function voiceMenu(){
+  const btn = document.getElementById("readBtn");
+  if (!btn || !synth || document.getElementById("voiceBtn")) return;
+  const b = document.createElement("button");
+  b.id = "voiceBtn"; b.title = "voice and speed"; b.innerHTML = "&#9881;";
+  btn.insertAdjacentElement("afterend", b);
+  const box = document.createElement("div");
+  box.id = "voiceBox";
+  box.style.cssText = "display:none;position:fixed;z-index:60;width:280px;max-width:calc(100vw - 20px);background:#0f172a;color:#fff;padding:14px 16px;border-radius:12px;font-size:13px;line-height:1.4;box-shadow:0 10px 34px rgba(0,0,0,.4)";
+  document.body.appendChild(box);
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]);
+  const sel = (id, label, opts, val) => '<label style="display:block;margin:0 0 10px">' + label
+    + '<select data-k="' + id + '" style="display:block;width:100%;margin-top:3px;padding:6px 8px;border-radius:7px;border:0;font:inherit;background:#fff;color:#0f172a">'
+    + opts.map(o => '<option value="' + esc(o[0]) + '"' + (String(val || "") === String(o[0]) ? " selected" : "") + '>' + esc(o[1]) + '</option>').join("") + '</select></label>';
+  const ofLang = lang => bsynth ? bsynth.getVoices().filter(v => v.lang && v.lang.toLowerCase().startsWith(lang)) : [];
+  const who = text => {
+    if (synth.ours(text)) {
+      const zh = /[一-鿿]/.test(text), list = TG_VOICES[zh ? "zh" : "en"], k = PREF[zh ? "zh" : "en"];
+      let name = (list.find(o => o[0] === k) || list[0])[1];
+      if (!zh && (list.find(o => o[0] === k) || list[0])[0] === "same") name = (TG_VOICES.zh.find(o => o[0] === PREF.zh) || TG_VOICES.zh[0])[1];
+      return "this machine, " + name;
+    }
+    const v = bsynth ? voiceFor(text).voice : null;
+    return v ? v.name : (bsynth ? "the browser's voice" : "nobody: no voice here");
+  };
+  const draw = () => {
+    let h = sel("mode", "Read with", [["", "Automatic: the better of the two"]].concat(bsynth ? [["browser", "This browser's voices"]] : [],
+      TG_VOICE ? [["own", "This machine's voice"]] : []), PREF.mode);
+    if (TG_VOICE && PREF.mode !== "browser") {
+      h += sel("zh", "This machine, Chinese", TG_VOICES.zh, PREF.zh || TG_VOICES.zh[0][0]) + sel("en", "This machine, English", TG_VOICES.en, PREF.en || TG_VOICES.en[0][0]);
+    }
+    if (bsynth && PREF.mode !== "own") {
+      const z = ofLang("zh"), e = ofLang("en");
+      if (z.length > 1) h += sel("bzh", "Browser, Chinese", [["", "Automatic"]].concat(z.map(v => [v.name, v.name])), PREF.bzh);
+      if (e.length > 1) h += sel("ben", "Browser, English", [["", "Automatic"]].concat(e.map(v => [v.name, v.name])), PREF.ben);
+    }
+    h += sel("rate", "Speed", [["0.75", "0.75 x"], ["1", "1 x"], ["1.25", "1.25 x"], ["1.5", "1.5 x"], ["1.75", "1.75 x"], ["2", "2 x"]], String(rateNow()));
+    h += '<div style="color:#cbd5e1;font-size:12px">Chinese is read by ' + esc(who("中文中文中文")) + '.<br>English by ' + esc(who("English text")) + '.'
+      + (TG_VOICE ? "" : '<br>A voice of this machine\'s own can be installed in Settings.') + '</div>';
+    box.innerHTML = h;
+    box.querySelectorAll("select").forEach(s => { s.onchange = () => {
+      const k = s.dataset.k;
+      if (s.value) PREF[k] = s.value; else delete PREF[k];
+      try { localStorage.setItem("tgarr.voice", JSON.stringify(PREF)); } catch (e) {}
+      if (k === "rate") { player.defaultPlaybackRate = player.playbackRate = rateNow(); }
+      else { draw(); document.dispatchEvent(new Event("tgvoice")); }
+    }; });
+  };
+  const place = () => { const r = b.getBoundingClientRect(); box.style.top = (r.bottom + 6) + "px"; box.style.left = Math.max(10, Math.min(window.innerWidth - 290, r.right - 280)) + "px"; };
+  b.onclick = e => { e.stopPropagation(); const open = box.style.display === "none"; if (open) { draw(); place(); } box.style.display = open ? "block" : "none"; };
+  box.onclick = e => e.stopPropagation();
+  box.onkeydown = e => e.stopPropagation();
+  document.addEventListener("click", () => { box.style.display = "none"; });
+  if (bsynth) bsynth.addEventListener("voiceschanged", () => { if (box.style.display !== "none") draw(); });
+}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", voiceMenu); else setTimeout(voiceMenu, 0);
 function chunks(text){
-  // sentences, packed into pieces of about 200 characters: some voices stop on long passages
+  // sentences, packed into pieces of about 200 characters: some voices stop on long passages.
+  // Where our own voice reads, a sentence or two: the first sound must not be long in coming.
+  const cjk = (text.match(/[一-鿿]/g) || []).length > text.length * 0.15;
+  const PIECE = (TG_VOICE && !synth.natural(text)) ? (cjk ? 50 : 160) : 200;
   const out = []; let buf = "";
   (text.match(/[^.!?。！？；;\n]+[.!?。！？；;\n]*/g) || [text]).forEach(s => {
-    if (buf && (buf + s).length > 200) { out.push(buf); buf = ""; }
+    if (buf && (buf + s).length > PIECE) { out.push(buf); buf = ""; }
     buf += s;
-    while (buf.length > 260) { out.push(buf.slice(0, 240)); buf = buf.slice(240); }
+    while (buf.length > PIECE * 1.3) { out.push(buf.slice(0, PIECE * 1.2)); buf = buf.slice(PIECE * 1.2); }
   });
   if (buf.trim()) out.push(buf);
   return out.map(x => x.trim()).filter(Boolean);
@@ -3338,7 +3415,8 @@ def _speech_js() -> str:
         on = tts.available()
     except Exception:
         on = False
-    return _SPEECH_JS.replace("__TG_VOICE__", "true" if on else "false")
+    voices = {lang: [[k, label] for k, label, _sid in vs] for lang, vs in tts.VOICES.items()}
+    return _SPEECH_JS.replace("__TG_VOICE__", "true" if on else "false").replace("__TG_VOICES__", _json.dumps(voices))
 
 
 _EPUB_READER_HTML = r"""<!DOCTYPE html>
@@ -3669,6 +3747,7 @@ function readFromView(){
 }
 // a person turned the page or jumped: read on from what is now in view
 function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 450); }
+document.addEventListener("tgvoice", userMoved);          // another voice was chosen: this paragraph again, in it
 $("readBtn").onclick = () => {
   if (!synth) { toast("this browser cannot read aloud"); return; }
   if (reading) { stopRead(); return; }
@@ -4199,6 +4278,7 @@ function turned(){
   // the reader turned the page itself: nothing to do. A person did: read on from there.
   if (reading && !byReader) readFrom(cur);
 }
+document.addEventListener("tgvoice", () => { if (reading) readFrom(cur); });      // another voice was chosen: this page again, in it
 $("readBtn").onclick = () => {
   if (!synth) { toast("this browser cannot read aloud"); return; }
   if (reading) { stopRead(); return; }
@@ -10061,14 +10141,16 @@ async def _tts_housekeeping():
 async def api_tts_say(request: Request):
     """One piece of text as audio (WAV). The readers ask for it piece by piece."""
     try:
-        text = str((await request.json()).get("text") or "")
+        body = await request.json()
+        text = str(body.get("text") or "")
+        zh, en = str(body.get("zh") or "")[:8], str(body.get("en") or "")[:8]
     except Exception:
         return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
     text = text.strip()
     if not text or len(text) > tts.TEXT_MAX:
         return JSONResponse({"status": "error", "message": f"between 1 and {tts.TEXT_MAX} characters"}, status_code=400)
     try:
-        data = await asyncio.to_thread(tts.say, text, await _tts_pronunciation_on())
+        data = await asyncio.to_thread(tts.say, text, await _tts_pronunciation_on(), zh, en)
     except RuntimeError as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=503)
     except Exception as e:
@@ -10135,11 +10217,13 @@ async def page_settings_voice():
 .vo-in{{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
 </style>
 <div class="vo-box"><h3>A voice of this machine's own <span id="voState"></span></h3>
-<p>A browser reads a book aloud with whatever voices it happens to have: natural ones in Edge, a robot in most others. With this
-voice installed, tgarr makes the audio itself - on this machine's processor, nothing is sent anywhere - and every browser, phone and
-television at home hears the same natural voice. It reads Chinese and English; for other languages the browser's voice is used.</p>
+<p>A browser reads a book aloud with whatever voices it happens to have: natural ones in Edge, a robot in most others, none on many
+televisions. With this voice installed, tgarr makes the audio itself - on this machine's processor, nothing is sent anywhere - for
+every browser that has no natural voice of its own. Edge goes on reading with Microsoft's voices, which are better. The voice
+(Kokoro, an open model) reads Chinese and English; for other languages the browser's voice is used.</p>
 <p>The voice is not part of tgarr: it is fetched once, {mb(tts.SIZES["voice"])}, from GitHub (the sherpa-onnx project's files), checked,
-and kept in the downloads folder. It needs about 300 MB of memory while a book is being read, and lets go of it a quarter of an hour after.</p>
+and kept in the downloads folder. It needs about 600 MB of memory while a book is being read, and lets go of it a quarter of an hour
+after. A sentence takes about a third of its length to make on an ordinary processor - on a small one, reading may halt between sentences.</p>
 <div class="vo-row" id="voVoice"></div></div>
 <div class="vo-box"><h3>Hard Chinese pronunciations <span id="prState"></span></h3>
 <p>长 in 路还长着呢, 得 in 你得去: which reading a character has depends on the sentence. tgarr decides the common cases by rules of

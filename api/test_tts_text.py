@@ -158,4 +158,51 @@ ok(toks == ["他", "打", "开", "iphone", "，", "wi", "##fi", "了"], f"charac
 ok(at[0] == 0 and at[3] is None and at[4] == 3 and at[9] == 3 and at[11] == 5 and at[13] == 6 and at[15] == 7, f"and every character knows its token: {at}")
 ok(G.tokens_of("龘", V)[0] == ["[UNK]"], "a character BERT does not know is one unknown token")
 
+# ---- the voice's own writing of sounds (Kokoro: zhuyin, some finals as one sign) -----------
+for py, signs in (("zhang3", "ㄓ ㄤ 3"), ("chang2", "ㄔ ㄤ 2"), ("dei3", "ㄉ ㄟ 3"), ("zhong1", "ㄓ 中 1"), ("yue4", "月 4"), ("xue2", "ㄒ 月 2"),
+                  ("lve4", "ㄌ 月 4"), ("nv3", "ㄋ ㄩ 3"), ("ju1", "ㄐ ㄩ 1"), ("lu4", "ㄌ ㄨ 4"), ("juan3", "ㄐ 元 3"), ("luan4", "ㄌ 万 4"),
+                  ("zi5", "ㄗ ㄭ 5"), ("shi4", "ㄕ 十 4"), ("yi1", "ㄧ 1"), ("wo3", "我 3"), ("ye3", "ㄝ 3"), ("qie3", "ㄑ ㄝ 3"), ("hui4", "ㄏ 为 4"),
+                  ("you3", "又 3"), ("liu2", "ㄌ 又 2"), ("xiong2", "ㄒ 用 2"), ("lun2", "ㄌ 文 2"), ("jun1", "ㄐ 云 1"), ("er2", "ㄦ 2")):
+    ok(T.voice_signs(py) == signs, f"{py}: {T.voice_signs(py)!r}")
+    ok(T.syllables_of(signs.split()) == [py], f"{signs}: {T.syllables_of(signs.split())!r}")
+ok(len(T.TO_VOICE) == len(T.TO_PINYIN) == len(set(T.TO_VOICE.values())), "one way of writing for each sound, and back")
+ok(T.voice_signs("xyz9") is None and T.voice_signs("zhang") is None and T.voice_signs("") is None, "what is not a sound has no signs")
+ok(T.syllables_of("ㄓ ㄤ 3 ㄓ ㄜ 5".split()) == ["zhang3", "zhe5"] and T.syllables_of("ㄏ 为 R 4".split()) is None and T.syllables_of(["ㄏ"]) is None,
+   "a word's syllables; a word ending in the r of Beijing, or half a syllable, is not ours to read")
+rare = T.rare_characters()
+ok(len(rare) > 3000 and all("一" <= c <= "鿿" for c in rare) and not set(rare) & set("的一是不了人我在有他这为之大来以个中上们长得地着行重"),
+   "thousands of characters the voice takes for Chinese and no book is likely to hold")
+import os
+import tempfile
+with tempfile.TemporaryDirectory() as tmp:
+    lp = os.path.join(tmp, "lexicon-zh.txt")
+    with open(lp, "w", encoding="utf-8") as f:
+        f.write("长 ㄓ ㄤ 3\n着 ㄓ ㄜ 5\n路 ㄌ ㄨ 4\n还 ㄏ ㄞ 2\n呢 ㄋ ㄜ 5\n得 ㄉ ㄜ 5\n等 ㄉ ㄥ 3\n一 ㄧ 1\n" + rare[0] + " ㄅ ㄚ 1\n" + rare[1] + " ㄆ ㄚ 1\n"
+                "着数 ㄓ ㄠ 1 ㄕ ㄨ 4\n会儿 ㄏ 为 R 4\n" + rare[1] + "路 ㄆ ㄚ 1 ㄌ ㄨ 4\n呣 ❓\nhello h ə l O\n")
+    K = T.Lexicon.read(lp)
+    ok(K.words["长"] == ["zhang3"] and K.words["着数"] == ["zhao1", "shu4"] and K.words["会儿"] is None and K.words["呣"] is None and "hello" not in K.words,
+       "the voice's list read into pinyin; what is not plain is kept as the voice's own")
+    ok(K.said("路还长着呢") == ["lu4", "hai2", "zhang3", "zhe5", "ne5"] and K.said("一会儿") == ["yi1", None, None], "what it says left alone")
+    ok(rare[0] in K.sound_of and rare[0] not in K.words and rare[1] not in K.sound_of and K.words[rare[1]] == ["pa1"],
+       "a rare character stands in; one that is part of a word of the list is left as it is")
+    ok("chang2" in K.standin and "dei3" in K.standin and "lu1" in K.standin and "xyz1" not in K.standin and len(K.standin) == 5 * len(T.TO_VOICE),
+       "a stand-in for every sound the voice can write, in all its tones")
+    text = K.lexicon_text(lp)
+    ok((K.standin["chang2"] + " ㄔ ㄤ 2\n") in text and ("\n" + rare[0] + " ㄅ ㄚ 1\n") not in text and "着数 ㄓ ㄠ 1 ㄕ ㄨ 4\n" in text and "hello h ə l O\n" in text,
+       "the list as the voice gets it: its lines, the stand-ins written its way, the old line of a stand-in gone")
+    fixed = T.prepare("“路还长着呢，”他说。", K)
+    ok(fixed == K.standin["chang2"].join(["路还", "着呢，他说。"]) and K.said(fixed)[2] == "chang2", "and the whole of it with the voice's real kind of list")
+    ok(T.prepare("等一会儿", K, None, lambda t: [None, None, "hui3", None]) == "等一会儿", "a word the voice says its own way is not touched")
+
+# ---- who reads: what the reader's menu may choose ---------------------------------------------
+import tts
+ok(tts.speaker(True) == 3 and tts.speaker(False) == 0, "nothing chosen: the first woman for Chinese, the American one for English")
+ok(tts.speaker(True, "m1") == 58 and tts.speaker(True, "f3", "uk") == 57 and tts.speaker(False, "m1", "uk") == 2, "a man for Chinese; the British woman for English")
+ok(tts.speaker(False, "m2", "same") == 60 and tts.speaker(False, "", "same") == 3, "'same': the Chinese voice reads the English too - the only man's voice for it")
+ok(tts.speaker(True, "../x", "zz") == 3 and tts.speaker(False, "nope", "nope") == 0 and tts.speaker(False, None, None) == 0, "a choice that is none: the first")
+ok(all(0 <= sid <= 102 for lang in tts.VOICES.values() for _k, _l, sid in lang if sid is not None)
+   and all(3 <= sid <= 57 for k, _l, sid in tts.VOICES["zh"] if k[0] == "f") and all(58 <= sid <= 102 for k, _l, sid in tts.VOICES["zh"] if k[0] == "m"),
+   "every choice is a speaker the model has: its women are 3-57, its men 58-102")
+ok(tts._cache_path("a", "-", 3) != tts._cache_path("a", "-", 58) and tts._cache_path("a", "-", 3) != tts._cache_path("a", "p", 3), "a clip is kept per voice")
+
 print(f"ok - {n} checks")

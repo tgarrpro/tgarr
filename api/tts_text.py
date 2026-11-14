@@ -1,8 +1,8 @@
 """Reading aloud: what happens to the text before the voice gets it.
 
-The voice (a small open model run on this machine's CPU) says what it is given, and its own
-idea of how Chinese is read is one reading per character plus a list of words: 长 is always
-zhang3, 得 is always de2, and "路还长着呢" comes out wrong. So the text is prepared here:
+The voice (Kokoro, a small open model run on this machine's CPU) says what it is given, and
+its own idea of how Chinese is read is one reading per character plus a list of words: 长 is
+always zhang3, 得 is always de5, and "路还长着呢" comes out wrong. So the text is prepared here:
 
   tidy        marks the voice stumbles over are taken out or turned into pauses; in an English
               sentence numbers become words ("platform 9" was read "platform jiu").
@@ -12,8 +12,12 @@ zhang3, 得 is always de2, and "路还长着呢" comes out wrong. So the text is
                 3. a model that reads the whole sentence (optional, see g2pw_lite.py), allowed
                    to decide a fixed list of characters only.
   stand in    a character the voice would say wrongly is replaced by a stand-in: a character
-              no book contains, added to the voice's list as "this syllable and nothing else".
-              One sound changes; the words and the flow around it do not.
+              hardly any book contains, put in the voice's list as "this syllable and nothing
+              else". One sound changes; the words and the flow around it do not.
+
+The voice writes sounds its own way (an initial and a final in zhuyin, some finals as one
+character of its own: "ㄓ ㄤ 3" is zhang3, "ㄓ 中 1" zhong1); everything here speaks pinyin, and
+sound_tables() is the dictionary between the two.
 
 Nothing here needs the voice or any model: everything is plain functions (test_tts_text.py).
 """
@@ -21,7 +25,96 @@ import re
 
 HAN = re.compile(r"[一-鿿]")
 SYLLABLE = re.compile(r"[a-z]+[1-5]")
-STANDIN_BASE = 0xE000            # private-use characters: one per syllable the voice can say
+LONGEST_ENTRY = 10               # the voice looks no further than this for a word of its list
+STANDIN_BASE = 0xE000            # private-use characters: one per syllable (a list given to Lexicon by hand)
+
+# ───────────────────────── the voice's writing of sounds ─────────────────────────
+
+_INITIALS = {"b": "ㄅ", "p": "ㄆ", "m": "ㄇ", "f": "ㄈ", "d": "ㄉ", "t": "ㄊ", "n": "ㄋ", "l": "ㄌ", "g": "ㄍ", "k": "ㄎ", "h": "ㄏ",
+             "j": "ㄐ", "q": "ㄑ", "x": "ㄒ", "zh": "ㄓ", "ch": "ㄔ", "sh": "ㄕ", "r": "ㄖ", "z": "ㄗ", "c": "ㄘ", "s": "ㄙ"}
+# the voice's sign for a final: (as written after a consonant, as written alone, its family)
+_FINALS = {
+    "ㄚ": ("a", "a", ""), "ㄛ": ("o", "o", ""), "ㄜ": ("e", "e", ""), "ㄞ": ("ai", "ai", ""), "ㄟ": ("ei", "ei", ""), "ㄠ": ("ao", "ao", ""),
+    "ㄡ": ("ou", "ou", ""), "ㄢ": ("an", "an", ""), "ㄣ": ("en", "en", ""), "ㄤ": ("ang", "ang", ""), "ㄥ": ("eng", "eng", ""), "ㄦ": ("er", "er", ""),
+    "ㄭ": ("i", None, "z"), "十": ("i", None, "zh"),                                    # zi ci si; zhi chi shi ri
+    "ㄧ": ("i", "yi", "i"), "压": ("ia", "ya", "i"), "ㄝ": ("ie", "ye", "i"), "要": ("iao", "yao", "i"), "又": ("iu", "you", "i"),
+    "言": ("ian", "yan", "i"), "阴": ("in", "yin", "i"), "阳": ("iang", "yang", "i"), "应": ("ing", "ying", "i"), "用": ("iong", "yong", "i"),
+    "ㄨ": ("u", "wu", "u"), "穵": ("ua", "wa", "u"), "我": ("uo", "wo", "u"), "外": ("uai", "wai", "u"), "为": ("ui", "wei", "u"),
+    "万": ("uan", "wan", "u"), "文": ("un", "wen", "u"), "王": ("uang", "wang", "u"), "中": ("ong", None, "u"), "瓮": (None, "weng", "u"),
+    "ㄩ": ("v", "yu", "v"), "月": ("ve", "yue", "v"), "元": ("van", "yuan", "v"), "云": ("vn", "yun", "v"),
+}
+
+
+def sound_tables():
+    """({pinyin without tone: the voice's signs}, {the voice's signs: pinyin}). 'v' is ü where
+    pinyin has to say so (lv, nve); after j, q and x it is written u, as in ju and xue."""
+    to_voice, to_pinyin = {}, {}
+    for sign, (after, alone, family) in _FINALS.items():
+        if alone:
+            to_voice[alone], to_pinyin[sign] = sign, alone
+        if not after:
+            continue
+        for ini, isign in _INITIALS.items():
+            hard, sib = ini in ("zh", "ch", "sh", "r"), ini in ("z", "c", "s")
+            if (family == "z" and not sib) or (family == "zh" and not hard) or (family == "i" and (hard or sib)):
+                continue
+            if ini in ("j", "q", "x"):
+                if family not in ("i", "v"):
+                    continue
+                spelled = ini + (after.replace("v", "u") if family == "v" else after)
+            elif family == "v":
+                if ini not in ("n", "l"):
+                    continue
+                spelled = ini + after
+            else:
+                spelled = ini + after
+            to_voice.setdefault(spelled, isign + " " + sign)
+            to_pinyin.setdefault(isign + " " + sign, spelled)
+    return to_voice, to_pinyin
+
+
+TO_VOICE, TO_PINYIN = sound_tables()
+
+
+def voice_signs(syllable: str):
+    """'zhang3' -> 'ㄓ ㄤ 3' (None: not a sound the voice writes)."""
+    base = TO_VOICE.get(syllable[:-1]) if syllable[-1:] in ("1", "2", "3", "4", "5") else None
+    return base + " " + syllable[-1] if base else None
+
+
+def syllables_of(signs: list):
+    """['ㄓ', 'ㄤ', '3', 'ㄓ', 'ㄜ', '5'] -> ['zhang3', 'zhe5']. None when it is not that plain:
+    a word said with the r of Beijing at its end, or a sign not in the table."""
+    out, cur = [], []
+    for t in signs:
+        if t in ("1", "2", "3", "4", "5"):
+            p = TO_PINYIN.get(" ".join(cur))
+            if not p:
+                return None
+            out.append(p + t)
+            cur = []
+        else:
+            cur.append(t)
+    return None if cur or not out else out
+
+
+def rare_characters() -> list:
+    """Characters the voice takes for Chinese (it knows no others as such) that hardly any book
+    contains: in neither of the two character sets that books in Chinese were set in."""
+    out = []
+    for cp in range(0x4E00, 0xA000):
+        ch = chr(cp)
+        try:
+            ch.encode("gb2312")
+            continue
+        except UnicodeEncodeError:
+            pass
+        try:
+            ch.encode("big5")
+            continue
+        except UnicodeEncodeError:
+            out.append(ch)
+    return out
 
 # ───────────────────────── tidy ─────────────────────────
 
@@ -150,32 +243,50 @@ class Lexicon:
     """The voice's list of words (word -> syllables), and a stand-in character for every
     syllable it can say. `words` maps a string to its list of syllables."""
 
-    def __init__(self, words: dict, syllables):
+    def __init__(self, words: dict, syllables, pool=None, write=None):
+        """words: {word: [syllables]}, or None in place of the list for a word the voice says
+            its own way and nothing here may touch. pool: the characters stand-ins are taken
+            from (private-use ones when not given). write: how a syllable is written in the
+            voice's list (as it is, when not given)."""
         self.words = words
-        self.longest = max((len(w) for w in words if HAN.search(w)), default=1)
-        self.standin, k = {}, 0
+        self.write = write or (lambda s: s)
+        self.longest = min(LONGEST_ENTRY, max((len(w) for w in words if HAN.search(w)), default=1))
+        pool = iter(pool) if pool is not None else (chr(STANDIN_BASE + k) for k in range(6400))
+        self.standin = {}
         for s in sorted(set(syllables)):
-            while chr(STANDIN_BASE + k) in words:
-                k += 1
-            self.standin[s] = chr(STANDIN_BASE + k)
-            k += 1
+            for ch in pool:
+                if ch not in words:
+                    self.standin[s] = ch
+                    break
         self.sound_of = {c: s for s, c in self.standin.items()}
 
     @classmethod
-    def read(cls, lexicon_path: str, tokens_path: str) -> "Lexicon":
+    def read(cls, lexicon_path: str) -> "Lexicon":
+        """From the voice's own list of Chinese words. The stand-ins take the place of rare
+        characters of that list (see lexicon_text)."""
         words = {}
         with open(lexicon_path, encoding="utf-8") as f:
             for ln in f:
                 p = ln.split()
-                if len(p) >= 2 and p[0] not in words:
-                    words[p[0]] = p[1:]
-        with open(tokens_path, encoding="utf-8") as f:
-            syll = [ln.split()[0] for ln in f if ln.strip() and SYLLABLE.fullmatch(ln.split()[0])]
-        return cls(words, syll)
+                if len(p) >= 2 and p[0] not in words and HAN.search(p[0]):
+                    syl = syllables_of(p[1:])
+                    words[p[0]] = syl if syl and len(syl) == len(p[0]) else None
+        in_words = {ch for w in words if len(w) > 1 for ch in w}
+        pool = [ch for ch in rare_characters() if ch not in in_words]
+        for ch in pool:
+            words.pop(ch, None)
+        return cls(words, [b + t for b in TO_VOICE for t in "12345"], pool, voice_signs)
 
     def extra_lines(self) -> str:
         """The lines to add to the voice's list so that it knows the stand-ins."""
-        return "".join(f"{c} {s}\n" for s, c in self.standin.items())
+        return "".join(f"{c} {self.write(s)}\n" for s, c in self.standin.items())
+
+    def lexicon_text(self, lexicon_path: str) -> str:
+        """The voice's list as it is given to the voice: its own lines, without those of the
+        characters that now stand in, and the stand-ins' lines after them."""
+        with open(lexicon_path, encoding="utf-8") as f:
+            kept = [ln for ln in f if ln.split()[:1] and ln.split()[0] not in self.sound_of]
+        return "".join(kept).rstrip("\n") + "\n" + self.extra_lines()
 
     def spans(self, text: str) -> list:
         """(start, end, [syllables]) for each stretch the voice reads as one entry: the
@@ -192,9 +303,9 @@ class Lexicon:
                 continue
             for size in range(min(self.longest, n - i), 0, -1):
                 w = text[i:i + size]
-                r = self.words.get(w)
-                if r is not None and len(r) == size and not any(c in self.sound_of for c in w):
-                    out.append((i, i + size, r))
+                if w in self.words and not any(c in self.sound_of for c in w):
+                    r = self.words[w]
+                    out.append((i, i + size, r if r is not None and len(r) == size else [None] * size))
                     i += size
                     break
             else:

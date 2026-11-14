@@ -1,10 +1,11 @@
 """Reading aloud with a voice of this machine's own.
 
 A browser reads with whatever voices it has: Edge has Microsoft's natural ones, Chrome on most
-systems a robot. Here the server makes the audio - a small open model on the CPU - so every
-browser, phone and television in the house hears the same voice.
+systems a robot. Here the server makes the audio - Kokoro, a small open model, on the CPU - so
+a browser, phone or television without a good voice of its own hears a natural one. It reads
+Chinese and English, each with a voice of that language.
 
-Nothing is in the image but the code. The voice (133 MB) is fetched when somebody asks for it
+Nothing is in the image but the code. The voice (365 MB) is fetched when somebody asks for it
 in Settings, the model for hard Chinese pronunciations (589 MB) only if that is asked for too;
 each file is checked against a known SHA-256 before it is used. Without the voice the readers
 go on using the browser's own, as before.
@@ -37,8 +38,27 @@ CACHE_MAX_BYTES = int(os.environ.get("TGARR_TTS_CACHE_MB", "300")) * 1024 * 1024
 IDLE_UNLOAD_S = 15 * 60
 TEXT_MAX = 600
 
-VOICE_DIR = os.path.join(MODELS, "matcha-icefall-zh-en")
-VOCODER = os.path.join(MODELS, "vocos-16khz-univ.onnx")
+VOICE_DIR = os.path.join(MODELS, "kokoro-multi-lang-v1_1")
+# Who reads: (key, what the reader's menu calls it, the model's number for the speaker). The
+# first of each is used when nothing was chosen. Of the model's hundred Chinese speakers 3-57
+# are women and 58-102 men; its English ones are three women, so a man's voice for English
+# is the Chinese one going on ("same").
+VOICES = {
+    "zh": (("f1", "Woman 1 (higher)", 3), ("f2", "Woman 2", 4), ("f3", "Woman 3 (lower)", 57),
+           ("m1", "Man 1", 58), ("m2", "Man 2 (deep)", 60), ("m3", "Man 3 (lighter)", 61)),
+    "en": (("us1", "Woman, American", 0), ("us2", "Woman, American (another)", 1), ("uk", "Woman, British", 2),
+           ("same", "The voice chosen for Chinese", None)),
+}
+_SID = {lang: {k: sid for k, _label, sid in vs} for lang, vs in VOICES.items()}
+
+
+def speaker(chinese: bool, zh: str = "", en: str = "") -> int:
+    """The model's speaker for a piece, from what the reader chose (anything else: the first)."""
+    z = _SID["zh"].get(zh, VOICES["zh"][0][2])
+    if chinese:
+        return z
+    e = _SID["en"].get(en, VOICES["en"][0][2]) if en in _SID["en"] else VOICES["en"][0][2]
+    return z if e is None else e
 G2PW_DIR = os.path.join(MODELS, "G2PWModel")
 BERT_VOCAB = os.path.join(MODELS, "bert-base-chinese-vocab.txt")
 STANDIN_LEXICON = os.path.join(MODELS, "lexicon-with-stand-ins.txt")
@@ -46,10 +66,9 @@ STANDIN_LEXICON = os.path.join(MODELS, "lexicon-with-stand-ins.txt")
 # (url, bytes, sha256, where it goes, how it is unpacked)
 FILES = {
     "voice": (
-        ("https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/matcha-icefall-zh-en.tar.bz2", 79033838,
-         "271b804af570400d3bcdcb53bf6e53cc9f75180ee763b9f13eb5eaf2b0d086ef", VOICE_DIR, "tar"),
-        ("https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/vocos-16khz-univ.onnx", 53882848,
-         "b599142a1fb8ff03de3e84ac35ff537c619e56f4267a6fe894851a42844acf9e", VOCODER, "file"),
+        # the full model: the smaller one of the same name (int8) is slower than speech on a CPU
+        ("https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2", 364855331,
+         "b78e1ac42b852e839cceaafbe88f66806bf5860992d1d7b9a3f2ad1198427aed", VOICE_DIR, "tar"),
     ),
     "pronunciation": (
         ("https://huggingface.co/YC-Chen/g2pW/resolve/main/G2PWModel-v2-onnx.zip", 589075404,
@@ -203,7 +222,7 @@ def unload() -> None:
 
 def unload_if_idle() -> None:
     """Called now and then: a model nobody has used for a quarter of an hour is let go
-    (the voice takes about 300 MB of memory, the pronunciation model about a gigabyte)."""
+    (the voice takes about 600 MB of memory, the pronunciation model about a gigabyte)."""
     if _engine["tts"] is not None and time.time() - _engine["used"] > IDLE_UNLOAD_S:
         unload()
         log.info("[tts] voice put away after a quarter of an hour unused")
@@ -214,17 +233,19 @@ def _load(pronunciation: bool) -> None:
     key = "p" if (pronunciation and installed("pronunciation")) else "-"
     if _engine["tts"] is not None and _engine["key"] == key:
         return
-    lex = tts_text.Lexicon.read(os.path.join(VOICE_DIR, "lexicon.txt"), os.path.join(VOICE_DIR, "tokens.txt"))
-    with open(os.path.join(VOICE_DIR, "lexicon.txt"), encoding="utf-8") as f, open(STANDIN_LEXICON + ".new", "w", encoding="utf-8") as g:
-        g.write(f.read().rstrip("\n") + "\n" + lex.extra_lines())
+    zh = os.path.join(VOICE_DIR, "lexicon-zh.txt")
+    lex = tts_text.Lexicon.read(zh)
+    with open(STANDIN_LEXICON + ".new", "w", encoding="utf-8") as g:
+        g.write(lex.lexicon_text(zh))
     os.replace(STANDIN_LEXICON + ".new", STANDIN_LEXICON)
     rule = ",".join(p for p in (os.path.join(VOICE_DIR, n) for n in ("phone-zh.fst", "date-zh.fst", "number-zh.fst")) if os.path.exists(p))
     threads = max(1, min(4, (os.cpu_count() or 2) - 1))
     cfg = sherpa_onnx.OfflineTtsConfig(
         model=sherpa_onnx.OfflineTtsModelConfig(
-            matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
-                acoustic_model=os.path.join(VOICE_DIR, "model-steps-3.onnx"), vocoder=VOCODER, lexicon=STANDIN_LEXICON,
-                tokens=os.path.join(VOICE_DIR, "tokens.txt"), data_dir=os.path.join(VOICE_DIR, "espeak-ng-data")),
+            kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
+                model=os.path.join(VOICE_DIR, "model.onnx"), voices=os.path.join(VOICE_DIR, "voices.bin"),
+                tokens=os.path.join(VOICE_DIR, "tokens.txt"), lexicon=os.path.join(VOICE_DIR, "lexicon-us-en.txt") + "," + STANDIN_LEXICON,
+                data_dir=os.path.join(VOICE_DIR, "espeak-ng-data"), dict_dir=os.path.join(VOICE_DIR, "dict")),
             num_threads=threads, provider="cpu"),
         rule_fsts=rule, max_num_sentences=1)
     t = time.time()
@@ -276,20 +297,21 @@ def _wav(samples, rate: int) -> bytes:
     return buf.getvalue()
 
 
-def _cache_path(text: str, key: str) -> str:
-    h = hashlib.sha1(("v1|" + key + "|" + text).encode("utf-8")).hexdigest()
+def _cache_path(text: str, key: str, sid: int) -> str:
+    h = hashlib.sha1(("k1|" + key + "|" + str(sid) + "|" + text).encode("utf-8")).hexdigest()
     return os.path.join(CACHE, h[:2], h + ".wav")
 
 
-def say(text: str, pronunciation: bool = True) -> bytes:
-    """The text as a WAV (16 kHz, one channel). Raises RuntimeError when it cannot be said."""
+def say(text: str, pronunciation: bool = True, zh: str = "", en: str = "") -> bytes:
+    """The text as a WAV (24 kHz, one channel). Raises RuntimeError when it cannot be said."""
     text = (text or "").strip()[:TEXT_MAX]
     if not text:
         raise RuntimeError("nothing to say")
     if not available():
         raise RuntimeError("no voice is installed")
     key = "p" if (pronunciation and installed("pronunciation")) else "-"
-    path = _cache_path(text, key)
+    sid = speaker(bool(tts_text.HAN.search(text)), zh, en)
+    path = _cache_path(text, key, sid)
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -304,7 +326,7 @@ def say(text: str, pronunciation: bool = True) -> bytes:
         prepared = tts_text.prepare(text, e["lex"], e["words"], _model_of(e["lex"], e["reader"]))
         if not prepared:
             raise RuntimeError("nothing in it to say")
-        audio = e["tts"].generate(prepared, sid=0, speed=1.0)
+        audio = e["tts"].generate(prepared, sid=sid, speed=1.0)
         if len(audio.samples) < audio.sample_rate // 20:
             raise RuntimeError("the voice made no sound for this")
         data = _wav(audio.samples, audio.sample_rate)
