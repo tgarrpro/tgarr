@@ -111,6 +111,18 @@ class NNTP:
                 continue
         return rows
 
+    def body(self, message_id):
+        """An article's body as lines (without line ends); None when the server has it no more."""
+        mid = str(message_id).strip().strip("<>")
+        if not mid or any(c.isspace() or c in "<>" for c in mid):
+            return None
+        code, _text = self.cmd(f"BODY <{mid}>")
+        if code in (420, 423, 430):
+            return None
+        if code != 222:
+            raise NNTPError(f"BODY {code}")
+        return self._multiline()
+
     def stat(self, message_id) -> bool:
         """Does the server still hold this article? Nothing is downloaded."""
         code, _ = self.cmd(f"STAT {message_id}")

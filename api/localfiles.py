@@ -96,7 +96,7 @@ def unique_id(rel: str) -> str:
 
 
 def title(root: str) -> str:
-    return "My files" if root == MINE else root
+    return {MINE: "My files", "usenet": "From Usenet", "usenet18": "From Usenet (18+)"}.get(root, root)
 
 
 def orphans(files, known, sidecars) -> list:

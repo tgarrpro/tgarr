@@ -457,6 +457,8 @@ import usenet  # local module
 import usenet_scan  # local module
 import usenet_client  # local module
 import usenet_rules  # local module
+import usenet_fetch  # local module
+import usenet_judge  # local module
 import tts  # local module
 import vision  # local module
 
@@ -651,6 +653,7 @@ async def _startup():
     asyncio.create_task(_cache_gc_worker())
     asyncio.create_task(_tts_housekeeping())
     asyncio.create_task(_vision_worker())
+    asyncio.create_task(_usenet_grab_worker())
     asyncio.create_task(_update_check_worker())
 
 
@@ -1001,6 +1004,12 @@ async def _migrate_schema():
             ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS detail SMALLINT NOT NULL DEFAULT 1;
             -- 'nsfw' for adult material (usenet_rules): left out of the feed unless adult content is switched on
             ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'sfw';
+            -- small things fetched from Usenet by tgarr itself (usenet_fetch.py): one row per asking
+            CREATE TABLE IF NOT EXISTS usenet_grabs (
+              id SERIAL PRIMARY KEY, card_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT,
+              state TEXT NOT NULL DEFAULT 'queued', note TEXT, files INT, bytes BIGINT, msg_id BIGINT,
+              added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), done_at TIMESTAMPTZ
+            );
             CREATE TABLE IF NOT EXISTS usenet_progress (
               grp TEXT PRIMARY KEY, first_article BIGINT, last_article BIGINT, next_article BIGINT,
               headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
@@ -6422,6 +6431,7 @@ NAV_ITEMS = [
     ("/music",     "Music",     "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"),
     ("/library",   "Library",   "M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 18H6V4h7v6l2-1 2 1V4h1v16z"),
     ("/downloads", "Downloads", "M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"),
+    ("/usenet",    "Usenet",    "M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z"),
     ("/files",     "My files",  "M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"),
     # /system page still accessible by URL, just hidden from nav (admin only).
     ("/search",    "Search",    "M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
@@ -8991,6 +9001,300 @@ async def _usenet_from_registry(q: str) -> int:
     return await _usenet_keep([c for c in cards if c.get("art_lo") and c.get("grp")])
 
 
+# ════════════════════════════════════════════════════════════════════
+# Small things fetched from Usenet by tgarr itself (usenet_fetch.py)
+#
+# A book, a song, a picture that was posted whole: fetched part by part, checked, and put
+# in a folder of this machine that is one more "chat" (as My files is), so the Library,
+# Music, the Gallery, the search and the Media Center show it like anything else. Never
+# video, nothing packed, never a program. One asking at a time, over at most four
+# connections; the reading of the index stands aside meanwhile. Adult cards go to a
+# folder of their own that is labelled 18+.
+# ════════════════════════════════════════════════════════════════════
+USENET_ROOT, USENET_ROOT_ADULT = "usenet", "usenet18"
+_UN_GRAB_KINDS = ("ebook", "audio", "photo")
+_UN_FOLDER = {"ebook": "books", "audio": "music", "photo": "pictures"}
+_UN_GRAB = {"now": None, "bytes": 0, "of": 0}
+
+
+def _usenet_grab_files(cfg: dict, take: list, folder: str, progress) -> list:
+    """In a thread: the files of one release over up to four connections.
+    [(path, size)] of those that arrived whole."""
+    import queue
+    import threading
+    todo = queue.Queue()
+    for f in take:
+        todo.put(dict(f, tries=0))
+    done, names, lock = [], set(), threading.Lock()
+
+    def work():
+        try:
+            nn = _usenet_connect(cfg)
+        except Exception:
+            return
+        try:
+            while True:
+                try:
+                    f = todo.get_nowait()
+                except queue.Empty:
+                    return
+                with lock:
+                    name = localfiles.free_name(lambda x: x in names or os.path.exists(os.path.join(folder, x)),
+                                                localfiles.safe_name(f["name"]))
+                    names.add(name)
+                try:
+                    got = usenet_fetch.fetch_file(nn.body, f, os.path.join(folder, name), progress)
+                    with lock:
+                        done.append((os.path.join(folder, name), got["size"]))
+                except usenet_fetch.Missing:
+                    pass
+                except (usenet.NNTPError, OSError):
+                    if f["tries"] < 2:             # the connection went: another one takes the file
+                        todo.put(dict(f, tries=f["tries"] + 1))
+                    return
+        finally:
+            nn.quit()
+    for round_ in range(3):                        # a connection that went leaves its file for the next round
+        if todo.empty():
+            break
+        threads = [threading.Thread(target=work, daemon=True) for _ in range(max(1, min(4, todo.qsize())))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    return done
+
+
+async def _usenet_grab_one(job) -> tuple:
+    """(state, note, files, bytes, message id of the first file)."""
+    import collections
+    import shutil
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow("SELECT * FROM usenet_cards WHERE id = $1", job["card_id"])
+    if (not c or c["kind"] not in _UN_GRAB_KINDS or CSAM_RX.search(c["name"])
+            or usenet_rules.forbidden({"name": c["name"], "groups": [c["grp"]], "audience": c["audience"]})):
+        return "failed", "it is no longer in the index", 0, 0, None
+    cfg = await _usenet_cfg()
+    base = None
+    _UN_INDEX["nzb"] += 1                          # the index reading stands aside meanwhile
+    try:
+        if c["sketch"]:
+            got = await asyncio.to_thread(
+                usenet_scan.rebuild, cfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
+                6000 if c["detail"] == 0 else 2000, c["name"], 4)
+            text = got["nzb"]
+        else:
+            text = await asyncio.to_thread(_usenet_nzb, cfg, c)
+        if not text:
+            return "failed", "it is no longer on the news server", 0, 0, None
+        p = usenet_fetch.plan(usenet_fetch.parse_nzb(text))
+        take = [f for f in p["take"] if not usenet_judge.is_program(f["name"]) and not CSAM_RX.search(f["name"])]
+        if not take:
+            return "failed", p["why"] or "nothing in it that can be opened as it is", 0, 0, None
+        want = int(sum(f["bytes"] for f in take) * 0.97)
+        if want > shutil.disk_usage("/downloads").free - (1 << 30):
+            return "failed", "not enough room left on the disk", 0, 0, None
+        adult = c["audience"] == "nsfw"
+        root = USENET_ROOT_ADULT if adult else USENET_ROOT
+        kind = collections.Counter(f["kind"] for f in take).most_common(1)[0][0]
+        base = f"/downloads/{root}/{_UN_FOLDER[kind]}"
+        os.makedirs(base, exist_ok=True)
+        if len(take) > 1:                          # an album, a set of pictures: a folder of its own
+            base = os.path.join(base, localfiles.free_name(lambda x: os.path.exists(os.path.join(base, x)),
+                                                           localfiles.safe_name(c["name"])[:120].strip(" .") or "release"))
+            os.makedirs(base, exist_ok=True)
+        _UN_GRAB.update(now=job["id"], bytes=0, of=want)
+
+        def progress(n):
+            _UN_GRAB["bytes"] += n
+        done = await asyncio.to_thread(_usenet_grab_files, cfg, take, base, progress)
+    finally:
+        _UN_INDEX["nzb"] -= 1
+        _UN_GRAB["now"] = None
+    if not done:
+        if len(take) > 1:
+            try:
+                os.rmdir(base)
+            except OSError:
+                pass
+        return "failed", "it is no longer whole on the news server", 0, 0, None
+    now = int(time.time())
+    rels = [(os.path.relpath(path, "/downloads").replace(os.sep, "/"), size, now) for path, size in sorted(done)]
+    async with db_pool.acquire() as conn:
+        await _local_add(conn, root, rels)
+        if adult:
+            await conn.execute("UPDATE channels SET audience = 'nsfw', audience_manual = TRUE WHERE tg_chat_id = $1",
+                               localfiles.chat_id(root))
+        mid = await conn.fetchval("SELECT id FROM messages WHERE local_path = $1 ORDER BY id DESC LIMIT 1", rels[0][0])
+    whole = len(done) == len(take)
+    return ("done" if whole else "partial", "" if whole else f"{len(done)} of {len(take)} files arrived whole",
+            len(done), sum(sz for _p, sz in done), mid)
+
+
+async def _usenet_grab_worker():
+    await asyncio.sleep(40)
+    try:
+        async with db_pool.acquire() as conn:      # what a restart interrupted starts over
+            await conn.execute("UPDATE usenet_grabs SET state = 'queued' WHERE state = 'working'")
+    except Exception:
+        pass
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                job = await conn.fetchrow(
+                    """UPDATE usenet_grabs SET state = 'working' WHERE id =
+                       (SELECT id FROM usenet_grabs WHERE state = 'queued' ORDER BY id LIMIT 1) RETURNING *""")
+            if not job:
+                await asyncio.sleep(3)
+                continue
+            try:
+                res = await _usenet_grab_one(job)
+            except Exception as e:
+                log.warning("[usenet] fetching %s: %s: %s", job["card_id"], type(e).__name__, str(e)[:160])
+                _USENET.update(ok=None)
+                res = ("failed", "the news server did not answer - try again later", 0, 0, None)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE usenet_grabs SET state = $2, note = $3, files = $4, bytes = $5, msg_id = $6, done_at = NOW() WHERE id = $1",
+                    job["id"], *res)
+            log.info("[usenet] fetched %s (%s): %s%s, %s file(s), %s", job["card_id"], job["name"][:60], res[0],
+                     f" - {res[1]}" if res[1] else "", res[2], _fmt_size(res[3]) or "0")
+        except Exception as e:
+            log.warning("[usenet] the fetching: %s: %s", type(e).__name__, str(e)[:160])
+            await asyncio.sleep(20)
+
+
+@app.post("/api/usenet/grab")
+async def api_usenet_grab(request: Request):
+    def no(msg, code=400):
+        return JSONResponse({"status": "error", "message": msg}, status_code=code)
+    try:
+        cid = str((await request.json()).get("id") or "")
+    except Exception:
+        cid = ""
+    if not re.fullmatch(r"[0-9a-f]{20}", cid):
+        return no("which one?")
+    if not await _usenet_ready():
+        return no("Usenet is switched off or the news server is not answering", 503)
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow("SELECT id, name, kind, size, grp, audience FROM usenet_cards WHERE id = $1", cid)
+        if not c or CSAM_RX.search(c["name"]) or usenet_rules.forbidden({"name": c["name"], "groups": [c["grp"]], "audience": c["audience"]}):
+            return no("no such item", 404)
+        if c["kind"] not in _UN_GRAB_KINDS:
+            return no("tgarr fetches only books, songs and pictures itself - video goes to Sonarr or Radarr")
+        if c["audience"] == "nsfw" and not await _is_nsfw_enabled():
+            return no("no such item", 404)
+        if (c["size"] or 0) > usenet_fetch.MOST_ALL:
+            return no("too large to fetch here")
+        had = await conn.fetchrow("SELECT id, state FROM usenet_grabs WHERE card_id = $1 AND state IN ('queued', 'working', 'done') ORDER BY id DESC LIMIT 1", cid)
+        if had:
+            return {"status": "ok", "job": had["id"], "state": had["state"]}
+        job = await conn.fetchval("INSERT INTO usenet_grabs (card_id, name, kind) VALUES ($1, $2, $3) RETURNING id", cid, c["name"], c["kind"])
+    return {"status": "ok", "job": job, "state": "queued"}
+
+
+@app.get("/api/usenet/grabs")
+async def api_usenet_grabs():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, card_id, name, kind, state, note, files, bytes, msg_id FROM usenet_grabs ORDER BY id DESC LIMIT 60")
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d["state"] == "working" and _UN_GRAB["now"] == d["id"] and _UN_GRAB["of"]:
+            d["percent"] = min(99, int(_UN_GRAB["bytes"] * 100 / _UN_GRAB["of"]))
+        out.append(d)
+    return {"grabs": out}
+
+
+@app.get("/usenet", response_class=HTMLResponse)
+async def page_usenet(q: Optional[str] = None, kind: str = ""):
+    cfg = await _usenet_cfg()
+    if not (cfg.get("enabled") and cfg.get("host")):
+        body = (_KIDS_CSS + '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">Usenet is not set up</h3>'
+                '<p style="color:var(--muted);margin:0 0 12px">With a Usenet account tgarr reads the newsgroups as well: films and series '
+                'for Sonarr and Radarr, and books, songs and pictures it can fetch itself, straight into the Library, Music and the Gallery.</p>'
+                '<a class="btn" href="/settings/usenet">Set up</a></div></div>')
+        return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=""))
+    kind = kind if kind in _UN_GRAB_KINDS else ""
+    q = (q or "").strip()
+    if q:
+        await _usenet_from_registry(q)
+    where = ["c.alive >= 0.5", "c.kind = ANY($1::text[])", "COALESCE(c.size, 0) <= $2"]
+    params = [[kind] if kind else list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL]
+    if not await _is_nsfw_enabled():
+        where.append("c.audience <> 'nsfw'")
+    for w in re.split(r"[\s.]+", q)[:8]:
+        if w:
+            params.append("%" + w.replace("%", "").replace("_", r"\_") + "%")
+            where.append(f"c.name ILIKE ${len(params)}")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT c.id, c.name, c.kind, c.size, c.grp, c.posted_from, c.files, c.audience
+                FROM usenet_cards c WHERE {' AND '.join(where)}
+                ORDER BY c.posted_from DESC NULLS LAST LIMIT 150""", *params)
+        counts = dict(await conn.fetch(
+            "SELECT kind, count(*) FROM usenet_cards WHERE alive >= 0.5 AND kind = ANY($1::text[]) AND COALESCE(size, 0) <= $2 GROUP BY 1",
+            list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL))
+    ico = {"ebook": "📖", "audio": "🎵", "photo": "🖼"}
+    qs = f"&q={_q(q)}" if q else ""
+    chips = "".join(
+        f'<a class="btn ghost km-chip{" on" if k == kind else ""}" href="/usenet?kind={k}{qs}">{lbl} <span style="opacity:.6">{n:,}</span></a>'
+        for k, lbl, n in (("", "All", sum(counts.values())), ("ebook", "📖 Books", counts.get("ebook", 0)),
+                          ("audio", "🎵 Music", counts.get("audio", 0)), ("photo", "🖼 Pictures", counts.get("photo", 0))))
+    items = "".join(
+        f'<div class="km-row"><span class="n">{ico.get(r["kind"], "")} {html.escape(r["name"])}'
+        + (' <small>· 18+</small>' if r["audience"] == "nsfw" else "")
+        + f'<br/><small>{_fmt_size(r["size"]) or "?"}'
+        + (f' · {r["files"]} files' if (r["files"] or 0) > 1 else "")
+        + f' · {html.escape(r["grp"])} · {time.strftime("%Y-%m-%d", time.gmtime(r["posted_from"] or 0))}</small></span>'
+        f'<span id="ug-{r["id"]}" style="white-space:nowrap"><button class="btn" onclick="ugGet(&quot;{r["id"]}&quot;,this)">Get</button></span></div>'
+        for r in rows)
+    body = (
+        _KIDS_CSS
+        + '<p style="color:var(--muted);margin:0 0 14px">Books, songs and pictures found in the newsgroups. <b>Get</b> fetches one through your '
+          'Usenet account and puts it in the Library, Music or the Gallery. Only what was posted whole and can be opened as it is: nothing '
+          'packed, never a program, never video - films and series go to Sonarr and Radarr.</p>'
+        + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}</div>'
+        + (f'<div class="km-box">{items}</div>' if items else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
+           + ("Nothing found for these words." if q else "Nothing yet. Cards appear here as the newsgroups are read; searching also asks the shared index.")
+           + '</div></div>')
+        + """<script>
+const ugEsc = t => String(t || "").replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
+function ugShow(g){
+  const e = document.getElementById("ug-" + g.card_id);
+  if (!e) return false;
+  const again = '<button class="btn ghost" onclick="ugGet(&quot;' + g.card_id + '&quot;,this)">Try again</button>';
+  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">Open</a>' : "";
+  if (g.state === "queued") e.innerHTML = '<small>waiting</small>';
+  else if (g.state === "working") e.innerHTML = '<small>fetching' + (g.percent != null ? " " + g.percent + "%" : "") + '</small>';
+  else if (g.state === "done") e.innerHTML = '<small>fetched</small> ' + open;
+  else if (g.state === "partial") e.innerHTML = '<small>' + ugEsc(g.note) + '</small> ' + open;
+  else e.innerHTML = '<small style="color:#b45309">' + ugEsc(g.note || "that did not work") + '</small> ' + again;
+  return g.state === "queued" || g.state === "working";
+}
+function ugPoll(){
+  fetch("/api/usenet/grabs").then(r => r.json()).then(j => {
+    const seen = new Set(); let busy = false;
+    (j.grabs || []).forEach(g => { if (seen.has(g.card_id)) return; seen.add(g.card_id); if (ugShow(g)) busy = true; });
+    if (busy) setTimeout(ugPoll, 2500);
+  }).catch(() => setTimeout(ugPoll, 8000));
+}
+function ugGet(id, b){
+  b.disabled = true;
+  fetch("/api/usenet/grab", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: id})})
+    .then(r => r.json()).then(j => { if (j.status === "ok") ugPoll(); else { b.disabled = false; alert(j.message || "that did not work"); } })
+    .catch(() => { b.disabled = false; });
+}
+ugPoll();
+</script>""")
+    top = ('<form action="/usenet" method="GET" style="margin-left:auto">'
+           + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else "")
+           + f'<input type="text" name="q" class="search" placeholder="Search books, songs, pictures on Usenet…" value="{html.escape(q, quote=True)}"/></form>')
+    return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=top))
+
+
 @app.get("/api/usenet/index")
 async def api_usenet_index():
     """What the index worker is doing (for looking; there is nothing to switch)."""
@@ -9467,7 +9771,7 @@ async def page_settings_usenet(request: Request):
 <label class="un-sw" title="switch Usenet on or off"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""} onchange="unToggle(this)"/><span></span><b>{"On" if cfg.get("enabled") else "Off"}</b></label></div>
 <p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
 card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
-tgarr does not download from Usenet itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet).</p>
+Films and series are never downloaded by tgarr itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet). Small things posted whole - a book, a song, a picture - tgarr fetches itself, on the <a href="/usenet">Usenet</a> page.</p>
 <p style="color:var(--muted);margin:6px 0 4px">Newsgroups hold fifteen years of posts, far more than one account reads in a lifetime, so the
 reading is shared, as it is for Telegram: tgarr.me hands every install a different stretch of a group, takes back the cards found
 there - a name, who posted it, where it lies - and a search here also finds what the others found. No file, no NZB and nothing
