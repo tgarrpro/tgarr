@@ -1707,6 +1707,10 @@ async def serve_media(msg_id: int, request: Request):
 # Only these three folders are touched - never what Sonarr/Radarr grabbed.
 # ════════════════════════════════════════════════════════════════════
 _CACHE_PREFIXES = ("video/", "audio/", "library/")
+# What was fetched from Usenet takes room the same way and is held to the same two rules -
+# with one difference: there is no index entry to keep (the card on the Usenet page is the
+# way back, for as long as the post lasts), so the item goes with its file.
+_FETCHED_PREFIXES = ("usenet/", "usenet18/")
 _CACHE_SIDECARS = ("", ".tail", ".pdf", ".cover.jpg", ".queue", ".pdf.inprogress.pdf")
 _LOCAL_SQL = "(m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__')"
 # What makes a sound file an audiobook. Not its length: an hour is as often a DJ set (of
@@ -1839,8 +1843,10 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
     items, lost, partial = [], [], []
     for r in rows:
         lp = r["local_path"]
-        if not lp.startswith(_CACHE_PREFIXES) or ".." in lp:
+        if not lp.startswith(_CACHE_PREFIXES + _FETCHED_PREFIXES) or ".." in lp:
             continue
+        if clear_all and lp.startswith(_FETCHED_PREFIXES):
+            continue                        # "remove all downloaded files" is about Telegram; Usenet has its own button
         st = await asyncio.to_thread(_cache_stat, lp)
         if st is None:
             lost.append(lp)                 # the file is gone: forget the path
@@ -1881,13 +1887,50 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
         await asyncio.to_thread(_cache_unlink, lp)
         freed += size
     gone = [x[2] for x in doomed] + lost
+    fetched = [x for x in gone if x.startswith(_FETCHED_PREFIXES)]
+    gone = [x for x in gone if not x.startswith(_FETCHED_PREFIXES)]
     if gone:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE messages SET local_path = NULL, local_accessed_at = NULL "
                 "WHERE local_path = ANY($1::text[])", gone)
+    if fetched:
+        await _fetched_forget(fetched)
     n_orphan, freed_orphan = await _cache_orphan_sweep(180 if clear_all else 3600)
     return len(doomed) + n_orphan, freed + freed_orphan
+
+
+def _fetched_unlink(paths: list) -> None:
+    """In a thread: the files, what stands beside them, and the folders left empty."""
+    folders = set()
+    for lp in paths:
+        if ".." in lp or not lp.startswith(_FETCHED_PREFIXES):
+            continue
+        _cache_unlink(lp)
+        folders.add(os.path.dirname(os.path.join("/downloads", lp)))
+    for d in sorted(folders, key=len, reverse=True):
+        try:
+            os.rmdir(d)                     # only when nothing is left in it
+        except OSError:
+            pass
+
+
+async def _fetched_forget(paths: list) -> None:
+    """Files fetched from Usenet leave: the disk, the library, and the note of the fetch
+    (so that the Usenet page offers Get again rather than a dead "Open")."""
+    await asyncio.to_thread(_fetched_unlink, paths)
+    async with db_pool.acquire() as conn:
+        ids = [r["id"] for r in await conn.fetch("SELECT id FROM messages WHERE local_path = ANY($1::text[])", paths)]
+        if ids:
+            await conn.execute("DELETE FROM downloads WHERE release_id IN "
+                               "(SELECT id FROM releases WHERE primary_msg_id = ANY($1::bigint[]))", ids)
+            await conn.execute("DELETE FROM releases WHERE primary_msg_id = ANY($1::bigint[])", ids)
+            await conn.execute("DELETE FROM favorites WHERE msg_id = ANY($1::bigint[])", ids)
+            await conn.execute("DELETE FROM messages WHERE id = ANY($1::bigint[])", ids)
+        if await conn.fetchval("SELECT to_regclass('usenet_grabs') IS NOT NULL"):
+            await conn.execute("""DELETE FROM usenet_grabs g WHERE g.state IN ('done', 'partial')
+                                  AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = g.msg_id)""")
+    _KID_OK.clear()
 
 
 def _cache_listing() -> list:
@@ -2470,6 +2513,15 @@ async def settings_cache(ttl_days: str = Form("30"), max_gb: str = Form("50")):
             await conn.execute(
                 """INSERT INTO config (key, value) VALUES ($1, $2)
                    ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()""", k, v)
+
+    async def _now():                       # the new rules count from now, not from the next hour
+        try:
+            n, freed = await _cache_sweep()
+            if n:
+                log.info("[cache] removed %d downloaded file(s) under the new rules, freed %s", n, _fmt_size(freed))
+        except Exception as e:
+            log.warning("[cache] sweep failed: %s", e)
+    asyncio.create_task(_now())
     return RedirectResponse("/settings#cache", status_code=302)
 
 
@@ -9515,6 +9567,8 @@ async def page_usenet(q: Optional[str] = None, kind: str = ""):
                 'for Sonarr and Radarr, and books, songs and pictures it can fetch itself, straight into the Library, Music and the Gallery.</p>'
                 '<a class="btn" href="/settings/usenet">Set up</a></div></div>')
         return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=""))
+    if kind == "have":
+        return await _usenet_have_page()
     kind = kind if kind in [s[0] for s in _UN_SHELVES] else ""
     q = (q or "").strip()
     if q:
@@ -9538,11 +9592,16 @@ async def page_usenet(q: Optional[str] = None, kind: str = ""):
                 ORDER BY c.posted_from DESC NULLS LAST LIMIT 150""", *params)
         counts = dict(await conn.fetch(
             f"SELECT ({_UN_SHELF_SQL}), count(*) FROM usenet_cards c WHERE {counted} GROUP BY 1", list(_UN_GRAB_KINDS), usenet_fetch.MOST_ALL))
+        have_bytes = await conn.fetchval(
+            f"""SELECT COALESCE(sum(m.file_size), 0) FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE {_FROM_USENET} AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'""")
     ico = {s[0]: s[1] for s in _UN_SHELVES}
     qs = f"&q={_q(q)}" if q else ""
     chips = "".join(
         f'<a class="btn ghost km-chip{" on" if k == kind else ""}" href="/usenet?kind={k}{qs}">{lbl} <span style="opacity:.6">{n:,}</span></a>'
         for k, lbl, n in [("", "All", sum(counts.values()))] + [(s[0], f"{s[1]} {s[2]}", counts.get(s[0], 0)) for s in _UN_SHELVES])
+    chips += ('<a class="btn ghost km-chip" href="/usenet?kind=have" style="margin-left:auto" '
+              f'title="what you fetched, and the room it takes">📥 Fetched <span style="opacity:.6">{_fmt_size(have_bytes) or "0"}</span></a>')
     items = "".join(
         f'<div class="km-row"><span class="n">{ico.get(r["shelf"], "")} {html.escape(r["name"])}'
         + (' <small>· 18+</small>' if r["audience"] == "nsfw" else "")
@@ -9598,6 +9657,89 @@ ugPoll();
            + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else "")
            + f'<input type="text" name="q" class="search" placeholder="Search books, songs, pictures on Usenet…" value="{html.escape(q, quote=True)}"/></form>')
     return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=top))
+
+
+@app.post("/api/usenet/forget")
+async def api_usenet_forget(request: Request):
+    """Remove what was fetched: {"release": key} one release, {"grp": newsgroup} all that
+    came from one newsgroup, {"all": true} everything. Files, library entries, the lot."""
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    cond, params = None, []
+    if b.get("all") is True:
+        cond = "TRUE"
+    elif isinstance(b.get("grp"), str) and b["grp"].strip():
+        cond, params = "m.usenet_grp = $1", [b["grp"].strip()[:200]]
+    elif isinstance(b.get("release"), str) and re.fullmatch(r"[0-9a-f]{32}", b["release"]):
+        cond, params = "md5(COALESCE(m.caption, m.local_path)) = $1", [b["release"]]
+    if not cond:
+        return JSONResponse({"status": "error", "message": "what to remove?"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT m.local_path, COALESCE(m.file_size, 0) AS sz FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE {_FROM_USENET} AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__' AND {cond}""", *params)
+    paths = [r["local_path"] for r in rows if r["local_path"].startswith(_FETCHED_PREFIXES)]
+    if paths:
+        await _fetched_forget(paths)
+        log.info("[usenet] removed by hand: %d file(s), %s", len(paths), _fmt_size(sum(r["sz"] for r in rows)) or "0")
+    return {"status": "ok", "removed": len(paths), "freed": _fmt_size(sum(r["sz"] for r in rows)) or "0 MB"}
+
+
+_UN_FORGET_JS = """<script>
+function ugForget(body, what, b){
+  if (!confirm("Remove " + what + " from this server? The files are deleted; they can be fetched again only while the post is still on Usenet.")) return;
+  if (b) b.disabled = true;
+  fetch("/api/usenet/forget", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "that did not work"); } })
+    .catch(() => { if (b) b.disabled = false; });
+}
+</script>"""
+
+
+async def _usenet_have_page() -> HTMLResponse:
+    """What was fetched, release by release, with the room each takes - and the way to
+    remove one, or all."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT md5(COALESCE(m.caption, m.local_path)) AS key, max(m.caption) AS cap, max(m.usenet_grp) AS grp,
+                       count(*) AS files, sum(COALESCE(m.file_size, 0)) AS bytes, min(m.id) AS first,
+                       max(m.local_accessed_at) AS used, max(m.posted_at) AS fetched, min(m.local_path) AS path,
+                       bool_or(EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)) AS fav
+                FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE {_FROM_USENET} AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
+                GROUP BY 1 ORDER BY max(m.id) DESC LIMIT 500""")
+    ttl_days, max_gb = await _cache_settings()
+    total = sum(r["bytes"] for r in rows)
+    items = "".join(
+        f'<div class="km-row"><span class="n">{html.escape((r["cap"] or "").split(" · ")[0] or os.path.basename(r["path"]))}'
+        + (' <small>· ♥ kept</small>' if r["fav"] else "")
+        + f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {r["files"]} file{"s" if r["files"] != 1 else ""}'
+        + (f' · {html.escape(r["grp"])}' if r["grp"] else "")
+        + f' · fetched {_ago(r["fetched"])}' + (f' · opened {_ago(r["used"])}' if r["used"] else ' · not opened yet')
+        + '</small></span><span style="white-space:nowrap">'
+        f'<a class="btn ghost" href="/watch/{r["first"]}">Open</a> '
+        f'<button class="btn ghost" onclick="ugForget({{release:&quot;{r["key"]}&quot;}},&quot;this release&quot;,this)">Delete</button></span></div>'
+        for r in rows)
+    rule = " and ".join(x for x in ((f"a file not opened for {ttl_days:g} days is removed" if ttl_days else ""),
+                                    (f"everything tgarr downloaded is kept under {max_gb:g} GB, the least recently opened going first" if max_gb else "")) if x)
+    body = (
+        _KIDS_CSS
+        + f'<p style="color:var(--muted);margin:0 0 14px">What you fetched from Usenet: <b>{len(rows):,}</b> release{"s" if len(rows) != 1 else ""}, '
+          f'<b>{_fmt_size(total) or "0 MB"}</b>. '
+        + (f'tgarr tidies up by itself: {rule}. A favourite (♥) is never removed that way. ' if rule else
+           'Nothing is removed automatically. ')
+        + '<a href="/settings#cache">Change the rules</a>.</p>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+        '<a class="btn ghost km-chip" href="/usenet">← Find more</a>'
+        + ('<button class="btn ghost" style="margin-left:auto" onclick="ugForget({all:true},&quot;everything fetched from Usenet&quot;,this)">'
+           f'🗑 Delete all ({_fmt_size(total) or "0"})</button>' if rows else "")
+        + '</div>'
+        + (f'<div class="km-box">{items}</div>' if items else
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing fetched yet.</div></div>')
+        + _UN_FORGET_JS)
+    return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Fetched from Usenet", top_actions_html=""))
 
 
 @app.get("/api/usenet/index")
@@ -11167,6 +11309,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
                        "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
            else _export_btn({"scope": "private", "kind": "photo"}, "⬇ Download all") if (private and _in)
+           else ('<button class="btn ghost" style="padding:5px 12px;font-size:12px" '
+                 f'onclick="ugForget({{grp:{html.escape(_json.dumps(grp), quote=True)}}},&quot;everything fetched from this newsgroup&quot;,this)">'
+                 '🗑 Delete this newsgroup</button>' + _UN_FORGET_JS) if grp
+           else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 Manage…</a>' if usenet
            else "")
         + (('<span class="sep"></span>'
             + _chip_link("all", "/gallery" + _gqs(rate=None, offset=None), not rate)
@@ -13458,7 +13604,10 @@ async def page_settings(request: Request):
         Now on disk: {cache_detail}.<br/>
         tgarr tidies up by itself: a file nobody opened for a while is removed
         (it stays in the index; opening it again fetches it again). Files
-        grabbed through Sonarr/Radarr are never touched.
+        grabbed through Sonarr/Radarr are never touched.<br/>
+        What you fetched from <a href="/usenet?kind=have">Usenet</a> is held to the same two rules. It does
+        not stay in the index: once removed it has to be fetched again from the Usenet page, for as long as
+        the post lasts. A favourite is never removed by these rules.
       </div>
       <form method="POST" action="/api/settings/cache" style="margin-top:12px;font-size:14px;line-height:2.2">
         Remove a file not opened for
@@ -13469,7 +13618,7 @@ async def page_settings(request: Request):
         <button class="btn" type="submit" style="margin-left:8px">Save</button>
       </form>
       <form method="POST" action="/api/settings/cache_clear" style="margin-top:6px"
-            onsubmit="return confirm('Remove every downloaded film, song and book from this server? They stay in the index and can be fetched again.')">
+            onsubmit="return confirm('Remove every film, song and book downloaded from Telegram from this server? They stay in the index and can be fetched again. What was fetched from Usenet is not touched - it is removed on the Usenet page.')">
         <button class="ghost" type="submit">Remove all downloaded files now</button>
       </form>
     </div>
