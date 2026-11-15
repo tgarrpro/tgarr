@@ -197,11 +197,14 @@ if ($lan -match '^(y|yes)$') {
     & netsh.exe interface portproxy delete v4tov4 listenport=$Port listenaddress=0.0.0.0 *> $null
     & netsh.exe interface portproxy delete v4tov6 listenport=$Port listenaddress=0.0.0.0 *> $null
     & netsh.exe interface portproxy add v4tov6 listenport=$Port listenaddress=0.0.0.0 connectport=$Port connectaddress=::1 | Out-Null
-    # Let in: machines on the same network as this PC, and no others. Not only on a network
-    # Windows calls "Private" - it calls most home networks "Public" until told otherwise.
+    # Let in: machines with a home-network address, and no others - this PC's own network and
+    # the other private ranges (a house with two routers, a mesh, a VPN home: the phone is
+    # often not on the PC's own subnet, and "the same subnet only" kept it out). Never an
+    # address from the internet. Not only on a network Windows calls "Private" - it calls
+    # most home networks "Public" until told otherwise.
     Get-NetFirewallRule -DisplayName "tgarr" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     New-NetFirewallRule -DisplayName "tgarr" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
-        -Profile Private, Public -RemoteAddress LocalSubnet | Out-Null
+        -Profile Private, Public -RemoteAddress LocalSubnet, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 | Out-Null
     $opened = $true
 }
 
@@ -212,7 +215,7 @@ if ($opened) {
     $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
            Where-Object { $_.PrefixOrigin -in "Dhcp", "Manual" -and $_.IPAddress -notlike "169.254.*" -and $_.InterfaceAlias -notlike "vEthernet*" } |
            Select-Object -First 1).IPAddress
-    if ($ip) { Note "from other devices: http://${ip}:$Port   (devices on the same network as this PC)" }
+    if ($ip) { Note "from other devices: http://${ip}:$Port   (devices on the home network)" }
 }
 Note "its files:          \\wsl$\$Distro\opt\tgarr   (fetched files in _data\downloads)"
 Note "logs:               wsl -d $Distro -u root -- docker logs -f tgarr-api"
