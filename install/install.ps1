@@ -3,10 +3,14 @@ tgarr installer for Windows 10 (2004 or later) and Windows 11.
 
     irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 | iex
 
-Run it in PowerShell "as Administrator". tgarr itself is Linux software; on Windows it runs
-inside WSL2, the Linux that Windows carries. This script:
+Or download install-tgarr.cmd from the releases page and double-click it: the same thing.
 
-  1. switches WSL2 on if it is not (Windows then needs a restart; run the script again after it),
+Windows asks once for permission ("Do you want to allow this app to make changes?") - the
+script asks for that itself, it need not be started "as Administrator". tgarr itself is Linux
+software; on Windows it runs inside WSL2, the Linux that Windows carries. This script:
+
+  1. switches WSL2 on if it is not (Windows then needs a restart; the script goes on by itself
+     when you have logged in again),
   2. makes sure there is an Ubuntu in it,
   3. runs tgarr's Linux installer inside that Ubuntu (Docker, and tgarr's containers),
   4. has it start with Windows (a scheduled task),
@@ -24,7 +28,11 @@ $ErrorActionPreference = "Stop"
 
 function Say($t)  { Write-Host "==> $t" -ForegroundColor Cyan }
 function Note($t) { Write-Host "    $t" }
-function Die($t)  { Write-Host "tgarr install: $t" -ForegroundColor Red; exit 1 }
+function Die($t)  {
+    Write-Host "tgarr install: $t" -ForegroundColor Red
+    if ($env:TGARR_KEEP_OPEN) { Write-Host ""; Read-Host "Press Enter to close this window" | Out-Null }
+    exit 1
+}
 
 $Port   = if ($env:TGARR_PORT)   { [int]$env:TGARR_PORT } else { 8765 }
 $Distro = if ($env:TGARR_DISTRO) { $env:TGARR_DISTRO }    else { "Ubuntu" }
@@ -33,9 +41,34 @@ $Raw    = "https://raw.githubusercontent.com/tgarrpro/tgarr/$Ref"
 if ($Port -lt 1 -or $Port -gt 65535) { Die "TGARR_PORT must be between 1 and 65535" }
 if ($Distro -notmatch '^[A-Za-z0-9._-]+$') { Die "TGARR_DISTRO is not a distribution's name" }
 
+# This same script, as one command line: with the settings it was given, fetched afresh. It is
+# what is started again with administrator's rights, and again after the restart.
+function Again {
+    $set = ""
+    foreach ($n in "TGARR_PORT", "TGARR_DISTRO", "TGARR_LAN", "TGARR_REF") {
+        $v = [Environment]::GetEnvironmentVariable($n)
+        if ($v -and $v -match '^[A-Za-z0-9._-]+$') { $set += "`$env:$n='$v'; " }
+    }
+    $run = if ($PSCommandPath) { "& '$($PSCommandPath -replace "'", "''")'" } else { "irm '$Raw/install/install.ps1' | iex" }
+    return "$set`$env:TGARR_KEEP_OPEN='1'; [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; $run"
+}
+function Done($code) {
+    if ($env:TGARR_KEEP_OPEN) { Write-Host ""; Read-Host "Press Enter to close this window" | Out-Null }
+    exit $code
+}
+
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Die "run this in a PowerShell opened with 'Run as administrator' (WSL, the scheduled task and the firewall rule need it)"
+    # WSL, the scheduled task and the firewall rule need an administrator: ask Windows for it
+    Say "asking Windows for permission to install (a window of its own opens)"
+    try {
+        # (handed over encoded, so that no quote or space in it can be misread on the way)
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes((Again)))
+        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $enc)
+    } catch {
+        Die "permission was not given. Nothing was changed."
+    }
+    exit 0
 }
 if ([Environment]::OSVersion.Version.Build -lt 19041) { Die "WSL2 needs Windows 10 version 2004 or later" }
 
@@ -49,10 +82,30 @@ $feat = @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform") |
 if ($feat | Where-Object { $_.State -ne "Enabled" }) {
     Say "switching on WSL2 (the Linux that Windows carries)"
     & wsl.exe --install --no-distribution
+    # after the restart, at the next log-in, go on from here (Windows runs this once and forgets it)
+    # A RunOnce entry may be 260 characters long at most, so it names a small file that holds the rest.
+    $dir = Join-Path $env:LOCALAPPDATA "tgarr"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $resume = Join-Path $dir "resume-install.cmd"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes((Again)))
+    Set-Content -Path $resume -Encoding ASCII -Value "@echo off`r`ntitle tgarr`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc`r`n"
+    $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }       # (never -Force here: it would empty a key that exists)
+    Set-ItemProperty -Path $key -Name "tgarr-install" -Value "`"$resume`""
     Write-Host ""
-    Say "Windows has to restart once. After the restart, run this same command again."
-    exit 0
+    Say "Windows has to restart once. When you have logged in again the installation goes on by itself"
+    Note "(Windows will ask for permission once more). Save your work first."
+    $now = Read-Host "Restart now? [y/N]"
+    if ($now -match '^(y|yes)$') {
+        # not forced: a program with unsaved work may still hold the restart back and ask
+        & shutdown.exe /r /t 10 /c "Restarting to switch on WSL2; tgarr's installation goes on after you log in."
+        exit 0
+    }
+    Note "Restart when it suits you."
+    Done 0
 }
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce" -Name "tgarr-install" -ErrorAction SilentlyContinue
+Remove-Item -Path (Join-Path $env:LOCALAPPDATA "tgarr\resume-install.cmd") -ErrorAction SilentlyContinue
 & wsl.exe --set-default-version 2 *> $null
 
 # ---- 2. an Ubuntu ------------------------------------------------------------------------------
@@ -123,6 +176,8 @@ if ($opened) {
 Note "its files:          \\wsl$\$Distro\opt\tgarr   (fetched files in _data\downloads)"
 Note "logs:               wsl -d $Distro -u root -- docker logs -f tgarr-api"
 Note "It keeps itself up to date. Nothing needs an account to begin with: open the page."
+if ($env:TGARR_KEEP_OPEN) { Start-Process "http://localhost:$Port" }
+Done 0
 
 <#
 To remove tgarr again (PowerShell as Administrator):

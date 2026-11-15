@@ -96,15 +96,15 @@ Public-tracker users have their IP logged by tens of thousands of peers. US ISPs
 
 ## Quick start
 
-**One line, on a computer of your own** (new in 0.5.11):
+**On a computer of your own** (new in 0.5.11) - download one file from the [latest release](https://github.com/tgarrpro/tgarr/releases/latest) and double-click it:
 
 | | |
 |---|---|
-| **Linux** | `curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.sh \| bash` |
-| **macOS** | the same line. It sets up [Colima](https://github.com/abiosoft/colima) (a small Linux machine with Docker in it) through Homebrew and installs tgarr inside it. |
-| **Windows 10 / 11** | in PowerShell opened *as Administrator*: `irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 \| iex` - it switches on WSL2 (the Linux that Windows carries; one restart the first time) and installs tgarr inside it. |
+| **Windows 10 / 11** | `install-tgarr.cmd`. Windows asks once for permission. It switches on WSL2 (the Linux that Windows carries - one restart the first time, after which it goes on by itself) and installs tgarr inside it. |
+| **macOS** | `install-tgarr-macos.zip`, then `install-tgarr.command` inside it. It sets up [Colima](https://github.com/abiosoft/colima) (a small Linux machine with Docker in it; needs [Homebrew](https://brew.sh)) and installs tgarr inside it. |
+| **Linux** | in a terminal: `curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.sh \| bash` |
 
-The installer makes a folder, puts tgarr's two files in it with two secrets it makes up, starts the containers and waits for the page: `http://localhost:8765`. No account of any kind is needed to begin. Details, settings and how to remove it again: [docs/install/desktop.md](docs/install/desktop.md).
+When it is done, tgarr opens at `http://localhost:8765`. No account of any kind is needed to begin. The files are short scripts you can read before running; Windows and macOS warn about any downloaded script that is not signed by a company ("Run anyway" / right-click → Open). What each does, its settings, and how to remove it again: [docs/install/desktop.md](docs/install/desktop.md). On the television and on a phone's home screen: [docs/install/tv.md](docs/install/tv.md).
 
 **By hand, or on a NAS:**
 

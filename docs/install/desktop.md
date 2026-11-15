@@ -26,7 +26,7 @@ script from get.docker.com); without a terminal to ask on, it stops and says so.
 
 ## macOS
 
-The same line, in Terminal. It needs [Homebrew](https://brew.sh). It installs `colima` and
+Download `install-tgarr-macos.zip` from the [latest release](https://github.com/tgarrpro/tgarr/releases/latest), open it, and double-click `install-tgarr.command` (the first time: right-click → *Open*, since it is not signed) - or paste the Linux line into Terminal. It needs [Homebrew](https://brew.sh). It installs `colima` and
 `docker`, starts Colima (2 processors, 4 GB of memory) and has it start again at login, then
 installs tgarr inside Colima's Linux, in `/opt/tgarr`. The database lives there, on the
 Linux side, where it is fast and its permissions are right. What tgarr fetches is put in
@@ -39,14 +39,16 @@ Linux side, where it is fast and its permissions are right. What tgarr fetches i
 
 ## Windows 10 (2004 or later) and 11
 
-In PowerShell opened with **Run as administrator**:
+Download `install-tgarr.cmd` from the [latest release](https://github.com/tgarrpro/tgarr/releases/latest)
+and double-click it. (Or, in PowerShell: `irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 | iex`.)
+Windows asks once whether the installer may make changes; it need not be started "as administrator".
 
-```powershell
-irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 | iex
-```
+Windows may first say that the file is not commonly downloaded, or "Windows protected your
+PC": it says that of every script that no company has paid to sign. *More info → Run
+anyway*. The file is four lines; open it in Notepad to see them.
 
-1. If WSL2 is not switched on, it switches it on and asks you to restart Windows; after the
-   restart, run the same line again.
+1. If WSL2 is not switched on, it switches it on and offers to restart Windows; when you
+   have logged in again it goes on by itself (and asks for permission once more).
 2. It installs Ubuntu in WSL (if there is none), and Docker and tgarr inside it, in `/opt/tgarr`.
 3. It adds a scheduled task, `tgarr`, that starts it when you log in.
 4. It asks whether phones, tablets and televisions at home may reach it. If yes, it adds a
