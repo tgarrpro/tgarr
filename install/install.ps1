@@ -62,13 +62,21 @@ if ($Lan) { $Args_ += @("-Lan", $Lan) }
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     # WSL, the scheduled task and the firewall rule need an administrator: ask Windows for it
-    Say "asking Windows for permission to install (the installation goes on in a window of its own)"
-    try {
-        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $Args_
-    } catch {
-        Die "permission was not given. Nothing was changed."
+    # A "No", or a question that went unanswered (right after logging in it is easily missed, and
+    # Windows takes it back after two minutes), is not the end: it is asked again when you say so.
+    while ($true) {
+        Say "Windows will now ask: 'Do you want to allow this app to make changes?' - choose Yes"
+        Note "(the installation then goes on in a window of its own)"
+        try {
+            Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $Args_
+            exit 0
+        } catch {
+            Write-Host "tgarr install: permission was not given ($($_.Exception.Message.Trim()))" -ForegroundColor Red
+            Note "Nothing was changed."
+            $a = Read-Host "Press Enter to be asked again, or type q to give up"
+            if ($a -match '^(q|quit|n|no)$') { exit 1 }
+        }
     }
-    exit 0
 }
 if ([Environment]::OSVersion.Version.Build -lt 19041) { Die "WSL2 needs Windows 10 version 2004 or later" }
 
@@ -77,11 +85,17 @@ $env:WSL_UTF8 = "1"
 function WslOut([string[]]$a) { $o = & wsl.exe @a 2>$null; if ($LASTEXITCODE -ne 0) { return $null }; return ($o -join "`n") }
 
 # ---- 1. WSL2 -----------------------------------------------------------------------------------
-$feat = @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform") |
-    ForEach-Object { Get-WindowsOptionalFeature -Online -FeatureName $_ }
-if ($feat | Where-Object { $_.State -ne "Enabled" }) {
+# WSL2 needs one Windows feature, "Virtual Machine Platform", and WSL itself (which Windows
+# fetches from Microsoft). The older feature "Windows Subsystem for Linux" is for WSL1 and is
+# not needed - asking for it too made this step repeat for ever on machines where
+# 'wsl --install' rightly leaves it off.
+function VmOn { return (Get-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform").State -eq "Enabled" }
+function WslWorks { & wsl.exe --status *> $null; return $LASTEXITCODE -eq 0 }
+if (-not (VmOn) -or -not (WslWorks)) {
     Say "switching on WSL2 (the Linux that Windows carries)"
     & wsl.exe --install --no-distribution
+}
+if (-not (VmOn)) {
     # After the restart, at the next log-in, go on from here: Windows runs what is named under
     # RunOnce a single time and forgets it. (An entry there may be 260 characters long at
     # most, so it names a small file that holds the command.)
