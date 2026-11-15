@@ -4,31 +4,40 @@ WORKDIR /app
 ENV QTWEBENGINE_DISABLE_SANDBOX=1 \
     QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu"
 
-# Two layers on purpose. The first (calibre + fonts) is large, slow to build
-# for arm64, and almost never changes; the second (Python packages) changes
-# whenever a dependency does. In one layer, bumping a package rebuilt calibre.
-
-# calibre + Noto fonts: serve any ebook format as PDF in the browser.
-# ffmpeg: plays what a browser cannot (disc images, avi, wmv ...) by converting while it is
-# watched (transcode.py). Beside calibre it adds under 100 MB: they share most libraries.
+# What every install uses, and no more. The image was 2.3 GB, nearly all of it calibre (with
+# the browser engine it prints through) and 480 MB of fonts for it - there for the few who
+# open a .mobi. calibre is now fetched when a book first needs it (packs.py), as its own
+# standalone build; here are only the dozen small libraries that build expects of a system.
+#   ffmpeg          plays what a browser cannot (disc images, avi, wmv ...) by converting
+#                   while it is watched (transcode.py)
+#   poppler-utils   the PDF reader's pages and text (it used to come in with calibre)
+#   fonts-wqy-microhei, fonts-dejavu-core   Chinese, Japanese, Korean and Latin for a PDF
+#                   that brings no fonts of its own, and for books calibre converts
+#   libegl1 ... libice6   what calibre's standalone build needs to start (11 MB together)
+#   intel-media-va-driver, mesa-va-drivers   the drivers through which ffmpeg reaches an
+#                   Intel or an AMD graphics card, when the container is given one, to make
+#                   the picture there (transcode.py). An NVIDIA card brings its own.
+#                   Intel's exists for amd64 only - there are no Intel cards on ARM.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        calibre \
         ffmpeg \
-        fonts-noto-core \
-        fonts-noto-cjk \
-        fonts-noto-extra \
-        fonts-noto-color-emoji \
+        poppler-utils \
+        xz-utils \
+        fontconfig \
         fonts-wqy-microhei \
+        fonts-dejavu-core \
+        libegl1 libopengl0 libnss3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+        libxcb-render-util0 libxcb-xkb1 libxkbcommon-x11-0 libsm6 libice6 \
+        mesa-va-drivers \
+        $( [ "$(dpkg --print-architecture)" = amd64 ] && echo intel-media-va-driver ) \
     && fc-cache -fv > /dev/null \
     && rm -rf /var/lib/apt/lists/*
 
 # tgcrypto needs gcc for the C extension wheel build.
 #
-# Reading aloud with a voice of this machine's own (tts.py): the runtime only - sherpa-onnx
-# (kept below 1.13: later builds no longer bring the part that turns English into sounds),
-# onnxruntime for the optional pronunciation model, jieba to split Chinese into words. The
-# voices themselves are not in the image; they are fetched when somebody asks for them.
+# What the voice and the picture model run on (numpy, onnxruntime, sherpa-onnx, jieba) is not
+# installed here any more: packs.py installs it with pip, into the downloads folder, when the
+# first model is fetched. pip itself therefore stays in the image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc python3-dev \
     && pip install --no-cache-dir \
@@ -39,10 +48,6 @@ RUN apt-get update \
         kurigram==2.2.27 \
         tgcrypto==1.2.5 \
         qrcode[pil]==7.4.2 \
-        "numpy>=1.26,<3" \
-        "sherpa-onnx>=1.12.40,<1.13" \
-        "onnxruntime>=1.19,<2" \
-        jieba==0.42.1 \
     && apt-get purge -y --auto-remove gcc python3-dev \
     && rm -rf /var/lib/apt/lists/*
 

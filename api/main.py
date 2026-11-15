@@ -354,7 +354,9 @@ async def _signed_out_block(request: Request):
                  # a public channel is followed and read without an account (the crawler's guest workers)
                  "/api/channel/subscribe", "/api/channel/unsubscribe/",
                  "/api/archive/",                    # the Internet Archive asks nobody for an account
-                 "/api/update/")):                   # nor does keeping tgarr itself current
+                 "/api/update/",                     # nor does keeping tgarr itself current
+                 "/api/packs/",                      # nor fetching what a book or a model needs
+                 "/api/settings/transcode_hw")):     # nor which part of this machine converts films
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -466,6 +468,7 @@ import usenet_client  # local module
 import usenet_rules  # local module
 import archive_org  # local module
 import updater
+import packs  # what is fetched when first wanted (calibre; the models' runtime)
 import transcode  # local module
 import usenet_fetch  # local module
 import usenet_judge  # local module
@@ -475,7 +478,7 @@ import vision  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.11"
+TGARR_VERSION = "0.5.12"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -667,6 +670,7 @@ async def _startup():
     asyncio.create_task(_archive_grab_worker())
     asyncio.create_task(_archive_arr_worker())
     asyncio.create_task(_update_check_worker())
+    asyncio.create_task(_packs_heal())
 
 
 async def _migrate_schema():
@@ -2982,6 +2986,12 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return True
     import time as _t
+    # calibre is no longer in the image: it is fetched when a book first needs it (packs.py).
+    # Until then nothing is queued - the page that asked says so and offers to fetch it.
+    convert = packs.program("ebook-convert")
+    if not convert:
+        _EBOOK_JOBS[msg_id] = {"state": "needs_converter", "started_at": _t.time()}
+        return False
     # Mark queued + write disk marker for restart persistence
     if msg_id not in _EBOOK_JOBS or _EBOOK_JOBS[msg_id].get("state") == "failed":
         _EBOOK_JOBS[msg_id] = {"state": "queued", "queued_at": _t.time()}
@@ -3000,6 +3010,7 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         env = dict(os.environ)
         env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
         env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
+        env["QT_QPA_PLATFORM"] = "offscreen"          # there is no screen to draw on
         tmp = pdf + ".inprogress.pdf"
         # preexec_fn: RLIMIT_CPU 240s + RLIMIT_FSIZE 200MB; mem bound via container cgroup
         def _set_limits():
@@ -3010,7 +3021,7 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
             except OSError:
                 pass
         proc = await asyncio.create_subprocess_exec(
-            "ebook-convert", src, tmp,
+            convert, src, tmp,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=env, preexec_fn=_set_limits, start_new_session=True)
@@ -3044,8 +3055,11 @@ async def _ebook_cover(src: str, cover: str) -> bool:
     import asyncio
     if os.path.exists(cover):
         return True
+    meta = packs.program("ebook-meta")
+    if not meta:                                    # (no converter fetched yet: no cover from these formats)
+        return False
     proc = await asyncio.create_subprocess_exec(
-        "ebook-meta", src, f"--get-cover={cover}",
+        meta, src, f"--get-cover={cover}",
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL)
     try:
@@ -3086,7 +3100,14 @@ async def ebook_status(msg_id: int, request: Request):
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
                 "size": os.path.getsize(pdf)}
+    if not packs.program("ebook-convert"):
+        st = packs.status("books")
+        return {"state": "needs_converter", "installing": st["installing"], "done": st["done"], "bytes": st["bytes"],
+                "error": st["error"], "possible": st["possible"]}
     job = _EBOOK_JOBS.get(msg_id)
+    if job and job.get("state") == "needs_converter":      # it has arrived since: start over
+        _EBOOK_JOBS.pop(msg_id, None)
+        job = None
     if job and job.get("state") == "converting":
         import time as _t
         return {"state": "converting",
@@ -3150,10 +3171,55 @@ async def ebook_pdf(msg_id: int):
         return Response("file rejected: zip-bomb or malformed archive", status_code=422)
     ok = await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not ok:
+        if not packs.program("ebook-convert"):
+            return Response("the book converter is not installed yet: open the book's page to fetch it", status_code=409)
         return Response("conversion failed", status_code=500)
     return FileResponse(pdf, media_type="application/pdf",
                         headers={"Content-Disposition": "inline",
                                  "Cache-Control": "private, max-age=86400"})
+
+
+async def _packs_heal():
+    """An install that was using what the image used to carry gets it back without being asked:
+    the models' runtime if a voice or the picture model is installed, the book converter if
+    there are books here it is needed for (looked at once, at the first start of a version
+    that no longer carries it; a new install fetches it when a book first asks)."""
+    await asyncio.sleep(90)
+    try:
+        if (tts.installed("voice") or vision.installed()) and not packs.installed("runtime"):
+            log.info("[packs] a model is installed but what it runs on is no longer in the image: fetching it")
+            packs.install("runtime")
+        if not packs.installed("books"):
+            async with db_pool.acquire() as conn:
+                if not await conn.fetchval("SELECT value FROM config WHERE key = 'packs_seeded'"):
+                    n = await conn.fetchval(
+                        r"""SELECT count(*) FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+                             AND file_name ~* '\.(mobi|azw3?|fb2|djvu|lit|rtf|lrf|pdb|docx|odt)$'""")
+                    await conn.execute("INSERT INTO config (key, value) VALUES ('packs_seeded', '1') ON CONFLICT (key) DO NOTHING")
+                    if n:
+                        log.info("[packs] %d books here need the converter the image no longer carries: fetching it", n)
+                        packs.install("books")
+    except Exception as e:
+        log.warning("[packs] looking what is needed: %s", e)
+
+
+@app.get("/api/packs")
+async def api_packs():
+    return {"status": "ok", "packs": {n: await asyncio.to_thread(packs.status, n) for n in packs.NAMES}}
+
+
+@app.post("/api/packs/install")
+async def api_packs_install(request: Request):
+    try:
+        name = str((await request.json()).get("name") or "")
+    except Exception:
+        name = ""
+    if name not in packs.NAMES:
+        return JSONResponse({"status": "error", "message": "which one?"}, status_code=400)
+    if await _is_locked(request):
+        return JSONResponse({"status": "error", "message": "ask whoever looks after this tgarr: it is fetched from the unlocked side"}, status_code=403)
+    started = packs.install(name)
+    return {"status": "ok", "started": started, **(await asyncio.to_thread(packs.status, name))}
 
 
 @app.get("/ebook-cover/{msg_id}")
@@ -4977,7 +5043,49 @@ function tgVideo(main){
 # Nothing is written; the file is not changed; when the viewer leaves, ffmpeg is stopped.
 # At most three at a time: a conversion takes most of a small machine's processor.
 # ════════════════════════════════════════════════════════════════════
-_TC = {"running": 0, "info": {}}
+_TC = {"running": 0, "info": {}, "hw": None, "hw_failed": 0}
+
+
+async def _tc_hw() -> tuple:
+    """(kind, device) of the graphics card films are encoded on, or ('', ''): looked for once
+    (a one-second trial on each card the container was given), unless Settings says software."""
+    async with db_pool.acquire() as conn:
+        if await conn.fetchval("SELECT value FROM config WHERE key = 'transcode_hw'") == "off":
+            return "", ""
+    if _TC["hw"] is None:
+        # TGARR_TRANSCODE_HW in the container's environment decides without a trial:
+        # "off", or a kind with its device ("vaapi:/dev/dri/renderD129", "nvenc").
+        forced = os.environ.get("TGARR_TRANSCODE_HW", "").strip()
+        if forced:
+            k, d, rc = (forced.split(":") + ["", ""])[:3]
+            _TC["hw"] = (k, d, rc or ("vbr" if k == "nvenc" else "cqp")) if k in transcode.HW_KINDS else ("", "", "")
+        else:
+            _TC["hw"] = await asyncio.to_thread(transcode.hw_find)
+        _TC["hw_failed"] = 0
+        log.info("[play] films are converted %s", ("on " + transcode.HW_NAMES[_TC["hw"][0]] + (" " + _TC["hw"][1] if _TC["hw"][1] else ""))
+                 if _TC["hw"][0] else "in software (no graphics card that can was given to this container)")
+    return _TC["hw"]
+
+
+@app.get("/api/transcode/hw")
+async def api_transcode_hw():
+    async with db_pool.acquire() as conn:
+        off = await conn.fetchval("SELECT value FROM config WHERE key = 'transcode_hw'") == "off"
+    hw = await _tc_hw() if not off else (_TC["hw"] or ("", ""))
+    return {"status": "ok", "setting": "off" if off else "auto", "kind": "" if off else hw[0], "device": "" if off else hw[1],
+            "name": transcode.HW_NAMES["" if off else hw[0]], "found": bool((_TC["hw"] or ("", ""))[0]),
+            "rc": "" if off else (tuple(hw) + ("", "", ""))[2]}
+
+
+@app.post("/api/settings/transcode_hw")
+async def settings_transcode_hw(value: str = Form("auto")):
+    val = "off" if value == "off" else "auto"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('transcode_hw', $1)
+               ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", val)
+    _TC["hw"] = None                              # looked for anew: a card may have been given since
+    return RedirectResponse("/settings", status_code=302)
 _TC_MOST = int(os.environ.get("TGARR_TRANSCODES", "3"))
 
 
@@ -5032,7 +5140,8 @@ async def api_transcode_info(msg_id: int):
     except transcode.NotAFilm as e:
         return JSONResponse({"status": "error", "message": f"this cannot be played: {e}"}, status_code=415)
     return {"status": "ok", "name": f[1], "duration": info["duration"], "width": info["width"], "height": info["height"],
-            "kind": info["kind"], "heights": [h for h in transcode.HEIGHTS if h < (info["height"] or 0)]}
+            "kind": info["kind"], "heights": [h for h in transcode.HEIGHTS if h < (info["height"] or 0)],
+            "hw": (await _tc_hw())[0]}
 
 
 @app.get("/transcode/{msg_id}")
@@ -5049,14 +5158,44 @@ async def api_transcode(msg_id: int, t: float = 0.0, h: int = 0):
         return PlainTextResponse("this cannot be played", status_code=415)
     if _TC["running"] >= _TC_MOST:
         return PlainTextResponse("too many films are being converted at once - try again in a moment", status_code=503)
-    cmd = transcode.command(info, t, h)
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    hw = ("", "") if transcode.can_copy(info, h if h in transcode.HEIGHTS else 0) else await _tc_hw()
+
+    async def begin(on):
+        """Start ffmpeg and wait for the first of the film: a card that will not do it says so
+        by ending without a byte, before anything was sent to the viewer."""
+        p = await asyncio.create_subprocess_exec(*transcode.command(info, t, h, on), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        return p, await p.stdout.read(1 << 16)
+
     _TC["running"] += 1
-    log.info("[play] converting %s from %.0fs%s (%d under way)", f[1][:80], max(0.0, t), f", {h}p" if h in transcode.HEIGHTS else "", _TC["running"])
+    try:
+        proc, first = await begin(hw)
+        if not first and hw[0]:
+            # The card took the trial but not this film (a size it has no room for, a busy
+            # encoder): the film is converted in software, and the viewer notices nothing.
+            # A card that fails three films running is not asked again until tgarr restarts.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            _TC["hw_failed"] += 1
+            log.warning("[play] %s would not convert %s (%d in a row): in software instead", transcode.HW_NAMES[hw[0]], f[1][:80], _TC["hw_failed"])
+            if _TC["hw_failed"] >= 3:
+                _TC["hw"] = ("", "")
+            hw = ("", "")
+            proc, first = await begin(hw)
+        elif first and hw[0]:
+            _TC["hw_failed"] = 0
+    except BaseException:
+        _TC["running"] -= 1
+        raise
+    log.info("[play] converting %s from %.0fs%s%s (%d under way)", f[1][:80], max(0.0, t), f", {h}p" if h in transcode.HEIGHTS else "",
+             " on " + transcode.HW_NAMES[hw[0]] if hw[0] else "", _TC["running"])
 
     async def stream():
         try:
-            while True:
+            if first:
+                yield first
+            while first:
                 chunk = await proc.stdout.read(1 << 16)
                 if not chunk:
                     break
@@ -5149,7 +5288,8 @@ document.getElementById("back").onclick = e => { e.preventDefault(); if (history
 fetch("/transcode/" + ID + "/info").then(r => r.json()).then(j => {
   if (j.status !== "ok") { say(j.message || "this cannot be played"); return; }
   dur = j.duration; bar.max = Math.floor(dur); bar.disabled = false;
-  document.getElementById("what").textContent = ({dvd: "DVD image", bluray: "Blu-ray image", file: ""})[j.kind] || "";
+  document.getElementById("what").textContent = [({dvd: "DVD image", bluray: "Blu-ray image", file: ""})[j.kind] || "",
+    j.hw ? "converted on the graphics card" : ""].filter(Boolean).join(" · ");
   const q = document.getElementById("q"); let want = 0;
   try { want = +(localStorage.getItem("tgarr.play.h") || 0); } catch (e) {}
   q.innerHTML = '<option value="0">' + (j.height ? j.height + "p" : "as it is") + '</option>'
@@ -5318,6 +5458,32 @@ function renderPlayer() {{
         if (j.state === "failed") {{
           document.getElementById("ebookStatus").textContent =
             "✗ conversion failed: " + (j.reason || "calibre error");
+          return;
+        }}
+        if (j.state === "needs_converter") {{
+          // the converter (calibre) is fetched once, when a book first needs it
+          const st = document.getElementById("ebookStatus"), mb = Math.round((j.bytes || 0) / 1e6);
+          document.getElementById("ebookElapsed").textContent = "";
+          if (j.installing) {{
+            const pc = j.bytes ? Math.min(100, Math.round(j.done * 100 / j.bytes)) : 0;
+            st.textContent = pc < 100 ? "fetching the book converter… " + pc + "%" : "unpacking the book converter…";
+            document.getElementById("ebookBar").style.width = pc + "%";
+          }} else if (!j.possible) {{
+            st.textContent = "✗ this kind of book needs a converter that does not exist for this machine";
+            return;
+          }} else if (!st.querySelector("button")) {{
+            st.innerHTML = 'This kind of book is converted before it is read, and the converter is not part of tgarr: ' +
+              'it is fetched once (' + mb + ' MB, about 1 GB on the disk).' + (j.error ? '<br><span style="color:#fbbf24">Last try: ' +
+              String(j.error).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]) + '</span>' : '') +
+              '<br><button id="getConv" style="margin-top:10px;padding:9px 18px;border-radius:8px;border:0;background:#229ED9;color:#fff;font:inherit;font-weight:600;cursor:pointer">Fetch the converter</button>';
+            document.getElementById("getConv").onclick = () => {{
+              st.textContent = "starting…";
+              fetch("/api/packs/install", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{name: "books"}})}})
+                .then(r => r.json()).then(x => {{ if (x.status !== "ok") st.textContent = "✗ " + (x.message || "could not start"); }})
+                .catch(() => {{ st.textContent = "✗ this server did not answer"; }});
+            }};
+          }}
+          setTimeout(tick, 2000);
           return;
         }}
         if (j.state === "no_source") {{
@@ -14756,6 +14922,21 @@ def _fmt_uptime(sec) -> str:
 async def page_settings(request: Request):
     if not _signed_in():
         return RedirectResponse("/login")     # settings belong to the account
+    # which part of this machine makes the picture when a film is converted while it is watched
+    _hw = await api_transcode_hw()
+    if _hw["setting"] == "off":
+        _hw_meta = "In software, because it was switched to that here." + (" A graphics card that can do it was found." if _hw["found"] else "")
+        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="auto"/><button class="btn" type="submit">Use the graphics card</button></form>'
+    elif _hw["kind"]:
+        _hw_meta = (f"On {html.escape(_hw['name'])}{' at ' + html.escape(_hw['device']) if _hw['device'] else ''}: a film takes a fraction of the processor it takes in software. "
+                    "If a film will not play, or looks wrong, switch to software.")
+        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="off"/><button class="btn ghost" type="submit">Use software</button></form>'
+    else:
+        _hw_meta = ("In software: this tgarr was not given a graphics card that can encode. On Linux, running the installer again hands it "
+                    "the card if there is one; the guide says how to do it by hand.")
+        _hw_btn = '<a class="btn ghost" href="https://github.com/tgarrpro/tgarr/blob/main/docs/install/gpu.md" target="_blank" rel="noopener">How</a>'
+    hw_row = ('<div class="dl-item"><div class="icon">🎞</div><div class="info"><div class="name">Converting films</div>'
+              f'<div class="meta">{_hw_meta}</div></div><div class="right">{_hw_btn}</div></div>')
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
     async with db_pool.acquire() as conn:
@@ -15051,6 +15232,7 @@ function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", h
     </div>
     <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
   </div>
+  {hw_row}
   <div class="dl-item">
     <div class="icon">⬆</div>
     <div class="info">

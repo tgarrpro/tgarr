@@ -17,6 +17,7 @@
 #   TGARR_DOWNLOADS=/path    where fetched files are kept (default: inside TGARR_DIR)
 #   TGARR_VERSION=0.5.11     stay on one version          (default: follow new releases)
 #   TGARR_INSTALL_DOCKER=1   install Docker without asking when it is missing (Linux)
+#   TGARR_GPU=no             do not hand this machine's graphics card to tgarr
 #   TGARR_REF=main           which branch or tag the two files are taken from
 set -euo pipefail
 
@@ -155,7 +156,46 @@ else
   PORT="$(sed -n 's/^TGARR_PORT=\([0-9][0-9]*\).*/\1/p' .env | head -1)"; PORT="${PORT:-8765}"
 fi
 
-say "fetching tgarr (about 1.5 GB the first time)"
+# The graphics card. tgarr converts films on it when it is given one (far lighter on the
+# processor than doing it in software). Docker hands a card over only if told to, and refuses
+# to start a container that names a card which is not there - so it is not in the compose
+# file everybody gets, but in docker-compose.override.yml, written here for this machine.
+# An override file of your own is never touched.
+gpu_lines=""
+if [ "${TGARR_GPU:-}" != no ]; then
+  if ls /dev/dri/renderD* >/dev/null 2>&1; then
+    gpu_lines="$gpu_lines    devices:
+      - /dev/dri:/dev/dri
+"
+  fi
+  if $DOCKER info 2>/dev/null | grep -qiE 'Runtimes:.*nvidia' && have nvidia-smi && nvidia-smi >/dev/null 2>&1; then
+    gpu_lines="$gpu_lines    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+"
+  fi
+fi
+if [ -n "$gpu_lines" ]; then
+  if [ ! -e docker-compose.override.yml ] || grep -q '^# written by tgarr.s installer' docker-compose.override.yml; then
+    { echo "# written by tgarr's installer for this machine: its graphics card, handed to tgarr."
+      echo "# (films are then converted on the card; Settings says whether it is in use)"
+      echo "services:"
+      echo "  api:"
+      printf '%s' "$gpu_lines"; } > docker-compose.override.yml
+    say "this machine's graphics card is handed to tgarr (docker-compose.override.yml)"
+  else
+    note "(this machine has a graphics card tgarr could convert films on, but there is a docker-compose.override.yml of your own:"
+    note " see docs/install/gpu.md for the lines to add to it)"
+  fi
+fi
+
+say "fetching tgarr (about 600 MB the first time)"
 $DOCKER compose pull -q
 say "starting"
 $DOCKER compose up -d
