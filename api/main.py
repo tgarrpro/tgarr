@@ -2201,6 +2201,56 @@ def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> 
         f'<div style="display:flex;gap:8px">{"".join(links)}</div></div>')
 
 
+# Where a file came from: Telegram, the newsgroups, the Internet Archive, or this server's own
+# folders. Videos, Music and the Library can be narrowed to one of them. A source is told by
+# the made-up chat id its folder stands under (localfiles.chat_id), so the condition needs
+# nothing but the message row.
+_SRC_NAMES = (("tg", "✈ Telegram", "from Telegram channels and chats"),
+              ("usenet", "📰 Usenet", "fetched from the newsgroups"),
+              ("archive", "🏛 Internet Archive", "fetched from the Internet Archive"),
+              ("mine", "📁 My files", "uploaded to this server, or found in its folders"))
+
+
+def _src_ids() -> tuple:
+    return (localfiles.chat_id("usenet"), localfiles.chat_id("usenet18")), localfiles.chat_id("archive")
+
+
+def _src_sql(src: str) -> str:
+    """The condition (over `m`) for one source; '' for none or an unknown one."""
+    (u1, u2), a = _src_ids()
+    top = localfiles.LOCAL_CHAT_MAX
+    return {"tg": f"m.tg_chat_id > {top}",
+            "usenet": f"m.tg_chat_id IN ({u1}, {u2})",
+            "archive": f"m.tg_chat_id = {a}",
+            "mine": f"(m.tg_chat_id <= {top} AND m.tg_chat_id NOT IN ({u1}, {u2}, {a}))"}.get(src or "", "")
+
+
+async def _src_counts(conn, from_sql: str, where: list, params: list) -> dict:
+    """How many of what the page shows came from each source (the page's other choices applied)."""
+    (u1, u2), a = _src_ids()
+    rows = await conn.fetch(
+        f"""SELECT CASE WHEN m.tg_chat_id > {localfiles.LOCAL_CHAT_MAX} THEN 'tg' WHEN m.tg_chat_id IN ({u1}, {u2}) THEN 'usenet'
+                        WHEN m.tg_chat_id = {a} THEN 'archive' ELSE 'mine' END AS s, count(*) AS n
+            FROM {from_sql} WHERE {' AND '.join(where)} GROUP BY 1""", *params)
+    return {r["s"]: r["n"] for r in rows}
+
+
+def _src_chips(path: str, qs, src: str, counts: dict) -> str:
+    """The sources as chips - only when there is a choice to make: two sources or more have
+    something, or one is chosen already."""
+    if not src and sum(1 for k, _, _ in _SRC_NAMES if counts.get(k)) < 2:
+        return ""
+    on = "background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);"
+    out = ""
+    for k, label, tip in _SRC_NAMES:
+        if not counts.get(k) and k != src:
+            continue
+        out += (f'<a class="btn ghost" href="{path}{qs(src=None if src == k else k, offset=None)}" '
+                f'style="{on if src == k else ""}padding:5px 12px;font-size:12px" title="{tip}">'
+                f'{label} <span style="opacity:.6">{counts.get(k, 0):,}</span></a>')
+    return out
+
+
 def _saved_chip(path: str, qs, local: int) -> str:
     style = ("background:rgba(16,185,129,0.15);color:#059669;border-color:#10b981;"
              if local else "")
@@ -11957,8 +12007,12 @@ window.addEventListener("hashchange", () => kmTab((location.hash || "#pin").slic
 # PRIVATE_CHAT_SQL). A group of thousands that merely has no public name is
 # not "my private chats".
 # What was fetched from Usenet has no @username either, but it is nobody's chat.
+# Nor is what was fetched from the Internet Archive, nor what was uploaded here: all of these
+# are folders of this install (channels.local_root), and none of them is "my private chats".
 _FROM_USENET = "(COALESCE(c.local_root, '') IN ('usenet', 'usenet18'))"
-_PRIVATE_CHAT = f"(c.username IS NULL AND COALESCE(c.members_count, 0) < 200 AND NOT {_FROM_USENET})"
+_FROM_ARCHIVE = "(COALESCE(c.local_root, '') = 'archive')"
+_ARCHIVE_ITEM = "split_part(m.local_path, '/', 3)"          # archive/<shelf>/<the item's folder>/<file>
+_PRIVATE_CHAT = "(c.username IS NULL AND COALESCE(c.members_count, 0) < 200 AND c.local_root IS NULL)"
 
 
 @app.get("/gallery", response_class=HTMLResponse)
@@ -11966,7 +12020,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        q: Optional[str] = None, dc: Optional[str] = None,
                        ch: Optional[int] = None, private: int = 0,
                        offset: int = 0, sort: str = "new", rate: Optional[str] = None, usenet: int = 0,
-                       grp: Optional[str] = None, art: Optional[str] = None):
+                       grp: Optional[str] = None, art: Optional[str] = None, archive: int = 0,
+                       item: Optional[str] = None):
     try:
         _looked = vision.available()            # the picture model is installed: pictures are told apart
     except Exception:
@@ -12006,6 +12061,15 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     if grp:
         params.append(grp)
         where.append(f"m.usenet_grp = ${len(params)}")
+    # the Internet Archive as a source of its own, opening into the items that were fetched
+    item = (item or "").strip()[:300] or None
+    archive = 0 if (private or usenet) else (1 if (archive or item) else 0)
+    item = item if archive else None
+    if archive:
+        where.append(_FROM_ARCHIVE)
+    if item:
+        params.append(item)
+        where.append(f"{_ARCHIVE_ITEM} = ${len(params)}")
     if q:
         for w in q.split():
             params.append(f"%{w}%")
@@ -12072,7 +12136,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                WHERE m.media_type = 'photo'
                  AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
                  {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw'"}
-                 {"" if _in else "AND FALSE"}
+                 {"" if _in else "AND c.local_root IS NOT NULL"}
                GROUP BY c.id
                ORDER BY count(*) DESC""")
         matched = await conn.fetchval(f"""
@@ -12101,6 +12165,19 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
               AND COALESCE(c.audience, 'sfw') <> 'blocked_csam'
               {"" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw' AND COALESCE(m.ai_adult, 0) < 0.9"}
             GROUP BY 1 ORDER BY 2 DESC, 1""") if usenet_n else []
+        _ar_gate = "" if _nsfw_on else "AND COALESCE(c.audience, 'sfw') <> 'nsfw' AND COALESCE(m.ai_adult, 0) < 0.9"
+        archive_items = await conn.fetch(f"""
+            SELECT {_ARCHIVE_ITEM} AS g, count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text)) AS n
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where[:3])} AND {_FROM_ARCHIVE} AND m.local_path IS NOT NULL
+              AND COALESCE(c.audience, 'sfw') <> 'blocked_csam' {_ar_gate}
+            GROUP BY 1 ORDER BY 2 DESC, 1""")
+        archive_items = [r for r in archive_items if r["g"]]
+        archive_n = await conn.fetchval(f"""
+            SELECT count(DISTINCT COALESCE(m.thumb_md5, 'id-' || m.id::text))
+            FROM messages m JOIN channels c ON c.id = m.channel_id
+            WHERE {' AND '.join(where[:3])} AND {_FROM_ARCHIVE}
+              AND COALESCE(c.audience, 'sfw') <> 'blocked_csam' {_ar_gate}""") if archive_items else 0
         # DISTINCT ON thumb_md5 → one row per unique image. Rows without md5
         # (legacy thumbs not yet hashed) fall through with NULL bucket; that
         # group will be deduped to one row, which is OK for now and the hash
@@ -12129,7 +12206,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
 
     # ── which photos: all / my private chats / one chat ──────────────
     def _gqs(**over):
-        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "usenet": (usenet or None) if not grp else None, "grp": grp, "q": q,
+        cur = {"ch": ch, "channel": channel, "private": 1 if private else None, "usenet": (usenet or None) if not grp else None, "grp": grp,
+               "archive": (archive or None) if not item else None, "item": item, "q": q,
                "dc": "mine" if same_dc_only else None, "rate": rate if rate != _rate0 else None, "art": art,
                "sort": sort if sort == "old" else None,
                "limit": limit if limit != 240 else None}
@@ -12147,12 +12225,14 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     def _name(r):
         return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
     opts = "".join(
-        f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, usenet=None, grp=None, offset=None)}" '
+        f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None)}" '
         f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
         f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
         + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
            else '<small>🔒 private</small>' if r["private"]
            else '<small>📰 from the newsgroups</small>' if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT)
+           else '<small>🏛 from the Internet Archive</small>' if r["local_root"] == ARCHIVE_ROOT
+           else '<small>📁 files of this server</small>' if r["local_root"]
            else '<small>group · no public name</small>')
         + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
         for r in all_channels)
@@ -12187,10 +12267,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '.gp-c{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}'
         '</style>'
         '<div class="bar-tools" style="margin-bottom:16px">'
-        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, grp=None, offset=None),
-                     not (picked or private or usenet))
+        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None),
+                     not (picked or private or usenet or archive))
         + (_chip_link(f'🔒 My private chats <span style="opacity:.6">{priv_n:,}</span>',
-                      "/gallery" + _gqs(ch=None, channel=None, private=1, usenet=None, grp=None, offset=None), bool(private),
+                      "/gallery" + _gqs(ch=None, channel=None, private=1, usenet=None, grp=None, archive=None, item=None, offset=None), bool(private),
                       "photos from chats and groups that have no public @username - yours alone")
            if priv else "")
         # Usenet opens into its newsgroups, as "Choose a channel" opens into the chats
@@ -12199,13 +12279,26 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             + (html.escape(grp[:34]) if grp else "Usenet")
             + f' <span style="opacity:.6">{(next((r["n"] for r in usenet_groups if r["g"] == grp), 0) if grp else usenet_n):,}</span> ▾</summary>'
             '<div class="gp-pop"><div class="gp-list">'
-            f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=1, grp=None, offset=None)}">'
+            f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=1, grp=None, archive=None, item=None, offset=None)}">'
             f'<span class="gp-n">All of Usenet</span><span class="gp-c">{usenet_n:,}</span></a>'
             + "".join(
-                f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=r["g"], offset=None)}">'
+                f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=r["g"], archive=None, item=None, offset=None)}">'
                 f'<span class="gp-n">{html.escape(r["g"])}</span><span class="gp-c">{r["n"]:,}</span></a>' for r in usenet_groups)
             + '</div></div></details>')
            if usenet_n else "")
+        # and the Internet Archive into the items that were fetched from it
+        + (('<details class="gp gu"><summary class="btn ghost gp-btn' + (" on" if archive else "") + '" '
+            'title="pictures fetched from the Internet Archive">🏛 '
+            + (html.escape(item[:34]) if item else "Internet Archive")
+            + f' <span style="opacity:.6">{(next((r["n"] for r in archive_items if r["g"] == item), 0) if item else archive_n):,}</span> ▾</summary>'
+            '<div class="gp-pop"><div class="gp-list">'
+            f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=1, item=None, offset=None)}">'
+            f'<span class="gp-n">All from the Archive</span><span class="gp-c">{archive_n:,}</span></a>'
+            + "".join(
+                f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=r["g"], offset=None)}">'
+                f'<span class="gp-n">{html.escape(r["g"])}</span><span class="gp-c">{r["n"]:,}</span></a>' for r in archive_items)
+            + '</div></div></details>')
+           if archive_n else "")
         + picker
         + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
                        "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
@@ -12214,6 +12307,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                  f'onclick="ugForget({{grp:{html.escape(_json.dumps(grp), quote=True)}}},&quot;everything fetched from this newsgroup&quot;,this)">'
                  '🗑 Delete this newsgroup</button>' + _UN_FORGET_JS) if grp
            else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 Manage…</a>' if usenet
+           else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/archive?kind=have">🗑 Manage…</a>' if archive
            else "")
         + (('<span class="sep"></span>'
             + _chip_link("all", "/gallery" + _gqs(rate=None if _rate0 == "all" else "all", offset=None), rate == "all")
@@ -12247,7 +12341,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         'if(e.key==="Enter"){const f=[...document.querySelectorAll("#gpList .gp-opt")].find(o=>o.style.display!=="none");'
         'if(f)location.href=f.href}})})()</script>')
     _where_txt = (f'in {html.escape(_name(picked))}' if picked else
-                  'in my private chats' if private else f'from {html.escape(grp)}' if grp else 'fetched from Usenet' if usenet else '')
+                  'in my private chats' if private else f'from {html.escape(grp)}' if grp else 'fetched from Usenet' if usenet
+                  else f'from {html.escape(item)}' if item else 'fetched from the Internet Archive' if archive else '')
 
     if not rows:
         body = (
@@ -12255,7 +12350,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
-            + ('<div>No photo matches.</div>' if (picked or private or usenet or q or same_dc_only or page_offset or rate) else
+            + ('<div>No photo matches.</div>' if (picked or private or usenet or archive or q or same_dc_only or page_offset or rate) else
                '<div>No photos yet.</div>'
                f'<div style="margin-top:8px;font-size:13px">{pending:,} photos are indexed; their '
                'thumbnails are fetched as pages are opened.</div>')
@@ -12271,6 +12366,10 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
             folder = os.path.basename(os.path.dirname(r["local_path"] or ""))
             return (r["file_name"] or r["ch_title"] or "",
                     r["caption"] or (folder if folder not in _UN_FOLDER.values() else "") or r["ch_title"] or "")
+        if r["local_root"] == ARCHIVE_ROOT:           # the item it came with, and the file
+            bits = (r["local_path"] or "").split("/")
+            name = bits[2] if len(bits) > 2 else ""
+            return ((name if len(bits) > 3 else name.rsplit(".", 1)[0]) or r["ch_title"] or "", r["caption"] or r["file_name"] or "")
         return r["ch_title"] or r["ch_user"] or "", r["caption"] or ""
 
     items = "".join(
@@ -12282,7 +12381,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         + (f'<div class="dup-badge" title="shared across {r["dup_count"]} channels">×{r["dup_count"]}</div>'
            if r.get("dup_count") and r["dup_count"] > 1 else '')
         + f'<figcaption class="meta">'
-        f'<div class="ch">{html.escape(_said(r)[0] if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT) else (r["ch_title"] or ""))}</div>'
+        f'<div class="ch">{html.escape(_said(r)[0] if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT, ARCHIVE_ROOT) else (r["ch_title"] or ""))}</div>'
         f'<div class="cap">{html.escape(_said(r)[1][:200])}</div>'
         f'</figcaption>'
         f'</figure>'
@@ -12801,7 +12900,7 @@ _MUSIC_PLAYER_HTML = r"""
 @app.get("/music", response_class=HTMLResponse)
 async def page_music(limit: int = 100, q: Optional[str] = None,
                      lang: Optional[str] = None, sort: str = "quality",
-                     offset: int = 0, local: int = 0, fav: int = 0, book: int = 0):
+                     offset: int = 0, local: int = 0, fav: int = 0, book: int = 0, src: Optional[str] = None):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -12854,12 +12953,17 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         where_parts.append(_LOCAL_SQL)
     if fav:
         where_parts.append("EXISTS (SELECT 1 FROM favorites f WHERE f.msg_id = m.id)")
+    where_nosrc = list(where_parts)
+    src = src if _src_sql(src) else None
+    if src:
+        where_parts.append(_src_sql(src))
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
 
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
             f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
+        src_n = await _src_counts(conn, "messages m", where_nosrc, params)
         shelf = f"m.media_type = 'audio' AND {'' if book else 'NOT '}{_AUDIOBOOK_SQL}"
         pending_n = await conn.fetchval(f"SELECT count(*) FROM messages m WHERE {shelf} AND m.local_path IS NULL")
         books_n = await conn.fetchval(f"SELECT count(*) FROM messages m WHERE m.media_type = 'audio'{_pub_m()} AND {_AUDIOBOOK_SQL}")
@@ -12883,7 +12987,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
 
     def _music_qs(**overrides):
         defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None,
-                    "local": 1 if local else None, "fav": 1 if fav else None, "book": book or None,
+                    "local": 1 if local else None, "fav": 1 if fav else None, "book": book or None, "src": src,
                     "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
@@ -12919,7 +13023,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         _music_sort_chip("recent",  "Recent") +
         _music_sort_chip("longest", "Longest") +
         _music_sort_chip("size",    "Largest") +
-        '<span style="margin-left:10px"></span>' + _saved_chip("/music", _music_qs, local) +
+        '<span style="margin-left:10px"></span>' + _src_chips("/music", _music_qs, src, src_n) + _saved_chip("/music", _music_qs, local) +
         f'<a class="btn ghost" href="/music{_music_qs(fav=None if fav else 1)}" '
         f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
         f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>')
@@ -13013,7 +13117,7 @@ _LANG_LABELS = {
 @app.get("/library", response_class=HTMLResponse)
 async def page_library(limit: int = 100, q: Optional[str] = None,
                        lang: Optional[str] = None, sort: str = "quality",
-                       fmt: Optional[str] = None, offset: int = 0, local: int = 0):
+                       fmt: Optional[str] = None, offset: int = 0, local: int = 0, src: Optional[str] = None):
     async with db_pool.acquire() as conn:
         n = await conn.fetchval("SELECT count(*) FROM channels")
     if not login.session_exists() and not n:
@@ -13056,12 +13160,17 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         where_parts.append(f"m.file_name ~* ${len(params)}")
     if local:
         where_parts.append(_LOCAL_SQL)
+    where_nosrc = list(where_parts)
+    src = src if _src_sql(src) else None
+    if src:
+        where_parts.append(_src_sql(src))
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
 
     async with db_pool.acquire() as conn:
         total = await conn.fetchval(
             f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
+        src_n = await _src_counts(conn, "messages m", where_nosrc, params)
         pending_n = await conn.fetchval(
             r"""SELECT count(*) FROM messages
                WHERE media_type='document' AND local_path IS NULL
@@ -13104,7 +13213,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
 
     def _qs(**overrides):
         defaults = {"q": q, "lang": lang, "sort": sort if sort != "quality" else None, "fmt": fmt,
-                    "local": 1 if local else None,
+                    "local": 1 if local else None, "src": src,
                     "limit": limit if limit != 100 else None}
         merged = {**defaults, **overrides}
         bits = []
@@ -13140,7 +13249,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         _sort_chip("recent",  "Recent") +
         _sort_chip("size",    "Largest") +
         _sort_chip("title",   "Title") +
-        '<span style="margin-left:10px"></span>' + _saved_chip("/library", _qs, local) +
+        '<span style="margin-left:10px"></span>' + _src_chips("/library", _qs, src, src_n) + _saved_chip("/library", _qs, local) +
         '<a class="btn ghost" href="/music?book=1" style="padding:5px 12px;font-size:12px;margin-left:auto" '
         'title="books that are listened to">🎧 Audiobooks</a>')
 
@@ -13213,7 +13322,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
 @app.get("/videos", response_class=HTMLResponse)
 async def page_videos(q: Optional[str] = None, limit: int = 120,
                       offset: int = 0, aud: Optional[str] = None,
-                      min_mb: int = 50, local: int = 0, fav: int = 0, sort: str = "new"):
+                      min_mb: int = 50, local: int = 0, fav: int = 0, sort: str = "new", src: Optional[str] = None):
     _aud0 = await _aud_default()                   # what opens when nothing was chosen on the page
     aud = aud if (aud in _AUD and await _is_nsfw_enabled()) else _aud0
     if not login.session_exists():
@@ -13252,9 +13361,14 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
             "AND COALESCE(oc.audience, 'sfw') = COALESCE(c.audience, 'sfw')" + _pub("oc") + ")")
     page_size = max(1, min(limit, 500))
     page_offset = max(0, offset)
+    where_nosrc = list(where)
+    src = src if _src_sql(src) else None
+    if src:
+        where.append(_src_sql(src))
     where_sql = " AND ".join(where)
     _vid_my_dc = await _get_my_dc()
     async with db_pool.acquire() as conn:
+        src_n = await _src_counts(conn, "messages m JOIN channels c ON c.id = m.channel_id", where_nosrc, params)
         total = await conn.fetchval(
             f"SELECT count(*) FROM messages m "
             f"JOIN channels c ON c.id = m.channel_id "
@@ -13278,7 +13392,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         defaults = {"q": q,
                     "aud": aud if aud != _aud0 else None,
                     "min_mb": min_mb if min_mb != 50 else None,
-                    "local": 1 if local else None, "fav": 1 if fav else None,
+                    "local": 1 if local else None, "fav": 1 if fav else None, "src": src,
                     "sort": sort if sort != "new" else None,
                     "limit": limit if limit != 120 else None}
         merged = {**defaults, **overrides}
@@ -13306,7 +13420,7 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         + _vc("newest", _qs(sort=None, offset=None), sort != "size")
         + _vc("largest", _qs(sort="size", offset=None), sort == "size")
         + '<span class="sep"></span>'
-        + _saved_chip("/videos", _qs, local)
+        + _src_chips("/videos", _qs, src, src_n) + _saved_chip("/videos", _qs, local)
         + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1, offset=None)}" '
           f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
           f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>'
