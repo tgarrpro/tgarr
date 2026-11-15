@@ -350,7 +350,8 @@ async def _signed_out_block(request: Request):
                 ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/",
                  # a public channel is followed and read without an account (the crawler's guest workers)
                  "/api/channel/subscribe", "/api/channel/unsubscribe/",
-                 "/api/archive/")):                  # the Internet Archive asks nobody for an account
+                 "/api/archive/",                    # the Internet Archive asks nobody for an account
+                 "/api/update/")):                   # nor does keeping tgarr itself current
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -461,6 +462,7 @@ import usenet_scan  # local module
 import usenet_client  # local module
 import usenet_rules  # local module
 import archive_org  # local module
+import updater
 import transcode  # local module
 import usenet_fetch  # local module
 import usenet_judge  # local module
@@ -2148,6 +2150,7 @@ async def _update_banner() -> str:
             f'It has not updated itself in {st["hours"]} hours, so its updater is probably missing or not running. '
             f'To update now, in the folder that holds <code>docker-compose.yml</code>:'
             f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
+            f'<a class="btn" href="/settings/update" style="margin-right:10px">Update now</a>'
             f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">How to make updates automatic again</a>')
     return box.format(bg="#fffbeb", bd="#fde68a", body=body, hide=hide)
 
@@ -2169,6 +2172,94 @@ async def update_dismiss():
                 """INSERT INTO config (key, value) VALUES ('update_dismissed', $1)
                    ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", latest)
     return RedirectResponse("/", status_code=303)
+
+
+# ---- updating now, from Settings (updater.py) ---------------------------------------------------
+_UPDATE_ASK = {"task": None, "at": 0.0}
+
+
+@app.post("/api/update/check")
+async def update_check_now():
+    """Ask tgarr.me which version is current, now (it is asked every six hours anyway)."""
+    try:
+        latest = await asyncio.to_thread(_update_fetch)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"tgarr.me did not answer ({type(e).__name__})"}, status_code=502)
+    if latest:
+        await _update_note(latest, time.time())
+    return {"status": "ok", "latest": latest, "running": TGARR_VERSION, "newer": _ver_tuple(latest) > _ver_tuple(TGARR_VERSION)}
+
+
+@app.post("/api/update/now")
+async def update_now():
+    """Have the updater look for a newer image now. It answers when it is done - and not at
+    all if it replaces this container - so a quick no is waited for, and silence is 'at work'."""
+    if _PINNED_TAG and _PINNED_TAG not in ("latest", "edge"):
+        return {"status": "ok", "state": "pinned",
+                "message": f"This install is held at {_PINNED_TAG} (TGARR_TAG in .env). Remove that line and run `docker compose up -d` to follow new versions."}
+    t = _UPDATE_ASK["task"]
+    if t is None or t.done() or time.time() - _UPDATE_ASK["at"] > 900:
+        t = _UPDATE_ASK["task"] = asyncio.create_task(asyncio.to_thread(updater.ask))
+        _UPDATE_ASK["at"] = time.time()
+    try:
+        state, message = await asyncio.wait_for(asyncio.shield(t), 5)
+    except asyncio.TimeoutError:
+        state, message = updater.verdict(error="timeout")
+    except Exception as e:
+        state, message = updater.verdict(error=str(e)[:120])
+    log.info("[update] asked the updater: %s", state)
+    return {"status": "ok", "state": state, "message": message}
+
+
+@app.get("/settings/update", response_class=HTMLResponse)
+async def page_settings_update():
+    body = """<style>.up-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px;max-width:760px}
+.up-box h3{margin:0 0 6px}.up-box p{color:var(--muted);margin:0 0 10px}
+.up-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.up-msg{margin-top:12px;line-height:1.6}.up-msg code{background:rgba(127,127,127,.14);padding:2px 6px;border-radius:5px}
+</style>
+<div class="up-box"><h3>This install <span id="upPill"></span></h3>
+<p id="upLine">…</p>
+<div class="up-row"><button class="btn" id="upNow" onclick="upNow()">Update now</button>
+<button class="btn ghost" id="upChk" onclick="upCheck()">Check for a new version</button></div>
+<div class="up-msg" id="upMsg"></div></div>
+<div class="up-box"><h3>How tgarr is kept current</h3>
+<p>A small updater runs beside tgarr and looks every half hour whether a newer version was released; when there is one it fetches it and
+restarts tgarr - your data is not touched. <b>Update now</b> has it look at once. If the updater is not running, or this install was set up
+from an older docker-compose.yml, the message above says what to type instead.</p></div>
+<script>
+const esc = t => String(t).replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
+const code = t => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>");
+const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
+let was = null, waiting = false;
+function show(j){
+  if (was === null) was = j.running;
+  const newer = j.kind && j.kind !== "current";
+  document.getElementById("upPill").innerHTML = newer ? pill("bad", esc(j.latest) + " is out") : pill("ok", "current");
+  document.getElementById("upLine").innerHTML = "Running <b>" + esc(j.running) + "</b>" + (newer ? " - <b>" + esc(j.latest) + "</b> was released." : ".")
+    + (j.checked_at ? " tgarr.me was last asked " + new Date(j.checked_at * 1000).toLocaleString() + "." : "")
+    + (j.kind === "pinned" ? " Held at <code>" + esc(j.tag) + "</code> by TGARR_TAG in .env." : "");
+  if (waiting && j.running !== was) location.reload();
+}
+function poll(){ fetch("/api/update").then(r => r.json()).then(show).catch(() => {}).finally(() => setTimeout(poll, waiting ? 3000 : 30000)); }
+function say(t, bad){ const m = document.getElementById("upMsg"); m.style.color = bad ? "#b45309" : ""; m.innerHTML = code(t); }
+function upCheck(){
+  const b = document.getElementById("upChk"); b.disabled = true;
+  fetch("/api/update/check", {method: "POST"}).then(r => r.json()).then(j => {
+    say(j.status !== "ok" ? j.message : j.newer ? "tgarr " + j.latest + " is out; this install runs " + j.running + "." : "This is the current version (" + j.running + ").", j.status !== "ok");
+    return fetch("/api/update").then(r => r.json()).then(show);
+  }).catch(() => say("this server did not answer", true)).finally(() => { b.disabled = false; });
+}
+function upNow(){
+  const b = document.getElementById("upNow"); b.disabled = true; say("Asking the updater…");
+  fetch("/api/update/now", {method: "POST"}).then(r => r.json()).then(j => {
+    say(j.message || "", !["asked", "current"].includes(j.state));
+    if (j.state === "asked") { waiting = true; poll(); setTimeout(() => { b.disabled = false; }, 240000); } else b.disabled = false;
+  }).catch(() => { say("tgarr is restarting - this page comes back by itself."); waiting = true; poll(); });
+}
+poll();
+</script>"""
+    return HTMLResponse(_layout("Update", "/settings", body, page_title="Updating tgarr", top_actions_html=""))
 
 
 @app.get("/api/update")
@@ -7298,7 +7389,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
       <svg class="mark" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
       <div class="logo">tg<span>arr</span></div>
     </div>
-    <div class="ver">v{TGARR_VERSION}</div>
+    <a class="ver" href="/settings/update" title="this version; updating" style="text-decoration:none;display:block">v{TGARR_VERSION}</a>
   </div>
   <div class="navlinks">{nav}</div>
   <div class="user">{'<a class="ub-in" href="/unlock">🔒 Enter PIN</a>' if locked else _user_block()}</div>
@@ -14802,6 +14893,14 @@ function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", h
       <div class="meta">With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.</div>
     </div>
     <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
+  </div>
+  <div class="dl-item">
+    <div class="icon">⬆</div>
+    <div class="info">
+      <div class="name">Updating tgarr</div>
+      <div class="meta">Running {TGARR_VERSION}. tgarr updates itself within the hour of a release; here you can have it look now.</div>
+    </div>
+    <div class="right"><a class="btn" href="/settings/update">Update…</a></div>
   </div>
   <div class="dl-item">
     <div class="icon">🔊</div>

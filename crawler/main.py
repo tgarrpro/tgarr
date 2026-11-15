@@ -4914,6 +4914,7 @@ SUBSCRIBE_BACKFILL_LIMIT = int(os.environ.get("TG_SUBSCRIBE_BACKFILL_LIMIT", "10
 # Registry pull cadence — deliberately slow to keep tgarr.me load sane at scale.
 # UUID-derived hour-of-day stagger means 100K instances spread evenly.
 REGISTRY_PULL_INTERVAL_SEC = int(os.environ.get("TGARR_REGISTRY_PULL_INTERVAL", "43200"))  # 12h
+REGISTRY_FULL_PULL_SEC = int(os.environ.get("TGARR_REGISTRY_FULL_PULL_SEC", str(7 * 86400)))
 REGISTRY_PULL_ENABLED = os.environ.get("TGARR_REGISTRY_PULL", "true").lower() == "true"
 
 
@@ -5406,6 +5407,14 @@ async def registry_puller() -> None:
                     "SELECT value FROM config WHERE key='nsfw_enabled'")) == "true"
                 _since = {r["audience"]: r["t"] for r in await conn.fetch(
                     "SELECT audience, max(last_pulled_at) AS t FROM discovered GROUP BY 1")}
+                # Asking only for what changed never brings back what a pull once missed: an
+                # install that was given a short list keeps a short list for ever (one stood
+                # at 951 channels of 5,000 for months). So once a week the whole list is asked
+                # for again - and at once on an install that has never noted doing so.
+                _full_at = await conn.fetchval("SELECT value FROM config WHERE key='registry_full_pull_at'")
+                _whole = not (_full_at or "").isdigit() or time.time() - int(_full_at) >= REGISTRY_FULL_PULL_SEC
+                if _whole:
+                    _since = {}
             channels = []
             for _aud in (["sfw", "nsfw"] if _adult else ["sfw"]):
                 params = {"audience": _aud, "only_verified": "1", "limit": "5000"}
@@ -5465,8 +5474,13 @@ async def registry_puller() -> None:
                     else:
                         updated += 1
 
-            log.info("[pull] registry sync: %d new, %d updated (of %d returned)",
-                     inserted, updated, len(channels))
+            log.info("[pull] registry sync: %d new, %d updated (of %d returned%s)",
+                     inserted, updated, len(channels), ", the whole list" if _whole else "")
+            if _whole and channels:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO config (key, value) VALUES ('registry_full_pull_at', $1)
+                           ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", str(int(time.time())))
             # Sleep but wake up every 60s to check for force-pull trigger
             for _ in range(REGISTRY_PULL_INTERVAL_SEC // 60):
                 await asyncio.sleep(60)
