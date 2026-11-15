@@ -45,11 +45,32 @@ def new_secret() -> str:
     return secrets.token_hex(32)
 
 
-def make_token(secret: str, seconds: int, now: float | None = None) -> str:
-    """'expiry.signature' - says only "this browser was unlocked until then"."""
+def make_token(secret: str, seconds: int, now: float | None = None, who: str = "") -> str:
+    """'expiry.signature' - says only "this browser was unlocked until then": the owner's.
+    With `who` ('p3': a person the owner has added) 'expiry.who.signature' - that browser is
+    still locked, it is only known whose it is."""
     exp = int((now if now is not None else time.time()) + seconds)
+    if who:
+        if not who.isalnum():
+            raise ValueError("who: letters and digits")
+        sig = hmac.new(secret.encode(), f"{exp}.{who}".encode(), hashlib.sha256).hexdigest()
+        return f"{exp}.{who}.{sig}"
     sig = hmac.new(secret.encode(), str(exp).encode(), hashlib.sha256).hexdigest()
     return f"{exp}.{sig}"
+
+
+def token_who(secret: str | None, token: str | None, now: float | None = None) -> str | None:
+    """Whose browser: '' the owner's (unlocked), 'p3' that person's, None nobody's."""
+    if token_ok(secret, token, now):
+        return ""
+    parts = (token or "").split(".")
+    if not secret or len(parts) != 3:
+        return None
+    exp, who, sig = parts
+    if not exp.isdigit() or not who.isalnum() or int(exp) < (now if now is not None else time.time()):
+        return None
+    good = hmac.new(secret.encode(), f"{exp}.{who}".encode(), hashlib.sha256).hexdigest()
+    return who if hmac.compare_digest(good, sig) else None
 
 
 def token_ok(secret: str | None, token: str | None, now: float | None = None) -> bool:

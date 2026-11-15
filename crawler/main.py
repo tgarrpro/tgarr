@@ -89,7 +89,7 @@ BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 # Single source for the version this crawler reports to the registry.
-TGARR_VERSION = "0.5.8"
+TGARR_VERSION = "0.5.9"
 TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
@@ -3031,10 +3031,82 @@ def _session_authed() -> bool:
         return False
 
 
+# ═════════════════════════════════════════════════
+# Before anybody has signed in
+#
+# A new install is not useless until its owner has a Telegram app id: public channels can
+# be followed and read from tgarr.me's file lists and Telegram's own web preview, neither of
+# which needs an account (see "HTTP first" above). So while main() waits for a session, the
+# few workers that never touch the account run already: the Discover list is pulled, followed
+# public channels are read, what they hold is judged, labelled and made searchable. Playing or
+# saving a file is what the account is for; the pages say so. When a session appears these
+# are stopped and everything starts the usual way.
+# ═════════════════════════════════════════════════
+NEEDS_ACCOUNT = "needs a Telegram account: Telegram does not show this channel without one"
+
+
+async def guest_poller() -> None:
+    """Followed public channels, read without an account. One that cannot be (Telegram shows
+    no web preview of it and tgarr.me has no list) is marked and looked at again in a day."""
+    log.info("[guest] nobody is signed in: followed public channels are read from tgarr.me and the web preview")
+    await asyncio.sleep(5)
+    while True:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT id, tg_chat_id, username, title, backfilled, handle_known, web_preview
+                       FROM channels
+                       WHERE subscribed = TRUE AND username IS NOT NULL AND local_root IS NULL
+                         AND (last_polled_at IS NULL
+                              OR last_polled_at < NOW() - (CASE WHEN subscribe_error = $2 THEN 86400 ELSE $1 END) * INTERVAL '1 second')
+                       ORDER BY last_polled_at NULLS FIRST LIMIT 1""",
+                    SUBSCRIBE_POLL_INTERVAL, NEEDS_ACCOUNT)
+            if not row:
+                await asyncio.sleep(20)
+                continue
+            try:
+                done = await _poll_without_account(row)
+            except Exception as e:
+                log.warning("[guest] @%s: %s", row["username"], str(e)[:160])
+                done = True                    # a hiccup: not a verdict on the channel
+                async with db_pool.acquire() as conn:
+                    await conn.execute("UPDATE channels SET last_polled_at = NOW() WHERE id = $1", row["id"])
+            if not done:
+                async with db_pool.acquire() as conn:
+                    have = await conn.fetchval("SELECT 1 FROM messages WHERE channel_id = $1 LIMIT 1", row["id"])
+                    await conn.execute(
+                        "UPDATE channels SET last_polled_at = NOW(), subscribe_error = $2 WHERE id = $1",
+                        row["id"], None if have else NEEDS_ACCOUNT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("[guest] poller: %s", str(e)[:200])
+            await asyncio.sleep(30)
+
+
 async def wait_for_session() -> None:
-    """Block until the api container's login flow finishes signing in."""
+    """Block until the api container's login flow finishes signing in. Meanwhile the workers
+    that need no account run (see above)."""
     if _session_authed():
         return
+    try:
+        async with db_pool.acquire() as conn:      # the Discover list now, not at this install's hour of the day
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES ('registry_pull_force', 'first start')
+                   ON CONFLICT (key) DO NOTHING""")
+    except Exception as e:
+        log.debug("[guest] %s", e)
+    guests = [asyncio.create_task(f()) for f in (registry_puller, guest_poller, meili_sync_worker,
+                                                 release_judge_worker, audience_classifier_worker)]
+    try:
+        await _wait_for_session()
+    finally:
+        for t in guests:
+            t.cancel()
+        await asyncio.gather(*guests, return_exceptions=True)
+
+
+async def _wait_for_session() -> None:
     log.info("[startup] no Telegram session yet — open tgarr in a browser (http://<this-host>:8765 unless you changed TGARR_PORT) and sign in")
     log.info("[startup] waiting for signed-in session at %s …", SESSION_PATH)
     while not _session_authed():

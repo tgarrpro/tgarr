@@ -1,0 +1,461 @@
+"""Reading aloud: what happens to the text before the voice gets it.
+
+The voice (Kokoro, a small open model run on this machine's CPU) says what it is given, and
+its own idea of how Chinese is read is one reading per character plus a list of words: 长 is
+always zhang3, 得 is always de5, and "路还长着呢" comes out wrong. So the text is prepared here:
+
+  tidy        marks the voice stumbles over are taken out or turned into pauses; in an English
+              sentence numbers become words ("platform 9" was read "platform jiu").
+  decide      how each Chinese character should sound, in this order:
+                1. a short list of rules of our own - each a case the others get wrong;
+                2. a word of the voice's own list, when it really is a word of this sentence;
+                3. a model that reads the whole sentence (optional, see g2pw_lite.py), allowed
+                   to decide a fixed list of characters only.
+  stand in    a character the voice would say wrongly is replaced by a stand-in: a character
+              hardly any book contains, put in the voice's list as "this syllable and nothing
+              else". One sound changes; the words and the flow around it do not.
+
+The voice writes sounds its own way (an initial and a final in zhuyin, some finals as one
+character of its own: "ㄓ ㄤ 3" is zhang3, "ㄓ 中 1" zhong1); everything here speaks pinyin, and
+sound_tables() is the dictionary between the two.
+
+Nothing here needs the voice or any model: everything is plain functions (test_tts_text.py).
+"""
+import re
+
+HAN = re.compile(r"[一-鿿]")
+SYLLABLE = re.compile(r"[a-z]+[1-5]")
+LONGEST_ENTRY = 10               # the voice looks no further than this for a word of its list
+STANDIN_BASE = 0xE000            # private-use characters: one per syllable (a list given to Lexicon by hand)
+
+# ───────────────────────── the voice's writing of sounds ─────────────────────────
+
+_INITIALS = {"b": "ㄅ", "p": "ㄆ", "m": "ㄇ", "f": "ㄈ", "d": "ㄉ", "t": "ㄊ", "n": "ㄋ", "l": "ㄌ", "g": "ㄍ", "k": "ㄎ", "h": "ㄏ",
+             "j": "ㄐ", "q": "ㄑ", "x": "ㄒ", "zh": "ㄓ", "ch": "ㄔ", "sh": "ㄕ", "r": "ㄖ", "z": "ㄗ", "c": "ㄘ", "s": "ㄙ"}
+# the voice's sign for a final: (as written after a consonant, as written alone, its family)
+_FINALS = {
+    "ㄚ": ("a", "a", ""), "ㄛ": ("o", "o", ""), "ㄜ": ("e", "e", ""), "ㄞ": ("ai", "ai", ""), "ㄟ": ("ei", "ei", ""), "ㄠ": ("ao", "ao", ""),
+    "ㄡ": ("ou", "ou", ""), "ㄢ": ("an", "an", ""), "ㄣ": ("en", "en", ""), "ㄤ": ("ang", "ang", ""), "ㄥ": ("eng", "eng", ""), "ㄦ": ("er", "er", ""),
+    "ㄭ": ("i", None, "z"), "十": ("i", None, "zh"),                                    # zi ci si; zhi chi shi ri
+    "ㄧ": ("i", "yi", "i"), "压": ("ia", "ya", "i"), "ㄝ": ("ie", "ye", "i"), "要": ("iao", "yao", "i"), "又": ("iu", "you", "i"),
+    "言": ("ian", "yan", "i"), "阴": ("in", "yin", "i"), "阳": ("iang", "yang", "i"), "应": ("ing", "ying", "i"), "用": ("iong", "yong", "i"),
+    "ㄨ": ("u", "wu", "u"), "穵": ("ua", "wa", "u"), "我": ("uo", "wo", "u"), "外": ("uai", "wai", "u"), "为": ("ui", "wei", "u"),
+    "万": ("uan", "wan", "u"), "文": ("un", "wen", "u"), "王": ("uang", "wang", "u"), "中": ("ong", None, "u"), "瓮": (None, "weng", "u"),
+    "ㄩ": ("v", "yu", "v"), "月": ("ve", "yue", "v"), "元": ("van", "yuan", "v"), "云": ("vn", "yun", "v"),
+}
+
+
+def sound_tables():
+    """({pinyin without tone: the voice's signs}, {the voice's signs: pinyin}). 'v' is ü where
+    pinyin has to say so (lv, nve); after j, q and x it is written u, as in ju and xue."""
+    to_voice, to_pinyin = {}, {}
+    for sign, (after, alone, family) in _FINALS.items():
+        if alone:
+            to_voice[alone], to_pinyin[sign] = sign, alone
+        if not after:
+            continue
+        for ini, isign in _INITIALS.items():
+            hard, sib = ini in ("zh", "ch", "sh", "r"), ini in ("z", "c", "s")
+            if (family == "z" and not sib) or (family == "zh" and not hard) or (family == "i" and (hard or sib)):
+                continue
+            if ini in ("j", "q", "x"):
+                if family not in ("i", "v"):
+                    continue
+                spelled = ini + (after.replace("v", "u") if family == "v" else after)
+            elif family == "v":
+                if ini not in ("n", "l"):
+                    continue
+                spelled = ini + after
+            else:
+                spelled = ini + after
+            to_voice.setdefault(spelled, isign + " " + sign)
+            to_pinyin.setdefault(isign + " " + sign, spelled)
+    return to_voice, to_pinyin
+
+
+TO_VOICE, TO_PINYIN = sound_tables()
+
+
+def voice_signs(syllable: str):
+    """'zhang3' -> 'ㄓ ㄤ 3' (None: not a sound the voice writes)."""
+    base = TO_VOICE.get(syllable[:-1]) if syllable[-1:] in ("1", "2", "3", "4", "5") else None
+    return base + " " + syllable[-1] if base else None
+
+
+def syllables_of(signs: list):
+    """['ㄓ', 'ㄤ', '3', 'ㄓ', 'ㄜ', '5'] -> ['zhang3', 'zhe5']. None when it is not that plain:
+    a word said with the r of Beijing at its end, or a sign not in the table."""
+    out, cur = [], []
+    for t in signs:
+        if t in ("1", "2", "3", "4", "5"):
+            p = TO_PINYIN.get(" ".join(cur))
+            if not p:
+                return None
+            out.append(p + t)
+            cur = []
+        else:
+            cur.append(t)
+    return None if cur or not out else out
+
+
+def rare_characters() -> list:
+    """Characters the voice takes for Chinese (it knows no others as such) that hardly any book
+    contains: in neither of the two character sets that books in Chinese were set in."""
+    out = []
+    for cp in range(0x4E00, 0xA000):
+        ch = chr(cp)
+        try:
+            ch.encode("gb2312")
+            continue
+        except UnicodeEncodeError:
+            pass
+        try:
+            ch.encode("big5")
+            continue
+        except UnicodeEncodeError:
+            out.append(ch)
+    return out
+
+# ───────────────────────── tidy ─────────────────────────
+
+_QUOTES = "“”„‟«»「」『』〝〞＂\"‘’‚‛`"
+_RX_APOSTROPHE = re.compile(r"(?<=[A-Za-z])[’'](?=[A-Za-z])")
+_RX_DASH = re.compile(r"\s*(?:—+|–|―|──+|-{2,})\s*")
+_RX_DOTS = re.compile(r"(?:…+|\.{3,}|。{2,})")
+_RX_BRACKETS = re.compile(r"[\(\)\[\]\{\}（）【】〔〕《》〈〉]")
+_RX_SPACE = re.compile(r"[ \t\r\n　]+")
+_RX_CJK_SPACE = re.compile(r"(?<=[　-鿿＀-￯]) +(?=[　-鿿＀-￯])")
+
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+         "seventeen eighteen nineteen").split()
+_TENS = "x x twenty thirty forty fifty sixty seventy eighty ninety".split()
+_ORD = {"one": "first", "two": "second", "three": "third", "five": "fifth", "eight": "eighth", "nine": "ninth", "twelve": "twelfth"}
+_BIG = ((10 ** 12, "trillion"), (10 ** 9, "billion"), (10 ** 6, "million"), (1000, "thousand"))
+
+
+def number_words(n: int) -> str:
+    """12 -> 'twelve', 1234 -> 'one thousand two hundred thirty-four'."""
+    if n < 0:
+        return "minus " + number_words(-n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ("-" + _ONES[n % 10] if n % 10 else "")
+    if n < 1000:
+        return _ONES[n // 100] + " hundred" + (" " + number_words(n % 100) if n % 100 else "")
+    for size, name in _BIG:
+        if n >= size:
+            if n >= size * 1000:
+                break
+            return number_words(n // size) + " " + name + (" " + number_words(n % size) if n % size else "")
+    return " ".join(_ONES[int(d)] for d in str(n))          # too long to be a quantity: digit by digit
+
+
+def ordinal_words(n: int) -> str:
+    w = number_words(n)
+    head, sep, last = w.rpartition("-") if "-" in w.split(" ")[-1] else w.rpartition(" ")
+    last = _ORD.get(last) or (last[:-1] + "ieth" if last.endswith("y") else last + "th")
+    return (head + sep + last) if head else last
+
+
+def year_words(y: int) -> str:
+    """1984 -> 'nineteen eighty-four', 2005 -> 'two thousand five', 2024 -> 'twenty twenty-four'."""
+    if y % 1000 == 0:
+        return number_words(y)
+    hi, lo = divmod(y, 100)
+    if lo == 0:
+        return number_words(hi) + " hundred"
+    if 2000 <= y < 2010:
+        return "two thousand " + number_words(lo)
+    return number_words(hi) + " " + ("oh " + number_words(lo) if lo < 10 else number_words(lo))
+
+
+def _spoken(digits: str) -> str:
+    return " ".join(_ONES[int(d)] for d in digits)
+
+
+_RX_MONEY = re.compile(r"([$£€])\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?")
+_RX_PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s?%")
+_RX_TIME = re.compile(r"\b(\d{1,2}):([0-5]\d)\b")
+_RX_ORDINAL = re.compile(r"\b(\d{1,4})(st|nd|rd|th)\b", re.I)
+_RX_DECIMAL = re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d+)\.(\d+)\b")
+_RX_YEAR = re.compile(r"(?<![\d.,$£€])(1[1-9]\d\d|20\d\d)(?![\d,]|\.\d)(s?)\b")
+_RX_INT = re.compile(r"\d{1,3}(?:,\d{3})+|\d+")
+_MONEY = {"$": ("dollar", "cent"), "£": ("pound", "penny"), "€": ("euro", "cent")}
+
+
+def numbers_to_english(text: str) -> str:
+    """Every figure in an English sentence as the words a person would say."""
+    def money(m):
+        unit, part = _MONEY[m.group(1)]
+        n = int(m.group(2).replace(",", ""))
+        out = number_words(n) + " " + unit + ("" if n == 1 else "s")
+        if m.group(3):
+            c = int(m.group(3).ljust(2, "0"))
+            if c:
+                out += " and " + number_words(c) + " " + ("pence" if part == "penny" and c != 1 else part + ("" if c == 1 or part == "penny" else "s"))
+        return out
+
+    def decimal(m):
+        return number_words(int(m.group(1).replace(",", ""))) + " point " + _spoken(m.group(2))
+
+    def year(m):
+        w = year_words(int(m.group(1)))
+        if m.group(2):                                       # "the 1990s"
+            w = w[:-1] + "ies" if w.endswith("y") else w + "s"
+        return w
+
+    t = _RX_MONEY.sub(money, text)
+    t = _RX_PERCENT.sub(lambda m: (decimal(_RX_DECIMAL.match(m.group(1))) if "." in m.group(1) else number_words(int(m.group(1)))) + " percent", t)
+    t = _RX_TIME.sub(lambda m: number_words(int(m.group(1))) + " " + ("o'clock" if m.group(2) == "00" else
+                                                                      ("oh " if m.group(2)[0] == "0" else "") + number_words(int(m.group(2)))), t)
+    t = _RX_ORDINAL.sub(lambda m: ordinal_words(int(m.group(1))), t)
+    t = _RX_DECIMAL.sub(decimal, t)
+    t = _RX_YEAR.sub(year, t)
+    return _RX_INT.sub(lambda m: number_words(int(m.group().replace(",", ""))), t)
+
+
+def tidy(text: str) -> str:
+    """The text as the voice should be given it: no marks it would skip a word over, pauses
+    where a dash or dots stood, and - in a sentence without Chinese - figures as words. (In a
+    Chinese sentence the voice's own tables read dates and quantities: 12月31日, 3.5吨.)"""
+    t = _RX_APOSTROPHE.sub("'", text or "")
+    for q in _QUOTES:
+        t = t.replace(q, " ")
+    t = re.sub(r"(?<![A-Za-z])'|'(?![A-Za-z])", " ", t)      # a quote mark, not the apostrophe of don't
+    chinese = bool(HAN.search(t))
+    t = _RX_DOTS.sub("。" if chinese else ". ", t)
+    t = _RX_DASH.sub("，" if chinese else ", ", t)
+    t = _RX_BRACKETS.sub("，" if chinese else ", ", t)
+    if not chinese:
+        t = numbers_to_english(t)
+    t = _RX_SPACE.sub(" ", t).strip()
+    if chinese:                    # a space between two Chinese characters (or their punctuation) is where a mark was
+        t = _RX_CJK_SPACE.sub("", t)
+    t = re.sub(r"\s+([,.;:!?，。；：！？])", r"\1", t)
+    t = re.sub(r"([，,])(?:\s*[，,])+", r"\1", t)
+    return re.sub(r"[，,\s]+$", "", re.sub(r"^[，,。.\s]+", "", t))
+
+
+# ───────────────────────── the voice's own word list ─────────────────────────
+
+class Lexicon:
+    """The voice's list of words (word -> syllables), and a stand-in character for every
+    syllable it can say. `words` maps a string to its list of syllables."""
+
+    def __init__(self, words: dict, syllables, pool=None, write=None):
+        """words: {word: [syllables]}, or None in place of the list for a word the voice says
+            its own way and nothing here may touch. pool: the characters stand-ins are taken
+            from (private-use ones when not given). write: how a syllable is written in the
+            voice's list (as it is, when not given)."""
+        self.words = words
+        self.write = write or (lambda s: s)
+        self.longest = min(LONGEST_ENTRY, max((len(w) for w in words if HAN.search(w)), default=1))
+        pool = iter(pool) if pool is not None else (chr(STANDIN_BASE + k) for k in range(6400))
+        self.standin = {}
+        for s in sorted(set(syllables)):
+            for ch in pool:
+                if ch not in words:
+                    self.standin[s] = ch
+                    break
+        self.sound_of = {c: s for s, c in self.standin.items()}
+
+    @classmethod
+    def read(cls, lexicon_path: str) -> "Lexicon":
+        """From the voice's own list of Chinese words. The stand-ins take the place of rare
+        characters of that list (see lexicon_text)."""
+        words = {}
+        with open(lexicon_path, encoding="utf-8") as f:
+            for ln in f:
+                p = ln.split()
+                if len(p) >= 2 and p[0] not in words and HAN.search(p[0]):
+                    syl = syllables_of(p[1:])
+                    words[p[0]] = syl if syl and len(syl) == len(p[0]) else None
+        in_words = {ch for w in words if len(w) > 1 for ch in w}
+        pool = [ch for ch in rare_characters() if ch not in in_words]
+        for ch in pool:
+            words.pop(ch, None)
+        return cls(words, [b + t for b in TO_VOICE for t in "12345"], pool, voice_signs)
+
+    def extra_lines(self) -> str:
+        """The lines to add to the voice's list so that it knows the stand-ins."""
+        return "".join(f"{c} {self.write(s)}\n" for s, c in self.standin.items())
+
+    def lexicon_text(self, lexicon_path: str) -> str:
+        """The voice's list as it is given to the voice: its own lines, without those of the
+        characters that now stand in, and the stand-ins' lines after them."""
+        with open(lexicon_path, encoding="utf-8") as f:
+            kept = [ln for ln in f if ln.split()[:1] and ln.split()[0] not in self.sound_of]
+        return "".join(kept).rstrip("\n") + "\n" + self.extra_lines()
+
+    def spans(self, text: str) -> list:
+        """(start, end, [syllables]) for each stretch the voice reads as one entry: the
+        longest entry at each place, which is how the voice itself looks them up."""
+        out, i, n = [], 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch in self.sound_of:
+                out.append((i, i + 1, [self.sound_of[ch]]))
+                i += 1
+                continue
+            if not HAN.match(ch):
+                i += 1
+                continue
+            for size in range(min(self.longest, n - i), 0, -1):
+                w = text[i:i + size]
+                if w in self.words and not any(c in self.sound_of for c in w):
+                    r = self.words[w]
+                    out.append((i, i + size, r if r is not None and len(r) == size else [None] * size))
+                    i += size
+                    break
+            else:
+                i += 1
+        return out
+
+    def said(self, text: str) -> list:
+        """What the voice says for each character when left alone (None: not a syllable)."""
+        out = [None] * len(text)
+        for a, b, r in self.spans(text):
+            out[a:b] = r
+        return out
+
+
+# ───────────────────────── decide ─────────────────────────
+
+# Characters whose tone moves with what follows; the voice was trained its own way with them.
+KEEP = frozenset("一不")
+# The sentence model was trained on readings as taught in Taiwan (成绩 with ji1, 和 as han4). It
+# may decide only characters that have more than one reading in mainland usage, and never one
+# of the readings that differ across the strait.
+POLYPHONIC = frozenset(
+    "长行重得地的着了还数教难好大差乐只发觉都为种处当分更给会几间将降角解空落没蒙闷泡片强曲塞散少盛省似宿弹挑调帖相兴应载占涨正中转传藏朝称冲臭创答待担倒钉斗恶干杆冠观号"
+    "和喝横哄划混夹假监结禁劲卷看壳累量凉笼露绿率论么模磨宁泊铺切亲圈任丧扇舍什石熟说提同吐鲜削血咽要饮与予晕扎炸挣症轴钻作背便别薄参曾叉场车乘匙畜揣打逮单掸读度肚囤垛"
+    "坊菲佛否服脯杆供勾估骨桧过哈汗巷貉核荷吓虹哗豁奇缉济系茄贾槛嚼侥脚校节芥矜仅尽靓颈据卡咳吭溃烙勒擂蠡俩撩淋馏溜碌抡脉埋蔓氓眯靡秘泌抹娜呢粘弄疟排迫胖刨炮喷漂撇仆朴"
+    "曝栖蹊茜呛悄翘雀阙撒色厦杉煞汤苔通拓瓦圩尾纤肖吁旋轧殷荫约钥择殖爪拽幢综柞坐")
+ACROSS_THE_STRAIT = frozenset({
+    ("和", "han4"), ("绩", "ji1"), ("期", "qi2"), ("质", "zhi2"), ("危", "wei2"), ("微", "wei2"), ("企", "qi4"), ("识", "shi4"),
+    ("液", "yi4"), ("击", "ji2"), ("携", "xi1"), ("括", "gua1"), ("血", "xie3"), ("熟", "shou2"), ("谁", "shei2"), ("角", "jiao3"),
+    ("说", "shui4"), ("薄", "bo2"), ("给", "ji3"), ("露", "lou4"), ("壳", "qiao4"), ("色", "shai3"), ("剥", "bo1"), ("削", "xue1")})
+
+_ADVERBS = "很还太更最多不好挺真这那么蛮较越再又也都"
+_GROWS = "大得成出高胖进满了着"
+_RX_NAN = re.compile("遇到了难|有难|遭难|大难|受难|落难|逃难|避难|发难|责难|非难|刁难|灾难|苦难|患难|磨难|罹难|殉难|遇难|空难|海难")
+
+
+def rules(text: str, py: list) -> list:
+    """Ours, over everything else. Each rule is here because a real sentence was read wrongly
+    by the voice's list AND by the model; when another turns up it is added - with its test."""
+    for m in re.finditer("长", text):
+        i = m.start()
+        before, after, third = text[i - 1:i], text[i + 1:i + 2], text[i + 2:i + 3]
+        # "路还长着呢", "日子长着呢": long, and going on - not "he has a beard" (长着胡子)
+        if after == "着" and (third == "呢" or not HAN.match(third or "。")):
+            py[i] = "chang2"
+        # 很长 / 太长 / 多长 / 不长 / 那么长: long - unless something grows (长大, 长得, 长高 ...)
+        elif before and before in _ADVERBS and (not after or after not in _GROWS):
+            py[i] = "chang2"
+    for m in re.finditer("着急", text):
+        py[m.start()] = "zhao2"
+    for m in re.finditer("大夫", text):                        # the doctor; the ancient title is rare in what people read
+        py[m.start()], py[m.start() + 1] = "dai4", "fu5"
+    for m in _RX_NAN.finditer(text):
+        py[m.start() + m.group().index("难")] = "nan4"
+    return py
+
+
+def spans_of(words: list) -> set:
+    """{(start, end)} of a sentence's words, given the words in order."""
+    out, at = set(), 0
+    for w in words:
+        w = w[0] if isinstance(w, tuple) else w
+        out.add((at, at + len(w)))
+        at += len(w)
+    return out
+
+
+def particles(words: list) -> dict:
+    """得 and 地, the two that every page is full of, from where they stand among the words
+    of the sentence ({position: syllable}). The big model does this better; this is for an
+    install without it, where the voice says de2 and di4 every time.
+    `words`: [(word, part of speech)] as a word splitter gives them ('v' verb, 'a' adjective,
+    'd' adverb, 'r' pronoun, 'n' noun, 'p' preposition ...)."""
+    out, at = {}, 0
+    for k, (w, flag) in enumerate(words):
+        prev = words[k - 1] if k else ("", "x")
+        nxt = words[k + 1] if k + 1 < len(words) else ("", "x")
+        if w == "得":
+            if prev[1][:1] in ("v", "a", "z", "i", "l", "m", "q", "b") and prev[0] not in ("还", "就", "都", "也", "总", "非", "必", "只"):
+                out[at] = "de5"                    # 跑得快, 长得很长, 种得深: after what is done or how it is
+            elif nxt[0] and nxt[0][0] not in "了到过着" and nxt[1][:1] in ("v", "p", "d", "r", "a", "n", "t", "m"):
+                out[at] = "dei3"                   # 你得去, 我们得在…, 还得等: must
+        elif w == "地":
+            if prev[1][:1] in ("a", "d", "z", "i", "l", "v", "b") and nxt[1][:1] in ("v", "p", "d", "a"):
+                out[at] = "de5"                    # 乐呵呵地说, 慢慢地走 - not 这块地很肥
+        elif len(w) == 3 and w[1] == "得":
+            out[at + 1] = "de5"                    # 说得对, 来得及, 跑得快 taken as one word
+        at += len(w)
+    return out
+
+
+def decide(text: str, lex: Lexicon, word_spans=None, model=None, hints=None) -> list:
+    """How every character of `text` should sound: a syllable, or None for what is not a
+    Chinese character the voice knows.
+    word_spans: {(start, end)} of the sentence's real words (a word splitter's answer), so
+        that an entry of the voice's list counts only where it is a word of this sentence -
+        the voice takes the longest entry at each place and finds "着数" (a move in chess) in
+        数着数. None: every entry counts.
+    model: one reading per character from a model that read the whole sentence, or None.
+    hints: {position: syllable} from particles(); they stand where the model says nothing."""
+    said = lex.said(text)
+    py = list(said)
+    for i, p in (hints or {}).items():
+        if 0 <= i < len(py) and said[i] and p in lex.standin:
+            py[i] = p
+    if model is not None:
+        for i, ch in enumerate(text):
+            m = model[i] if i < len(model) else None
+            if m and said[i] and m != said[i] and ch in POLYPHONIC and (ch, m) not in ACROSS_THE_STRAIT and m in lex.standin:
+                py[i] = m
+    for a, b, r in lex.spans(text):
+        if b - a > 1 and (word_spans is None or (a, b) in word_spans):
+            py[a:b] = r
+    py = rules(text, py)
+    return [said[i] if (said[i] is None or ch in KEEP or not py[i] or py[i] not in lex.standin) else py[i]
+            for i, ch in enumerate(text)]
+
+
+def stand_in(text: str, lex: Lexicon, want: list) -> str:
+    """`text` with every character the voice would say otherwise than wanted replaced by the
+    stand-in for the wanted syllable. The same length as `text`."""
+    said = lex.said(text)
+    return "".join(lex.standin[want[i]] if (want[i] and said[i] and want[i] != said[i]) else ch
+                   for i, ch in enumerate(text))
+
+
+def prepare(text: str, lex: Lexicon, words_of=None, model_of=None) -> str:
+    """Everything, for one piece of text: tidied, decided, stood in. The two helpers are
+    optional - words_of(text) -> [(word, part of speech)], a word splitter; model_of(text) ->
+    one reading per character, the sentence model. Without them the rules and the voice's
+    own words decide."""
+    t = tidy(text)
+    if not t or not HAN.search(t):
+        return t
+    words = words_of(t) if words_of else None
+    model = model_of(t) if model_of else None
+    return stand_in(t, lex, decide(t, lex, spans_of(words) if words else None, model, particles(words) if words else None))
+
+
+def split(text: str, limit: int = 260) -> list:
+    """Pieces of at most `limit` characters, cut at the end of a sentence where there is one."""
+    out, buf = [], ""
+    for s in re.findall(r"[^.!?。！？；;\n]+[.!?。！？；;\n]*", text or "") or ([text] if text else []):
+        if buf and len(buf) + len(s) > limit:
+            out.append(buf)
+            buf = ""
+        buf += s
+        while len(buf) > limit:
+            out.append(buf[:limit])
+            buf = buf[limit:]
+    if buf.strip():
+        out.append(buf)
+    return [x.strip() for x in out if x.strip()]

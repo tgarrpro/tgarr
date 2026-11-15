@@ -10,9 +10,11 @@
 
 ---
 
-## Two sources, and a household
+## Three sources, and a household
 
-**Telegram and Usenet, one indexer.** Since 0.5.8 tgarr reads Usenet as well: give it a Usenet account (Settings → Usenet) and it reads newsgroup *headers*, keeps a card for every named film, episode, album and book, and makes the NZB itself when Sonarr or Radarr wants one - no outside NZB indexer, no invite. Your downloader (SABnzbd, NZBGet) does the downloading; tgarr never downloads from Usenet. Like the Telegram index, the reading is shared: every install reads a different stretch and all of them can search what any of them found - names and pointers, never files. [Choosing a Usenet provider](https://tgarr.me/usenet/).
+**New in 0.5.9: it works before you give it any account.** The Internet Archive is a third source - old films, radio plays, audiobooks, books and magazines that anybody may download: search it on the Archive page, press Get, and Radarr can ask for its films through tgarr with nothing configured but tgarr itself. Public Telegram channels can be followed and browsed without signing in; the Telegram app id is asked for when you first want to play a file, not before. Small things posted whole on Usenet - a book, an album, a set of pictures - are fetched by tgarr itself. And what a browser cannot play (a DVD or Blu-ray image, an avi, an mkv with sound it has no decoder for) is converted while it is watched, so a phone or a tablet can play it.
+
+**Telegram and Usenet, one indexer.** Since 0.5.8 tgarr reads Usenet as well: give it a Usenet account (Settings → Usenet) and it reads newsgroup *headers*, keeps a card for every named film, episode, album and book, and makes the NZB itself when Sonarr or Radarr wants one - no outside NZB indexer, no invite. Your downloader (SABnzbd, NZBGet) does the downloading of films and series; tgarr itself fetches only small things that were posted whole - a book, a song, a picture - straight into its Library, Music and Gallery, and never video. Like the Telegram index, the reading is shared: every install reads a different stretch and all of them can search what any of them found - names and pointers, never files. [Choosing a Usenet provider](https://tgarr.me/usenet/).
 
 **A media center the family can use.** Films, series, music, books, photos and your own uploaded files, played in the browser. Set a PIN and every other browser at home gets only the Media Center, with only what you ticked - whole channels or single files - and with time rules: opening hours, minutes a day, a break after so long in one go. Adult material is labelled and left out unless you switch it on; sexual material involving children is never indexed.
 

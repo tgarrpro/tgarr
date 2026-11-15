@@ -25,7 +25,12 @@ _B0, _B1 = r"(^|[^a-z0-9])", r"($|[^a-z0-9])"
 FORBIDDEN_SQL = _B0 + (r"(pthc|ptsc|hussyfan|r@ygold|raygold|babyshivid|kingpass|jail.?bait|pre.?teens?|lolicon|loli|shotacon|shota|"
                        r"p[ae]doph[a-z]*|kiddie|kiddy|kinder.?(porn|sex)|child(ren)?[^a-z0-9]*(porn|sex|erotic[a-z]*|nude|rape)|"
                        r"kids?[^a-z0-9]*(porn|sex)|under.?age[a-z]*|cp[0-9]{3,})") + _B1
-MINOR_SQL = _B0 + (r"(lolitas?|p[ae]dos?|([1-9]|1[0-7])[^a-z0-9]?(yo|y[^a-z0-9]?o|yrs?|years?[^a-z0-9]?old|jahre|ans)|school.?girls?|school.?boys?|"
+# A number under eighteen where it reads as an age: "15yo", "age 14", "Anna (15)", "Anna, 15",
+# "12 girls". Not every number after a name: of 24,000 adult cards one in twenty-five has one
+# ("Babe 2", "Divx 11", a date as "17 10 12") and each of those looked at was a count.
+_AGE = (r"([1-9]|1[0-7])[^a-z0-9]?(yo|y[^a-z0-9]?o|yrs?|years?[^a-z0-9]?old|jahre|ans)|age[ds]?[^a-z0-9]{0,2}([1-9]|1[0-7])|"
+        r"[a-z]{3,}[^a-z0-9]?(\(|\[)([6-9]|1[0-7])(\)|\])|[a-z]{3,}, ?([6-9]|1[0-7])|([6-9]|1[0-7])[^a-z0-9]{0,2}(girls?|boys?|teens?)")
+MINOR_SQL = _B0 + (r"(lolitas?|p[ae]dos?|" + _AGE + r"|school.?girls?|school.?boys?|"
                    r"very.?young|tiny.?teens?|young.?(girls?|boys?)|little.?(girls?|boys?)|kids?|child(ren)?|minors?|prepubescent|toddlers?)") + _B1
 ADULT_GROUP_SQL = _B0 + (r"(erotic[a-z]*|sex|porn[a-z]*|xxx|nude[a-z]*|nudis[a-z]*|hentai|fetish[a-z]*|bdsm|bondage|playboy|penthouse|hustler|"
                          r"voyeur[a-z]*|incest|lingerie)") + _B1
@@ -47,6 +52,24 @@ def group_forbidden(grp: str) -> bool:
     """A group whose posts are never kept, wherever else they were posted too: one named
     for sexual material with children."""
     return bool(GROUP_FORBIDDEN_RX.search(grp or ""))
+
+
+def never_kept(names, groups=(), adult: bool = False) -> str:
+    """'' - or why a file is never fetched and never kept. `names` is everything that names
+    it: the file's name, its subject line, the name inside the post, its release, its
+    folder. `adult`: it is known to be adult some other way (the card's label, the folder
+    it lies in, a picture found to be adult by looking at it). The same three rules as for
+    a card, applied to a file."""
+    names = [x for x in names if x]
+    groups = [g for g in groups or () if g]
+    if any(group_forbidden(g) for g in groups):
+        return "posted to a group named for it"
+    if any(FORBIDDEN_RX.search(x) for x in names):
+        return "a term for it in its name"
+    adult = adult or any(ADULT_GROUP_RX.search(g) for g in groups) or any(ADULT_NAME_RX.search(x) for x in names)
+    if adult and any(MINOR_RX.search(x) for x in names):
+        return "adult material named for the young"
+    return ""
 
 
 def group_never(grp: str) -> bool:

@@ -60,4 +60,21 @@ while clock < 86400:
     clock += 1
 ok(tries < 200, f"at most a couple of hundred guesses a day from one address ({tries})")
 
+# a person's browser: known whose it is, and still locked
+t = A.make_token("s3cret", 100, now=1000, who="p3")
+ok(A.token_who("s3cret", t, now=1001) == "p3", "a person's token says whose it is")
+ok(not A.token_ok("s3cret", t, now=1001), "a person's token does not unlock")
+ok(A.token_who("s3cret", t, now=1101) is None, "a person's token runs out")
+ok(A.token_who("other", t, now=1001) is None, "a person's token signed with another secret is nobody's")
+ok(A.token_who("s3cret", t.replace(".p3.", ".p4."), now=1001) is None, "a person's token cannot be turned into another's")
+own = A.make_token("s3cret", 100, now=1000)
+ok(A.token_who("s3cret", own, now=1001) == "", "the owner's token is the owner's")
+ok(A.token_who("s3cret", own.replace(".", ".p3.", 1), now=1001) is None, "the owner's token cannot be made a person's")
+ok(A.token_who("s3cret", "", now=1001) is None and A.token_who("s3cret", None) is None, "no token: nobody")
+try:
+    A.make_token("s3cret", 100, who="p.3")
+    ok(False, "a name with a dot in it is refused")
+except ValueError:
+    ok(True, "a name with a dot in it is refused")
+
 print(f"ok - {n} checks")
