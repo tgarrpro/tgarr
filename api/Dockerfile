@@ -9,9 +9,12 @@ ENV QTWEBENGINE_DISABLE_SANDBOX=1 \
 # whenever a dependency does. In one layer, bumping a package rebuilt calibre.
 
 # calibre + Noto fonts: serve any ebook format as PDF in the browser.
+# ffmpeg: plays what a browser cannot (disc images, avi, wmv ...) by converting while it is
+# watched (transcode.py). Beside calibre it adds under 100 MB: they share most libraries.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         calibre \
+        ffmpeg \
         fonts-noto-core \
         fonts-noto-cjk \
         fonts-noto-extra \

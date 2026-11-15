@@ -20,7 +20,7 @@ LOCAL_CHAT_MAX = -100_000_000_000_000_000
 MINE = "mine"
 
 _KINDS = {
-    "video": "mp4 mkv avi mov m4v webm wmv flv ts m2ts mpg mpeg 3gp rmvb",
+    "video": "mp4 mkv avi mov m4v webm wmv flv ts m2ts mpg mpeg 3gp rmvb vob divx iso",     # (iso: a DVD or Blu-ray image)
     "audio": "mp3 flac m4a m4b aac ogg opus wav wma ape alac aiff dsf wv",
     "photo": "jpg jpeg png webp gif bmp heic heif tif tiff",
     "document": "pdf epub mobi azw azw3 djvu fb2 cbz cbr txt doc docx xls xlsx ppt pptx zip rar 7z srt ass",

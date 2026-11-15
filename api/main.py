@@ -100,7 +100,7 @@ def _cross_site(request) -> bool:
 #     settings. The pages hide those buttons; this refuses the requests.
 _PRIVATE_ID_RX = re.compile(
     r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/lyrics|api/fav|"
-    r"ebook-pdf|ebook-cover|epub|comic|pdf)/(\d+)(?:/|$)")
+    r"ebook-pdf|ebook-cover|epub|comic|pdf|play|transcode)/(\d+)(?:/|$)")
 _PUBLIC_MSG: dict = {}
 
 
@@ -461,6 +461,7 @@ import usenet_scan  # local module
 import usenet_client  # local module
 import usenet_rules  # local module
 import archive_org  # local module
+import transcode  # local module
 import usenet_fetch  # local module
 import usenet_judge  # local module
 import tts  # local module
@@ -4730,6 +4731,208 @@ function tgVideo(main){
 """
 
 
+# ════════════════════════════════════════════════════════════════════
+# Playing what a browser cannot (transcode.py)
+#
+# A DVD or Blu-ray image, an avi, a wmv, an mkv whose sound the browser has no decoder for:
+# on a phone or a tablet such a file is of no use once it is there. /play/<id> plays it all
+# the same - ffmpeg converts while it is watched, from whatever second the slider is put on.
+# Nothing is written; the file is not changed; when the viewer leaves, ffmpeg is stopped.
+# At most three at a time: a conversion takes most of a small machine's processor.
+# ════════════════════════════════════════════════════════════════════
+_TC = {"running": 0, "info": {}}
+_TC_MOST = int(os.environ.get("TGARR_TRANSCODES", "3"))
+
+
+async def _tc_file(msg_id: int):
+    """(path on the disk, file name) of a message whose file is here, whole; else None."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT local_path, file_name, file_size FROM messages WHERE id = $1", msg_id)
+    lp = (r["local_path"] or "") if r else ""
+    if not lp or lp.startswith("__") or ".." in lp:
+        return None
+    path = lp if lp.startswith("/downloads/") else os.path.join("/downloads", lp)
+    try:
+        if not os.path.isfile(path) or (r["file_size"] and os.path.getsize(path) < r["file_size"] * 0.98):
+            return None
+    except OSError:
+        return None
+    return path, (r["file_name"] or os.path.basename(path))
+
+
+async def _tc_info(path: str) -> dict:
+    """What the file is (asked of ffprobe once, remembered while the file does not change)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        raise transcode.NotAFilm("gone")
+    hit = _TC["info"].get(path)
+    if hit and hit[0] == mtime:
+        if isinstance(hit[1], Exception):
+            raise hit[1]
+        return hit[1]
+    try:
+        info = await asyncio.to_thread(transcode.probe, path)
+    except transcode.NotAFilm as e:
+        info = e
+    if len(_TC["info"]) > 400:
+        _TC["info"].clear()
+    _TC["info"][path] = (mtime, info)
+    if isinstance(info, Exception):
+        raise info
+    return info
+
+
+@app.get("/transcode/{msg_id}/info")
+async def api_transcode_info(msg_id: int):
+    if not transcode.available():
+        return JSONResponse({"status": "error", "message": "this install has no ffmpeg: it cannot convert"}, status_code=501)
+    f = await _tc_file(msg_id)
+    if not f:
+        return JSONResponse({"status": "error", "message": "the file is not on this server yet"}, status_code=404)
+    try:
+        info = await _tc_info(f[0])
+    except transcode.NotAFilm as e:
+        return JSONResponse({"status": "error", "message": f"this cannot be played: {e}"}, status_code=415)
+    return {"status": "ok", "name": f[1], "duration": info["duration"], "width": info["width"], "height": info["height"],
+            "kind": info["kind"], "heights": [h for h in transcode.HEIGHTS if h < (info["height"] or 0)]}
+
+
+@app.get("/transcode/{msg_id}")
+async def api_transcode(msg_id: int, t: float = 0.0, h: int = 0):
+    """The film from second t, as a stream the browser plays while it arrives."""
+    if not transcode.available():
+        return PlainTextResponse("this install has no ffmpeg", status_code=501)
+    f = await _tc_file(msg_id)
+    if not f:
+        return PlainTextResponse("not found", status_code=404)
+    try:
+        info = await _tc_info(f[0])
+    except transcode.NotAFilm:
+        return PlainTextResponse("this cannot be played", status_code=415)
+    if _TC["running"] >= _TC_MOST:
+        return PlainTextResponse("too many films are being converted at once - try again in a moment", status_code=503)
+    cmd = transcode.command(info, t, h)
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    _TC["running"] += 1
+    log.info("[play] converting %s from %.0fs%s (%d under way)", f[1][:80], max(0.0, t), f", {h}p" if h in transcode.HEIGHTS else "", _TC["running"])
+
+    async def stream():
+        try:
+            while True:
+                chunk = await proc.stdout.read(1 << 16)
+                if not chunk:
+                    break
+                yield chunk
+        finally:                              # the viewer left, or the film is over
+            _TC["running"] -= 1
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+    return StreamingResponse(stream(), media_type="video/mp4", headers={"Cache-Control": "no-store", "Accept-Ranges": "none"})
+
+
+_PLAY_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>__TITLE__ — tgarr</title>
+<style>
+html,body{height:100%}body{background:#000;color:#e2e8f0;font-family:system-ui,sans-serif;margin:0;display:flex;flex-direction:column}
+.bar{background:#0f172a;padding:10px 16px;display:flex;align-items:center;gap:12px;font-size:13px}
+.bar a{color:#94a3b8;text-decoration:none}.bar .title{flex:1;font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;position:relative;background:#000}
+video{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;background:#000}
+.msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;color:#cbd5e1;font-size:16px;pointer-events:none}
+.ctl{background:#0f172a;padding:10px 16px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.ctl button,.ctl select{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:8px;height:38px;min-width:42px;padding:0 12px;font:inherit;font-size:14px;cursor:pointer}
+.ctl input[type=range]{flex:1;min-width:140px;accent-color:#38bdf8;height:28px}
+.time{font-variant-numeric:tabular-nums;font-size:13px;color:#cbd5e1;white-space:nowrap}
+@media (max-width:640px){.bar .hide-s{display:none}.ctl{gap:8px;padding:8px 10px 12px}}
+</style></head><body>
+<div class="bar"><a href="#" id="back">&larr; back</a><div class="title">__TITLE__</div>
+<span class="hide-s" id="what" style="color:#64748b"></span><a href="/media/__ID__" download>&#11015; download</a></div>
+<div class="stage"><video id="v" playsinline></video><div class="msg" id="msg">getting ready…</div></div>
+<div class="ctl">
+  <button id="pp" title="play or pause (space)">&#9654;</button>
+  <button id="b10" title="back ten seconds (left arrow)">&minus;10</button>
+  <input type="range" id="bar" min="0" max="1" step="1" value="0" disabled>
+  <button id="f10" title="on thirty seconds (right arrow)">+30</button>
+  <span class="time" id="time">0:00 / 0:00</span>
+  <select id="q" title="how tall the picture is made: smaller is lighter on this server and on the connection"></select>
+  <button id="fs" title="full screen (F)">&#9974;</button>
+</div>
+<script>
+const ID = __ID__, v = document.getElementById("v"), bar = document.getElementById("bar"), msg = document.getElementById("msg");
+const KEY = "tgarr.play." + ID;
+let dur = 0, base = 0, drag = false, tries = 0, height = 0;
+const fmt = s => { s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(x).padStart(2, "0"); };
+const now = () => Math.min(dur, base + (v.currentTime || 0));
+function say(t){ msg.textContent = t || ""; msg.style.display = t ? "flex" : "none"; }
+function from(t, keep){
+  base = Math.max(0, Math.min(dur ? dur - 1 : 0, t));
+  say("converting…");
+  v.src = "/transcode/" + ID + "?t=" + base.toFixed(2) + (height ? "&h=" + height : "");
+  v.play().catch(() => { document.getElementById("pp").innerHTML = "&#9654;"; say("press play"); });
+}
+function tick(){
+  if (!drag) bar.value = Math.floor(now());
+  document.getElementById("time").textContent = fmt(drag ? bar.value : now()) + " / " + fmt(dur);
+  try { if (dur && now() > 5) localStorage.setItem(KEY, String(Math.floor(now()))); } catch (e) {}
+}
+v.addEventListener("timeupdate", tick);
+v.addEventListener("playing", () => { tries = 0; say(""); document.getElementById("pp").innerHTML = "&#10074;&#10074;"; });
+v.addEventListener("pause", () => { document.getElementById("pp").innerHTML = "&#9654;"; });
+v.addEventListener("waiting", () => say("converting…"));
+v.addEventListener("ended", () => { if (dur - now() > 15 && tries++ < 3) from(now()); else { say("the end"); try { localStorage.removeItem(KEY); } catch (e) {} } });
+v.addEventListener("error", () => {
+  if (!v.src) return;
+  if (tries++ < 2) setTimeout(() => from(now()), 1500 * tries);
+  else say("it could not be played here - too many films are being converted at once, or this file cannot be read");
+});
+bar.addEventListener("input", () => { drag = true; tick(); });
+bar.addEventListener("change", () => { drag = false; from(+bar.value); });
+document.getElementById("pp").onclick = () => { if (!v.src) from(base); else if (v.paused) v.play(); else v.pause(); };
+document.getElementById("b10").onclick = () => from(now() - 10);
+document.getElementById("f10").onclick = () => from(now() + 30);
+document.getElementById("fs").onclick = () => { const s = document.querySelector(".stage");
+  if (document.fullscreenElement) document.exitFullscreen(); else if (s.requestFullscreen) s.requestFullscreen(); else if (v.webkitEnterFullscreen) v.webkitEnterFullscreen(); };
+document.getElementById("q").onchange = e => { height = +e.target.value; try { localStorage.setItem("tgarr.play.h", String(height)); } catch (x) {} from(now()); };
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+  if (e.key === " ") { e.preventDefault(); document.getElementById("pp").click(); }
+  else if (e.key === "ArrowLeft") from(now() - 10); else if (e.key === "ArrowRight") from(now() + 30);
+  else if (e.key === "f" || e.key === "F") document.getElementById("fs").click();
+});
+document.getElementById("back").onclick = e => { e.preventDefault(); if (history.length > 1) history.back(); else location.href = "/videos"; };
+fetch("/transcode/" + ID + "/info").then(r => r.json()).then(j => {
+  if (j.status !== "ok") { say(j.message || "this cannot be played"); return; }
+  dur = j.duration; bar.max = Math.floor(dur); bar.disabled = false;
+  document.getElementById("what").textContent = ({dvd: "DVD image", bluray: "Blu-ray image", file: ""})[j.kind] || "";
+  const q = document.getElementById("q"); let want = 0;
+  try { want = +(localStorage.getItem("tgarr.play.h") || 0); } catch (e) {}
+  q.innerHTML = '<option value="0">' + (j.height ? j.height + "p" : "as it is") + '</option>'
+    + j.heights.slice().reverse().map(h => '<option value="' + h + '">' + h + 'p</option>').join("");
+  if (j.heights.includes(want)) { height = want; q.value = String(want); }
+  if (!j.heights.length) q.style.display = "none";
+  let at = 0; try { at = +(localStorage.getItem(KEY) || 0); } catch (e) {}
+  from(at > 5 && at < dur - 30 ? at : 0);
+}).catch(() => say("this server did not answer"));
+</script></body></html>"""
+
+
+@app.get("/play/{msg_id}", response_class=HTMLResponse)
+async def page_play(msg_id: int):
+    f = await _tc_file(msg_id)
+    if not f:
+        return RedirectResponse(f"/watch/{msg_id}")           # not here yet: the watch page fetches it and comes back
+    return HTMLResponse(_PLAY_HTML.replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
+
+
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
 async def watch_page(msg_id: int):
     """Loading-aware media viewer. Polls /api/media-status until enough bytes
@@ -4784,6 +4987,7 @@ audio {{ width:600px; max-width:96vw; }}
   <a href="#" id="backBtn">← back</a>
   <div class="title">{html.escape(title)}</div>
   <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{'in your favourites' if row["fav"] else 'add to favourites'}">♥ Favourite</button>
+  {f'<a href="/play/{msg_id}" title="no picture or no sound? this plays it converted for this device">▶ play converted</a>' if (transcode.available() and transcode.needs(title) == "maybe") else ""}
   <a href="/media/{msg_id}" download>⬇ download</a>
 </div>
 <main id="main">
@@ -4798,6 +5002,9 @@ audio {{ width:600px; max-width:96vw; }}
 <script>
 const MSG_ID = {msg_id};
 const MEDIA_TYPE = {_js_str(mt)};
+// 'always': no browser plays this kind of file (a disc image, an avi ...) - it is converted
+// while it is watched, on /play. 'maybe': tried as it is first, converted if that fails.
+const CONVERT = {_js_str(transcode.needs(title) if transcode.available() else "")};
 const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
 {_WATCH_PLAYER_JS}
 tgFavBtn();
@@ -4811,8 +5018,13 @@ function fmtBytes(b) {{
 function renderPlayer() {{
   if (started) return; started = true;
   const main = document.getElementById("main");
+  if (CONVERT === "always") {{ location.replace("/play/" + MSG_ID); return; }}
   if (MEDIA_TYPE === "video") {{
     tgVideo(main);
+    if (CONVERT === "maybe") {{
+      const vv = main.querySelector("video");
+      if (vv) vv.addEventListener("error", () => location.replace("/play/" + MSG_ID), {{once: true}});
+    }}
     return;
   }}
   if (MEDIA_TYPE === "audio") {{
@@ -4946,7 +5158,7 @@ async function poll() {{
       // Start the player as soon as ~2MB or 10% is on disk — progressive
       // playback can then keep up with the download. Only for video and
       // audio: a book or a PDF is useless until it is whole.
-      if ((MEDIA_TYPE === "video" || MEDIA_TYPE === "audio") &&
+      if ((MEDIA_TYPE === "video" || MEDIA_TYPE === "audio") && CONVERT !== "always" &&
           (j.bytes > 2_000_000 || (j.total && pct > 10))) {{
         renderPlayer();
         return;

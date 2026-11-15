@@ -64,7 +64,7 @@ ok(p["shelf"] == "film" and names(p) == ["film.mp4"] and p["bytes"] == 900_000_0
 p = A.plan(item("movies", [F("part1.mp4", 500), F("part2.mp4", 600), F("part1.ia.mp4", 100, "derivative", original="part1.mp4")]))
 ok(names(p) == ["part1.mp4", "part2.mp4"], "the uploader's own playable files, all of them, in order")
 p = A.plan(item("movies", [F("old.avi", 700_000_000)]))
-ok(names(p) == ["old.avi"], "no copy a browser plays: the original (it is converted when it is watched)")
+ok(names(p) == ["old.avi"], "no copy a browser plays: the original (/play converts it while it is watched)")
 p = A.plan(item("audio", [F("book.m4b", 295_000_000), F("ch_02.mp3", 56_000_000, title="02 - The Red-Headed League"), F("ch_01.mp3", 62_000_000, title="01 - A Scandal in Bohemia"),
                           F("ch_01.ogg", 36_000_000, "derivative", original="ch_01.mp3"), F("ch_01_64kb.mp3", 31_000_000, "derivative", original="ch_01.mp3"),
                           F("ch_01_spectrogram.png", 250_000, "derivative"), F("cover.jpg", 120_000)], collection=["librivoxaudio", "audio_bookspoetry"]))
