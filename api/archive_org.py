@@ -59,9 +59,13 @@ def clean_query(q: str) -> str:
 
 def search_url(q: str, shelf: str, page: int = 1, rows: int = ROWS) -> str:
     """One page of what a shelf holds for these words, the most downloaded first. Items that
-    can only be borrowed (the lending library) are left out: they cannot be fetched."""
+    can only be borrowed (the lending library) are left out: they cannot be fetched.
+    Every word must be in the title or in the maker's name. Asked without naming a field, the
+    Archive looks through the descriptions too, and with the most downloaded first that put
+    whatever is popular and mentions the words above the thing itself: "night of the living
+    dead" began with six items that were not it."""
     want = SHELF[shelf][3]
-    words = clean_query(q)
+    words = " AND ".join(f'(title:"{w}" OR creator:"{w}")' for w in clean_query(q).split())
     query = (f"({words}) AND " if words else "") + f"{want} AND NOT access-restricted-item:true"
     params = [("q", query)] + [("fl[]", f) for f in ("identifier", "title", "creator", "year", "mediatype", "downloads", "item_size")]
     params += [("rows", str(rows)), ("page", str(max(1, int(page)))), ("sort[]", "downloads desc"), ("output", "json")]

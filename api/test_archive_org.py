@@ -23,7 +23,12 @@ ok(A.clean_query("  ") == "" and A.clean_query(None) == "" and len(A.clean_query
 u = urllib.parse.urlparse(A.search_url("sherlock holmes", "audiobook", 3))
 q = urllib.parse.parse_qs(u.query)
 ok(u.netloc == "archive.org" and u.path == "/advancedsearch.php", "the search's address")
-ok(q["q"] == ["(sherlock holmes) AND collection:librivoxaudio AND NOT access-restricted-item:true"], f"the words, the shelf, and never what can only be borrowed: {q['q']}")
+ok(q["q"] == ['((title:"sherlock" OR creator:"sherlock") AND (title:"holmes" OR creator:"holmes")) AND collection:librivoxaudio AND NOT access-restricted-item:true'],
+   f"every word in the title or the maker's name, the shelf, and never what can only be borrowed: {q['q']}")
+ok('(title:"and" OR creator:"and")' in urllib.parse.parse_qs(urllib.parse.urlparse(A.search_url("Duck and Cover", "film")).query)["q"][0]
+   and '(title:"don\'t" OR creator:"don\'t")' in urllib.parse.parse_qs(urllib.parse.urlparse(A.search_url("don't look now", "film")).query)["q"][0],
+   "a small 'and' is a word to look for, not the search's own; an apostrophe stays inside its word")
+ok('"' not in A.clean_query('a" OR title:"b'), "nothing typed can close the quotes")
 ok(q["page"] == ["3"] and q["rows"] == [str(A.ROWS)] and q["output"] == ["json"] and q["sort[]"] == ["downloads desc"], "which page, how many, most wanted first")
 ok("collection" not in q["fl[]"] and "identifier" in q["fl[]"], "only the fields that are used (an item can be in hundreds of collections)")
 ok(urllib.parse.parse_qs(urllib.parse.urlparse(A.search_url("", "film")).query)["q"] == ["mediatype:movies AND NOT access-restricted-item:true"],
