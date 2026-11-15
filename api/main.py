@@ -8308,7 +8308,9 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         + '</div></div>')
     status_html = f'{welcome_html}<div class="st-row">{tg}{cr}{sh}{sto}</div>'
     status_html = await _update_banner() + status_html
-    if not browsable:
+    # (only somebody who is signed in is told so: an install nobody has signed in to showed
+    # "You are signed in" above its welcome)
+    if not browsable and _signed_in():
         status_html = (
             '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;'
             'padding:16px 18px;margin-bottom:16px;line-height:1.6">'
