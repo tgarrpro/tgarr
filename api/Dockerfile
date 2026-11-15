@@ -14,6 +14,9 @@ ENV QTWEBENGINE_DISABLE_SANDBOX=1 \
 #   fonts-wqy-microhei, fonts-dejavu-core   Chinese, Japanese, Korean and Latin for a PDF
 #                   that brings no fonts of its own, and for books calibre converts
 #   libegl1 ... libice6   what calibre's standalone build needs to start (11 MB together)
+#   intel-media-va-driver, mesa-va-drivers   the drivers through which ffmpeg reaches an
+#                   Intel or an AMD graphics card, when the container is given one, to make
+#                   the picture there (transcode.py). An NVIDIA card brings its own.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
@@ -24,6 +27,7 @@ RUN apt-get update \
         fonts-dejavu-core \
         libegl1 libopengl0 libnss3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
         libxcb-render-util0 libxcb-xkb1 libxkbcommon-x11-0 libsm6 libice6 \
+        intel-media-va-driver mesa-va-drivers \
     && fc-cache -fv > /dev/null \
     && rm -rf /var/lib/apt/lists/*
 

@@ -355,7 +355,8 @@ async def _signed_out_block(request: Request):
                  "/api/channel/subscribe", "/api/channel/unsubscribe/",
                  "/api/archive/",                    # the Internet Archive asks nobody for an account
                  "/api/update/",                     # nor does keeping tgarr itself current
-                 "/api/packs/")):                    # nor fetching what a book or a model needs
+                 "/api/packs/",                      # nor fetching what a book or a model needs
+                 "/api/settings/transcode_hw")):     # nor which part of this machine converts films
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -5042,7 +5043,49 @@ function tgVideo(main){
 # Nothing is written; the file is not changed; when the viewer leaves, ffmpeg is stopped.
 # At most three at a time: a conversion takes most of a small machine's processor.
 # ════════════════════════════════════════════════════════════════════
-_TC = {"running": 0, "info": {}}
+_TC = {"running": 0, "info": {}, "hw": None, "hw_failed": 0}
+
+
+async def _tc_hw() -> tuple:
+    """(kind, device) of the graphics card films are encoded on, or ('', ''): looked for once
+    (a one-second trial on each card the container was given), unless Settings says software."""
+    async with db_pool.acquire() as conn:
+        if await conn.fetchval("SELECT value FROM config WHERE key = 'transcode_hw'") == "off":
+            return "", ""
+    if _TC["hw"] is None:
+        # TGARR_TRANSCODE_HW in the container's environment decides without a trial:
+        # "off", or a kind with its device ("vaapi:/dev/dri/renderD129", "nvenc").
+        forced = os.environ.get("TGARR_TRANSCODE_HW", "").strip()
+        if forced:
+            k, d, rc = (forced.split(":") + ["", ""])[:3]
+            _TC["hw"] = (k, d, rc or ("vbr" if k == "nvenc" else "cqp")) if k in transcode.HW_KINDS else ("", "", "")
+        else:
+            _TC["hw"] = await asyncio.to_thread(transcode.hw_find)
+        _TC["hw_failed"] = 0
+        log.info("[play] films are converted %s", ("on " + transcode.HW_NAMES[_TC["hw"][0]] + (" " + _TC["hw"][1] if _TC["hw"][1] else ""))
+                 if _TC["hw"][0] else "in software (no graphics card that can was given to this container)")
+    return _TC["hw"]
+
+
+@app.get("/api/transcode/hw")
+async def api_transcode_hw():
+    async with db_pool.acquire() as conn:
+        off = await conn.fetchval("SELECT value FROM config WHERE key = 'transcode_hw'") == "off"
+    hw = await _tc_hw() if not off else (_TC["hw"] or ("", ""))
+    return {"status": "ok", "setting": "off" if off else "auto", "kind": "" if off else hw[0], "device": "" if off else hw[1],
+            "name": transcode.HW_NAMES["" if off else hw[0]], "found": bool((_TC["hw"] or ("", ""))[0]),
+            "rc": "" if off else (tuple(hw) + ("", "", ""))[2]}
+
+
+@app.post("/api/settings/transcode_hw")
+async def settings_transcode_hw(value: str = Form("auto")):
+    val = "off" if value == "off" else "auto"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO config (key, value) VALUES ('transcode_hw', $1)
+               ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", val)
+    _TC["hw"] = None                              # looked for anew: a card may have been given since
+    return RedirectResponse("/settings", status_code=302)
 _TC_MOST = int(os.environ.get("TGARR_TRANSCODES", "3"))
 
 
@@ -5097,7 +5140,8 @@ async def api_transcode_info(msg_id: int):
     except transcode.NotAFilm as e:
         return JSONResponse({"status": "error", "message": f"this cannot be played: {e}"}, status_code=415)
     return {"status": "ok", "name": f[1], "duration": info["duration"], "width": info["width"], "height": info["height"],
-            "kind": info["kind"], "heights": [h for h in transcode.HEIGHTS if h < (info["height"] or 0)]}
+            "kind": info["kind"], "heights": [h for h in transcode.HEIGHTS if h < (info["height"] or 0)],
+            "hw": (await _tc_hw())[0]}
 
 
 @app.get("/transcode/{msg_id}")
@@ -5114,14 +5158,44 @@ async def api_transcode(msg_id: int, t: float = 0.0, h: int = 0):
         return PlainTextResponse("this cannot be played", status_code=415)
     if _TC["running"] >= _TC_MOST:
         return PlainTextResponse("too many films are being converted at once - try again in a moment", status_code=503)
-    cmd = transcode.command(info, t, h)
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    hw = ("", "") if transcode.can_copy(info, h if h in transcode.HEIGHTS else 0) else await _tc_hw()
+
+    async def begin(on):
+        """Start ffmpeg and wait for the first of the film: a card that will not do it says so
+        by ending without a byte, before anything was sent to the viewer."""
+        p = await asyncio.create_subprocess_exec(*transcode.command(info, t, h, on), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        return p, await p.stdout.read(1 << 16)
+
     _TC["running"] += 1
-    log.info("[play] converting %s from %.0fs%s (%d under way)", f[1][:80], max(0.0, t), f", {h}p" if h in transcode.HEIGHTS else "", _TC["running"])
+    try:
+        proc, first = await begin(hw)
+        if not first and hw[0]:
+            # The card took the trial but not this film (a size it has no room for, a busy
+            # encoder): the film is converted in software, and the viewer notices nothing.
+            # A card that fails three films running is not asked again until tgarr restarts.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            _TC["hw_failed"] += 1
+            log.warning("[play] %s would not convert %s (%d in a row): in software instead", transcode.HW_NAMES[hw[0]], f[1][:80], _TC["hw_failed"])
+            if _TC["hw_failed"] >= 3:
+                _TC["hw"] = ("", "")
+            hw = ("", "")
+            proc, first = await begin(hw)
+        elif first and hw[0]:
+            _TC["hw_failed"] = 0
+    except BaseException:
+        _TC["running"] -= 1
+        raise
+    log.info("[play] converting %s from %.0fs%s%s (%d under way)", f[1][:80], max(0.0, t), f", {h}p" if h in transcode.HEIGHTS else "",
+             " on " + transcode.HW_NAMES[hw[0]] if hw[0] else "", _TC["running"])
 
     async def stream():
         try:
-            while True:
+            if first:
+                yield first
+            while first:
                 chunk = await proc.stdout.read(1 << 16)
                 if not chunk:
                     break
@@ -5214,7 +5288,8 @@ document.getElementById("back").onclick = e => { e.preventDefault(); if (history
 fetch("/transcode/" + ID + "/info").then(r => r.json()).then(j => {
   if (j.status !== "ok") { say(j.message || "this cannot be played"); return; }
   dur = j.duration; bar.max = Math.floor(dur); bar.disabled = false;
-  document.getElementById("what").textContent = ({dvd: "DVD image", bluray: "Blu-ray image", file: ""})[j.kind] || "";
+  document.getElementById("what").textContent = [({dvd: "DVD image", bluray: "Blu-ray image", file: ""})[j.kind] || "",
+    j.hw ? "converted on the graphics card" : ""].filter(Boolean).join(" · ");
   const q = document.getElementById("q"); let want = 0;
   try { want = +(localStorage.getItem("tgarr.play.h") || 0); } catch (e) {}
   q.innerHTML = '<option value="0">' + (j.height ? j.height + "p" : "as it is") + '</option>'
@@ -14847,6 +14922,21 @@ def _fmt_uptime(sec) -> str:
 async def page_settings(request: Request):
     if not _signed_in():
         return RedirectResponse("/login")     # settings belong to the account
+    # which part of this machine makes the picture when a film is converted while it is watched
+    _hw = await api_transcode_hw()
+    if _hw["setting"] == "off":
+        _hw_meta = "In software, because it was switched to that here." + (" A graphics card that can do it was found." if _hw["found"] else "")
+        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="auto"/><button class="btn" type="submit">Use the graphics card</button></form>'
+    elif _hw["kind"]:
+        _hw_meta = (f"On {html.escape(_hw['name'])}{' at ' + html.escape(_hw['device']) if _hw['device'] else ''}: a film takes a fraction of the processor it takes in software. "
+                    "If a film will not play, or looks wrong, switch to software.")
+        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="off"/><button class="btn ghost" type="submit">Use software</button></form>'
+    else:
+        _hw_meta = ("In software: this tgarr was not given a graphics card that can encode. On Linux, running the installer again hands it "
+                    "the card if there is one; the guide says how to do it by hand.")
+        _hw_btn = '<a class="btn ghost" href="https://github.com/tgarrpro/tgarr/blob/main/docs/install/gpu.md" target="_blank" rel="noopener">How</a>'
+    hw_row = ('<div class="dl-item"><div class="icon">🎞</div><div class="info"><div class="name">Converting films</div>'
+              f'<div class="meta">{_hw_meta}</div></div><div class="right">{_hw_btn}</div></div>')
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
     async with db_pool.acquire() as conn:
@@ -15142,6 +15232,7 @@ function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", h
     </div>
     <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
   </div>
+  {hw_row}
   <div class="dl-item">
     <div class="icon">⬆</div>
     <div class="info">
