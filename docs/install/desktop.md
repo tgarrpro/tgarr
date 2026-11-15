@@ -43,6 +43,10 @@ Download `install-tgarr.cmd` from the [latest release](https://github.com/tgarrp
 and double-click it. (Or, in PowerShell: `irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 | iex`.)
 Windows asks once whether the installer may make changes; it need not be started "as administrator".
 
+(The installer was written so that antivirus software has nothing to object to - it does not
+hide anything it does, and it was checked against Windows' own. If yours blocks it all the
+same, tell us what it said.)
+
 Windows may first say that the file is not commonly downloaded, or "Windows protected your
 PC": it says that of every script that no company has paid to sign. *More info → Run
 anyway*. The file is four lines; open it in Notepad to see them.
@@ -62,7 +66,8 @@ tgarr's files are at `\\wsl$\Ubuntu\opt\tgarr` in Explorer; what it fetched is i
 ## Settings
 
 All optional; set them before the install line (`NAME=value` in front of `bash` on Linux and
-macOS, `$env:NAME = "value"` on Windows).
+macOS). On Windows: `$env:NAME = "value"` before running, or as parameters of `install.ps1`
+(`-Port`, `-Distro`, `-Lan`, `-Ref`).
 
 | | |
 |---|---|

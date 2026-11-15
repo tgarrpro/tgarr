@@ -1,9 +1,9 @@
 <#
 tgarr installer for Windows 10 (2004 or later) and Windows 11.
 
-    irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 | iex
-
-Or download install-tgarr.cmd from the releases page and double-click it: the same thing.
+Download install-tgarr.cmd from tgarr's releases page and double-click it; it fetches this
+file and runs it. How to run it by hand, and what it does step by step:
+https://github.com/tgarrpro/tgarr/blob/main/docs/install/desktop.md
 
 Windows asks once for permission ("Do you want to allow this app to make changes?") - the
 script asks for that itself, it need not be started "as Administrator". tgarr itself is Linux
@@ -13,58 +13,58 @@ software; on Windows it runs inside WSL2, the Linux that Windows carries. This s
      when you have logged in again),
   2. makes sure there is an Ubuntu in it,
   3. runs tgarr's Linux installer inside that Ubuntu (Docker, and tgarr's containers),
-  4. has it start with Windows (a scheduled task),
+  4. has it start with Windows (a scheduled task named "tgarr"),
   5. if you say so, lets the other devices at home reach it (a firewall rule and a port forward).
 
 Nothing else on the machine is changed. To remove it all again: see the end of this file.
 
-Settings, all optional, as environment variables set before running:
-    $env:TGARR_PORT = 8765        port of the web page
-    $env:TGARR_DISTRO = "Ubuntu"  which WSL distribution to use
-    $env:TGARR_LAN = "yes" | "no" reachable from other devices, without being asked
-    $env:TGARR_REF = "main"       which branch or tag the files are taken from
+Settings, all optional - as parameters, or as environment variables TGARR_PORT, TGARR_DISTRO,
+TGARR_LAN, TGARR_REF set before running:
+    -Port 8765          port of the web page
+    -Distro Ubuntu      which WSL distribution to use
+    -Lan yes | no       reachable from other devices, without being asked
+    -Ref main           which branch or tag the files are taken from
 #>
+param([int]$Port = 0, [string]$Distro = "", [string]$Lan = "", [string]$Ref = "", [switch]$KeepOpen)
 $ErrorActionPreference = "Stop"
 
 function Say($t)  { Write-Host "==> $t" -ForegroundColor Cyan }
 function Note($t) { Write-Host "    $t" }
-function Die($t)  {
-    Write-Host "tgarr install: $t" -ForegroundColor Red
-    if ($env:TGARR_KEEP_OPEN) { Write-Host ""; Read-Host "Press Enter to close this window" | Out-Null }
-    exit 1
-}
-
-$Port   = if ($env:TGARR_PORT)   { [int]$env:TGARR_PORT } else { 8765 }
-$Distro = if ($env:TGARR_DISTRO) { $env:TGARR_DISTRO }    else { "Ubuntu" }
-$Ref    = if ($env:TGARR_REF)    { $env:TGARR_REF }       else { "main" }
-$Raw    = "https://raw.githubusercontent.com/tgarrpro/tgarr/$Ref"
-if ($Port -lt 1 -or $Port -gt 65535) { Die "TGARR_PORT must be between 1 and 65535" }
-if ($Distro -notmatch '^[A-Za-z0-9._-]+$') { Die "TGARR_DISTRO is not a distribution's name" }
-
-# This same script, as one command line: with the settings it was given, fetched afresh. It is
-# what is started again with administrator's rights, and again after the restart.
-function Again {
-    $set = ""
-    foreach ($n in "TGARR_PORT", "TGARR_DISTRO", "TGARR_LAN", "TGARR_REF") {
-        $v = [Environment]::GetEnvironmentVariable($n)
-        if ($v -and $v -match '^[A-Za-z0-9._-]+$') { $set += "`$env:$n='$v'; " }
-    }
-    $run = if ($PSCommandPath) { "& '$($PSCommandPath -replace "'", "''")'" } else { "irm '$Raw/install/install.ps1' | iex" }
-    return "$set`$env:TGARR_KEEP_OPEN='1'; [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; $run"
-}
 function Done($code) {
-    if ($env:TGARR_KEEP_OPEN) { Write-Host ""; Read-Host "Press Enter to close this window" | Out-Null }
+    if ($KeepOpen) { Write-Host ""; Read-Host "Press Enter to close this window" | Out-Null }
     exit $code
 }
+function Die($t)  { Write-Host "tgarr install: $t" -ForegroundColor Red; Done 1 }
+
+if (-not $Port)   { $Port   = if ($env:TGARR_PORT)   { [int]$env:TGARR_PORT } else { 8765 } }
+if (-not $Distro) { $Distro = if ($env:TGARR_DISTRO) { $env:TGARR_DISTRO }    else { "Ubuntu" } }
+if (-not $Ref)    { $Ref    = if ($env:TGARR_REF)    { $env:TGARR_REF }       else { "main" } }
+if (-not $Lan)    { $Lan    = "$env:TGARR_LAN" }
+if ($Port -lt 1 -or $Port -gt 65535) { Die "the port must be between 1 and 65535" }
+if ($Distro -notmatch '^[A-Za-z0-9._-]+$') { Die "'$Distro' is not a distribution's name" }
+if ($Ref -notmatch '^[A-Za-z0-9._/-]+$')   { Die "'$Ref' is not a branch or a tag" }
+if ($Lan -and $Lan -notmatch '^(y|yes|n|no)$') { Die "-Lan is yes or no" }
+$Raw = "https://raw.githubusercontent.com/tgarrpro/tgarr/$Ref"
+
+# This script as a file on this machine. It is started a second time with administrator's
+# rights, and a third time after the restart - from the file, with the same settings.
+$Home_ = Join-Path $env:LOCALAPPDATA "tgarr"
+$Self  = $PSCommandPath
+if (-not $Self) {
+    New-Item -ItemType Directory -Path $Home_ -Force | Out-Null
+    $Self = Join-Path $Home_ "install.ps1"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -UseBasicParsing -Uri "$Raw/install/install.ps1" -OutFile $Self
+}
+$Args_ = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$Self`"", "-Port", "$Port", "-Distro", $Distro, "-Ref", $Ref, "-KeepOpen")
+if ($Lan) { $Args_ += @("-Lan", $Lan) }
 
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     # WSL, the scheduled task and the firewall rule need an administrator: ask Windows for it
-    Say "asking Windows for permission to install (a window of its own opens)"
+    Say "asking Windows for permission to install (the installation goes on in a window of its own)"
     try {
-        # (handed over encoded, so that no quote or space in it can be misread on the way)
-        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes((Again)))
-        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $enc)
+        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $Args_
     } catch {
         Die "permission was not given. Nothing was changed."
     }
@@ -82,13 +82,12 @@ $feat = @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform") |
 if ($feat | Where-Object { $_.State -ne "Enabled" }) {
     Say "switching on WSL2 (the Linux that Windows carries)"
     & wsl.exe --install --no-distribution
-    # after the restart, at the next log-in, go on from here (Windows runs this once and forgets it)
-    # A RunOnce entry may be 260 characters long at most, so it names a small file that holds the rest.
-    $dir = Join-Path $env:LOCALAPPDATA "tgarr"
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    $resume = Join-Path $dir "resume-install.cmd"
-    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes((Again)))
-    Set-Content -Path $resume -Encoding ASCII -Value "@echo off`r`ntitle tgarr`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc`r`n"
+    # After the restart, at the next log-in, go on from here: Windows runs what is named under
+    # RunOnce a single time and forgets it. (An entry there may be 260 characters long at
+    # most, so it names a small file that holds the command.)
+    New-Item -ItemType Directory -Path $Home_ -Force | Out-Null
+    $resume = Join-Path $Home_ "resume-install.cmd"
+    Set-Content -Path $resume -Encoding ASCII -Value "@echo off`r`ntitle tgarr`r`npowershell.exe $($Args_ -join ' ')`r`n"
     $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
     if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }       # (never -Force here: it would empty a key that exists)
     Set-ItemProperty -Path $key -Name "tgarr-install" -Value "`"$resume`""
@@ -105,7 +104,7 @@ if ($feat | Where-Object { $_.State -ne "Enabled" }) {
     Done 0
 }
 Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce" -Name "tgarr-install" -ErrorAction SilentlyContinue
-Remove-Item -Path (Join-Path $env:LOCALAPPDATA "tgarr\resume-install.cmd") -ErrorAction SilentlyContinue
+Remove-Item -Path (Join-Path $Home_ "resume-install.cmd") -ErrorAction SilentlyContinue
 & wsl.exe --set-default-version 2 *> $null
 
 # ---- 2. an Ubuntu ------------------------------------------------------------------------------
@@ -140,14 +139,14 @@ Say "starting it with Windows (scheduled task 'tgarr')"
 $keep = "service docker start >/dev/null 2>&1; systemctl start docker >/dev/null 2>&1; exec sleep infinity"
 $act  = New-ScheduledTaskAction -Execute "wsl.exe" -Argument "-d $Distro -u root -- sh -c `"$keep`""
 $trg  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-$set  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -Hidden `
+$set  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 $prn  = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName "tgarr" -Action $act -Trigger $trg -Settings $set -Principal $prn -Force | Out-Null
 Start-ScheduledTask -TaskName "tgarr"
 
 # ---- 5. the other devices at home ----------------------------------------------------------------
-$lan = $env:TGARR_LAN
+$lan = $Lan
 if (-not $lan) {
     Write-Host ""
     Write-Host "tgarr answers on this PC only. Phones, tablets and televisions at home reach it if Windows"
@@ -176,7 +175,7 @@ if ($opened) {
 Note "its files:          \\wsl$\$Distro\opt\tgarr   (fetched files in _data\downloads)"
 Note "logs:               wsl -d $Distro -u root -- docker logs -f tgarr-api"
 Note "It keeps itself up to date. Nothing needs an account to begin with: open the page."
-if ($env:TGARR_KEEP_OPEN) { Start-Process "http://localhost:$Port" }
+if ($KeepOpen) { Start-Process "http://localhost:$Port" }
 Done 0
 
 <#
