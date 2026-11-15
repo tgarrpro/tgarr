@@ -149,15 +149,33 @@ if ($LASTEXITCODE -ne 0) { Die "the installer inside $Distro did not finish. Wha
 # ---- 4. started with Windows ---------------------------------------------------------------------
 # WSL stops a distribution nobody is using; this keeps one quiet process in it, and starts
 # Docker where there is no systemd to do it.
+# The task runs "whether the user is logged on or not": it starts when Windows starts, before
+# anybody logs in, and it has no window. (It first ran in a window at log-in; the window was
+# closed, as any stray black window is, and tgarr stopped with it.)
 Say "starting it with Windows (scheduled task 'tgarr')"
 $keep = "service docker start >/dev/null 2>&1; systemctl start docker >/dev/null 2>&1; exec sleep infinity"
+$who  = "$env:USERDOMAIN\$env:USERNAME"
 $act  = New-ScheduledTaskAction -Execute "wsl.exe" -Argument "-d $Distro -u root -- sh -c `"$keep`""
-$trg  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$trg  = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -AtLogOn -User $who))
 $set  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-$prn  = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+        -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+$prn  = New-ScheduledTaskPrincipal -UserId $who -LogonType S4U -RunLevel Limited
+Stop-ScheduledTask -TaskName "tgarr" -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName "tgarr" -Action $act -Trigger $trg -Settings $set -Principal $prn -Force | Out-Null
 Start-ScheduledTask -TaskName "tgarr"
+# is it really keeping tgarr up? (some Windows set-ups do not let WSL run without a desktop)
+# Looked at twice, some seconds apart: a task that failed takes a moment to say so.
+function Kept { return ((Get-ScheduledTask -TaskName "tgarr").State -eq "Running") -and ((WslOut @("-l", "--running", "-q")) -match [regex]::Escape($Distro)) }
+Start-Sleep -Seconds 10
+$kept = Kept
+if ($kept) { Start-Sleep -Seconds 8; $kept = Kept }
+if (-not $kept) {
+    Note "(Windows would not run it in the background; it will start when you log in instead, in a small window of its own - leave that window open)"
+    $prn = New-ScheduledTaskPrincipal -UserId $who -LogonType Interactive -RunLevel Limited
+    $trg = New-ScheduledTaskTrigger -AtLogOn -User $who
+    Register-ScheduledTask -TaskName "tgarr" -Action $act -Trigger $trg -Settings $set -Principal $prn -Force | Out-Null
+    Start-ScheduledTask -TaskName "tgarr"
+}
 
 # ---- 5. the other devices at home ----------------------------------------------------------------
 $lan = $Lan
@@ -172,10 +190,18 @@ if (-not $lan) {
 $opened = $false
 if ($lan -match '^(y|yes)$') {
     Say "letting the home network in on port $Port"
+    # WSL answers for tgarr on this PC's own "localhost" only. A port forward hands what arrives
+    # from the network on to it - to localhost's IPv6 address, [::1]: forwarding to 127.0.0.1
+    # would be forwarding to the forward itself, which now holds that address (it did: nothing
+    # answered, on the network or on 127.0.0.1).
     & netsh.exe interface portproxy delete v4tov4 listenport=$Port listenaddress=0.0.0.0 *> $null
-    & netsh.exe interface portproxy add v4tov4 listenport=$Port listenaddress=0.0.0.0 connectport=$Port connectaddress=127.0.0.1 | Out-Null
+    & netsh.exe interface portproxy delete v4tov6 listenport=$Port listenaddress=0.0.0.0 *> $null
+    & netsh.exe interface portproxy add v4tov6 listenport=$Port listenaddress=0.0.0.0 connectport=$Port connectaddress=::1 | Out-Null
+    # Let in: machines on the same network as this PC, and no others. Not only on a network
+    # Windows calls "Private" - it calls most home networks "Public" until told otherwise.
     Get-NetFirewallRule -DisplayName "tgarr" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-    New-NetFirewallRule -DisplayName "tgarr" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -Profile Private | Out-Null
+    New-NetFirewallRule -DisplayName "tgarr" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
+        -Profile Private, Public -RemoteAddress LocalSubnet | Out-Null
     $opened = $true
 }
 
@@ -186,7 +212,7 @@ if ($opened) {
     $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
            Where-Object { $_.PrefixOrigin -in "Dhcp", "Manual" -and $_.IPAddress -notlike "169.254.*" -and $_.InterfaceAlias -notlike "vEthernet*" } |
            Select-Object -First 1).IPAddress
-    if ($ip) { Note "from other devices: http://${ip}:$Port   (on a network Windows calls 'Private')" }
+    if ($ip) { Note "from other devices: http://${ip}:$Port   (devices on the same network as this PC)" }
 }
 Note "its files:          \\wsl$\$Distro\opt\tgarr   (fetched files in _data\downloads)"
 Note "logs:               wsl -d $Distro -u root -- docker logs -f tgarr-api"
@@ -199,7 +225,7 @@ To remove tgarr again (PowerShell as Administrator):
 
     Unregister-ScheduledTask -TaskName tgarr -Confirm:$false
     Get-NetFirewallRule -DisplayName tgarr | Remove-NetFirewallRule
-    netsh interface portproxy delete v4tov4 listenport=8765 listenaddress=0.0.0.0
+    netsh interface portproxy delete v4tov6 listenport=8765 listenaddress=0.0.0.0
     wsl -d Ubuntu -u root -- sh -c "cd /opt/tgarr && docker compose down"
     wsl -d Ubuntu -u root -- rm -rf /opt/tgarr        # this deletes tgarr's data
 
