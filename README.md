@@ -96,6 +96,18 @@ Public-tracker users have their IP logged by tens of thousands of peers. US ISPs
 
 ## Quick start
 
+**One line, on a computer of your own** (new in 0.5.11):
+
+| | |
+|---|---|
+| **Linux** | `curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.sh \| bash` |
+| **macOS** | the same line. It sets up [Colima](https://github.com/abiosoft/colima) (a small Linux machine with Docker in it) through Homebrew and installs tgarr inside it. |
+| **Windows 10 / 11** | in PowerShell opened *as Administrator*: `irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 \| iex` - it switches on WSL2 (the Linux that Windows carries; one restart the first time) and installs tgarr inside it. |
+
+The installer makes a folder, puts tgarr's two files in it with two secrets it makes up, starts the containers and waits for the page: `http://localhost:8765`. No account of any kind is needed to begin. Details, settings and how to remove it again: [docs/install/desktop.md](docs/install/desktop.md).
+
+**By hand, or on a NAS:**
+
 > Requires Docker + docker compose v2. Runs on any platform that runs Docker — Synology, CasaOS, Unraid, TrueNAS, QNAP, Portainer, plain Linux, etc.
 
 ```bash
@@ -130,6 +142,7 @@ Once running:
 | Platform | Status | Install guide |
 |---|---|---|
 | Plain docker / docker-compose | ✅ ready | `README` quickstart |
+| Linux, macOS, Windows (a computer of your own) | ✅ one-line installer (macOS and Windows: new, see the guide) | [docs/install/desktop.md](docs/install/desktop.md) |
 | Synology DSM (Container Manager) | ✅ docker-compose | [docs/install/synology.md](docs/install/synology.md) |
 | CasaOS | ✅ app store entry coming | [docs/install/casaos.md](docs/install/casaos.md) |
 | Unraid | ✅ Community Apps XML coming | [docs/install/unraid.md](docs/install/unraid.md) |

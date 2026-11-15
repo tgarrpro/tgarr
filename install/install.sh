@@ -77,7 +77,7 @@ if [ "$(id -u)" != 0 ]; then have sudo && SUDO="sudo" || true; fi
 have curl || die "curl is needed (for example: ${SUDO:+sudo }apt-get install -y curl)"
 
 ask() {   # ask "question" -> 0 for yes. Only when somebody is there to answer.
-  [ -r /dev/tty ] && [ -w /dev/tty ] || return 1
+  { : > /dev/tty; } 2>/dev/null || return 1          # (a terminal that is listed but cannot be opened is nobody)
   printf '%s [y/N] ' "$1" > /dev/tty
   local a; read -r a < /dev/tty || return 1
   case "$a" in y|Y|yes|YES) return 0;; *) return 1;; esac

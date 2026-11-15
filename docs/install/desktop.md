@@ -1,0 +1,80 @@
+# tgarr on a computer of your own: Linux, macOS, Windows
+
+tgarr is Linux software in containers. On Linux the installer starts them. On a Mac and on
+Windows there is no way around a small Linux machine underneath - every "Docker for the
+desktop" is one - so the installer sets one up and puts tgarr inside it: **Colima** on macOS,
+**WSL2** on Windows. You get a page at `http://localhost:8765`; what runs underneath need not
+concern you again.
+
+| | Tried on | State |
+|---|---|---|
+| Linux | a new Ubuntu 24.04 with nothing on it | works |
+| Windows 10 / 11 (WSL2) | the part that runs inside WSL: a new Ubuntu 24.04 without systemd. The Windows side of it (WSL being switched on, the scheduled task, the firewall rule) has not yet been run on a real PC. | new in 0.5.11 |
+| macOS (Colima) | not yet run on a real Mac | new in 0.5.11 |
+
+If the Windows or the macOS installer goes wrong for you, what it printed is what we need:
+[open an issue](https://github.com/tgarrpro/tgarr/issues).
+
+## Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.sh | bash
+```
+
+It installs into `~/tgarr`. If Docker is missing it asks before installing it (Docker's own
+script from get.docker.com); without a terminal to ask on, it stops and says so.
+
+## macOS
+
+The same line, in Terminal. It needs [Homebrew](https://brew.sh). It installs `colima` and
+`docker`, starts Colima (2 processors, 4 GB of memory) and has it start again at login, then
+installs tgarr inside Colima's Linux, in `/opt/tgarr`. The database lives there, on the
+Linux side, where it is fast and its permissions are right. What tgarr fetches is put in
+`~/tgarr/downloads` on the Mac, where Finder sees it.
+
+- `docker ps`, `docker logs -f tgarr-api` work from the Mac's Terminal.
+- `colima stop` / `colima start` stop and start everything.
+- More memory for a big library: `TGARR_COLIMA_MEMORY=8` before the install line, or
+  `colima stop && colima start --memory 8`.
+
+## Windows 10 (2004 or later) and 11
+
+In PowerShell opened with **Run as administrator**:
+
+```powershell
+irm https://raw.githubusercontent.com/tgarrpro/tgarr/main/install/install.ps1 | iex
+```
+
+1. If WSL2 is not switched on, it switches it on and asks you to restart Windows; after the
+   restart, run the same line again.
+2. It installs Ubuntu in WSL (if there is none), and Docker and tgarr inside it, in `/opt/tgarr`.
+3. It adds a scheduled task, `tgarr`, that starts it when you log in.
+4. It asks whether phones, tablets and televisions at home may reach it. If yes, it adds a
+   firewall rule for *private* networks and a port forward for port 8765. Say no and tgarr
+   answers on that PC only.
+
+tgarr's files are at `\\wsl$\Ubuntu\opt\tgarr` in Explorer; what it fetched is in
+`_data\downloads` there. How to remove everything again is written at the end of
+[install.ps1](../../install/install.ps1).
+
+## Settings
+
+All optional; set them before the install line (`NAME=value` in front of `bash` on Linux and
+macOS, `$env:NAME = "value"` on Windows).
+
+| | |
+|---|---|
+| `TGARR_PORT` | port of the page (8765) |
+| `TGARR_DIR` | Linux: where to install (`~/tgarr`) |
+| `TGARR_DOWNLOADS` | Linux, macOS: where fetched files are kept |
+| `TGARR_VERSION` | stay on one version, for example `0.5.11`, instead of following new ones |
+| `TGARR_INSTALL_DOCKER=1` | Linux: install Docker without asking |
+| `TGARR_LAN=yes` / `no` | Windows: reachable from other devices, without being asked |
+| `TGARR_DISTRO` | Windows: the WSL distribution to use (`Ubuntu`) |
+
+## Afterwards
+
+- **Updates** come by themselves within the hour of a release. *Settings → Updating tgarr* has it look at once.
+- **Run the installer again** at any time: it brings `docker-compose.yml` up to date, starts
+  what is not running, and leaves `.env` and your data alone.
+- **Your data** is the `_data` folder beside `docker-compose.yml`. Copy it, with `.env`, and you have a backup.
