@@ -60,7 +60,10 @@ ADULT_MIN_RATIO = 0.08
 #     unless set, so an upgrade never locks anyone out.
 _API_KEY = os.environ.get("TGARR_API_KEY", "").strip()
 _UI_PASSWORD = os.environ.get("TGARR_UI_PASSWORD", "").strip()
-_GUARD_OPEN_PATHS = ("/health", "/favicon.svg", "/favicon.ico")
+_GUARD_OPEN_PATHS = ("/health", "/favicon.svg", "/favicon.ico",
+                     # what a browser fetches to put tgarr on a home screen: asked for without the page's cookies
+                     "/manifest.webmanifest", "/mediacenter/manifest.webmanifest", "/icon-192.png", "/icon-512.png",
+                     "/icon-maskable-512.png", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png")
 
 
 def _is_arr_path(path: str) -> bool:
@@ -1378,6 +1381,96 @@ FAVICON_SVG = (
 @app.get("/favicon.ico")  # browsers auto-request this; serve same SVG payload
 async def favicon():
     return Response(FAVICON_SVG, media_type="image/svg+xml")
+
+
+# ══════════════════════════════════════════════════════════════════
+# On the home screen: tgarr as an app of the phone, the tablet, the television
+# (a web app manifest and icons; nothing is installed, the browser makes the icon).
+# Two of them: the whole of tgarr, and the Media Center alone - what a child's
+# tablet or the television in the living room should open.
+# ══════════════════════════════════════════════════════════════════
+_PWA_HEAD = ('<link rel="manifest" href="__MANIFEST__" />'
+             '<meta name="theme-color" content="__THEME__" />'
+             '<meta name="mobile-web-app-capable" content="yes" />'
+             '<meta name="apple-mobile-web-app-capable" content="yes" />'
+             '<meta name="apple-mobile-web-app-title" content="__TITLE__" />'
+             '<link rel="apple-touch-icon" href="/apple-touch-icon.png" />')
+
+
+def _pwa_head(kids: bool = False) -> str:
+    return (_PWA_HEAD.replace("__MANIFEST__", "/mediacenter/manifest.webmanifest" if kids else "/manifest.webmanifest")
+            .replace("__THEME__", "#fff8ef" if kids else "#229ED9").replace("__TITLE__", "Media Center" if kids else "tgarr"))
+
+
+def _pwa_manifest(kids: bool) -> dict:
+    icons = [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+             {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+             {"src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}]
+    if kids:
+        return {"name": "tgarr Media Center", "short_name": "Media Center", "id": "/mediacenter", "start_url": "/mediacenter",
+                "scope": "/", "display": "standalone", "background_color": "#fff8ef", "theme_color": "#fff8ef", "icons": icons}
+    return {"name": "tgarr", "short_name": "tgarr", "id": "/", "start_url": "/", "scope": "/", "display": "standalone",
+            "background_color": "#0e1621", "theme_color": "#229ED9", "icons": icons}
+
+
+@app.get("/manifest.webmanifest")
+async def pwa_manifest():
+    return Response(_json.dumps(_pwa_manifest(False)), media_type="application/manifest+json", headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/mediacenter/manifest.webmanifest")
+async def pwa_manifest_kids():
+    return Response(_json.dumps(_pwa_manifest(True)), media_type="application/manifest+json", headers={"Cache-Control": "public, max-age=3600"})
+
+
+_PWA_ICONS = {}
+
+
+def _pwa_icon(size: int, maskable: bool = False) -> bytes:
+    """tgarr's mark as a PNG: the white paper plane on the blue. Round for an ordinary icon;
+    for a 'maskable' one the blue fills the square and the plane keeps to the middle, since
+    the phone cuts its own shape out of it. Drawn four times too large and brought down, so
+    that the edges are smooth."""
+    key = (size, maskable)
+    if key not in _PWA_ICONS:
+        import io
+        from PIL import Image, ImageDraw
+        s = size * 4
+        im = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        blue = (0x22, 0x9E, 0xD9, 255)
+        if maskable:
+            d.rectangle([0, 0, s, s], fill=blue)
+        else:
+            d.ellipse([0, 0, s - 1, s - 1], fill=blue)
+        k = (0.60 if maskable else 1.0) * s / 24.0            # the favicon's own 24 x 24 drawing
+        off = (s - 24 * k) / 2
+        d.polygon([(off + x * k, off + y * k) for x, y in ((5.5, 17), (19, 12), (5.5, 7), (5, 11), (13, 12), (5, 13))], fill=(255, 255, 255, 255))
+        out = io.BytesIO()
+        im.resize((size, size), Image.LANCZOS).save(out, "PNG", optimize=True)
+        _PWA_ICONS[key] = out.getvalue()
+    return _PWA_ICONS[key]
+
+
+@app.get("/icon-192.png")
+async def pwa_icon_192():
+    return Response(await asyncio.to_thread(_pwa_icon, 192), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/icon-512.png")
+async def pwa_icon_512():
+    return Response(await asyncio.to_thread(_pwa_icon, 512), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/icon-maskable-512.png")
+async def pwa_icon_maskable():
+    return Response(await asyncio.to_thread(_pwa_icon, 512, True), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/apple-touch-icon.png")
+@app.get("/apple-touch-icon-precomposed.png")
+async def pwa_icon_apple():
+    return Response(await asyncio.to_thread(_pwa_icon, 180, True), media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -7381,6 +7474,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
 <title>{html.escape(title)} · tgarr</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+{_pwa_head()}
 <style>{CSS}{MOBILE_CSS}</style>
 </head><body>
 <aside class="nav">
@@ -11630,6 +11724,7 @@ _MEDIACENTER_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
 <title>tgarr Media Center</title>
 <link rel="icon" href="/favicon.svg"/>
+__PWA__
 <style>
 :root{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--accent:__COLOR__;
   --shadow:0 6px 18px rgba(64,40,10,.10);--r:22px}
@@ -11676,6 +11771,11 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
 .card{background:var(--card);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);display:flex;
   flex-direction:column;transition:transform .15s, box-shadow .15s;position:relative}
 .card:hover,.card:focus-visible{transform:translateY(-4px) scale(1.015);box-shadow:0 12px 26px rgba(64,40,10,.18);outline:none}
+/* what the remote control is on: seen from the sofa */
+.card:focus-visible{outline:5px solid var(--accent);outline-offset:3px;transform:translateY(-4px) scale(1.04)}
+.cat:focus-visible,.pill:focus-visible,.more a:focus-visible,.find button:focus-visible,.logo:focus-visible{outline:5px solid var(--accent);outline-offset:3px}
+.find input:focus-visible{border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 35%,transparent)}
+html.tv .name{font-size:18px}html.tv h2{font-size:25px}
 .pic{aspect-ratio:16/10;background:linear-gradient(135deg,color-mix(in srgb,var(--c) 55%,#fff),var(--c));
   display:flex;align-items:center;justify-content:center;font-size:54px;position:relative;overflow:hidden}
 .pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
@@ -11760,6 +11860,52 @@ __MORE__
   });
 })();
 </script>
+
+<script>
+(function(){
+  // With a remote control (or a keyboard): the arrows go to the nearest thing in that
+  // direction that can be chosen, OK / Enter opens it. A television has no pointer.
+  var SEL = "a.cat, .find input[type=search], .find button, a.card, .more a, a.pill, button.pill, .top a.logo";
+  function all(){ return Array.prototype.filter.call(document.querySelectorAll(SEL), function(e){ var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }); }
+  function mid(e){ var r = e.getBoundingClientRect(); return {x: r.left + r.width / 2, y: r.top + r.height / 2, r: r}; }
+  function next(from, dir){
+    // What lies straight ahead - in the same row for left and right, in the same column for
+    // up and down - is taken, the nearest of it. Only up and down go on to something that is
+    // off to the side when nothing is straight ahead (the row above may be shorter); left and
+    // right stay where they are at the end of a row, as a television does.
+    var a = mid(from), side = (dir === "ArrowLeft" || dir === "ArrowRight"), best = null, bestD = 1e18, near = null, nearD = 1e18;
+    all().forEach(function(e){
+      if (e === from) return;
+      var b = mid(e), dx = b.x - a.x, dy = b.y - a.y, along, across;
+      if (dir === "ArrowRight") { along = dx; across = dy; } else if (dir === "ArrowLeft") { along = -dx; across = dy; }
+      else if (dir === "ArrowDown") { along = dy; across = dx; } else { along = -dy; across = dx; }
+      if (along < 4) return;
+      var ahead = side ? (b.r.bottom > a.r.top + 4 && b.r.top < a.r.bottom - 4) : (b.r.right > a.r.left + 4 && b.r.left < a.r.right - 4);
+      if (ahead) { if (along + Math.abs(across) * 0.2 < bestD) { bestD = along + Math.abs(across) * 0.2; best = e; } }
+      else if (!side) { var d = along * 3 + Math.abs(across); if (d < nearD) { nearD = d; near = e; } }
+    });
+    return best || near;
+  }
+  function go(e){ if (!e) return; e.focus({preventScroll: true}); e.scrollIntoView({block: "center", inline: "center", behavior: "smooth"}); }
+  document.addEventListener("keydown", function(ev){
+    if (ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    if (document.getElementById("lb").classList.contains("on")) return;       // the large picture has its own keys
+    var k = ev.key, at = document.activeElement;
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].indexOf(k) < 0) return;
+    var typing = at && at.tagName === "INPUT";
+    if (typing && (k === "ArrowLeft" || k === "ArrowRight") && at.value) return;   // moving inside what was typed
+    var from = (at && at !== document.body && at.matches && at.matches(SEL)) ? at : null;
+    var to = from ? next(from, k) : (document.querySelector("a.card") || all()[0]);
+    if (to) { ev.preventDefault(); go(to); }
+  });
+  // a television opens with something already chosen
+  if (/[?&]tv=1/.test(location.search) || /\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\b/i.test(navigator.userAgent)) {
+    document.documentElement.classList.add("tv");
+    var first = document.querySelector("a.card") || document.querySelector("a.cat");
+    if (first) first.focus({preventScroll: true});
+  }
+})();
+</script>
 <script src="/mc/ping.js" defer></script>
 </body></html>"""
 
@@ -11836,7 +11982,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
              + '<a class="pill" href="/mediacenter/manage">⚙ Choose what is shown</a>'
              '<a class="pill" href="/">← Back to tgarr</a>')
     heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
-    page = (_MEDIACENTER_HTML.replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
+    page = (_MEDIACENTER_HTML.replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
             .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
             .replace("__GRID__", grid).replace("__MORE__", nav))

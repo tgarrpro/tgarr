@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the wide tile a television's home screen shows: 320 x 180 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp" android:height="180dp" android:viewportWidth="320" android:viewportHeight="180">
+    <path android:fillColor="#229ED9" android:pathData="M0,0H320V180H0Z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M112,138L224,90L112,42L108,80L174,90L108,100Z" />
+</vector>
