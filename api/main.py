@@ -10085,10 +10085,17 @@ async def _archive_grab_one(job) -> tuple:
     """(state, note, files, bytes, message id of the first file)."""
     import shutil
     ident = job["item_id"]
-    try:
-        meta = await asyncio.to_thread(archive_org.fetch_json, archive_org.metadata_url(ident))
-    except Exception:
-        return "failed", "archive.org did not answer - try again later", 0, 0, None
+    meta = None
+    for attempt in (1, 2, 3):                       # the Archive is slow now and then: one silence is not a no
+        try:
+            meta = await asyncio.to_thread(archive_org.fetch_json, archive_org.metadata_url(ident), 40)
+            break
+        except Exception as e:
+            log.info("[archive] %s: asking what it holds (try %d): %s: %s", ident, attempt, type(e).__name__, str(e)[:120])
+            if attempt < 3:
+                await asyncio.sleep(5 * attempt)
+    if meta is None:
+        return "failed", "archive.org did not answer (asked three times) - try again later", 0, 0, None
     p = archive_org.plan(meta)
     if not p["take"]:
         return "failed", p["why"], 0, 0, None
