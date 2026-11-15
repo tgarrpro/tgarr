@@ -27,6 +27,7 @@ import urllib.request
 import wave
 import zipfile
 
+import packs
 import tts_text
 
 log = logging.getLogger("tgarr")
@@ -172,6 +173,7 @@ def _fetch(what: str, url: str, size: int, sha256: str, dest: str, how: str) -> 
 def _install(what: str) -> None:
     s = _state[what]
     try:
+        packs.ensure("runtime")                       # what the voice runs on: fetched with the first model
         for url, size, sha256, dest, how in FILES[what]:
             _fetch(what, url, size, sha256, dest, how)
         with open(READY_MARK[what], "w") as f:

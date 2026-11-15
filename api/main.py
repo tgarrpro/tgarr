@@ -354,7 +354,8 @@ async def _signed_out_block(request: Request):
                  # a public channel is followed and read without an account (the crawler's guest workers)
                  "/api/channel/subscribe", "/api/channel/unsubscribe/",
                  "/api/archive/",                    # the Internet Archive asks nobody for an account
-                 "/api/update/")):                   # nor does keeping tgarr itself current
+                 "/api/update/",                     # nor does keeping tgarr itself current
+                 "/api/packs/")):                    # nor fetching what a book or a model needs
             return JSONResponse({"status": "error", "message": "sign in to Telegram first"},
                                 status_code=401)
         return None
@@ -466,6 +467,7 @@ import usenet_client  # local module
 import usenet_rules  # local module
 import archive_org  # local module
 import updater
+import packs  # what is fetched when first wanted (calibre; the models' runtime)
 import transcode  # local module
 import usenet_fetch  # local module
 import usenet_judge  # local module
@@ -475,7 +477,7 @@ import vision  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.11"
+TGARR_VERSION = "0.5.12"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -667,6 +669,7 @@ async def _startup():
     asyncio.create_task(_archive_grab_worker())
     asyncio.create_task(_archive_arr_worker())
     asyncio.create_task(_update_check_worker())
+    asyncio.create_task(_packs_heal())
 
 
 async def _migrate_schema():
@@ -2982,6 +2985,12 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return True
     import time as _t
+    # calibre is no longer in the image: it is fetched when a book first needs it (packs.py).
+    # Until then nothing is queued - the page that asked says so and offers to fetch it.
+    convert = packs.program("ebook-convert")
+    if not convert:
+        _EBOOK_JOBS[msg_id] = {"state": "needs_converter", "started_at": _t.time()}
+        return False
     # Mark queued + write disk marker for restart persistence
     if msg_id not in _EBOOK_JOBS or _EBOOK_JOBS[msg_id].get("state") == "failed":
         _EBOOK_JOBS[msg_id] = {"state": "queued", "queued_at": _t.time()}
@@ -3000,6 +3009,7 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         env = dict(os.environ)
         env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
         env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
+        env["QT_QPA_PLATFORM"] = "offscreen"          # there is no screen to draw on
         tmp = pdf + ".inprogress.pdf"
         # preexec_fn: RLIMIT_CPU 240s + RLIMIT_FSIZE 200MB; mem bound via container cgroup
         def _set_limits():
@@ -3010,7 +3020,7 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
             except OSError:
                 pass
         proc = await asyncio.create_subprocess_exec(
-            "ebook-convert", src, tmp,
+            convert, src, tmp,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=env, preexec_fn=_set_limits, start_new_session=True)
@@ -3044,8 +3054,11 @@ async def _ebook_cover(src: str, cover: str) -> bool:
     import asyncio
     if os.path.exists(cover):
         return True
+    meta = packs.program("ebook-meta")
+    if not meta:                                    # (no converter fetched yet: no cover from these formats)
+        return False
     proc = await asyncio.create_subprocess_exec(
-        "ebook-meta", src, f"--get-cover={cover}",
+        meta, src, f"--get-cover={cover}",
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL)
     try:
@@ -3086,7 +3099,14 @@ async def ebook_status(msg_id: int, request: Request):
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
                 "size": os.path.getsize(pdf)}
+    if not packs.program("ebook-convert"):
+        st = packs.status("books")
+        return {"state": "needs_converter", "installing": st["installing"], "done": st["done"], "bytes": st["bytes"],
+                "error": st["error"], "possible": st["possible"]}
     job = _EBOOK_JOBS.get(msg_id)
+    if job and job.get("state") == "needs_converter":      # it has arrived since: start over
+        _EBOOK_JOBS.pop(msg_id, None)
+        job = None
     if job and job.get("state") == "converting":
         import time as _t
         return {"state": "converting",
@@ -3150,10 +3170,55 @@ async def ebook_pdf(msg_id: int):
         return Response("file rejected: zip-bomb or malformed archive", status_code=422)
     ok = await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not ok:
+        if not packs.program("ebook-convert"):
+            return Response("the book converter is not installed yet: open the book's page to fetch it", status_code=409)
         return Response("conversion failed", status_code=500)
     return FileResponse(pdf, media_type="application/pdf",
                         headers={"Content-Disposition": "inline",
                                  "Cache-Control": "private, max-age=86400"})
+
+
+async def _packs_heal():
+    """An install that was using what the image used to carry gets it back without being asked:
+    the models' runtime if a voice or the picture model is installed, the book converter if
+    there are books here it is needed for (looked at once, at the first start of a version
+    that no longer carries it; a new install fetches it when a book first asks)."""
+    await asyncio.sleep(90)
+    try:
+        if (tts.installed("voice") or vision.installed()) and not packs.installed("runtime"):
+            log.info("[packs] a model is installed but what it runs on is no longer in the image: fetching it")
+            packs.install("runtime")
+        if not packs.installed("books"):
+            async with db_pool.acquire() as conn:
+                if not await conn.fetchval("SELECT value FROM config WHERE key = 'packs_seeded'"):
+                    n = await conn.fetchval(
+                        r"""SELECT count(*) FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
+                             AND file_name ~* '\.(mobi|azw3?|fb2|djvu|lit|rtf|lrf|pdb|docx|odt)$'""")
+                    await conn.execute("INSERT INTO config (key, value) VALUES ('packs_seeded', '1') ON CONFLICT (key) DO NOTHING")
+                    if n:
+                        log.info("[packs] %d books here need the converter the image no longer carries: fetching it", n)
+                        packs.install("books")
+    except Exception as e:
+        log.warning("[packs] looking what is needed: %s", e)
+
+
+@app.get("/api/packs")
+async def api_packs():
+    return {"status": "ok", "packs": {n: await asyncio.to_thread(packs.status, n) for n in packs.NAMES}}
+
+
+@app.post("/api/packs/install")
+async def api_packs_install(request: Request):
+    try:
+        name = str((await request.json()).get("name") or "")
+    except Exception:
+        name = ""
+    if name not in packs.NAMES:
+        return JSONResponse({"status": "error", "message": "which one?"}, status_code=400)
+    if await _is_locked(request):
+        return JSONResponse({"status": "error", "message": "ask whoever looks after this tgarr: it is fetched from the unlocked side"}, status_code=403)
+    started = packs.install(name)
+    return {"status": "ok", "started": started, **(await asyncio.to_thread(packs.status, name))}
 
 
 @app.get("/ebook-cover/{msg_id}")
@@ -5318,6 +5383,32 @@ function renderPlayer() {{
         if (j.state === "failed") {{
           document.getElementById("ebookStatus").textContent =
             "✗ conversion failed: " + (j.reason || "calibre error");
+          return;
+        }}
+        if (j.state === "needs_converter") {{
+          // the converter (calibre) is fetched once, when a book first needs it
+          const st = document.getElementById("ebookStatus"), mb = Math.round((j.bytes || 0) / 1e6);
+          document.getElementById("ebookElapsed").textContent = "";
+          if (j.installing) {{
+            const pc = j.bytes ? Math.min(100, Math.round(j.done * 100 / j.bytes)) : 0;
+            st.textContent = pc < 100 ? "fetching the book converter… " + pc + "%" : "unpacking the book converter…";
+            document.getElementById("ebookBar").style.width = pc + "%";
+          }} else if (!j.possible) {{
+            st.textContent = "✗ this kind of book needs a converter that does not exist for this machine";
+            return;
+          }} else if (!st.querySelector("button")) {{
+            st.innerHTML = 'This kind of book is converted before it is read, and the converter is not part of tgarr: ' +
+              'it is fetched once (' + mb + ' MB, about 1 GB on the disk).' + (j.error ? '<br><span style="color:#fbbf24">Last try: ' +
+              String(j.error).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]) + '</span>' : '') +
+              '<br><button id="getConv" style="margin-top:10px;padding:9px 18px;border-radius:8px;border:0;background:#229ED9;color:#fff;font:inherit;font-weight:600;cursor:pointer">Fetch the converter</button>';
+            document.getElementById("getConv").onclick = () => {{
+              st.textContent = "starting…";
+              fetch("/api/packs/install", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{name: "books"}})}})
+                .then(r => r.json()).then(x => {{ if (x.status !== "ok") st.textContent = "✗ " + (x.message || "could not start"); }})
+                .catch(() => {{ st.textContent = "✗ this server did not answer"; }});
+            }};
+          }}
+          setTimeout(tick, 2000);
           return;
         }}
         if (j.state === "no_source") {{

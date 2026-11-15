@@ -31,6 +31,8 @@ import threading
 import time
 import urllib.request
 
+import packs
+
 log = logging.getLogger("tgarr")
 
 ROOT = os.environ.get("TGARR_VISION_DIR", "/downloads/.vision")
@@ -80,6 +82,7 @@ def status() -> dict:
 
 def _install() -> None:
     try:
+        packs.ensure("runtime")                       # what the models run on: fetched with the first of them
         os.makedirs(ROOT, exist_ok=True)
         for name, (url, size, sha256) in FILES.items():
             part = _path(name) + ".part"
