@@ -111,6 +111,9 @@ services:
       # lets the Dashboard say "you pinned this version" instead of "your updater is broken"
       TGARR_PINNED_TAG: ${TGARR_TAG:-}
       TGARR_UPDATE_CHECK: ${TGARR_UPDATE_CHECK:-true}
+      # "Update now" in Settings: the updater below is asked over tgarr's own network
+      TGARR_UPDATER_URL: http://watchtower:8080
+      TGARR_UPDATER_TOKEN: ${TGARR_UPDATE_TOKEN:-tgarr-update-now}
       TGARR_UI_PASSWORD: ${TGARR_UI_PASSWORD:-}
     volumes:
       - ./_data/session:/app/session
@@ -149,6 +152,13 @@ services:
       WATCHTOWER_CLEANUP: "true"
       WATCHTOWER_POLL_INTERVAL: "${TGARR_AUTOUPDATE_INTERVAL:-1800}"
       WATCHTOWER_INCLUDE_RESTARTING: "true"
+      # it can also be told to look now (Settings -> Updating tgarr). Its port is not
+      # published: only tgarr's own containers reach it. The token it wants is not a
+      # secret worth keeping - all it allows is "look for a new version now" - so it is
+      # no password of yours; set TGARR_UPDATE_TOKEN in .env for one of your own.
+      WATCHTOWER_HTTP_API_UPDATE: "true"
+      WATCHTOWER_HTTP_API_PERIODIC_POLLS: "true"
+      WATCHTOWER_HTTP_API_TOKEN: ${TGARR_UPDATE_TOKEN:-tgarr-update-now}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
