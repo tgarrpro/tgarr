@@ -17,13 +17,15 @@ the same either way.
 
 ## On the television (Android TV, Google TV, Fire TV)
 
-`tgarr-tv.apk`, from the [releases page](https://github.com/tgarrpro/tgarr/releases), is a
-frame around the Media Center: full screen, driven by the remote control.
+`tgarr-tv-preview.apk`, from the [releases page](https://github.com/tgarrpro/tgarr/releases), is a
+frame around the Media Center: full screen, driven by the remote control. It is a preview: tried on
+an Android TV 14 emulator, not yet on a television in a living room; and it is signed with a
+preview key, so the first regular version will have to be installed over a removed preview.
 
 - It **looks for tgarr on the home network** by itself (tgarr 0.5.11 or later, on port
   8765). If it does not find it, type the address you open tgarr at in a browser.
 - **Arrows** move to the nearest thing in that direction, **OK** opens it, **Back** goes
-  back. **Menu** offers another address, or loading the page again.
+  back. To search, press OK on **Find**: the keyboard opens. **Menu** offers another address, or loading the page again.
 - A television that was not unlocked with the PIN shows the Media Center and nothing else,
   with the time rules you set - that is tgarr's rule for every device, and the reason this
   app shows the Media Center.

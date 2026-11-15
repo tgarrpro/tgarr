@@ -9,10 +9,10 @@ concern you again.
 | | Tried on | State |
 |---|---|---|
 | Linux | a new Ubuntu 24.04 with nothing on it | works |
-| Windows 10 / 11 (WSL2) | the part that runs inside WSL: a new Ubuntu 24.04 without systemd. The Windows side of it (WSL being switched on, the scheduled task, the firewall rule) has not yet been run on a real PC. | new in 0.5.11 |
-| macOS (Colima) | not yet run on a real Mac | new in 0.5.11 |
+| Windows 10 / 11 (WSL2) | a Windows 11 PC, from the double-click to the page: WSL2 switched on, the restart, going on by itself after it, starting with Windows, reachable from the other machines in the house. Not yet on Windows 10. | works; new in 0.5.11 |
+| macOS (Colima) | **not yet run on a real Mac** | new in 0.5.11, unverified |
 
-If the Windows or the macOS installer goes wrong for you, what it printed is what we need:
+If an installer goes wrong for you - the macOS one above all - what it printed is what we need:
 [open an issue](https://github.com/tgarrpro/tgarr/issues).
 
 ## Linux
@@ -54,10 +54,11 @@ anyway*. The file is four lines; open it in Notepad to see them.
 1. If WSL2 is not switched on, it switches it on and offers to restart Windows; when you
    have logged in again it goes on by itself (and asks for permission once more).
 2. It installs Ubuntu in WSL (if there is none), and Docker and tgarr inside it, in `/opt/tgarr`.
-3. It adds a scheduled task, `tgarr`, that starts it when you log in.
-4. It asks whether phones, tablets and televisions at home may reach it. If yes, it adds a
-   firewall rule for *private* networks and a port forward for port 8765. Say no and tgarr
-   answers on that PC only.
+3. It adds a scheduled task, `tgarr`, that starts it with Windows - in the background, before
+   anybody logs in, without a window.
+4. It asks whether phones, tablets and televisions at home may reach it (Enter is yes). If
+   yes, it adds a firewall rule that lets in home-network addresses only, never the internet,
+   and a port forward for port 8765. Say no and tgarr answers on that PC only.
 
 tgarr's files are at `\\wsl$\Ubuntu\opt\tgarr` in Explorer; what it fetched is in
 `_data\downloads` there. How to remove everything again is written at the end of
