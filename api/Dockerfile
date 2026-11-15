@@ -17,6 +17,7 @@ ENV QTWEBENGINE_DISABLE_SANDBOX=1 \
 #   intel-media-va-driver, mesa-va-drivers   the drivers through which ffmpeg reaches an
 #                   Intel or an AMD graphics card, when the container is given one, to make
 #                   the picture there (transcode.py). An NVIDIA card brings its own.
+#                   Intel's exists for amd64 only - there are no Intel cards on ARM.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
@@ -27,7 +28,8 @@ RUN apt-get update \
         fonts-dejavu-core \
         libegl1 libopengl0 libnss3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
         libxcb-render-util0 libxcb-xkb1 libxkbcommon-x11-0 libsm6 libice6 \
-        intel-media-va-driver mesa-va-drivers \
+        mesa-va-drivers \
+        $( [ "$(dpkg --print-architecture)" = amd64 ] && echo intel-media-va-driver ) \
     && fc-cache -fv > /dev/null \
     && rm -rf /var/lib/apt/lists/*
 
