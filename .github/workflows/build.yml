@@ -22,6 +22,15 @@ jobs:
           python-version: '3.12'
       - name: Syntax-check every Python file
         run: python -W error::SyntaxWarning -m compileall -q api crawler registry tools || python -m compileall -q api crawler registry tools
+      - name: The installers parse
+        # (a prompt reworded as "port $Port:" once shipped to a tester as a script that could not start)
+        shell: pwsh
+        run: |
+          bash -n install/install.sh
+          $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install/install.ps1), [ref]$null, [ref]$errs)
+          if ($errs.Count) { $errs | ForEach-Object { Write-Host "install.ps1:$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          if ((Get-Content install/install.sh -Raw) -match "`r") { Write-Host 'install.sh has carriage returns'; exit 1 }
       - name: Parser regression tests
         working-directory: crawler
         run: python test_parser.py && python test_tme.py && python test_library.py

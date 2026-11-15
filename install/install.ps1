@@ -164,7 +164,7 @@ $lan = $Lan
 if (-not $lan) {
     Write-Host ""
     Write-Host "So far tgarr answers on this PC only. For the phones, tablets and televisions at home to reach"
-    Write-Host "it - which is what it is for - Windows must let them in on port $Port: a firewall rule for"
+    Write-Host "it - which is what it is for - Windows must let them in on port ${Port}: a firewall rule for"
     Write-Host "private networks, and a port forward. Say no to keep it to this PC."
     $lan = Read-Host "Let the other devices at home reach it? [Y/n]"
     if (-not $lan.Trim()) { $lan = "yes" }                   # the answer most people want is the one Enter gives
