@@ -11867,8 +11867,16 @@ __MORE__
 (function(){
   // With a remote control (or a keyboard): the arrows go to the nearest thing in that
   // direction that can be chosen, OK / Enter opens it. A television has no pointer.
-  var SEL = "a.cat, .find input[type=search], .find button, a.card, .more a, a.pill, button.pill, .top a.logo";
+  var TV = /[?&]tv=1/.test(location.search) || /\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\b/i.test(navigator.userAgent);
+  // On a television the search box is not among what the arrows go to: the moment it is
+  // chosen the on-screen keyboard opens and takes the arrows for itself, and the remote is
+  // caught in it. There the way to search is OK on "Find", which opens the keyboard on purpose.
+  var SEL = "a.cat, " + (TV ? "" : ".find input[type=search], ") + ".find button, a.card, .more a, a.pill, button.pill, .top a.logo";
   function all(){ return Array.prototype.filter.call(document.querySelectorAll(SEL), function(e){ var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }); }
+  if (TV) {
+    var fm = document.querySelector("form.find"), box = fm && fm.querySelector("input[type=search]");
+    if (fm && box) fm.addEventListener("submit", function(ev){ if (!box.value.trim()) { ev.preventDefault(); box.focus(); } });
+  }
   function mid(e){ var r = e.getBoundingClientRect(); return {x: r.left + r.width / 2, y: r.top + r.height / 2, r: r}; }
   function next(from, dir){
     // What lies straight ahead - in the same row for left and right, in the same column for
@@ -11896,12 +11904,13 @@ __MORE__
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].indexOf(k) < 0) return;
     var typing = at && at.tagName === "INPUT";
     if (typing && (k === "ArrowLeft" || k === "ArrowRight") && at.value) return;   // moving inside what was typed
+    if (typing && TV && k === "ArrowDown") { ev.preventDefault(); go(document.querySelector(".find button")); return; }   // out of the box again
     var from = (at && at !== document.body && at.matches && at.matches(SEL)) ? at : null;
     var to = from ? next(from, k) : (document.querySelector("a.card") || all()[0]);
     if (to) { ev.preventDefault(); go(to); }
   });
   // a television opens with something already chosen
-  if (/[?&]tv=1/.test(location.search) || /\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\b/i.test(navigator.userAgent)) {
+  if (TV) {
     document.documentElement.classList.add("tv");
     var first = document.querySelector("a.card") || document.querySelector("a.cat");
     if (first) first.focus({preventScroll: true});
