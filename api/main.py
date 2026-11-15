@@ -1019,6 +1019,9 @@ async def _migrate_schema():
               state TEXT NOT NULL DEFAULT 'queued', note TEXT, files INT, bytes BIGINT, msg_id BIGINT,
               added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), done_at TIMESTAMPTZ
             );
+            -- own files kept by a version in which a disc image was not yet a film: listed with the videos now
+            UPDATE messages SET media_type = 'video'
+             WHERE tg_chat_id <= -100000000000000000 AND media_type = 'document' AND lower(file_name) ~ '[.](iso|vob|divx)$';
             CREATE TABLE IF NOT EXISTS archive_grabs (
               id SERIAL PRIMARY KEY, item_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT,
               state TEXT NOT NULL DEFAULT 'queued', note TEXT, files INT, bytes BIGINT, msg_id BIGINT,
