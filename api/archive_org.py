@@ -228,6 +228,11 @@ def split_year(q: str) -> tuple:
     return " ".join(words), ""
 
 
+# a word beside the title that says the item is something about the film, or a piece of it
+_NOT_THE_FILM = frozenset("trailer trailers teaser promo preview clip clips excerpt review commentary soundtrack ost podcast "
+                          "featurette interview making outtakes bloopers audiobook radio lecture".split())
+
+
 def is_the_film(title: str, year: str, asked: str, asked_year: str) -> bool:
     """Is an item what was asked for? Its title is the asked words and nothing more than a
     few besides (the Archive's search also finds every talk ABOUT a film), and where both
@@ -236,9 +241,33 @@ def is_the_film(title: str, year: str, asked: str, asked_year: str) -> bool:
     if not want or any(w not in have for w in want):
         return False
     extra = [w for w in have if w not in want and not re.fullmatch(r"(19|20)\d\d", w)]
-    if len(extra) > 3:
+    if len(extra) > 3 or any(w in _NOT_THE_FILM for w in extra):
         return False
     return not (year and asked_year and year != asked_year)
+
+
+def registry_url(registry: str, asked: str, year: str = "", kind: str = "film") -> str:
+    """Where tgarr.me is asked for the Archive's items under a title. It keeps a list of the
+    ones people download (a few million of 85 million), so that a Radarr with a long list of
+    films does not put each of them to the Archive's own search from every install."""
+    params = [("q", asked), ("kind", kind)] + ([("year", year)] if year else [])
+    return registry.rstrip("/") + "/api/v1/archive/search?" + urllib.parse.urlencode(params)
+
+
+def parse_registry(body) -> list:
+    """Its answer in the shape parse_search() gives. Raises ValueError when it is no answer
+    (so that the caller asks the Archive itself)."""
+    d = json.loads(body) if isinstance(body, (str, bytes)) else body
+    if not isinstance(d, dict) or d.get("status") != "ok" or not isinstance(d.get("items"), list):
+        raise ValueError("no answer")
+    out = []
+    for i in d["items"]:
+        ident = _one(i.get("id")) if isinstance(i, dict) else ""
+        if not ID_RX.fullmatch(ident):
+            continue
+        out.append({"id": ident, "title": _one(i.get("title"))[:300] or ident, "creator": _one(i.get("creator"))[:200],
+                    "year": _one(i.get("year"))[:4], "size": int(i.get("size") or 0), "downloads": int(i.get("downloads") or 0)})
+    return out
 
 
 def release_name(title: str, year: str, height: int) -> str:

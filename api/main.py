@@ -10202,7 +10202,16 @@ async def _archive_for_arr(q: str) -> list:
     asked, asked_year = archive_org.split_year(q)
     if len(asked) < 2:
         return []
-    _total, found, _trouble = await _archive_search(asked, "film", 1)
+    # tgarr.me first: it keeps a list of the Archive's items people download, and answering
+    # from it spares the Archive a search for every film on every install's list. Its answer
+    # is taken as it is, also when it knows of none; only when it does not answer at all is
+    # the Archive itself asked.
+    try:
+        body = await asyncio.wait_for(asyncio.to_thread(
+            archive_org.fetch_json, archive_org.registry_url(UPDATE_REGISTRY_URL, asked, asked_year), 8), 10)
+        found = archive_org.parse_registry(body)
+    except Exception:
+        _total, found, _trouble = await _archive_search(asked, "film", 1)
     picked = [i for i in found if archive_org.is_the_film(i["title"], i["year"], asked, asked_year) and not re.search(ADULT_RX, i["title"], re.I)][:6]
     out = []
     for i, meta in zip(picked, await asyncio.gather(*[_archive_meta(i["id"]) for i in picked])):

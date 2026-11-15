@@ -108,6 +108,9 @@ ok(A.is_the_film("Night Of The Living Dead (1968) [HD]", "1968", "Night of the L
 ok(not A.is_the_film("Night of the Living Dead", "1990", "night of the living dead", "1968"), "the remake is another film")
 ok(A.is_the_film("Night of the Living Dead", "", "night of the living dead", "1968"), "an item that names no year is not ruled out by one")
 ok(not A.is_the_film("A lecture about why Night of the Living Dead changed horror films forever", "2015", "night of the living dead", ""), "a talk about the film is not the film")
+ok(not A.is_the_film("Night of the living dead Trailer", "", "night of the living dead", "1968")
+   and not A.is_the_film("Night of the Living Dead - Soundtrack", "1968", "night of the living dead", "1968")
+   and A.is_the_film("The Making of a Murderer", "", "the making of a murderer", ""), "its trailer, its music: not the film - unless the word is part of what was asked")
 ok(not A.is_the_film("Day of the Dead", "1985", "night of the living dead", "") and not A.is_the_film("Anything", "", "", ""), "another film; nothing asked")
 ok(A.release_name("Night of the Living Dead", "1968", 1080) == "Night.of.the.Living.Dead.1968.1080p.WEB-archive.org", "a name Radarr reads")
 ok(A.release_name("Duck & Cover!", "1951", 480) == "Duck.Cover.1951.480p.WEB-archive.org" and A.release_name("X", "", 0) == "X.SD.WEB-archive.org"
@@ -115,5 +118,22 @@ ok(A.release_name("Duck & Cover!", "1951", 480) == "Duck.Cover.1951.480p.WEB-arc
 p = A.plan(item("movies", [F("a.mp4", 500, height="480"), F("b.mp4", 900, height="1080")]))
 ok(A.film_file(p)["name"] == "b.mp4" and A.film_file(p)["height"] == 1080, "of two cuts, the larger - and how tall its picture is")
 ok(A.film_file(A.plan(item("audio", [F("a.mp3")]))) is None and A.film_file({}) is None, "what is not a film is not offered as one")
+
+# ---- the registry's list -------------------------------------------------------------------------
+ok(A.registry_url("https://tgarr.me/", "night of the living dead", "1968") == "https://tgarr.me/api/v1/archive/search?q=night+of+the+living+dead&kind=film&year=1968",
+   "where the registry is asked: " + A.registry_url("https://tgarr.me/", "night of the living dead", "1968"))
+ok("year" not in A.registry_url("https://tgarr.me", "duck and cover") and "kind=book" in A.registry_url("https://tgarr.me", "alice", kind="book"), "no year: none sent; another shelf")
+got = A.parse_registry(json.dumps({"status": "ok", "items": [
+    {"id": "Night.Of.The.Living.Dead_1080p", "kind": "film", "title": "Night of the Living Dead", "creator": "Russell W. Streiner", "year": 1968, "downloads": 9000, "size": 123},
+    {"id": "NoYear", "kind": "film", "title": "Another", "creator": None, "year": None, "downloads": 5, "size": None}, {"id": "bad id"}, "junk"]}))
+ok(got == [{"id": "Night.Of.The.Living.Dead_1080p", "title": "Night of the Living Dead", "creator": "Russell W. Streiner", "year": "1968", "size": 123, "downloads": 9000},
+           {"id": "NoYear", "title": "Another", "creator": "", "year": "", "size": 0, "downloads": 5}], f"its answer, in the shape the Archive's own is read into: {got}")
+ok(A.parse_registry({"status": "ok", "items": []}) == [], "it knows of none: that is an answer")
+for bad in ("not json", "{}", json.dumps({"status": "error"}), json.dumps({"status": "ok"}), json.dumps([1, 2])):
+    try:
+        A.parse_registry(bad)
+        ok(False, f"taken for an answer: {bad}")
+    except ValueError:
+        ok(True, "what is no answer raises, so that the Archive itself is asked")
 
 print(f"test_archive_org: {n} checks passed")
