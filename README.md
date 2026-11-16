@@ -12,6 +12,8 @@
 
 ## Three sources, and a household
 
+**New in 0.5.14: courses.** A parent picks a course - a shelf of fairy tales read aloud, a set of readers, a channel a volunteer teaches in - and each child works through it lesson by lesson, with a place of their own kept in every film, recording and book. Lessons done can earn the evening's film. Courses come with tgarr and, between releases, from [@tgarr0](https://t.me/tgarr0), where volunteers of any country publish theirs.
+
 **New in 0.5.13: books open as they are.** A book, a document, a slide deck or a sheet opens in tgarr's own reader the moment it is here - type you can size, pages that fit a phone, Read aloud - with nothing to convert first and no converter to download (calibre, and the gigabyte it brought, are gone).
 
 | Opens in the reader | |
