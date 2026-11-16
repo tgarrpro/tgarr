@@ -327,7 +327,7 @@ async def _locked_block(request: Request):
     if rules["on"]:
         who = _mc_who(request)
         await _mc_device(who, rules)
-        if not _DEVICES.check(who, rules, time.time(), await _bonus(who, rules), await _learning_path(path))["ok"]:
+        if not _DEVICES.check(who, rules, time.time(), await _bonus(who, rules), await _learning_path(request))["ok"]:
             if request.method in ("GET", "HEAD") and "text/html" in (request.headers.get("accept") or ""):
                 return RedirectResponse("/mediacenter/rest", status_code=303)
             return JSONResponse({"status": "rest", "message": "the Media Center is closed for now"}, status_code=403)
@@ -12305,6 +12305,15 @@ async def page_mc_rest(request: Request):
         "day": ("🌟", tr("That is all for today"), tr("Well done. See you tomorrow!")),
         "rest": ("🤸", tr("Time for a break"), tr("Stretch, drink some water, look far away. Back at {t}.", t=v["until"])),
     }.get(v["why"], ("🌙", tr("The Media Center is closed now"), ""))
+    if v["why"] == "day":
+        # the day's minutes are used up: lessons may still be open, and may earn more
+        rw = await _reward()
+        async with db_pool.acquire() as conn:
+            has = await conn.fetchval("SELECT 1 FROM kids_allow WHERE kind = 'course' LIMIT 1")
+        if has and rw["learn_free"]:
+            text += ('<br/><a href="/mediacenter?kind=learn" style="display:inline-block;margin-top:22px;font-size:19px;opacity:1;'
+                     'padding:12px 26px;border-radius:999px;background:#16a34a;color:#fff;text-decoration:none;font-weight:700">'
+                     + (tr("Lessons are still open - and earn more time") if rw["on"] else tr("Lessons are still open")) + '</a>')
     return HTMLResponse(i18n.fill(lang, _MC_REST_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
                         .replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
 
@@ -12432,6 +12441,9 @@ async def api_kids_allow(request: Request):
 # What a course is, is in courses.py. Here: its lessons worked out of the library, learning
 # time and rewards, and what the pages ask (the pages themselves are further down).
 COURSE_PACKS = {}                   # slug -> a list shipped with tgarr (coursepacks/<language>/*.json)
+_COURSE_LEVEL = {"all": "all ages", "5-8": "ages 5 to 8", "8-12": "ages 8 to 12", "12-16": "ages 12 to 16", "16+": "16 and older"}
+_COURSE_SUBJECT = {"reading": "Reading", "language": "A foreign language", "math": "Mathematics", "science": "Science", "history": "History and society",
+                   "arts": "Arts", "music": "Music", "computing": "Computing", "life": "Life skills", "other": "Other"}
 _LESSON: dict = {}                  # message id -> (is it a lesson on the children's list, when asked)
 _REWARD = {"at": 0.0, "v": dict(courses.REWARD_DEFAULT)}
 _BONUS: dict = {}                   # who -> (seconds earned today, day, when worked out)
@@ -12480,12 +12492,13 @@ async def _is_lesson(msg_id: int) -> bool:
     return ok
 
 
-async def _learning_path(path: str) -> bool:
+async def _learning_path(request: Request) -> bool:
     """Is what is asked for learning that the day's minutes do not close? The Learn shelf and
     a course's page, and a lesson itself - when the parent left learning free of the day."""
     if not (await _reward())["learn_free"]:
         return False
-    if path.startswith(("/mediacenter/learn", "/mediacenter/course/")):
+    path = request.url.path
+    if path == "/mediacenter" and request.query_params.get("kind") == "learn":
         return True
     m = _PRIVATE_ID_RX.match(path)
     return bool(m) and await _is_lesson(int(m.group(1)))
@@ -12800,6 +12813,7 @@ _MC_ICONS = {
     "video": _MC_SVG + '<rect x="3" y="5" width="18" height="14" rx="3.5"/><path d="M10.2 9.2v5.6l4.8-2.8z" fill="currentColor"/></svg>',
     "audio": _MC_SVG + '<path d="M4.5 14.5v-2.2a7.500 7.500 0 0 1 15 0v2.200"/><rect x="3" y="13.500" width="4.600" height="7" rx="2.200"/><rect x="16.400" y="13.500" width="4.600" height="7" rx="2.200"/></svg>',
     "book": _MC_SVG + '<path d="M12 6.8C10.200 5.500 7.900 4.900 4.900 5a.9.9 0 0 0-.9.9v11.300c0 .5.400.9.900.9 2.900-.1 5.200.5 7.100 1.800 1.900-1.300 4.200-1.900 7.100-1.800.5 0 .9-.4.9-.9V5.900a.9.9 0 0 0-.9-.9c-3-.1-5.300.5-7.100 1.800z"/><path d="M12 6.800v13.100"/></svg>',
+    "learn": _MC_SVG + '<path d="M2.500 9.500L12 5l9.500 4.500L12 14z"/><path d="M6.500 11.700v4.300c1.500 1.700 3.300 2.500 5.500 2.500s4-.8 5.500-2.500v-4.300"/><path d="M21.500 9.500v5"/></svg>',
     "photo": _MC_SVG + '<rect x="3" y="4.500" width="18" height="15" rx="3.500"/><circle cx="8.600" cy="9.700" r="1.700"/><path d="M21 15.300l-4.200-4.200a1.700 1.700 0 0 0-2.400 0L6.600 19.500"/></svg>',
 }
 _UI_LANG = {"at": 0.0, "v": ""}
@@ -13035,6 +13049,18 @@ html.tv .play{opacity:0}html.tv .card:focus-visible .play{opacity:1;transform:no
   padding:4px 9px;border-radius:999px;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
 .saved::before{content:"";width:7px;height:7px;border-radius:50%;background:#34d399}
 .name{padding:11px 14px 14px;font-size:15px;font-weight:600;line-height:1.3;word-break:break-word}
+/* a course and its lessons: how far, which is done, which comes next */
+.card .num{position:absolute;right:10px;top:10px;min-width:26px;height:26px;padding:0 7px;border-radius:13px;display:grid;place-items:center;
+  background:rgba(8,10,16,.62);color:#fff;font-size:12.500px;font-weight:700;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.card.fin .num{background:#16a34a}
+.card .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.28)}
+.card .prog i{display:block;height:100%;background:var(--accent)}
+.card.fin .pic{opacity:.72}
+.card .sub{display:block;margin-top:4px;font-size:13px;font-weight:500;color:var(--soft)}
+.card.course .pic{aspect-ratio:16/9}
+.h2back{color:var(--soft);font-weight:600;margin-inline-end:10px}
+.earned{margin:14px clamp(16px,4vw,44px) 0;display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:999px;
+  background:color-mix(in srgb, #16a34a 16%, var(--card));color:var(--ink);font-weight:700;font-size:15px}
 .name span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .photo .name{display:none}
 .empty{margin:30px clamp(16px,4vw,44px);padding:46px 20px;text-align:center;background:var(--card);border-radius:var(--r);
@@ -13355,16 +13381,18 @@ async def page_kids_old():
 
 
 @app.get("/mediacenter", response_class=HTMLResponse)
-async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
+async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0, course: int = 0):
     """What a locked browser gets: the items on the Media Center list, as a
     page of its own - large pictures, four big choices, nothing to configure."""
     lang = await _lang(request)
 
     def tr(text: str, **values) -> str:
         return html.escape(i18n.t(lang, text, **values))
-    kind = kind if kind in _MC_KINDS else "video"
+    kind = kind if kind in _MC_KINDS or kind == "learn" else "video"
     offset, per = max(0, int(offset)), 48
-    label, icon, colour, cond = _MC_KINDS[kind]
+    # the fifth shelf holds courses, not files: nothing is asked of the library for it here
+    label, icon, colour, cond = _MC_KINDS[kind] if kind != "learn" else ("Learn", "", "#16a34a", "FALSE")
+    who_learns = _progress_who(request)
     where, params = [_kid_sql(), cond], []
     for w in (q or "").split()[:6]:
         params.append(f"%{w}%")
@@ -13380,6 +13408,14 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
             SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
             WHERE {_kid_sql()} AND {v[3]}""") for k, v in _MC_KINDS.items()}
         theme = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_theme'")
+        my_courses = await _course_list(conn, who_learns, _LOCKED.get())
+        lessons = []
+        if kind == "learn" and course and any(c["id"] == course for c in my_courses):
+            lessons = await conn.fetch(
+                """SELECT ci.pos, m.id, m.file_name, m.caption, m.media_type, COALESCE(p.done, FALSE) AS done, p.frac
+                   FROM course_items ci JOIN messages m ON m.id = ci.msg_id
+                   LEFT JOIN progress p ON p.msg_id = m.id AND p.who = $2
+                   WHERE ci.course_id = $1 ORDER BY ci.pos""", course, who_learns)
     theme = theme if theme in _MC_THEME_KEYS else "auto"
     more, rows = len(rows) > per, rows[:per]
     locked = _LOCKED.get()
@@ -13387,6 +13423,9 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
         f'<a class="cat{" on" if k == kind else ""}" style="--c:{v[2]}" href="/mediacenter?kind={k}">'
         f'<span class="ic">{_MC_ICONS[k]}</span><b>{tr(v[0])}</b><small>{counts[k]:,}</small></a>'
         for k, v in _MC_KINDS.items())
+    if my_courses or not locked:                    # a shelf of its own, once there is a course (the owner sees it always)
+        cats += (f'<a class="cat{" on" if kind == "learn" else ""}" style="--c:#16a34a" href="/mediacenter?kind=learn">'
+                 f'<span class="ic">{_MC_ICONS["learn"]}</span><b>{tr("Learn")}</b><small>{len(my_courses):,}</small></a>')
     cards = []
     hero, ph = "", f'<span class="ph">{_MC_ICONS[kind]}</span>'
     for r in rows:
@@ -13415,13 +13454,64 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
             + (f'<span class="saved">{tr("ready")}</span>' if r["saved"] and kind != "photo" else "")
             + ('' if kind == "photo" else '<span class="play">▶</span>')
             + f'</div><div class="name"><span>{html.escape(name)}</span></div></a>')
+    back, earned = "", ""
+    if kind == "learn":
+        play = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.500v13l11-6.500z"/></svg>'
+        this = next((c for c in my_courses if c["id"] == course), None) if course else None
+        if this:
+            # one course: its lessons in their order, the next one in the banner
+            label, back = this["title"], f'<a class="h2back" href="/mediacenter?kind=learn">← {tr("Learn")}</a>'
+            nxt = next((r for r in lessons if not r["done"]), None)
+            for r in lessons:
+                name = _friendly_name(r["file_name"], r["caption"])
+                mt = "video" if r["media_type"] == "video" else ("audio" if r["media_type"] == "audio" else "book")
+                pic = f"/api/thumb/{r['id']}" if mt == "video" else (f"/ebook-cover/{r['id']}" if mt == "book" else "")
+                img = f'<img loading="lazy" src="{pic}" alt="" onerror="this.remove()"/>' if pic else ""
+                bar = f'<span class="prog"><i style="width:{int(100 * min(1, max(0, r["frac"] or 0)))}%"></i></span>' if (r["frac"] and not r["done"]) else ""
+                cards.append(
+                    f'<a class="card {mt}{" fin" if r["done"] else ""}" style="--c:{colour}" href="/watch/{r["id"]}">'
+                    f'<div class="pic"><span class="ph">{_MC_ICONS[{"book": "book", "audio": "audio"}.get(mt, "video")]}</span>{img}'
+                    f'<span class="num">{"✓" if r["done"] else r["pos"] + 1}</span>{bar}<span class="play">▶</span></div>'
+                    f'<div class="name"><span>{html.escape(name)}</span></div></a>')
+            if nxt and not q:
+                hero = (f'<section class="hero" style="--c:{colour};--img:url(data:,)"><div class="bk"></div><span class="hi">{_MC_ICONS["learn"]}</span>'
+                        f'<div class="tx"><span class="ey"><span class="hic">{_MC_ICONS["learn"]}</span>'
+                        f'{tr("Lesson {n} of {total}", n=nxt["pos"] + 1, total=len(lessons))}</span>'
+                        f'<h1>{html.escape(_friendly_name(nxt["file_name"], nxt["caption"]))}</h1>'
+                        f'<a class="hbtn" href="/watch/{nxt["id"]}">{play}{tr("Continue")}</a></div></section>')
+        else:
+            words_q = [w.lower() for w in (q or "").split()[:6]]
+            shown = [c for c in my_courses if all(w in (c["title"] or "").lower() for w in words_q)]
+            going = next((c for c in shown if c["next"] and 0 < c["done"] < c["lessons"]), None) or next((c for c in shown if c["next"]), None)
+            for c in shown:
+                pct = int(100 * c["done"] / c["lessons"]) if c["lessons"] else 0
+                cards.append(
+                    f'<a class="card course{" fin" if c["lessons"] and c["done"] >= c["lessons"] else ""}" style="--c:{colour}" href="/mediacenter?kind=learn&amp;course={c["id"]}">'
+                    f'<div class="pic"><span class="ph">{_MC_ICONS["learn"]}</span>'
+                    + (f'<span class="num">✓</span>' if c["lessons"] and c["done"] >= c["lessons"] else "")
+                    + (f'<span class="prog"><i style="width:{pct}%"></i></span>' if c["done"] else "")
+                    + f'</div><div class="name"><span>{html.escape(c["title"])}</span>'
+                    f'<small class="sub">{tr("{n} of {total} lessons", n=c["done"], total=c["lessons"])}</small></div></a>')
+            if going and not q:
+                hero = (f'<section class="hero" style="--c:{colour};--img:url(data:,)"><div class="bk"></div><span class="hi">{_MC_ICONS["learn"]}</span>'
+                        f'<div class="tx"><span class="ey"><span class="hic">{_MC_ICONS["learn"]}</span>'
+                        f'{tr("{n} of {total} lessons", n=going["done"], total=going["lessons"])}</span>'
+                        f'<h1>{html.escape(going["title"])}</h1>'
+                        f'<a class="hbtn" href="/watch/{going["next"]}">{play}{tr("Continue")}</a></div></section>')
+        if locked and (await _reward())["on"]:
+            got = await _bonus(who_learns, await _rules_now())
+            earned = f'<div class="earned">★ {tr("Earned today: {n} min", n=got // 60)}</div>'
     if cards:
-        grid = f'<div class="grid {kind}">{"".join(cards)}</div>'
+        grid = f'<div class="grid {"" if kind == "learn" and course else kind}">{"".join(cards)}</div>'
+    elif kind == "learn" and not q:
+        grid = (f'<div class="empty"><i>🎓</i>{tr("No courses yet.")}<br/>'
+                + (tr("A parent adds courses under Media Center & PIN.") if locked else
+                   f'<a href="/mediacenter/manage#courses" style="color:var(--accent);font-weight:700">{tr("Add a course")}</a>') + '</div>')
     elif q:
         grid = f'<div class="empty"><i>🔎</i>{tr("Nothing found. Try another word?")}</div>'
     else:
         grid = (f'<div class="empty"><i>🌱</i>{tr("Nothing here yet.")}<br/>{tr("Things show up here once they are added to the Media Center.")}</div>')
-    qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
+    qs = f"kind={kind}" + (f"&course={int(course)}" if kind == "learn" and course else "") + (f"&q={_q(q)}" if q else "")
     nav = ""
     if offset or more:
         nav = ('<div class="more">'
@@ -13437,13 +13527,14 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
              (f'<a class="pill" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else '')
              + f'<a class="pill" href="/mediacenter/manage">⚙ {tr("Choose what is shown")}</a>'
              f'<a class="pill" href="/">← {tr("Back to tgarr")}</a>')
-    heading = f'<span class="hic" style="--c:{colour}">{_MC_ICONS[kind]}</span>{tr(label)}' + (f' · “{html.escape(q)}”' if q else "")
+    heading = (back + f'<span class="hic" style="--c:{colour}">{_MC_ICONS[kind]}</span>'
+               + (html.escape(label) if back else tr(label)) + (f' · “{html.escape(q)}”' if q else ""))
     page = (i18n.fill(lang, _MEDIACENTER_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
             .replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
             .replace("__THEME__", theme).replace("__THEMES__", _json.dumps(list(_MC_THEME_KEYS)))
             .replace("__THEMEPANEL__", _mc_theme_panel(not locked, lang)).replace("__LANGPANEL__", _lang_panel(lang, not locked))
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
-            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading).replace("__HERO__", hero)
+            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading).replace("__HERO__", hero + earned)
             .replace("__GRID__", grid).replace("__MORE__", nav))
     return HTMLResponse(page)
 
@@ -13620,9 +13711,72 @@ async def page_kids_manage():
                   f'<small>{_fmt_time(o["at"])} · {who_label(o["who"])}</small></div>' for o in opened))
     n_chan = sum(1 for c in chans if c["allowed"])
     n_file = sum(1 for r in items if r["allowed"])
+    # ── courses: what there is, what can be added, what learning earns ──
+    async with db_pool.acquire() as conn:
+        my_courses = await _course_list(conn, "owner", False)
+    rw = await _reward()
+    kind_word = {"pack": "from the Internet Archive", "folder": "a folder", "channel": "a channel", "list": "an imported list"}
+    course_rows = "".join(
+        f'<div class="km-row"><input type="checkbox" {"checked" if c["allowed"] else ""} title="{_t("shown in the Media Center")}" '
+        f'onchange="kmAllow(\'course\', {c["id"]}, this)"/>'
+        f'<span class="n"><b>{html.escape(c["title"])}</b> <small>{_t("{n} lessons", n=c["lessons"])} · {_t(kind_word.get(c["kind"], "a channel"))}'
+        + (f' · {html.escape(c["license"])}' if c["license"] else "") + '</small></span>'
+        + (f'<button class="btn ghost" onclick="kcFetch({c["id"]}, this)">{_t("Fetch its files")}</button>' if c["kind"] == "pack" else "")
+        + f'<a class="btn ghost" href="/api/courses/{c["id"]}/export">{_t("Export")}</a>'
+        f'<button class="btn ghost" style="color:#dc2626" onclick="kcDel({c["id"]})">{_t("Remove")}</button></div>'
+        for c in my_courses)
+    have_slugs = {c["slug"] for c in my_courses if c["slug"]}
+    ui_lang = _LANG.get().split("-")[0]
+    packs = sorted((pk for pk in _course_packs().values() if pk["slug"] not in have_slugs),
+                   key=lambda pk: (pk["lang"].split("-")[0] != ui_lang, pk["subject"] != "language", pk["lang"], pk["title"]))
+    pack_rows = "".join(
+        f'<div class="km-row"><span class="n"><b>{html.escape(pk["title"])}</b> <small>{html.escape(pk["lang"])} · '
+        f'{_t(_COURSE_SUBJECT[pk["subject"]])} · {_t(_COURSE_LEVEL[pk["level"]])} · {_t("{n} parts", n=len(pk["parts"]))} · {html.escape(pk["right"])}</small>'
+        + (f'<br/><small>{html.escape(pk["about"])}</small>' if pk["about"] else "") + '</span>'
+        f'<button class="btn" onclick="kcAdd({{pack: \'{pk["slug"]}\'}})">{_t("Add")}</button></div>' for pk in packs)
+    opt = lambda table, cur="": "".join(f'<option value="{k}"{" selected" if k == cur else ""}>{_t(v)}</option>' for k, v in table.items())  # noqa: E731
+    course_box = (
+        '<p class="note">' + _t("A course is a list of lessons in an order. Tick a course and all of it is shown on the Learn shelf of the Media Center; each child's place and what they finished is kept.") + '</p>'
+        + f'<div class="km-box km-list" style="max-height:none;min-height:0">{course_rows or "<div class=km-pad style=color:var(--muted)>" + _t("No courses yet.") + "</div>"}</div>'
+        # what learning earns
+        + f'<h2 class="section">{_t("What learning earns")}</h2><div class="km-box"><div class="km-pad">'
+        f'<label><input type="checkbox" id="rwOn" {"checked" if rw["on"] else ""}/> {_t("A lesson done earns time in the Media Center")}</label>'
+        '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0">'
+        + _t("for each lesson") + f' <input class="km-in" id="rwPer" type="number" min="0" max="240" value="{rw["per_lesson"]}" style="width:80px"/> ' + _t("minutes")
+        + ' · ' + _t("at most") + f' <input class="km-in" id="rwMost" type="number" min="0" max="720" value="{rw["most"]}" style="width:80px"/> ' + _t("minutes a day")
+        + '</div><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0">'
+        + _t("a film or a recording counts when its end was reached and this much of its length was really spent on it:")
+        + f' <input class="km-in" id="rwShare" type="number" min="10" max="100" value="{rw["share"]}" style="width:70px"/> %'
+        + '</div><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0">'
+        + _t("reading counts as one lesson for every") + f' <input class="km-in" id="rwBook" type="number" min="5" max="120" value="{rw["book_minutes"]}" style="width:70px"/> ' + _t("minutes")
+        + f'</div><label><input type="checkbox" id="rwFree" {"checked" if rw["learn_free"] else ""}/> '
+        + _t("Time spent on lessons is not taken from the day's minutes, and lessons stay open when those are used up") + '</label>'
+        f'<div style="margin-top:14px"><button class="btn" onclick="kcReward()">{_t("Save")}</button> <span id="rwMsg" style="color:var(--muted);margin-left:8px"></span></div>'
+        '<p style="color:var(--muted);font-size:13px;margin:12px 0 0">' + _t("Opening hours and breaks hold for lessons as for everything else. Time is counted only for a browser that has not entered your PIN.") + '</p>'
+        '</div></div>'
+        # add a course
+        + f'<h2 class="section">{_t("Add a course")}</h2>'
+        + (f'<p class="note">{_t("Lists that come with tgarr. Their material is at the Internet Archive and is fetched to this machine when you ask for it.")}</p>'
+           f'<div class="km-box km-list" style="max-height:420px;min-height:0">{pack_rows}</div>' if pack_rows else "")
+        + '<div class="km-box"><div class="km-pad">'
+        f'<b>{_t("From a channel or a folder of your own")}</b>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">'
+        '<select class="km-in" id="kcChan">' + "".join(f'<option value="{c["id"]}">{html.escape(c["title"] or "?")}</option>' for c in chans) + '</select>'
+        f'<input class="km-in" id="kcPath" placeholder="{_t("folder inside it (optional)")}" style="width:220px"/>'
+        f'<input class="km-in" id="kcTitle" placeholder="{_t("name of the course")}" style="width:220px"/>'
+        f'<select class="km-in" id="kcSubject">{opt(_COURSE_SUBJECT, "other")}</select>'
+        f'<select class="km-in" id="kcLevel">{opt(_COURSE_LEVEL, "all")}</select>'
+        f'<button class="btn" onclick="kcMake()">{_t("Make a course")}</button></div>'
+        '<p style="color:var(--muted);font-size:13px;margin:10px 0 0">' + _t("Its lessons are the films, recordings and books there, in the order of their names (a channel: in the order they were posted). New files join by themselves.") + '</p>'
+        f'<div style="margin-top:18px"><b>{_t("From a list somebody shared")}</b> '
+        '<input type="file" id="kcFile" accept=".json,application/json" style="margin-left:8px"/> '
+        f'<button class="btn ghost" onclick="kcImport()">{_t("Import")}</button></div>'
+        '<p style="color:var(--muted);font-size:13px;margin:10px 0 0">' + _t("A shared list holds a course's order and the names of its files, never the files: the lessons you have are found by name.") + '</p>'
+        '</div></div>')
     tabs = (("pin", "PIN & time", ""), ("people", "People", f"{len(profs)}" if profs else ""),
             ("channels", "Channels", _t("{n} shown", n=f"{n_chan:,}") if n_chan else ""),
-            ("files", "Files", _t("{n} shown", n=f"{n_file:,}") if n_file else ""), ("usage", "Usage", ""))
+            ("files", "Files", _t("{n} shown", n=f"{n_file:,}") if n_file else ""),
+            ("courses", "Courses", f"{len(my_courses)}" if my_courses else ""), ("usage", "Usage", ""))
     body = (
         _KIDS_CSS
         + '<div class="km-tabs" role="tablist">'
@@ -13641,6 +13795,7 @@ async def page_kids_manage():
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
            + _t("Nothing is saved yet. Files you open in a player are kept and appear here.") + '</div></div>')
         + '</div>'
+        + f'<div class="km-pane" id="km-courses" hidden>{course_box}</div>'
         + '<div class="km-pane" id="km-usage" hidden>'
           '<p class="note">' + _t("Kept on this machine only: time per person or device, and what was opened in the Media Center.") + '</p>'
         + (f'<div class="km-box km-list">{used_rows}</div>' if used_rows else
@@ -13682,6 +13837,28 @@ function mcSave(){
     on: g("mcOn").checked, wd: part("wd"), we: part("we"), session: +g("mcSession").value, rest: +g("mcRest").value,
     tz: -new Date().getTimezoneOffset()})}).then(r => r.json())
     .then(j => { msg.textContent = j.status === "ok" ? "[[@js:saved]]" : (j.message || "[[@js:that did not work]]"); });
+}
+function kcSend(path, body){
+  return fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})}).then(r => r.json());
+}
+function kcAdd(body){ kcSend("/api/courses", body).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "[[@js:that did not work]]"); }); }
+function kcMake(){ kcAdd({channel: +G("kcChan").value, folder: G("kcPath").value.trim() ? +G("kcChan").value : undefined, path: G("kcPath").value.trim(),
+  title: G("kcTitle").value, subject: G("kcSubject").value, level: G("kcLevel").value}); }
+function kcDel(id){ if (confirm("[[@js:Remove this course? Its files stay where they are.]]")) kcSend("/api/courses/" + id + "/delete").then(() => location.reload()); }
+function kcFetch(id, b){
+  b.disabled = true;
+  kcSend("/api/courses/" + id + "/fetch").then(j => {
+    b.textContent = j.status === "ok" ? "[[@js:asked for %1, %2 still to come]]".replace("%1", j.queued).replace("%2", j.left) : (j.message || "[[@js:that did not work]]");
+  });
+}
+function kcImport(){
+  const f = G("kcFile").files[0]; if (!f) return;
+  f.text().then(t => { let j; try { j = JSON.parse(t); } catch (e) { alert("[[@js:This file is not a course list.]]"); return; } kcAdd({import: j}); });
+}
+function kcReward(){
+  kcSend("/api/kids/reward", {on: G("rwOn").checked, per_lesson: +G("rwPer").value, most: +G("rwMost").value, share: +G("rwShare").value,
+    book_minutes: +G("rwBook").value, learn_free: G("rwFree").checked})
+    .then(j => { G("rwMsg").textContent = j.status === "ok" ? "[[@js:saved]]" : (j.message || "[[@js:that did not work]]"); });
 }
 function kmShow(b){
   document.querySelectorAll(".km-chip").forEach(x => x.classList.toggle("on", x === b));
