@@ -3597,9 +3597,9 @@ async def _own_book(path: str, kind: str):
     try:
         return await asyncio.to_thread(ownbooks.load, path, kind), ""
     except ownbooks.NotReadable as e:
-        return None, str(e)
+        return None, i18n.t(_LANG.get(), str(e))      # said in the reader's language (words_books.py)
     except Exception as e:
-        return None, f"this book could not be opened ({type(e).__name__})"
+        return None, i18n.t(_LANG.get(), "this book could not be opened ({why})", why=type(e).__name__)
 
 
 # ── comics ─────────────────────────────────────────────────────────────────────────────

@@ -72,6 +72,8 @@ missing = sorted(a for a in asked if a not in I.T)
 ok(not missing, f"asked for by a page, not in the catalogue: {missing}")
 # (a word may reach a page through a list or a table of the code rather than a call: it is
 #  enough that the English stands somewhere in main.py, in quotes)
+# (and the sentences of the book readers, which stand in their own files and are translated where shown)
+src += "".join(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), f), encoding="utf-8").read() for f in ("ownbooks.py", "textbook.py"))
 unused = sorted(k for k in I.T if k not in asked and ('"' + k + '"') not in src and ("'" + k + "'") not in src)
 ok(not unused, f"in the catalogue, asked for by no page: {unused}")
 # the same English is not given two translations in two files
