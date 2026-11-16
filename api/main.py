@@ -35,6 +35,7 @@ import localfiles  # local module
 import ownbooks  # local module: books read here without converting (.txt .fb2 .docx .odt .rtf .mobi .html)
 import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
 import i18n  # local module: the words on the pages, in the languages of those who read them
+import progress  # local module: where somebody stopped, kept per person
 
 # What counts as a book on every shelf, count and export: everything a reader here opens.
 # (This list used to be written out in seven places, each a little different.)
@@ -114,7 +115,7 @@ def _cross_site(request) -> bool:
 #   * anything that acts through the account: follow, unfollow, grab, fetch,
 #     settings. The pages hide those buttons; this refuses the requests.
 _PRIVATE_ID_RX = re.compile(
-    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/ebook-status|api/lyrics|api/fav|"
+    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/ebook-status|api/lyrics|api/fav|api/progress|"
     r"ebook-pdf|ebook-cover|epub|comic|pdf|play|transcode)/(\d+)(?:/|$)")
 _PUBLIC_MSG: dict = {}
 
@@ -328,6 +329,13 @@ async def _locked_block(request: Request):
             return JSONResponse({"status": "rest", "message": "the Media Center is closed for now"}, status_code=403)
     if path in _LOCKED_OPEN:
         return None
+    if request.method == "POST" and path.startswith("/api/progress/"):
+        # the one thing a locked browser may write: where it stopped, in something it may open
+        m = _PRIVATE_ID_RX.match(path)
+        if m and await _kid_ok(int(m.group(1)), f"""
+                SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.id = $1 AND {_kid_sql()}""", int(m.group(1))):
+            return None
     if request.method in ("GET", "HEAD"):
         m = _PRIVATE_ID_RX.match(path)
         if m and path.startswith("/watch/") and db_pool is not None:
@@ -364,6 +372,7 @@ async def _signed_out_block(request: Request):
         # Telegram account: they work whether or not anybody is signed in
         if path.startswith("/api/") and not path.startswith(
                 ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/",
+                 "/api/progress/",                   # where one stopped: this install's own business
                  # a public channel is followed and read without an account (the crawler's guest workers)
                  "/api/channel/subscribe", "/api/channel/unsubscribe/",
                  "/api/archive/",                    # the Internet Archive asks nobody for an account
@@ -1077,6 +1086,13 @@ async def _migrate_schema():
               at TIMESTAMPTZ NOT NULL DEFAULT NOW(), who TEXT NOT NULL, msg_id BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_mc_log_at ON mc_log (at DESC);
+            -- where somebody stopped in a film, a book, a recording (progress.py): per person
+            -- (a child's PIN), else per device, else the owner
+            CREATE TABLE IF NOT EXISTS progress (
+              who TEXT NOT NULL, msg_id BIGINT NOT NULL, key TEXT NOT NULL, val TEXT, frac REAL,
+              done BOOLEAN NOT NULL DEFAULT FALSE, at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (who, msg_id)
+            );
             CREATE TABLE IF NOT EXISTS kids_allow (
               kind TEXT NOT NULL,
               ref BIGINT NOT NULL,
@@ -2511,6 +2527,59 @@ def _saved_chip(path: str, qs, local: int) -> str:
     return chip
 
 
+def _progress_who(request: Request) -> str:
+    """Whose place it is: the child's whose PIN this browser has, else this device's (a browser
+    without the PIN), else the owner's."""
+    return _mc_who(request) if _LOCKED.get() else "owner"
+
+
+async def _progress_row(request: Request, msg_id: int):
+    if db_pool is None:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            r = await conn.fetchrow(
+                "SELECT key, val, frac, done, (extract(epoch FROM at) * 1000)::bigint AS at FROM progress WHERE who = $1 AND msg_id = $2",
+                _progress_who(request), int(msg_id))
+        return dict(r) if r else None
+    except Exception:
+        return None
+
+
+async def _progress_js(request: Request, msg_id: int) -> str:
+    """The script a player page carries before its own (progress.py)."""
+    return progress.script(msg_id, await _progress_row(request, msg_id))
+
+
+@app.get("/api/progress/{msg_id}")
+async def progress_get(msg_id: int, request: Request):
+    r = await _progress_row(request, msg_id)
+    return {"frac": r["frac"], "done": r["done"], "at": r["at"]} if r else {}
+
+
+@app.post("/api/progress/{msg_id}")
+async def progress_put(msg_id: int, request: Request):
+    try:
+        raw = await request.body()
+        body = _json.loads(raw[:4096] or b"{}")
+    except Exception:
+        body = None
+    p = progress.clean(body)
+    if not p:
+        return JSONResponse({"status": "error", "message": "not a place"}, status_code=400)
+    who = _progress_who(request)
+    async with db_pool.acquire() as conn:
+        if not await conn.fetchval("SELECT 1 FROM messages WHERE id = $1", msg_id):
+            return JSONResponse({"status": "error", "message": "no such item"}, status_code=404)
+        # a thing once finished stays finished when it is opened again; its place is the new one
+        await conn.execute(
+            """INSERT INTO progress (who, msg_id, key, val, frac, done) VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (who, msg_id) DO UPDATE SET key = $3, val = $4, frac = COALESCE($5, progress.frac),
+                 done = progress.done OR $6, at = NOW()""",
+            who, msg_id, p["key"], p["val"], p["frac"], p["done"])
+    return {"status": "ok"}
+
+
 @app.post("/api/fav/{msg_id}")
 async def fav_toggle(msg_id: int):
     """Toggle a favourite. Favourites get their own filter, and their
@@ -3691,12 +3760,13 @@ async def comic_page(msg_id: int, n: int):
 
 
 @app.get("/comic/{msg_id}", response_class=HTMLResponse)
-async def comic_render(msg_id: int):
+async def comic_render(msg_id: int, request: Request):
     c = await _comic_of(msg_id)
     if not c:
         return HTMLResponse(f'<p>{_t("This comic cannot be shown as it is.")} <a href="/watch/{int(msg_id)}">{_t("Open it")}</a></p>', status_code=404)
     n = len(c[2])
     mid = int(msg_id)
+    place_js = await _progress_js(request, mid)
     page_n = _t("page %1")
     pages = "".join(f'<img id="p{i}" data-n="{i}" loading="lazy" decoding="async" src="/comic/{mid}/page/{i}" alt="{page_n.replace("%1", str(i + 1))}"/>'
                     for i in range(n))
@@ -3713,7 +3783,7 @@ async def comic_render(msg_id: int):
         '</style></head><body><div class="bar"><a href="#" id="back">&larr; ' + _t("back") + '</a>'
         f'<div class="t">{html.escape(c[1])}</div><span id="at">1 / {n}</span>'
         '<button id="w" title="' + _t("fit the width of the window") + '">' + _t("wider") + '</button>'
-        f'<a href="/media/{mid}" download>&#11015; {_t("download")}</a></div><main id="m" class="fit">{pages}</main><script>'
+        f'<a href="/media/{mid}" download>&#11015; {_t("download")}</a></div><main id="m" class="fit">{pages}</main>{place_js}<script>'
         f'const ID={mid},N={n},KEY="comic-"+ID;'
         'const m=document.getElementById("m"),at=document.getElementById("at");'
         'document.getElementById("back").onclick=e=>{e.preventDefault();if(history.length>1)history.back();else location.href="/library";};'
@@ -4072,7 +4142,7 @@ button.on{background:var(--acc,#2563eb);color:#fff;border-color:var(--acc,#2563e
   </div>
   <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
-<script>
+__PROGRESS__<script>
 (function(){
 const ID = __ID__, KEY = "tgarr.read." + ID;
 const $ = id => document.getElementById(id);
@@ -4370,7 +4440,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
 
 
 @app.get("/epub/{msg_id}", response_class=HTMLResponse)
-async def epub_render(msg_id: int):
+async def epub_render(msg_id: int, request: Request):
     """The e-book reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
@@ -4394,7 +4464,7 @@ async def epub_render(msg_id: int):
                 .replace("%1", f'<a href="/media/{int(msg_id)}" download>').replace("%2", "</a>") + '</p>'
                 '<p><a href="/library">&larr; ' + _t("Library") + '</a></p></body></html>', status_code=422)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"book-{msg_id}")
-    return HTMLResponse(_fill(_EPUB_READER_HTML).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_fill(_EPUB_READER_HTML).replace("__PROGRESS__", await _progress_js(request, msg_id)).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -4680,7 +4750,7 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
   </div>
   <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
-<script>
+__PROGRESS__<script>
 (function(){
 const ID = __ID__, KEY = "tgarr.pdf." + ID;
 const $ = id => document.getElementById(id);
@@ -4923,7 +4993,7 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
 
 
 @app.get("/pdf/{msg_id}", response_class=HTMLResponse)
-async def pdf_reader(msg_id: int, conv: int = 0):
+async def pdf_reader(msg_id: int, request: Request, conv: int = 0):
     """The PDF reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
@@ -4949,7 +5019,7 @@ async def pdf_reader(msg_id: int, conv: int = 0):
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
     page_of = _t("page %1 of %2").replace("%1", '<input type="number" id="pno" min="1" value="1">').replace("%2", '<b id="ptotal">…</b>')
-    return HTMLResponse(_fill(_PDF_READER_HTML).replace("__PAGE_OF__", page_of).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_fill(_PDF_READER_HTML).replace("__PROGRESS__", await _progress_js(request, msg_id)).replace("__PAGE_OF__", page_of).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -5528,7 +5598,7 @@ video{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;b
   <select id="q" title="[[@how tall the picture is made: smaller is lighter on this server and on the connection]]"></select>
   <button id="fs" title="[[@full screen (F)]]">&#9974;</button>
 </div>
-<script>
+__PROGRESS__<script>
 const ID = __ID__, v = document.getElementById("v"), bar = document.getElementById("bar"), msg = document.getElementById("msg");
 const KEY = "tgarr.play." + ID;
 let dur = 0, base = 0, drag = false, tries = 0, height = 0;
@@ -5590,16 +5660,16 @@ fetch("/transcode/" + ID + "/info").then(r => r.json()).then(j => {
 
 
 @app.get("/play/{msg_id}", response_class=HTMLResponse)
-async def page_play(msg_id: int):
+async def page_play(msg_id: int, request: Request):
     f = await _tc_file(msg_id)
     if not f:
         return RedirectResponse(f"/watch/{msg_id}")           # not here yet: the watch page fetches it and comes back
     # the words first, the file's name after: a name is never read for marks
-    return HTMLResponse(_fill(_PLAY_HTML).replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
+    return HTMLResponse(_fill(_PLAY_HTML).replace("__PROGRESS__", await _progress_js(request, msg_id)).replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
 
 
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
-async def watch_page(msg_id: int):
+async def watch_page(msg_id: int, request: Request):
     """Loading-aware media viewer. Polls /api/media-status until enough bytes
     are written to start playback, then renders <video>/<audio>/<iframe>."""
     async with db_pool.acquire() as conn:
@@ -5613,6 +5683,7 @@ async def watch_page(msg_id: int):
         return HTMLResponse("<h1>404 — " + _t("message not indexed") + "</h1>", status_code=404)
     title = row["file_name"] or f"msg-{msg_id}"
     mt = row["media_type"] or "document"
+    place_js = await _progress_js(request, msg_id)
     await _want_fetch(msg_id, opened=True)
 
     # Trigger queueing immediately so the user doesn\'t wait for first poll.
@@ -5664,7 +5735,7 @@ audio {{ width:600px; max-width:96vw; }}
     <div class="hint" id="dchint" style="margin-top:6px"></div>
   </div>
 </main>
-<script>
+{place_js}<script>
 const MSG_ID = {msg_id};
 const MEDIA_TYPE = {_js_str(mt)};
 // 'always': no browser plays this kind of file (a disc image, an avi ...) - it is converted
@@ -5700,6 +5771,16 @@ function renderPlayer() {{
   }}
   if (MEDIA_TYPE === "audio") {{
     main.innerHTML = `<audio controls autoplay src="/media/${{MSG_ID}}"></audio>`;
+    // a long recording goes on where it stopped (kept as the film player keeps its place)
+    const au = main.querySelector("audio"), AK = "tgarr.a." + MSG_ID;
+    au.addEventListener("loadedmetadata", () => {{
+      let pos = 0; try {{ pos = +localStorage.getItem(AK) || 0; }} catch (e) {{}}
+      if (pos > 20 && (!au.duration || pos < au.duration - 20)) au.currentTime = pos;
+    }});
+    let auSaved = 0;
+    au.addEventListener("timeupdate", () => {{ const now = Date.now(); if (now - auSaved < 4000) return; auSaved = now;
+      try {{ if (au.duration && au.currentTime > au.duration - 15) localStorage.removeItem(AK); else if (au.currentTime > 5) localStorage.setItem(AK, String(Math.floor(au.currentTime))); }} catch (e) {{}} }});
+    au.addEventListener("ended", () => {{ try {{ localStorage.removeItem(AK); }} catch (e) {{}} }});
     return;
   }}
   // document — pick by extension
