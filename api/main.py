@@ -12169,6 +12169,46 @@ _MC_KINDS = {
     "book": ("Read", "📖", "#f5a524", _book_sql("m.file_name")),
     "photo": ("Photos", "🖼️", "#8b6cf6", "m.media_type = 'photo'"),
 }
+# The looks of the Media Center: key, name, a line about it, and the two colours of its swatch.
+_MC_THEMES = (
+    ("auto", "Day & Night", "light by day, dark where the device is", "#fff8ef", "#191624"),
+    ("cinema", "Cinema", "a dark room and the pictures - for a television", "#07080c", "#f5c518"),
+    ("playroom", "Playroom", "big, round and coloured - for the youngest", "#bfe6ff", "#ffd166"),
+    ("paper", "Paper", "quiet, like a shelf of books", "#f4ecd8", "#8b4a2b"),
+    ("aurora", "Aurora", "glass over a night sky", "#1b1b4b", "#5eead4"),
+    ("clear", "Clear", "black, white and yellow, large", "#000000", "#ffe600"),
+    ("day", "Always light", "", "#fff8ef", "#ffffff"),
+    ("night", "Always dark", "", "#191624", "#262234"),
+)
+_MC_THEME_KEYS = tuple(t[0] for t in _MC_THEMES)
+
+
+def _mc_theme_panel(may_set_default: bool) -> str:
+    out = []
+    for key, name, about, a, b in _MC_THEMES:
+        out.append(f'<button type="button" class="th" data-th="{key}"><i style="background:linear-gradient(135deg,{a} 0 55%,{b} 55% 100%)"></i>'
+                   f'<span><b>{html.escape(name)}</b><small>{html.escape(about)}</small></span></button>')
+    if may_set_default:
+        out.append('<button type="button" class="th all" id="thAll">Make this the look every screen starts with</button>')
+    return "".join(out)
+
+
+@app.post("/api/kids/theme")
+async def api_kids_theme(request: Request):
+    """The look a screen starts with when it has not chosen one. (A locked browser cannot
+    reach this: it may choose its own look, which it keeps to itself.)"""
+    try:
+        theme = str((await request.json()).get("theme") or "")
+    except Exception:
+        theme = ""
+    if theme not in _MC_THEME_KEYS:
+        return JSONResponse({"status": "error", "message": "no such look"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('mc_theme', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", theme)
+    return {"status": "ok", "theme": theme}
+
+
 _MC_JUNK_RX = re.compile(
     r"\b(2160p|1080p|720p|480p|4k|uhd|hdr\d*|dv|x26[45]|h\.?26[45]|hevc|avc|web-?dl|webrip|bluray|blu-ray|bdrip|"
     r"hdtv|dvdrip|remux|aac\d?(\.\d)?|ddp?\d?(\.\d)?|atmos|dts(-hd)?|flac|mp3|10bit|8bit|repack|proper|"
@@ -12201,6 +12241,16 @@ _MEDIACENTER_HTML = """<!DOCTYPE html>
 <title>tgarr Media Center</title>
 <link rel="icon" href="/favicon.svg"/>
 __PWA__
+<script>
+(function(){
+  var def = "__THEME__", own = null, known = __THEMES__;
+  try { own = localStorage.getItem("tgarr.mc.theme"); } catch (e) {}
+  var tv = /[?&]tv=1/.test(location.search) || /\\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\\b/i.test(navigator.userAgent);
+  if (known.indexOf(own) < 0) own = null;
+  // this screen's own choice, else the household's, else - on a television - the dark room
+  document.documentElement.setAttribute("data-th", own || (def !== "auto" ? def : (tv ? "cinema" : "auto")));
+})();
+</script>
 <style>
 :root{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--accent:__COLOR__;
   --shadow:0 6px 18px rgba(64,40,10,.10);--r:22px}
@@ -12273,6 +12323,113 @@ html.tv .name{font-size:18px}html.tv h2{font-size:25px}
 .lb.on{display:flex}.lb img{max-width:96vw;max-height:92vh;border-radius:12px}
 .lb button{position:fixed;top:14px;right:16px;width:50px;height:50px;border-radius:50%;border:0;font-size:24px;cursor:pointer}
 .lb .nv{top:50%;transform:translateY(-50%)}.lb .pv{left:14px;right:auto}.lb .nx{right:14px}
+/* ── looks ──────────────────────────────────────────────────────────────────────────
+   A look is a set of colours and a few shapes, chosen on the page (the 🎨 button) and kept by
+   each screen. "auto" is the page as it always was: light by day, dark where the device is. */
+html[data-th=day]{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--shadow:0 6px 18px rgba(64,40,10,.10);color-scheme:light}
+html[data-th=night]{--bg:#191624;--card:#262234;--ink:#f3eefc;--soft:#a79fbd;--line:#342f45;--shadow:0 6px 18px rgba(0,0,0,.35);color-scheme:dark}
+
+/* Cinema: a dark room and the pictures. Made for a television. */
+html[data-th=cinema]{--bg:#07080c;--card:#14161d;--ink:#f2f3f5;--soft:#9aa0ad;--line:#262b38;--accent:#f5c518;
+  --shadow:0 10px 28px rgba(0,0,0,.6);--r:12px;color-scheme:dark}
+html[data-th=cinema] body{background:radial-gradient(1100px 520px at 18% -12%,#1b2540 0%,rgba(27,37,64,0) 62%),
+  radial-gradient(900px 480px at 96% 0%,#2a1730 0%,rgba(42,23,48,0) 60%),#07080c;background-attachment:fixed;
+  font-family:"Inter","Segoe UI","Helvetica Neue","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+html[data-th=cinema] .cats{display:flex;flex-wrap:wrap;gap:10px}
+html[data-th=cinema] .cat{display:flex;align-items:center;gap:10px;padding:10px 22px;border-radius:999px;box-shadow:none;
+  border:2px solid var(--line);background:rgba(255,255,255,.04)}
+html[data-th=cinema] .cat .ic{font-size:22px;display:inline}
+html[data-th=cinema] .cat b{display:inline;margin:0;font-size:17px}
+html[data-th=cinema] .cat small{display:none}
+html[data-th=cinema] .cat.on{background:var(--accent);border-color:var(--accent);color:#111}
+html[data-th=cinema] .card{background:transparent;box-shadow:none;overflow:visible}
+html[data-th=cinema] .pic{border-radius:12px;box-shadow:var(--shadow);background:linear-gradient(160deg,#262c3f,#0e1016)}
+html[data-th=cinema] .name{padding:11px 4px 6px;font-weight:600}
+html[data-th=cinema] .card:hover,html[data-th=cinema] .card:focus-visible{transform:scale(1.06);box-shadow:none;z-index:2}
+html[data-th=cinema] .card:focus-visible{outline:none}
+html[data-th=cinema] .card:focus-visible .pic{outline:4px solid var(--accent);outline-offset:3px;
+  box-shadow:0 0 0 10px rgba(245,197,24,.16),var(--shadow)}
+html[data-th=cinema] .play,html[data-th=cinema] .find button,html[data-th=cinema] .more a.go{background:var(--accent);color:#111}
+html[data-th=cinema] .pill{background:rgba(255,255,255,.05)}
+html[data-th=cinema] .logo .wm b{color:#fff}
+html[data-th=cinema] h2{font-weight:700;letter-spacing:.2px}
+
+/* Playroom: for the youngest. Big, round, coloured. */
+html[data-th=playroom]{--bg:#e8f6ff;--card:#ffffff;--ink:#27314d;--soft:#62739a;--line:#c9e3fa;
+  --shadow:0 8px 0 rgba(39,49,77,.10);--r:30px;color-scheme:light}
+html[data-th=playroom] body{background:linear-gradient(180deg,#bfe6ff 0%,#e8f6ff 34%,#fff4d6 100%);background-attachment:fixed;
+  font-family:"Baloo 2","Comic Neue",ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+html[data-th=playroom] .cat{border:4px solid var(--c)}
+html[data-th=playroom] .cat .ic{font-size:clamp(40px,7vw,66px)}
+html[data-th=playroom] .cat.on{background:var(--c);color:#fff}
+html[data-th=playroom] .cat.on small{color:#fff}
+html[data-th=playroom] .card{border:4px solid #fff}
+html[data-th=playroom] .card:hover{transform:translateY(-6px) rotate(-1deg) scale(1.03)}
+html[data-th=playroom] .pill,html[data-th=playroom] .find input{border-width:3px;font-weight:700}
+html[data-th=playroom] h2{font-size:25px}
+html[data-th=playroom] .name{font-size:17px}
+
+/* Paper: quiet, like a shelf of books. */
+html[data-th=paper]{--bg:#f4ecd8;--card:#fbf6e9;--ink:#3a2f22;--soft:#8a7860;--line:#dccfb0;--accent:#8b4a2b;--shadow:none;--r:6px;color-scheme:light}
+html[data-th=paper] body{font-family:"Iowan Old Style","Palatino Linotype",Georgia,"Songti SC","SimSun","Noto Serif CJK SC",serif}
+html[data-th=paper] .card,html[data-th=paper] .cat{border:1px solid var(--line);box-shadow:none}
+html[data-th=paper] .cat.on{border-color:var(--accent);background:#efe2c4}
+html[data-th=paper] .pic{filter:sepia(.16)}
+html[data-th=paper] h2{font-weight:600;border-bottom:1px solid var(--line);padding-bottom:8px}
+html[data-th=paper] .play,html[data-th=paper] .find button,html[data-th=paper] .more a.go{background:var(--accent);color:#fff}
+html[data-th=paper] .card:hover,html[data-th=paper] .card:focus-visible{box-shadow:0 6px 16px rgba(58,47,34,.18)}
+
+/* Aurora: glass over a night sky. */
+html[data-th=aurora]{--bg:#0b1026;--card:rgba(255,255,255,.09);--ink:#eef2ff;--soft:#aab5dc;--line:rgba(255,255,255,.16);--accent:#5eead4;
+  --shadow:0 10px 30px rgba(0,0,0,.35);--r:20px;color-scheme:dark}
+html[data-th=aurora] body{background:linear-gradient(135deg,#0b1026 0%,#1b1b4b 36%,#3b1d60 68%,#0f3d5c 100%);background-attachment:fixed}
+html[data-th=aurora] .card,html[data-th=aurora] .cat,html[data-th=aurora] .pill,html[data-th=aurora] .find input,
+html[data-th=aurora] .more a,html[data-th=aurora] .empty{-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border:1px solid var(--line)}
+html[data-th=aurora] .cat.on{background:rgba(94,234,212,.2);border-color:var(--accent)}
+html[data-th=aurora] .find button,html[data-th=aurora] .more a.go,html[data-th=aurora] .play{background:var(--accent);color:#062925}
+html[data-th=aurora] .logo .wm b{color:#fff}
+
+/* Clear: black, white and yellow, large - for tired eyes and far sofas. */
+html[data-th=clear]{--bg:#000;--card:#000;--ink:#fff;--soft:#e8e8e8;--line:#fff;--accent:#ffe600;--shadow:none;--r:8px;color-scheme:dark}
+html[data-th=clear] .card,html[data-th=clear] .cat,html[data-th=clear] .pill,html[data-th=clear] .find input{border:3px solid #fff}
+html[data-th=clear] .cat.on{background:#ffe600;border-color:#ffe600;color:#000}
+html[data-th=clear] .cat.on small{color:#000}
+html[data-th=clear] .name{font-size:19px}
+html[data-th=clear] h2{font-size:26px}
+html[data-th=clear] .cat b{font-size:clamp(18px,2.4vw,24px)}
+html[data-th=clear] .cat small,html[data-th=clear] .pill{font-size:16px}
+html[data-th=clear] .find button,html[data-th=clear] .more a.go,html[data-th=clear] .play{background:#ffe600;color:#000}
+html[data-th=clear] .logo .wm,html[data-th=clear] .logo .mark,html[data-th=clear] .logo .wm b{color:#fff}
+html[data-th=clear] .card:focus-visible,html[data-th=clear] .cat:focus-visible,html[data-th=clear] .pill:focus-visible{outline:6px solid #ffe600}
+
+/* a picture that is not there yet: in the colours of the look, not a bright tile in a dark room */
+html[data-th=aurora] .pic{background:linear-gradient(135deg,color-mix(in srgb,var(--c) 34%,#1b1b4b),color-mix(in srgb,var(--c) 50%,#0b1026))}
+html[data-th=night] .pic,html[data-th=clear] .pic{background:linear-gradient(135deg,color-mix(in srgb,var(--c) 30%,#262234),color-mix(in srgb,var(--c) 50%,#000))}
+html[data-th=paper] .pic{background:linear-gradient(135deg,#efe2c4,color-mix(in srgb,var(--c) 30%,#e2d2ad))}
+/* room for the ring around what the remote is on */
+.grid{padding-top:8px;padding-bottom:8px}
+/* the list of looks */
+.thp{position:fixed;top:66px;right:clamp(12px,4vw,44px);z-index:8;background:var(--card);color:var(--ink);border:1.5px solid var(--line);
+  border-radius:18px;box-shadow:0 18px 44px rgba(0,0,0,.35);padding:12px;display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;
+  width:min(440px,calc(100vw - 24px))}
+.thp.on{display:grid}
+html[data-th=aurora] .thp{background:#1b1b4b}
+.th{font:inherit;color:inherit;text-align:left;cursor:pointer;background:transparent;border:2px solid var(--line);border-radius:14px;padding:10px;
+  display:flex;gap:10px;align-items:center}
+.th i{flex:none;width:46px;height:34px;border-radius:8px;border:1px solid rgba(128,128,128,.45)}
+.th b{display:block;font-size:15px}.th small{display:block;color:var(--soft);font-size:12px;line-height:1.25}
+.th.on{border-color:var(--accent)}
+.th:focus-visible{outline:5px solid var(--accent);outline-offset:2px}
+.thp .all{grid-column:1/-1;font-size:13px;color:var(--soft);text-align:center;border-style:dashed;justify-content:center}
+button.pill{font-family:inherit;cursor:pointer}
+/* on a television: seen from three metres */
+html.tv .top{padding-top:26px}
+html.tv .pill{font-size:16px;padding:12px 18px}
+html.tv .grid{grid-template-columns:repeat(auto-fill,minmax(clamp(190px,17vw,300px),1fr))}
+html.tv .grid.book{grid-template-columns:repeat(auto-fill,minmax(clamp(150px,12vw,220px),1fr))}
+html.tv .cat b{font-size:clamp(18px,1.9vw,26px)}
+html.tv .th b{font-size:18px}html.tv .th small{font-size:14px}
+html.tv .thp{width:min(620px,calc(100vw - 24px))}
 @media (max-width:560px){.cats{grid-template-columns:repeat(4,1fr);gap:8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
 </style></head>
 <body>
@@ -12288,6 +12445,7 @@ html.tv .name{font-size:18px}html.tv h2{font-size:25px}
   <input type="search" name="q" value="__Q__" placeholder="What are you looking for?" aria-label="search"/>
   <button type="submit">Find</button>
 </form>
+<div class="thp" id="thP" role="dialog" aria-label="how this page looks">__THEMEPANEL__</div>
 <div id="recent"></div>
 <h2>__HEADING__</h2>
 __GRID__
@@ -12339,14 +12497,45 @@ __MORE__
 
 <script>
 (function(){
+  // The look of the page: chosen here, kept by this screen.
+  var panel = document.getElementById("thP"), btn = document.getElementById("thB"), root = document.documentElement;
+  if (!panel || !btn) return;
+  function mark(){ panel.querySelectorAll("button.th[data-th]").forEach(function(b){ b.classList.toggle("on", b.dataset.th === root.getAttribute("data-th")); }); }
+  function open(on){ panel.classList.toggle("on", on); if (on) { mark(); var f = panel.querySelector("button.th.on") || panel.querySelector("button.th"); if (f) f.focus(); } else btn.focus(); }
+  btn.addEventListener("click", function(){ open(!panel.classList.contains("on")); });
+  panel.addEventListener("click", function(ev){
+    var b = ev.target.closest("button.th");
+    if (!b) return;
+    if (b.dataset.th) {
+      root.setAttribute("data-th", b.dataset.th);
+      try { localStorage.setItem("tgarr.mc.theme", b.dataset.th); } catch (e) {}
+      mark();
+    } else if (b.id === "thAll") {
+      // for the one who looks after this tgarr: the look every screen starts with
+      fetch("/api/kids/theme", {method: "POST", headers: {"Content-Type": "application/json"},
+                                body: JSON.stringify({theme: root.getAttribute("data-th")})})
+        .then(function(r){ return r.json(); })
+        .then(function(j){ b.textContent = j.status === "ok" ? "✓ every screen now starts with this look" : "✗ " + (j.message || "not saved"); })
+        .catch(function(){ b.textContent = "✗ not saved"; });
+    }
+  });
+  document.addEventListener("keydown", function(ev){ if (ev.key === "Escape" && panel.classList.contains("on")) { ev.stopPropagation(); open(false); } });
+  document.addEventListener("click", function(ev){ if (panel.classList.contains("on") && !panel.contains(ev.target) && ev.target !== btn) panel.classList.remove("on"); });
+})();
+</script>
+<script>
+(function(){
   // With a remote control (or a keyboard): the arrows go to the nearest thing in that
   // direction that can be chosen, OK / Enter opens it. A television has no pointer.
-  var TV = /[?&]tv=1/.test(location.search) || /\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\b/i.test(navigator.userAgent);
+  var TV = /[?&]tv=1/.test(location.search) || /\\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\\b/i.test(navigator.userAgent);
   // On a television the search box is not among what the arrows go to: the moment it is
   // chosen the on-screen keyboard opens and takes the arrows for itself, and the remote is
   // caught in it. There the way to search is OK on "Find", which opens the keyboard on purpose.
-  var SEL = "a.cat, " + (TV ? "" : ".find input[type=search], ") + ".find button, a.card, .more a, a.pill, button.pill, .top a.logo";
-  function all(){ return Array.prototype.filter.call(document.querySelectorAll(SEL), function(e){ var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }); }
+  var SEL = "a.cat, " + (TV ? "" : ".find input[type=search], ") + ".find button, a.card, .more a, a.pill, button.pill, .top a.logo, button.th";
+  function all(){
+    var open = document.querySelector(".thp.on");      // the list of looks is open: the arrows stay in it
+    return Array.prototype.filter.call((open || document).querySelectorAll(open ? "button.th" : SEL), function(e){ var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+  }
   if (TV) {
     var fm = document.querySelector("form.find"), box = fm && fm.querySelector("input[type=search]");
     if (fm && box) fm.addEventListener("submit", function(ev){ if (!box.value.trim()) { ev.preventDefault(); box.focus(); } });
@@ -12421,6 +12610,8 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
         counts = {k: await conn.fetchval(f"""
             SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
             WHERE {_kid_sql()} AND {v[3]}""") for k, v in _MC_KINDS.items()}
+        theme = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_theme'")
+    theme = theme if theme in _MC_THEME_KEYS else "auto"
     more, rows = len(rows) > per, rows[:per]
     locked = _LOCKED.get()
     cats = "".join(
@@ -12462,12 +12653,15 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
     prof = _PROFILE.get()
     whose = (f'<span class="pill">👤 {html.escape(prof["name"])}</span>'
              '<a class="pill" href="/lock" title="this is not me">Leave</a>') if prof else ""
-    top_right = (whose + '<a class="pill" href="/unlock" title="your own PIN, or the one that opens all of tgarr">🔒 Enter PIN</a>' if locked else
+    look = '<button type="button" class="pill" id="thB" title="how this page looks" aria-haspopup="dialog">🎨 Look</button>'
+    top_right = look + (whose + '<a class="pill" href="/unlock" title="your own PIN, or the one that opens all of tgarr">🔒 Enter PIN</a>' if locked else
              ('<a class="pill" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
              + '<a class="pill" href="/mediacenter/manage">⚙ Choose what is shown</a>'
              '<a class="pill" href="/">← Back to tgarr</a>')
     heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
     page = (_MEDIACENTER_HTML.replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
+            .replace("__THEME__", theme).replace("__THEMES__", _json.dumps(list(_MC_THEME_KEYS)))
+            .replace("__THEMEPANEL__", _mc_theme_panel(not locked))
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
             .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
             .replace("__GRID__", grid).replace("__MORE__", nav))
