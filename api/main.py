@@ -699,6 +699,7 @@ async def _startup():
     asyncio.create_task(_usenet_grab_worker())
     asyncio.create_task(_archive_grab_worker())
     asyncio.create_task(_course_report_worker())
+    asyncio.create_task(_course_catalogue_worker())
     asyncio.create_task(_archive_arr_worker())
     asyncio.create_task(_update_check_worker())
     asyncio.create_task(_packs_heal())
@@ -12475,17 +12476,106 @@ _REWARD = {"at": 0.0, "v": dict(courses.REWARD_DEFAULT)}
 _BONUS: dict = {}                   # who -> (seconds earned today, day, when worked out)
 
 
+_COURSE_BUNDLED: dict = {}           # the lists in the image
+_CATALOGUE = {"serial": 0, "packs": {}, "withdrawn": [], "at": 0.0}     # the registry's signed catalogue, as last taken
+
+
 def _course_packs() -> dict:
+    """The lists there are: those in the image, and over them those of the registry's catalogue
+    (newer by nature: a list of the image that the catalogue also carries is the catalogue's);
+    a list the catalogue takes back is not among them, whichever it came with."""
     if not COURSE_PACKS:
-        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coursepacks")
-        try:
-            for sub_ in sorted(os.listdir(base)):
-                if os.path.isdir(os.path.join(base, sub_)):
-                    for slug, p in courses.load_packs(os.path.join(base, sub_), lambda m: log.info("[courses] %s", m)).items():
-                        COURSE_PACKS.setdefault(slug, p)
-        except OSError:
-            pass
+        if not _COURSE_BUNDLED:
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coursepacks")
+            try:
+                for sub_ in sorted(os.listdir(base)):
+                    if os.path.isdir(os.path.join(base, sub_)):
+                        for slug, p in courses.load_packs(os.path.join(base, sub_), lambda m: log.info("[courses] %s", m)).items():
+                            _COURSE_BUNDLED.setdefault(slug, p)
+            except OSError:
+                pass
+        COURSE_PACKS.update(_COURSE_BUNDLED)
+        COURSE_PACKS.update(_CATALOGUE["packs"])
+        for g in _CATALOGUE["withdrawn"]:
+            COURSE_PACKS.pop(g, None)
     return COURSE_PACKS
+
+
+async def _course_catalogue_take(doc: str, sig: str, keep: bool) -> str:
+    """Take a signed catalogue (courses.open_catalogue says whether it is ours and not an older
+    one). The courses made from its lists follow it: a channel's course reaches as far as the
+    list now says, an Archive course has the items the list now names. A list taken back goes
+    off the children's list at once - the course and what was learned stay, for the parents to
+    decide. `keep`: store it (a catalogue read back from the store is not stored again)."""
+    got = courses.open_catalogue(doc, sig, least_serial=_CATALOGUE["serial"])
+    if got["serial"] == _CATALOGUE["serial"] and keep:
+        return f"the same as in use (serial {got['serial']})"
+    async with db_pool.acquire() as conn:
+        if keep:
+            await conn.execute("INSERT INTO config (key, value) VALUES ('course_catalogue', $1) "
+                               "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", _json.dumps({"doc": doc, "sig": sig}))
+        changed = 0
+        for slug, pk in got["packs"].items():
+            if pk["channel"]:
+                r = await conn.execute(
+                    """UPDATE courses SET ref = $2, title = $3, about = $4, built_at = NULL
+                       WHERE slug = $1 AND kind = 'channel' AND (ref, title, about) IS DISTINCT FROM ($2, $3, $4)""",
+                    slug, f"@{pk['channel']} {pk['tag'] or '-'} {pk['upto']}", pk["title"], pk["about"])
+            else:
+                r = await conn.execute(
+                    """UPDATE courses SET parts = $2, title = $3, about = $4, built_at = NULL
+                       WHERE slug = $1 AND kind = 'pack' AND (parts, title, about) IS DISTINCT FROM ($2, $3, $4)""",
+                    slug, _json.dumps(pk["parts"]), pk["title"], pk["about"])
+            changed += int(r.split()[-1])
+        off = 0
+        if got["withdrawn"]:
+            r = await conn.execute(
+                "DELETE FROM kids_allow WHERE kind = 'course' AND ref IN (SELECT id FROM courses WHERE slug = ANY($1::text[]))", got["withdrawn"])
+            off = int(r.split()[-1])
+    _CATALOGUE.update(serial=got["serial"], packs=got["packs"], withdrawn=got["withdrawn"], at=time.time())
+    COURSE_PACKS.clear()
+    _KID_OK.clear()
+    _LESSON.clear()
+    return (f"serial {got['serial']}: {len(got['packs'])} lists, {len(got['withdrawn'])} taken back; "
+            f"{changed} courses here follow, {off} taken off the children's list")
+
+
+async def _course_catalogue_fetch() -> str:
+    def get():
+        req = urllib.request.Request(UPDATE_REGISTRY_URL + "/api/v1/courses/catalogue", headers={"User-Agent": f"tgarr/{TGARR_VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return _json.loads(r.read(courses.CATALOGUE_BYTES + 65536).decode("utf-8"))
+    j = await asyncio.to_thread(get)
+    if not isinstance(j, dict) or not j.get("doc"):
+        return "the registry has no catalogue"
+    return await _course_catalogue_take(str(j.get("doc")), str(j.get("sig") or ""), True)
+
+
+async def _course_catalogue_worker():
+    """The catalogue last taken is in use from the start; the registry is asked for a newer one
+    soon after, and twice a day. Asking is part of asking the registry at all (TGARR_UPDATE_CHECK)."""
+    import random
+    for _ in range(60):
+        if db_pool is not None:
+            break
+        await asyncio.sleep(1)
+    try:
+        async with db_pool.acquire() as conn:
+            kept = await conn.fetchval("SELECT value FROM config WHERE key = 'course_catalogue'")
+        if kept:
+            k = _json.loads(kept)
+            log.info("[courses] the catalogue kept here: %s", await _course_catalogue_take(k["doc"], k["sig"], False))
+    except Exception as e:
+        log.info("[courses] the catalogue kept here is not used: %s: %s", type(e).__name__, str(e)[:120])
+    if not UPDATE_CHECK_ENABLED:
+        return
+    await asyncio.sleep(random.uniform(60, 240))
+    while True:
+        try:
+            log.info("[courses] the registry's catalogue: %s", await _course_catalogue_fetch())
+        except Exception as e:
+            log.info("[courses] the registry's catalogue was not taken: %s: %s", type(e).__name__, str(e)[:120])
+        await asyncio.sleep(43200 + random.uniform(0, 3600))
 
 
 async def _reward() -> dict:

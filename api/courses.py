@@ -109,6 +109,73 @@ def load_packs(folder: str, log=None) -> dict:
     return out
 
 
+# ── the catalogue: lists the registry hands out between releases ──
+# A list a volunteer made in @tgarr0 should not wait for a release. So besides the lists in the
+# image an install takes a catalogue from the registry. What keeps that safe is not the
+# registry: the catalogue is signed where it is written, with a key the registry never holds,
+# and an install takes only a catalogue whose signature is good under a key named here. On top
+# of that a catalogue's list may name Internet Archive items, or the one channel named here -
+# nothing else - and a catalogue older than the one an install has is not taken (so that an old
+# one, with a list since withdrawn, cannot be played back to it).
+CATALOGUE_KEYS = ("UNQXsA23nwAYFx7yGTvc9gSxHHOXID49Rby5MaPpvMQ=",)
+CATALOGUE_CHANNELS = ("tgarr0",)
+CATALOGUE_MOST, CATALOGUE_BYTES = 2000, 8 * 1024 * 1024
+
+
+def clean_catalogue_pack(raw) -> dict:
+    """A list of the catalogue: in order as any list is (clean_pack), and of no channel but ours."""
+    p = clean_pack(raw)
+    if p["channel"] and p["channel"].lower() not in CATALOGUE_CHANNELS:
+        raise ValueError("a catalogue's list names no channel but " + ", ".join("@" + c for c in CATALOGUE_CHANNELS))
+    if p["channel"] and not p["tag"]:
+        raise ValueError("a catalogue's list over the channel names its tag")
+    return p
+
+
+def open_catalogue(doc, sig, least_serial: int = 0, keys=None) -> dict:
+    """{"serial", "packs": {slug: pack}, "withdrawn": [slug]} of a signed catalogue, or ValueError
+    saying why it is not taken. `doc`: the text that was signed; `sig`: its signature, base64."""
+    import base64
+    import ed25519
+    if not isinstance(doc, str) or not isinstance(sig, str) or not doc or len(doc) > CATALOGUE_BYTES:
+        raise ValueError("no catalogue")
+    try:
+        s = base64.b64decode(sig, validate=True)
+    except Exception:
+        raise ValueError("the signature is not readable")
+    raw = doc.encode("utf-8")
+    good = False
+    for k in (CATALOGUE_KEYS if keys is None else keys):
+        try:
+            good = good or ed25519.verify(base64.b64decode(k), raw, s)
+        except Exception:
+            pass
+    if not good:
+        raise ValueError("the signature is not ours")
+    try:
+        d = json.loads(doc)
+    except Exception:
+        raise ValueError("not readable")
+    if not isinstance(d, dict) or d.get("v") != 1:
+        raise ValueError("a catalogue of a kind this version does not know")
+    serial = d.get("serial")
+    if isinstance(serial, bool) or not isinstance(serial, int) or serial <= 0:
+        raise ValueError("no serial")
+    if serial < least_serial:
+        raise ValueError(f"older than the one in use ({serial} < {least_serial})")
+    packs = {}
+    for one in (d.get("packs") if isinstance(d.get("packs"), list) else [])[:CATALOGUE_MOST]:
+        try:
+            p = clean_catalogue_pack(one)
+            packs.setdefault(p["slug"], p)
+        except ValueError:
+            continue                                   # a list this version cannot read is left out; the others stand
+    gone = [g for g in (d.get("withdrawn") if isinstance(d.get("withdrawn"), list) else []) if isinstance(g, str) and SLUG_RX.match(g)][:CATALOGUE_MOST]
+    for g in gone:
+        packs.pop(g, None)
+    return {"serial": serial, "packs": packs, "withdrawn": gone}
+
+
 def ia_of(caption: str) -> str:
     """The Internet Archive item a fetched file came from, read out of its caption
     ("Title · archive.org/details/<identifier> · 1923"), or ''."""

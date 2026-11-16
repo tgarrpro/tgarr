@@ -77,3 +77,13 @@ the rights it states are checked against where the material is published, and th
 family would not want in a children's library. `python api/test_courses.py` checks the form of every list here.
 
 Lists are for children: nothing sexual, no cruelty for its own sake, no hate, no preaching.
+
+## Lists between releases: the catalogue
+
+A list does not have to wait for a release. Besides the lists in this folder an install takes a
+catalogue of lists from the registry, twice a day. The catalogue is signed where it is written, with a
+key the registry does not hold; an install takes it only when the signature is good under a key in its
+image (`courses.CATALOGUE_KEYS`). A catalogue's list may name Internet Archive items, or `@tgarr0` with a
+tag and `upto` - nothing else. When the catalogue raises a channel list's `upto`, the courses made from
+it reach further by themselves; a list it takes back leaves the children's list at once.
+`TGARR_UPDATE_CHECK=false` switches this asking off together with the asking for new versions.
