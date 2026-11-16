@@ -82,4 +82,23 @@ for i in range(0, 361):
 ok(not last["ok"] and last["why"] == "day" and D3.by["tv"]["used"] >= 180 * 60, "the day's 180 minutes run out")
 ok(D3.ping("tv", RW, at(15, "09:00"))["ok"] and D3.by["tv"]["used"] == 0, "the next day starts from nothing")
 
+# minutes earned by learning are added to the day; learning itself may be free of it
+D4, t = S.Devices(), at(14, "09:00")
+for i in range(0, 361):
+    last = D4.ping("kid", RW, t + 30 * i, bonus_s=20 * 60)
+ok(last["ok"] and last["left_s"] > 0, "twenty earned minutes: the day is not over at 180")
+for i in range(361, 361 + 45):
+    last = D4.ping("kid", RW, t + 30 * i, bonus_s=20 * 60)
+ok(not last["ok"] and last["why"] == "day", "and it is over when those are used too")
+ok(D4.check("kid", RW, t + 30 * 410, bonus_s=20 * 60, free=True)["ok"], "a lesson can still be opened then")
+ok(not D4.check("kid", RW, at(14, "23:30"), free=True)["ok"], "but not outside the opening hours")
+used = D4.by["kid"]["used"]
+v = D4.ping("kid", RW, t + 30 * 406, bonus_s=20 * 60, free=True)
+ok(v["ok"] and v["added"] > 0 and D4.by["kid"]["used"] == used, "time on a lesson is counted for the lesson, not taken from the day")
+D5, t = S.Devices(), at(14, "09:00")
+for i in range(0, 81):
+    last = D5.ping("kid", R, t + 30 * i, free=True)
+ok(not last["ok"] and last["why"] == "rest" and D5.by["kid"]["used"] == 0, "a break is due after a long sitting of lessons as well")
+ok(D5.ping("kid", R, t + 30 * 81)["added"] == 0, "nothing is counted during the break")
+
 print(f"ok - {n} checks")

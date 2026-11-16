@@ -1,0 +1,28 @@
+{
+ "slug": "maerchen-zum-hoeren",
+ "title": "Märchen zum Hören",
+ "about": "Vier große Märchensammlungen, vorgelesen: die Kinder- und Hausmärchen der Brüder Grimm, Andersens Märchen, die Märchen von Charles Perrault und Wolfs Deutsche Hausmärchen.",
+ "lang": "de",
+ "level": "5-8",
+ "subject": "reading",
+ "right": "PD",
+ "credit": "Brüder Grimm, Hans Christian Andersen, Charles Perrault, Johann Wilhelm Wolf. Aufnahmen von LibriVox-Freiwilligen, gemeinfrei.",
+ "parts": [
+  {
+   "ia": "kinder_und_hausmaerchen_2003_librivox",
+   "title": "Brüder Grimm: Kinder- und Hausmärchen"
+  },
+  {
+   "ia": "maerchen_andersen_1004_librivox",
+   "title": "Hans Christian Andersen: Märchen"
+  },
+  {
+   "ia": "maerchen_von_charles_perrault_1505_librivox",
+   "title": "Charles Perrault: Märchen"
+  },
+  {
+   "ia": "deutschehausmarchen_2109_librivox",
+   "title": "Johann Wilhelm Wolf: Deutsche Hausmärchen"
+  }
+ ]
+}

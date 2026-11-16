@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- Synology with DSM 7.0+ and Container Manager installed
+- Synology with Container Manager installed (tested on DSM 7.2)
 - SSH enabled (Control Panel → Terminal & SNMP → ✅ Enable SSH service)
 - A shared folder for tgarr data, e.g. `docker/tgarr`
 
@@ -32,26 +32,32 @@
    ```
    TG_API_ID=<from my.telegram.org/apps>
    TG_API_HASH=<from my.telegram.org/apps>
-   TG_PHONE=+1XXXXXXXXXX
    DB_PASSWORD=<openssl rand -hex 24>
    MEILI_MASTER_KEY=<openssl rand -hex 32>
    ```
 
-4. Start the stack (next step), then sign in:
+   The two Telegram values may be left empty: tgarr then asks for them in the browser when they are first needed.
 
-   After the stack is started, open `http://<your-host>:8765` in a browser and sign in — scan the QR code with the Telegram app, or enter your phone number and the code Telegram sends you. Nothing is typed in a terminal, and the code never touches a file.
-
-5. Start the stack:
+4. Start the stack:
 
    ```bash
    docker compose up -d
    ```
 
-6. Add tgarr as a Newznab indexer in Sonarr/Radarr:
-   - URL: `http://<synology-ip>:8765/api`
-   - API Key: (none required for self-hosted)
+5. Sign in:
+
+   Open `http://<synology-ip>:8765` in a browser and sign in — scan the QR code with the Telegram app, or enter your phone number and the code Telegram sends you. Nothing is typed in a terminal, and the code never touches a file.
+
+6. Add tgarr to Sonarr/Radarr:
+   - Indexer: Settings → Indexers → + → Newznab → URL `http://<synology-ip>:8765/newznab/`, API Path `/api`
+   - Download client: Settings → Download Clients → + → SABnzbd → Host `<synology-ip>`, Port `8765`, URL Base `/sabnzbd`
+   - API Key: any text, unless you set `TGARR_API_KEY` in `.env` - then that key
+
+   The Dashboard shows the exact address. Field by field: [docs/integration/sonarr.md](../integration/sonarr.md).
 
 ## Updating
+
+New releases are installed automatically (the `tgarr-watchtower` container). To update by hand:
 
 ```bash
 cd /volume1/docker/tgarr

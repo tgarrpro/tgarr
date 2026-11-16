@@ -1,0 +1,60 @@
+{
+ "slug": "fables-de-la-fontaine",
+ "title": "Fables de La Fontaine",
+ "about": "Les douze livres des Fables, lus à voix haute : La Cigale et la Fourmi, Le Corbeau et le Renard, Le Lièvre et la Tortue et toutes les autres.",
+ "lang": "fr",
+ "level": "8-12",
+ "subject": "reading",
+ "right": "PD",
+ "credit": "Jean de La Fontaine (1668-1694). Enregistrements de bénévoles de LibriVox, dans le domaine public.",
+ "parts": [
+  {
+   "ia": "fables_de_la_fontaine_01_jl_0809_librivox",
+   "title": "Livre 1"
+  },
+  {
+   "ia": "fables_de_la_fontaine_02_jl_0809_librivox",
+   "title": "Livre 2"
+  },
+  {
+   "ia": "fables_de_la_fontaine_03_jl_0811_librivox",
+   "title": "Livre 3"
+  },
+  {
+   "ia": "fables_de_la_fontaine_04_jl_librivox",
+   "title": "Livre 4"
+  },
+  {
+   "ia": "fables_de_la_fontaine_05_jl_librivox",
+   "title": "Livre 5"
+  },
+  {
+   "ia": "fables_de_la_fontaine_06_jl_librivox",
+   "title": "Livre 6"
+  },
+  {
+   "ia": "fables_de_la_fontaine_07_jl_librivox",
+   "title": "Livre 7"
+  },
+  {
+   "ia": "fables_de_la_fontaine_08_jl_librivox",
+   "title": "Livre 8"
+  },
+  {
+   "ia": "fables_de_la_fontaine_09_jl_librivox",
+   "title": "Livre 9"
+  },
+  {
+   "ia": "fables_de_la_fontaine_10_jl_librivox",
+   "title": "Livre 10"
+  },
+  {
+   "ia": "fables_de_la_fontaine_11_jl_librivox",
+   "title": "Livre 11"
+  },
+  {
+   "ia": "fables_de_la_fontaine_12_jl_librivox",
+   "title": "Livre 12"
+  }
+ ]
+}

@@ -34,7 +34,6 @@ curl -fsSL  https://raw.githubusercontent.com/tgarrpro/tgarr/main/.env.example -
 ## Step 3 — configure `.env`
 
 ```bash
-cp .env.example .env
 chmod 600 .env
 nano .env
 ```
@@ -44,14 +43,13 @@ Fill in:
 ```bash
 TG_API_ID=12345678
 TG_API_HASH=abcdef0123456789abcdef0123456789
-TG_PHONE=+12815551234
 
 # Random secrets — generate fresh, do not reuse
 DB_PASSWORD=<openssl rand -hex 24>
 MEILI_MASTER_KEY=<openssl rand -hex 32>
 
 # Where releases link back to (Sonarr fetches NZB stubs from here)
-TGARR_BASE_URL=http://192.168.2.124:8765
+TGARR_BASE_URL=http://<nas-ip>:8765
 
 # Optional: change the external port (default 8765)
 TGARR_PORT=8765
@@ -63,6 +61,8 @@ Generate the secrets:
 echo "DB_PASSWORD=$(openssl rand -hex 24)"        # paste into .env
 echo "MEILI_MASTER_KEY=$(openssl rand -hex 32)"   # paste into .env
 ```
+
+`TG_API_ID` and `TG_API_HASH` may be left empty: tgarr then asks for the two values in the browser when they are first needed.
 
 ## Step 4 — start it
 
@@ -84,19 +84,13 @@ Expected logs:
 [tgarr] starting backfill (limit 5000/channel)...
 ```
 
-The backfill walks every channel your account has joined. Active piracy channels with 10K+ messages may take 30 minutes to several hours.
+The backfill walks every channel your account has joined.
 
 ## Step 6 — open the dashboard
 
-In your browser: **`http://192.168.2.124:8765/`**
+In your browser: **`http://<nas-ip>:8765/`**
 
-You should see:
-
-- Stats banner (channels / messages indexed / parsed releases / pending / downloading / completed)
-- Recent downloads table — every grab from Sonarr/Radarr shows up here with live progress
-- Recent releases — last 30 parsed releases
-- Indexed channels — what your account has joined
-- Auto-refresh every 10 s
+The Dashboard has a "Connect Sonarr / Radarr" block with the exact addresses for the next step.
 
 ## Step 7 — wire up Sonarr / Radarr on the same box
 
@@ -116,15 +110,13 @@ tgarr only indexes channels your Telegram account has joined. To grow your index
 - Join channels (cinema, TV, books — anything with file attachments).
 - tgarr's crawler picks them up within minutes, then back-fills history.
 
-A starter list of channels is at <https://tgarr.me/channels/>.
-
 ## Common issues
 
 | Symptom | Fix |
 |---|---|
 | Dashboard 404 | Container failed to start — `docker compose logs api` |
-| 0 releases after 30 min | All joined channels are link-only or have no media. Join a real piracy/media channel. |
-| Crawler logs `FloodWait` | Telegram rate-limit — handled automatically. Reduce `TG_BACKFILL_LIMIT` for faster startup. |
+| 0 releases after 30 min | All joined channels are link-only or have no media. Join a public channel that posts files. |
+| Crawler logs `FloodWait` | Telegram rate-limit — handled automatically. |
 | Download stuck "downloading" | Big file or slow Telegram DC. Watch `_data/downloads/tgarr/<release>/*.temp` size. |
 | Sonarr "test" indexer fails | Bad URL. From the CasaOS box, `curl http://localhost:8765/newznab/api?t=caps` should return XML. |
 

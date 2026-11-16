@@ -23,18 +23,19 @@ $EDITOR .env
 ```
 
 Fill in:
-- `TG_API_ID` / `TG_API_HASH` — from https://my.telegram.org/apps
-- `TG_PHONE` — your Telegram phone, international format
+- `TG_API_ID` / `TG_API_HASH` — from https://my.telegram.org/apps. May be left empty: tgarr then asks for the two values in the browser when they are first needed.
 - `DB_PASSWORD` — `openssl rand -hex 24`
 - `MEILI_MASTER_KEY` — `openssl rand -hex 32`
 
 Then the standard flow:
 
 ```bash
-# then sign in in the browser: http://<your-host>:8765
 docker compose up -d
 docker compose logs -f crawler
+# then sign in in the browser: http://<qnap-ip>:8765
 ```
+
+The database and the Telegram session are kept in `_data/`, a folder docker compose creates next to `docker-compose.yml`.
 
 ## Resource notes
 
@@ -42,4 +43,9 @@ Comfortable on QNAP TS-451+, TS-453D, TS-464, TS-673A, and similar 4 GB+ models.
 
 ## Newznab endpoint
 
-Once running, the Newznab-compatible API is on `http://<qnap-ip>:8765/api`. Point Sonarr/Radarr there in Settings → Indexers → Add Newznab.
+Once running, add tgarr to Sonarr/Radarr:
+
+- Indexer: Settings → Indexers → + → Newznab → URL `http://<qnap-ip>:8765/newznab/`, API Path `/api`
+- Download client: Settings → Download Clients → + → SABnzbd → Host `<qnap-ip>`, Port `8765`, URL Base `/sabnzbd`
+
+The Dashboard shows the exact address. Field by field: [docs/integration/sonarr.md](../integration/sonarr.md).

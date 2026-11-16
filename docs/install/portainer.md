@@ -14,10 +14,11 @@
    ```
    TG_API_ID=<from my.telegram.org/apps>
    TG_API_HASH=<from my.telegram.org/apps>
-   TG_PHONE=+1XXXXXXXXXX
    DB_PASSWORD=<openssl rand -hex 24>
    MEILI_MASTER_KEY=<openssl rand -hex 32>
    ```
+
+   The two Telegram values may be left empty: tgarr then asks for them in the browser when they are first needed.
 
 7. **Enable automatic updates** (optional) → Polling interval `6h` → auto-pull new tgarr versions.
 8. **Deploy the stack**.
@@ -40,4 +41,9 @@ Add this to Portainer's App Template list (Settings → App Templates → URL fi
 
 ## Newznab endpoint
 
-After login + `up`, the API is on `http://<host-ip>:8765/api`. Add to Sonarr/Radarr → Settings → Indexers → Newznab.
+Once the stack is up, add tgarr to Sonarr/Radarr:
+
+- Indexer: Settings → Indexers → + → Newznab → URL `http://<host-ip>:8765/newznab/`, API Path `/api`
+- Download client: Settings → Download Clients → + → SABnzbd → Host `<host-ip>`, Port `8765`, URL Base `/sabnzbd`
+
+The Dashboard shows the exact address. Field by field: [docs/integration/sonarr.md](../integration/sonarr.md).

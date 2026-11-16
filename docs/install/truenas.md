@@ -1,34 +1,8 @@
 # Install on TrueNAS Scale
 
-> Tested on TrueNAS Scale 23.x / 24.x. Native Kubernetes (k3s)–based — install via docker-compose mode (Custom App) or wait for TrueCharts catalog entry.
+> Tested on TrueNAS Scale 23.x / 24.x. Install with docker compose over SSH.
 
-## Recommended (today): Custom App via docker-compose
-
-TrueNAS Scale supports docker-compose syntax in Custom Apps.
-
-1. **Apps → Discover Apps → Custom App**
-2. Application Name: `tgarr`
-3. Image:  
-   - Image repository: `ghcr.io/tgarrpro/tgarr-crawler`
-   - Image tag: `latest`
-   - Pull Policy: IfNotPresent
-4. Add **Environment Variables**:
-   - `TG_API_ID` = your Telegram API ID
-   - `TG_API_HASH` = your Telegram API hash
-   - `TG_PHONE` = your Telegram phone, international format
-   - `DB_DSN` = `postgresql://tgarr:<DB_PASSWORD>@db:5432/tgarr`
-   - `MEILI_URL` = `http://meili:7700`
-   - `MEILI_MASTER_KEY` = your Meilisearch master key
-5. Add **Storage** (Host Path):
-   - `/mnt/<pool>/tgarr/session` → mount path `/app/session`
-6. Networking → expose port `8765` (Newznab API)
-7. Apply.
-
-Repeat for `db` (postgres:16-alpine) and `meili` (getmeili/meilisearch:v1.11) — see [docker-compose.yml](https://raw.githubusercontent.com/tgarrpro/tgarr/main/docker-compose.yml) for the exact env / volume layout.
-
-## Alternative: docker-compose via SSH
-
-If you prefer the standard docker-compose flow:
+## docker compose via SSH
 
 ```bash
 ssh root@truenas
@@ -37,11 +11,17 @@ curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/docker-compose.
 curl -fsSL https://raw.githubusercontent.com/tgarrpro/tgarr/main/.env.example -o .env
 chmod 600 .env
 $EDITOR .env
-# then sign in in the browser: http://<your-host>:8765
 docker compose up -d
+# then sign in in the browser: http://<your-host>:8765
 ```
 
-Note: TrueNAS Scale's `docker` CLI is provided through the system but isn't officially supported by iX — prefer the Custom App route for production.
+In `.env`, fill in `DB_PASSWORD` and `MEILI_MASTER_KEY`. `TG_API_ID` and `TG_API_HASH` may be left empty: tgarr then asks for the two values in the browser when they are first needed.
+
+Note: TrueNAS Scale's `docker` CLI is provided through the system but isn't officially supported by iX.
+
+## Custom App
+
+tgarr is several containers (database, search, crawler, api, updater), all defined by [docker-compose.yml](https://raw.githubusercontent.com/tgarrpro/tgarr/main/docker-compose.yml). A single Custom App of one image is not enough: one container alone does not give a working install.
 
 ## TrueCharts catalog (coming)
 

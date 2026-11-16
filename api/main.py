@@ -35,6 +35,8 @@ import localfiles  # local module
 import ownbooks  # local module: books read here without converting (.txt .fb2 .docx .odt .rtf .mobi .html)
 import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
 import i18n  # local module: the words on the pages, in the languages of those who read them
+import progress  # local module: where somebody stopped, kept per person
+import courses  # local module: courses - lists, the order of lessons, what a lesson done is worth
 
 # What counts as a book on every shelf, count and export: everything a reader here opens.
 # (This list used to be written out in seven places, each a little different.)
@@ -114,7 +116,7 @@ def _cross_site(request) -> bool:
 #   * anything that acts through the account: follow, unfollow, grab, fetch,
 #     settings. The pages hide those buttons; this refuses the requests.
 _PRIVATE_ID_RX = re.compile(
-    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/ebook-status|api/lyrics|api/fav|"
+    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/ebook-status|api/lyrics|api/fav|api/progress|"
     r"ebook-pdf|ebook-cover|epub|comic|pdf|play|transcode)/(\d+)(?:/|$)")
 _PUBLIC_MSG: dict = {}
 
@@ -178,15 +180,18 @@ _LANG = contextvars.ContextVar("tgarr_lang", default="en")      # the language t
 _ACCESS = {"at": 0.0, "pin": None, "secret": None}
 _GUESSES = access.Guesses()
 _KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
-_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
+_KID_COURSE = "m.id IN (SELECT ci.msg_id FROM course_items ci JOIN kids_allow k ON k.kind = 'course' AND k.ref = ci.course_id)"
+_KID_SQL = f"""(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
-                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')
+                    OR {_KID_COURSE}))"""
 # An older child: everything all-ages from public channels and the folders of this machine -
 # not the owner's private chats, unless ticked - and never a picture found adult.
-_TEEN_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
+_TEEN_SQL = f"""(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
                AND (c.username IS NOT NULL OR c.local_root IS NOT NULL
                     OR m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
-                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')
+                    OR {_KID_COURSE}))"""
 # The people the owner has added (table profiles): each a PIN of their own and a level,
 # 'kid' (only what is ticked - as a browser with no PIN at all) or 'teen'. Their browsers
 # stay LOCKED; the PIN only says whose it is, so that time is counted per person, on
@@ -322,12 +327,21 @@ async def _locked_block(request: Request):
     if rules["on"]:
         who = _mc_who(request)
         await _mc_device(who, rules)
-        if not _DEVICES.check(who, rules, time.time())["ok"]:
+        if not _DEVICES.check(who, rules, time.time(), await _bonus(who, rules), await _learning_path(request))["ok"]:
             if request.method in ("GET", "HEAD") and "text/html" in (request.headers.get("accept") or ""):
                 return RedirectResponse("/mediacenter/rest", status_code=303)
             return JSONResponse({"status": "rest", "message": "the Media Center is closed for now"}, status_code=403)
     if path in _LOCKED_OPEN:
         return None
+    if request.method == "GET" and path == "/api/courses":
+        return None                                # its own courses, to read (the answer holds only those ticked for it)
+    if request.method == "POST" and path.startswith("/api/progress/"):
+        # the one thing a locked browser may write: where it stopped, in something it may open
+        m = _PRIVATE_ID_RX.match(path)
+        if m and await _kid_ok(int(m.group(1)), f"""
+                SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                WHERE m.id = $1 AND {_kid_sql()}""", int(m.group(1))):
+            return None
     if request.method in ("GET", "HEAD"):
         m = _PRIVATE_ID_RX.match(path)
         if m and path.startswith("/watch/") and db_pool is not None:
@@ -364,6 +378,8 @@ async def _signed_out_block(request: Request):
         # Telegram account: they work whether or not anybody is signed in
         if path.startswith("/api/") and not path.startswith(
                 ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/",
+                 "/api/progress/",                   # where one stopped: this install's own business
+                 "/api/courses",                     # nor do courses need an account
                  # a public channel is followed and read without an account (the crawler's guest workers)
                  "/api/channel/subscribe", "/api/channel/unsubscribe/",
                  "/api/archive/",                    # the Internet Archive asks nobody for an account
@@ -492,7 +508,7 @@ import vision  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.13"
+TGARR_VERSION = "0.5.14"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -682,6 +698,8 @@ async def _startup():
     asyncio.create_task(_vision_worker())
     asyncio.create_task(_usenet_grab_worker())
     asyncio.create_task(_archive_grab_worker())
+    asyncio.create_task(_course_report_worker())
+    asyncio.create_task(_course_catalogue_worker())
     asyncio.create_task(_archive_arr_worker())
     asyncio.create_task(_update_check_worker())
     asyncio.create_task(_packs_heal())
@@ -1077,6 +1095,37 @@ async def _migrate_schema():
               at TIMESTAMPTZ NOT NULL DEFAULT NOW(), who TEXT NOT NULL, msg_id BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_mc_log_at ON mc_log (at DESC);
+            -- where somebody stopped in a film, a book, a recording (progress.py): per person
+            -- (a child's PIN), else per device, else the owner
+            CREATE TABLE IF NOT EXISTS progress (
+              who TEXT NOT NULL, msg_id BIGINT NOT NULL, key TEXT NOT NULL, val TEXT, frac REAL,
+              done BOOLEAN NOT NULL DEFAULT FALSE, at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (who, msg_id)
+            );
+            ALTER TABLE progress ADD COLUMN IF NOT EXISTS total REAL;
+            -- courses (courses.py): what a course is made of. kind: 'pack' (items of the Internet
+            -- Archive, parts = JSON [{ia, title}]), 'folder' (ref = "<channel id>:<path>"),
+            -- 'channel' (ref = "<channel id>"), 'list' (file names, parts = JSON [{name}]: a
+            -- course somebody else made, matched to the files here). Its lessons are worked out
+            -- from the library and kept in course_items.
+            CREATE TABLE IF NOT EXISTS courses (
+              id SERIAL PRIMARY KEY, slug TEXT UNIQUE, title TEXT NOT NULL, about TEXT, lang TEXT, level TEXT,
+              subject TEXT, license TEXT, credit TEXT, kind TEXT NOT NULL, ref TEXT, parts TEXT,
+              built_at TIMESTAMPTZ, added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS course_items (
+              course_id INT NOT NULL, pos INT NOT NULL, msg_id BIGINT NOT NULL, PRIMARY KEY (course_id, pos)
+            );
+            CREATE INDEX IF NOT EXISTS idx_course_items_msg ON course_items (msg_id);
+            -- learning: seconds really spent on a lesson (from the page's "still here" signals),
+            -- and the day a lesson first counted as done for a reward
+            CREATE TABLE IF NOT EXISTS lesson_time (
+              who TEXT NOT NULL, msg_id BIGINT NOT NULL, day INT NOT NULL, seconds INT NOT NULL DEFAULT 0,
+              PRIMARY KEY (who, msg_id, day)
+            );
+            CREATE TABLE IF NOT EXISTS lesson_done (
+              who TEXT NOT NULL, msg_id BIGINT NOT NULL, day INT NOT NULL, PRIMARY KEY (who, msg_id)
+            );
             CREATE TABLE IF NOT EXISTS kids_allow (
               kind TEXT NOT NULL,
               ref BIGINT NOT NULL,
@@ -2511,6 +2560,86 @@ def _saved_chip(path: str, qs, local: int) -> str:
     return chip
 
 
+def _progress_who(request: Request) -> str:
+    """Whose place it is: the child's whose PIN this browser has, else this device's (a browser
+    without the PIN), else the owner's."""
+    return _mc_who(request) if _LOCKED.get() else "owner"
+
+
+async def _progress_row(request: Request, msg_id: int):
+    if db_pool is None:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            r = await conn.fetchrow(
+                "SELECT key, val, frac, done, (extract(epoch FROM at) * 1000)::bigint AS at FROM progress WHERE who = $1 AND msg_id = $2",
+                _progress_who(request), int(msg_id))
+        return dict(r) if r else None
+    except Exception:
+        return None
+
+
+async def _lesson_nav(request: Request, msg_id: int):
+    """When the file is a lesson of a course this browser may see: its place in the course, and
+    the lessons before and after it."""
+    if db_pool is None:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            r = await conn.fetchrow(
+                f"""SELECT ci.course_id, ci.pos, c.title,
+                           (SELECT count(*) FROM course_items x WHERE x.course_id = ci.course_id) AS total,
+                           (SELECT x.msg_id FROM course_items x WHERE x.course_id = ci.course_id AND x.pos < ci.pos ORDER BY x.pos DESC LIMIT 1) AS prev,
+                           (SELECT x.msg_id FROM course_items x WHERE x.course_id = ci.course_id AND x.pos > ci.pos ORDER BY x.pos LIMIT 1) AS next
+                    FROM course_items ci JOIN courses c ON c.id = ci.course_id
+                    WHERE ci.msg_id = $1 {"AND EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'course' AND k.ref = c.id)" if _LOCKED.get() else ""}
+                    ORDER BY c.added_at DESC LIMIT 1""", int(msg_id))
+    except Exception:
+        return None
+    if not r:
+        return None
+    lang = _LANG.get()
+    return {"n": r["pos"] + 1, "total": r["total"], "prev": r["prev"], "next": r["next"], "title": r["title"],
+            "back": f"/mediacenter?kind=learn&course={r['course_id']}",
+            "word_next": i18n.t(lang, "Next lesson"), "word_done": i18n.t(lang, "done")}
+
+
+async def _progress_js(request: Request, msg_id: int) -> str:
+    """The script a player page carries before its own (progress.py)."""
+    return progress.script(msg_id, await _progress_row(request, msg_id), await _lesson_nav(request, msg_id))
+
+
+@app.get("/api/progress/{msg_id}")
+async def progress_get(msg_id: int, request: Request):
+    r = await _progress_row(request, msg_id)
+    return {"frac": r["frac"], "done": r["done"], "at": r["at"]} if r else {}
+
+
+@app.post("/api/progress/{msg_id}")
+async def progress_put(msg_id: int, request: Request):
+    try:
+        raw = await request.body()
+        body = _json.loads(raw[:4096] or b"{}")
+    except Exception:
+        body = None
+    p = progress.clean(body)
+    if not p:
+        return JSONResponse({"status": "error", "message": "not a place"}, status_code=400)
+    who = _progress_who(request)
+    async with db_pool.acquire() as conn:
+        if not await conn.fetchval("SELECT 1 FROM messages WHERE id = $1", msg_id):
+            return JSONResponse({"status": "error", "message": "no such item"}, status_code=404)
+        # a thing once finished stays finished when it is opened again; its place is the new one
+        await conn.execute(
+            """INSERT INTO progress (who, msg_id, key, val, frac, done, total) VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (who, msg_id) DO UPDATE SET key = $3, val = $4, frac = COALESCE($5, progress.frac),
+                 done = progress.done OR $6, total = COALESCE($7, progress.total), at = NOW()""",
+            who, msg_id, p["key"], p["val"], p["frac"], p["done"], p["total"])
+    if p["done"] and _LOCKED.get():
+        await _lesson_check(who, msg_id)
+    return {"status": "ok"}
+
+
 @app.post("/api/fav/{msg_id}")
 async def fav_toggle(msg_id: int):
     """Toggle a favourite. Favourites get their own filter, and their
@@ -3559,8 +3688,10 @@ def _epub_chapter_body(zf, msg_id: int, chapter_path: str) -> str:
 
 _EPUB_CHAPTER_CSS = (
     "html,body{margin:0;padding:0}"
-    "body{font-family:'PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Hiragino Sans GB',"
-    "Georgia,system-ui,sans-serif;line-height:1.9;word-break:break-word}"
+    # Latin letters first, from a Latin face: with a Chinese face first, an English book is set in
+    # it and every ’ and “ comes out a full square wide ("there’ s"). Chinese falls through to its own.
+    "body{font-family:-apple-system,'Segoe UI','Helvetica Neue',Roboto,'PingFang SC','Microsoft YaHei',"
+    "'Noto Sans CJK SC','Hiragino Sans GB',system-ui,sans-serif;line-height:1.9;word-break:break-word}"
     "h1,h2,h3,h4{font-weight:600;margin:1.2em 0 .6em;line-height:1.4}"
     "h1{font-size:1.5em}h2{font-size:1.3em}h3{font-size:1.12em}"
     "p{margin:.9em 0;text-indent:2em}"
@@ -3689,12 +3820,13 @@ async def comic_page(msg_id: int, n: int):
 
 
 @app.get("/comic/{msg_id}", response_class=HTMLResponse)
-async def comic_render(msg_id: int):
+async def comic_render(msg_id: int, request: Request):
     c = await _comic_of(msg_id)
     if not c:
         return HTMLResponse(f'<p>{_t("This comic cannot be shown as it is.")} <a href="/watch/{int(msg_id)}">{_t("Open it")}</a></p>', status_code=404)
     n = len(c[2])
     mid = int(msg_id)
+    place_js = await _progress_js(request, mid)
     page_n = _t("page %1")
     pages = "".join(f'<img id="p{i}" data-n="{i}" loading="lazy" decoding="async" src="/comic/{mid}/page/{i}" alt="{page_n.replace("%1", str(i + 1))}"/>'
                     for i in range(n))
@@ -3711,7 +3843,7 @@ async def comic_render(msg_id: int):
         '</style></head><body><div class="bar"><a href="#" id="back">&larr; ' + _t("back") + '</a>'
         f'<div class="t">{html.escape(c[1])}</div><span id="at">1 / {n}</span>'
         '<button id="w" title="' + _t("fit the width of the window") + '">' + _t("wider") + '</button>'
-        f'<a href="/media/{mid}" download>&#11015; {_t("download")}</a></div><main id="m" class="fit">{pages}</main><script>'
+        f'<a href="/media/{mid}" download>&#11015; {_t("download")}</a></div><main id="m" class="fit">{pages}</main>{place_js}<script>'
         f'const ID={mid},N={n},KEY="comic-"+ID;'
         'const m=document.getElementById("m"),at=document.getElementById("at");'
         'document.getElementById("back").onclick=e=>{e.preventDefault();if(history.length>1)history.back();else location.href="/library";};'
@@ -4070,7 +4202,7 @@ button.on{background:var(--acc,#2563eb);color:#fff;border-color:var(--acc,#2563e
   </div>
   <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
-<script>
+__PROGRESS__<script>
 (function(){
 const ID = __ID__, KEY = "tgarr.read." + ID;
 const $ = id => document.getElementById(id);
@@ -4368,7 +4500,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
 
 
 @app.get("/epub/{msg_id}", response_class=HTMLResponse)
-async def epub_render(msg_id: int):
+async def epub_render(msg_id: int, request: Request):
     """The e-book reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
@@ -4392,7 +4524,7 @@ async def epub_render(msg_id: int):
                 .replace("%1", f'<a href="/media/{int(msg_id)}" download>').replace("%2", "</a>") + '</p>'
                 '<p><a href="/library">&larr; ' + _t("Library") + '</a></p></body></html>', status_code=422)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"book-{msg_id}")
-    return HTMLResponse(_fill(_EPUB_READER_HTML).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_fill(_EPUB_READER_HTML).replace("__PROGRESS__", await _progress_js(request, msg_id)).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -4678,7 +4810,7 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
   </div>
   <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
-<script>
+__PROGRESS__<script>
 (function(){
 const ID = __ID__, KEY = "tgarr.pdf." + ID;
 const $ = id => document.getElementById(id);
@@ -4921,7 +5053,7 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
 
 
 @app.get("/pdf/{msg_id}", response_class=HTMLResponse)
-async def pdf_reader(msg_id: int, conv: int = 0):
+async def pdf_reader(msg_id: int, request: Request, conv: int = 0):
     """The PDF reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
@@ -4947,7 +5079,7 @@ async def pdf_reader(msg_id: int, conv: int = 0):
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
     page_of = _t("page %1 of %2").replace("%1", '<input type="number" id="pno" min="1" value="1">').replace("%2", '<b id="ptotal">…</b>')
-    return HTMLResponse(_fill(_PDF_READER_HTML).replace("__PAGE_OF__", page_of).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_fill(_PDF_READER_HTML).replace("__PROGRESS__", await _progress_js(request, msg_id)).replace("__PAGE_OF__", page_of).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -5526,7 +5658,7 @@ video{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;b
   <select id="q" title="[[@how tall the picture is made: smaller is lighter on this server and on the connection]]"></select>
   <button id="fs" title="[[@full screen (F)]]">&#9974;</button>
 </div>
-<script>
+__PROGRESS__<script>
 const ID = __ID__, v = document.getElementById("v"), bar = document.getElementById("bar"), msg = document.getElementById("msg");
 const KEY = "tgarr.play." + ID;
 let dur = 0, base = 0, drag = false, tries = 0, height = 0;
@@ -5588,16 +5720,16 @@ fetch("/transcode/" + ID + "/info").then(r => r.json()).then(j => {
 
 
 @app.get("/play/{msg_id}", response_class=HTMLResponse)
-async def page_play(msg_id: int):
+async def page_play(msg_id: int, request: Request):
     f = await _tc_file(msg_id)
     if not f:
         return RedirectResponse(f"/watch/{msg_id}")           # not here yet: the watch page fetches it and comes back
     # the words first, the file's name after: a name is never read for marks
-    return HTMLResponse(_fill(_PLAY_HTML).replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
+    return HTMLResponse(_fill(_PLAY_HTML).replace("__PROGRESS__", await _progress_js(request, msg_id)).replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
 
 
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
-async def watch_page(msg_id: int):
+async def watch_page(msg_id: int, request: Request):
     """Loading-aware media viewer. Polls /api/media-status until enough bytes
     are written to start playback, then renders <video>/<audio>/<iframe>."""
     async with db_pool.acquire() as conn:
@@ -5611,6 +5743,7 @@ async def watch_page(msg_id: int):
         return HTMLResponse("<h1>404 — " + _t("message not indexed") + "</h1>", status_code=404)
     title = row["file_name"] or f"msg-{msg_id}"
     mt = row["media_type"] or "document"
+    place_js = await _progress_js(request, msg_id)
     await _want_fetch(msg_id, opened=True)
 
     # Trigger queueing immediately so the user doesn\'t wait for first poll.
@@ -5662,7 +5795,7 @@ audio {{ width:600px; max-width:96vw; }}
     <div class="hint" id="dchint" style="margin-top:6px"></div>
   </div>
 </main>
-<script>
+{place_js}<script>
 const MSG_ID = {msg_id};
 const MEDIA_TYPE = {_js_str(mt)};
 // 'always': no browser plays this kind of file (a disc image, an avi ...) - it is converted
@@ -5698,6 +5831,16 @@ function renderPlayer() {{
   }}
   if (MEDIA_TYPE === "audio") {{
     main.innerHTML = `<audio controls autoplay src="/media/${{MSG_ID}}"></audio>`;
+    // a long recording goes on where it stopped (kept as the film player keeps its place)
+    const au = main.querySelector("audio"), AK = "tgarr.a." + MSG_ID;
+    au.addEventListener("loadedmetadata", () => {{
+      let pos = 0; try {{ pos = +localStorage.getItem(AK) || 0; }} catch (e) {{}}
+      if (pos > 20 && (!au.duration || pos < au.duration - 20)) au.currentTime = pos;
+    }});
+    let auSaved = 0;
+    au.addEventListener("timeupdate", () => {{ const now = Date.now(); if (now - auSaved < 4000) return; auSaved = now;
+      try {{ if (au.duration && au.currentTime > au.duration - 15) localStorage.removeItem(AK); else if (au.currentTime > 5) localStorage.setItem(AK, String(Math.floor(au.currentTime))); }} catch (e) {{}} }});
+    au.addEventListener("ended", () => {{ try {{ localStorage.removeItem(AK); }} catch (e) {{}} }});
     return;
   }}
   // document — pick by extension
@@ -7874,7 +8017,13 @@ def _color_for(s: str) -> str:
 
 
 _LANG_JS = ('<script>'
-            'function tgLang(c){document.cookie="tgarr_lang="+c+"; path=/; max-age=31536000; SameSite=Lax";location.reload()}'
+            # the language chosen here is also what the Media Center starts in on every screen that has
+            # not chosen one of its own (the household's language). A locked browser is refused that
+            # part by the guard, and keeps its choice to itself.
+            'function tgLang(c){document.cookie="tgarr_lang="+c+"; path=/; max-age=31536000; SameSite=Lax";'
+            'var go=function(){location.reload()},t=setTimeout(go,2500);'
+            'fetch("/api/kids/lang",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang:c})})'
+            '.catch(function(){}).then(function(){clearTimeout(t);go()})}'
             'function tgLangOpen(e){e.stopPropagation();var l=document.getElementById("tgLangList");if(l)l.hidden=!l.hidden}'
             '</script>')
 
@@ -12101,7 +12250,9 @@ _MC_PING_JS = """(function(){
   }
   function ping(){
     if (!busy()) return;
-    fetch("/api/mc/ping", {credentials: "same-origin"}).then(function(r){ return r.json(); })
+    // which file this page shows, when it shows one: a lesson's time is counted apart
+    var m = /^\\/(?:watch|epub|pdf|comic|play)\\/(\\d+)/.exec(location.pathname);
+    fetch("/api/mc/ping" + (m ? "?m=" + m[1] : ""), {credentials: "same-origin"}).then(function(r){ return r.json(); })
       .then(function(j){ if (j && j.ok === false && location.pathname !== "/mediacenter/rest") location.href = "/mediacenter/rest"; })
       .catch(function(){});
   }
@@ -12123,8 +12274,20 @@ async def api_mc_ping(request: Request):
     rules = await _rules_now()
     who, now = _mc_who(request), time.time()
     await _mc_device(who, rules)
-    v = _DEVICES.ping(who, rules, now)
+    # what the page shows: a lesson's time is counted for the lesson, and (unless the parent
+    # said otherwise) not taken from the day
+    try:
+        lesson = int(request.query_params.get("m") or 0)
+    except ValueError:
+        lesson = 0
+    reward = await _reward()
+    if lesson and not await _is_lesson(lesson):
+        lesson = 0
+    v = _DEVICES.ping(who, rules, now, await _bonus(who, rules), bool(lesson) and reward["learn_free"])
     d = _DEVICES.by[who]
+    if lesson and v.get("added"):
+        await _lesson_tick(who, lesson, d["day"], v["added"])
+    v["earned_s"] = await _bonus(who, rules)
     try:
         async with db_pool.acquire() as conn:
             await conn.execute("""INSERT INTO mc_usage (day, who, seconds) VALUES ($1, $2, $3)
@@ -12157,7 +12320,7 @@ async def page_mc_rest(request: Request):
     rules = await _rules_now()
     who = _mc_who(request)
     await _mc_device(who, rules)
-    v = _DEVICES.check(who, rules, time.time())
+    v = _DEVICES.check(who, rules, time.time(), await _bonus(who, rules))
     if v["ok"] or not await _is_locked(request):
         return RedirectResponse("/mediacenter", status_code=303)
     lang = await _lang(request)
@@ -12169,6 +12332,15 @@ async def page_mc_rest(request: Request):
         "day": ("🌟", tr("That is all for today"), tr("Well done. See you tomorrow!")),
         "rest": ("🤸", tr("Time for a break"), tr("Stretch, drink some water, look far away. Back at {t}.", t=v["until"])),
     }.get(v["why"], ("🌙", tr("The Media Center is closed now"), ""))
+    if v["why"] == "day":
+        # the day's minutes are used up: lessons may still be open, and may earn more
+        rw = await _reward()
+        async with db_pool.acquire() as conn:
+            has = await conn.fetchval("SELECT 1 FROM kids_allow WHERE kind = 'course' LIMIT 1")
+        if has and rw["learn_free"]:
+            text += ('<br/><a href="/mediacenter?kind=learn" style="display:inline-block;margin-top:22px;font-size:19px;opacity:1;'
+                     'padding:12px 26px;border-radius:999px;background:#16a34a;color:#fff;text-decoration:none;font-weight:700">'
+                     + (tr("Lessons are still open - and earn more time") if rw["on"] else tr("Lessons are still open")) + '</a>')
     return HTMLResponse(i18n.fill(lang, _MC_REST_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
                         .replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
 
@@ -12279,7 +12451,7 @@ async def api_kids_allow(request: Request):
         kind, ref, on = str(body.get("kind")), int(body.get("ref")), bool(body.get("on"))
     except Exception:
         return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
-    if kind not in ("channel", "message"):
+    if kind not in ("channel", "message", "course"):
         return JSONResponse({"status": "error", "message": "bad kind"}, status_code=400)
     async with db_pool.acquire() as conn:
         if on:
@@ -12288,7 +12460,541 @@ async def api_kids_allow(request: Request):
         else:
             await conn.execute("DELETE FROM kids_allow WHERE kind = $1 AND ref = $2", kind, ref)
     _KID_OK.clear()
+    _LESSON.clear()
     return {"status": "ok", "on": on}
+
+
+# ─────────────────────────────────── courses ───────────────────────────────────
+# What a course is, is in courses.py. Here: its lessons worked out of the library, learning
+# time and rewards, and what the pages ask (the pages themselves are further down).
+COURSE_PACKS = {}                   # slug -> a list shipped with tgarr (coursepacks/<language>/*.json)
+_COURSE_LEVEL = {"all": "all ages", "5-8": "ages 5 to 8", "8-12": "ages 8 to 12", "12-16": "ages 12 to 16", "16+": "16 and older"}
+_COURSE_SUBJECT = {"reading": "Reading", "language": "A foreign language", "math": "Mathematics", "science": "Science", "history": "History and society",
+                   "arts": "Arts", "music": "Music", "computing": "Computing", "life": "Life skills", "other": "Other"}
+_LESSON: dict = {}                  # message id -> (is it a lesson on the children's list, when asked)
+_REWARD = {"at": 0.0, "v": dict(courses.REWARD_DEFAULT)}
+_BONUS: dict = {}                   # who -> (seconds earned today, day, when worked out)
+
+
+_COURSE_BUNDLED: dict = {}           # the lists in the image
+_CATALOGUE = {"serial": 0, "packs": {}, "withdrawn": [], "at": 0.0}     # the registry's signed catalogue, as last taken
+
+
+def _course_packs() -> dict:
+    """The lists there are: those in the image, and over them those of the registry's catalogue
+    (newer by nature: a list of the image that the catalogue also carries is the catalogue's);
+    a list the catalogue takes back is not among them, whichever it came with."""
+    if not COURSE_PACKS:
+        if not _COURSE_BUNDLED:
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coursepacks")
+            try:
+                for sub_ in sorted(os.listdir(base)):
+                    if os.path.isdir(os.path.join(base, sub_)):
+                        for slug, p in courses.load_packs(os.path.join(base, sub_), lambda m: log.info("[courses] %s", m)).items():
+                            _COURSE_BUNDLED.setdefault(slug, p)
+            except OSError:
+                pass
+        COURSE_PACKS.update(_COURSE_BUNDLED)
+        COURSE_PACKS.update(_CATALOGUE["packs"])
+        for g in _CATALOGUE["withdrawn"]:
+            COURSE_PACKS.pop(g, None)
+    return COURSE_PACKS
+
+
+async def _course_catalogue_take(doc: str, sig: str, keep: bool) -> str:
+    """Take a signed catalogue (courses.open_catalogue says whether it is ours and not an older
+    one). The courses made from its lists follow it: a channel's course reaches as far as the
+    list now says, an Archive course has the items the list now names. A list taken back goes
+    off the children's list at once - the course and what was learned stay, for the parents to
+    decide. `keep`: store it (a catalogue read back from the store is not stored again)."""
+    got = courses.open_catalogue(doc, sig, least_serial=_CATALOGUE["serial"])
+    if got["serial"] == _CATALOGUE["serial"] and keep:
+        return f"the same as in use (serial {got['serial']})"
+    async with db_pool.acquire() as conn:
+        if keep:
+            await conn.execute("INSERT INTO config (key, value) VALUES ('course_catalogue', $1) "
+                               "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", _json.dumps({"doc": doc, "sig": sig}))
+        changed = 0
+        for slug, pk in got["packs"].items():
+            if pk["channel"]:
+                r = await conn.execute(
+                    """UPDATE courses SET ref = $2, title = $3, about = $4, built_at = NULL
+                       WHERE slug = $1 AND kind = 'channel' AND (ref, title, about) IS DISTINCT FROM ($2, $3, $4)""",
+                    slug, f"@{pk['channel']} {pk['tag'] or '-'} {pk['upto']}", pk["title"], pk["about"])
+            else:
+                r = await conn.execute(
+                    """UPDATE courses SET parts = $2, title = $3, about = $4, built_at = NULL
+                       WHERE slug = $1 AND kind = 'pack' AND (parts, title, about) IS DISTINCT FROM ($2, $3, $4)""",
+                    slug, _json.dumps(pk["parts"]), pk["title"], pk["about"])
+            changed += int(r.split()[-1])
+        off = 0
+        if got["withdrawn"]:
+            r = await conn.execute(
+                "DELETE FROM kids_allow WHERE kind = 'course' AND ref IN (SELECT id FROM courses WHERE slug = ANY($1::text[]))", got["withdrawn"])
+            off = int(r.split()[-1])
+    _CATALOGUE.update(serial=got["serial"], packs=got["packs"], withdrawn=got["withdrawn"], at=time.time())
+    COURSE_PACKS.clear()
+    _KID_OK.clear()
+    _LESSON.clear()
+    return (f"serial {got['serial']}: {len(got['packs'])} lists, {len(got['withdrawn'])} taken back; "
+            f"{changed} courses here follow, {off} taken off the children's list")
+
+
+async def _course_catalogue_fetch() -> str:
+    def get():
+        req = urllib.request.Request(UPDATE_REGISTRY_URL + "/api/v1/courses/catalogue", headers={"User-Agent": f"tgarr/{TGARR_VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return _json.loads(r.read(courses.CATALOGUE_BYTES + 65536).decode("utf-8"))
+    j = await asyncio.to_thread(get)
+    if not isinstance(j, dict) or not j.get("doc"):
+        return "the registry has no catalogue"
+    return await _course_catalogue_take(str(j.get("doc")), str(j.get("sig") or ""), True)
+
+
+async def _course_catalogue_worker():
+    """The catalogue last taken is in use from the start; the registry is asked for a newer one
+    soon after, and twice a day. Asking is part of asking the registry at all (TGARR_UPDATE_CHECK)."""
+    import random
+    for _ in range(60):
+        if db_pool is not None:
+            break
+        await asyncio.sleep(1)
+    try:
+        async with db_pool.acquire() as conn:
+            kept = await conn.fetchval("SELECT value FROM config WHERE key = 'course_catalogue'")
+        if kept:
+            k = _json.loads(kept)
+            log.info("[courses] the catalogue kept here: %s", await _course_catalogue_take(k["doc"], k["sig"], False))
+    except Exception as e:
+        log.info("[courses] the catalogue kept here is not used: %s: %s", type(e).__name__, str(e)[:120])
+    if not UPDATE_CHECK_ENABLED:
+        return
+    await asyncio.sleep(random.uniform(60, 240))
+    while True:
+        try:
+            log.info("[courses] the registry's catalogue: %s", await _course_catalogue_fetch())
+        except Exception as e:
+            log.info("[courses] the registry's catalogue was not taken: %s: %s", type(e).__name__, str(e)[:120])
+        await asyncio.sleep(43200 + random.uniform(0, 3600))
+
+
+async def _reward() -> dict:
+    now = time.monotonic()
+    if now - _REWARD["at"] > 10 and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                raw = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_reward'")
+            _REWARD["v"] = courses.clean_reward(_json.loads(raw) if raw else None)
+        except Exception:
+            pass
+        _REWARD["at"] = now
+    return _REWARD["v"]
+
+
+async def _is_lesson(msg_id: int) -> bool:
+    """Is this file a lesson of a course on the children's list?"""
+    hit = _LESSON.get(msg_id)
+    if hit and time.monotonic() - hit[1] < 30:
+        return hit[0]
+    ok = False
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            ok = bool(await conn.fetchval(
+                """SELECT 1 FROM course_items ci JOIN kids_allow k ON k.kind = 'course' AND k.ref = ci.course_id
+                   WHERE ci.msg_id = $1 LIMIT 1""", int(msg_id)))
+    if len(_LESSON) > 20000:
+        _LESSON.clear()
+    _LESSON[msg_id] = (ok, time.monotonic())
+    return ok
+
+
+async def _learning_path(request: Request) -> bool:
+    """Is what is asked for learning that the day's minutes do not close? The Learn shelf and
+    a course's page, and a lesson itself - when the parent left learning free of the day."""
+    if not (await _reward())["learn_free"]:
+        return False
+    path = request.url.path
+    if path == "/mediacenter" and request.query_params.get("kind") == "learn":
+        return True
+    m = _PRIVATE_ID_RX.match(path)
+    return bool(m) and await _is_lesson(int(m.group(1)))
+
+
+async def _lesson_tick(who: str, msg_id: int, day: int, seconds: int) -> None:
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO lesson_time (who, msg_id, day, seconds) VALUES ($1, $2, $3, $4)
+                                  ON CONFLICT (who, msg_id, day) DO UPDATE SET seconds = lesson_time.seconds + $4""",
+                               who, int(msg_id), int(day), int(seconds))
+        await _lesson_check(who, msg_id)
+    except Exception:
+        pass
+
+
+async def _lesson_check(who: str, msg_id: int) -> None:
+    """Note the lesson as done - once - when its end was reached and enough of its length was
+    really spent on it (courses.lesson_done)."""
+    if not await _is_lesson(msg_id):
+        return
+    rule = await _reward()
+    async with db_pool.acquire() as conn:
+        if await conn.fetchval("SELECT 1 FROM lesson_done WHERE who = $1 AND msg_id = $2", who, int(msg_id)):
+            return
+        p = await conn.fetchrow("SELECT done, total FROM progress WHERE who = $1 AND msg_id = $2", who, int(msg_id))
+        spent = await conn.fetchval("SELECT COALESCE(sum(seconds), 0) FROM lesson_time WHERE who = $1 AND msg_id = $2", who, int(msg_id))
+        if p and courses.lesson_done(rule, int(spent), p["total"], p["done"]):
+            day = screentime.local(time.time(), (await _rules_now()).get("tz", 0))[0]
+            await conn.execute("INSERT INTO lesson_done (who, msg_id, day) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", who, int(msg_id), day)
+            _BONUS.pop(who, None)
+
+
+async def _bonus(who: str, rules: dict) -> int:
+    """Seconds of entertainment this person earned today by learning."""
+    rule = await _reward()
+    if not rule["on"] or db_pool is None:
+        return 0
+    day = screentime.local(time.time(), rules.get("tz", 0))[0]
+    hit = _BONUS.get(who)
+    if hit and hit[1] == day and time.monotonic() - hit[2] < 20:
+        return hit[0]
+    try:
+        async with db_pool.acquire() as conn:
+            done = await conn.fetchval("SELECT count(*) FROM lesson_done WHERE who = $1 AND day = $2", who, day)
+            # reading has no end to reach: every so many minutes on a book is a lesson's worth
+            read = await conn.fetchval(
+                """SELECT COALESCE(sum(t.seconds), 0) FROM lesson_time t
+                   WHERE t.who = $1 AND t.day = $2
+                     AND NOT EXISTS (SELECT 1 FROM progress p WHERE p.who = t.who AND p.msg_id = t.msg_id AND p.total IS NOT NULL)""", who, day)
+        got = courses.bonus_seconds(rule, int(done), int(read))
+    except Exception:
+        got = 0
+    if len(_BONUS) > 5000:
+        _BONUS.clear()
+    _BONUS[who] = (got, day, time.monotonic())
+    return got
+
+
+async def _course_build(conn, c) -> int:
+    """Work out a course's lessons from what the library holds now. Returns how many."""
+    kind, ids = c["kind"], []
+    playable = f"(m.media_type IN ('video', 'audio') OR {_book_sql('m.file_name')})"
+    live = "COALESCE(m.local_path, '') NOT IN ('__failed__', '__deleted__')"
+    if kind == "pack":
+        parts = _json.loads(c["parts"] or "[]")
+        want = [p["ia"] for p in parts]
+        rows = await conn.fetch(
+            f"""SELECT m.id, m.caption, COALESCE(m.local_path, m.file_name, '') AS name FROM messages m
+                WHERE m.caption LIKE '%archive.org/details/%' AND {live} AND {playable}
+                  AND substring(m.caption FROM 'archive\\.org/details/([A-Za-z0-9][A-Za-z0-9._-]*)') = ANY($1::text[])""", want)
+        ids = courses.order_lessons(parts, [(r["id"], courses.ia_of(r["caption"]), r["name"]) for r in rows])
+    elif kind == "folder":
+        cid, _, path = (c["ref"] or "").partition(":")
+        rows = await conn.fetch(
+            f"""SELECT m.id, COALESCE(m.local_path, m.file_name, '') AS name FROM messages m
+                WHERE m.channel_id = $1 AND {live} AND {playable}
+                  AND ($2 = '' OR m.local_path LIKE $3)""", int(cid or 0), path, path.replace("%", "\\%").replace("_", "\\_") + "/%")
+        ids = [r["id"] for r in sorted(rows, key=lambda r: courses.natural_key(r["name"]))]
+    elif kind == "channel":
+        # ref: "<channel id>" (one's own choice of a channel: all of it), or - a shipped list -
+        # "<channel id> <#tag or -> <up to which post>"
+        # A shipped list names its channel by @name, not by this install's number for it: one channel
+        # can stand here under more than one row (followed by name while the account is in it too,
+        # a placeholder that is merged later), and its posts are under whichever row read them.
+        bits = (c["ref"] or "").split(" ")
+        tag = bits[1] if len(bits) > 1 and bits[1] != "-" else ""
+        upto = int(bits[2]) if len(bits) > 2 and bits[2].isdigit() else 0
+        if bits[0].startswith("@"):
+            cids = [r["id"] for r in await conn.fetch("SELECT id FROM channels WHERE username ILIKE $1", bits[0][1:])]
+        else:
+            cids = [int(bits[0])] if bits[0].isdigit() else []
+        rows = await conn.fetch(
+            f"""SELECT DISTINCT ON (m.tg_message_id, m.posted_at, m.file_name) m.id, m.posted_at
+                FROM messages m WHERE m.channel_id = ANY($1::bigint[]) AND {live} AND {playable}
+                  AND ($2 = '' OR position(lower($2) IN lower(COALESCE(m.caption, ''))) > 0)
+                  AND ($3 = 0 OR m.tg_message_id <= $3)
+                ORDER BY m.tg_message_id, m.posted_at, m.file_name, m.id LIMIT 2000""", cids, tag, upto)
+        rows = sorted(rows, key=lambda r: (r["posted_at"] is None, r["posted_at"], r["id"]))
+        ids = [r["id"] for r in rows]
+    elif kind == "list":
+        names = [str(p.get("name") or "") for p in _json.loads(c["parts"] or "[]")]
+        rows = await conn.fetch(
+            f"""SELECT DISTINCT ON (lower(m.file_name)) m.id, lower(m.file_name) AS name FROM messages m
+                WHERE lower(m.file_name) = ANY($1::text[]) AND {live} ORDER BY lower(m.file_name), (m.local_path IS NOT NULL) DESC, m.id""",
+            [n.lower() for n in names])
+        by = {r["name"]: r["id"] for r in rows}
+        ids = [by[n.lower()] for n in names if n.lower() in by]
+    had = [r["msg_id"] for r in await conn.fetch("SELECT msg_id FROM course_items WHERE course_id = $1 ORDER BY pos", c["id"])]
+    if had != ids:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM course_items WHERE course_id = $1", c["id"])
+            if ids:
+                await conn.executemany("INSERT INTO course_items (course_id, pos, msg_id) VALUES ($1, $2, $3)",
+                                       [(c["id"], i, mid) for i, mid in enumerate(ids)])
+        _KID_OK.clear()
+        _LESSON.clear()
+    await conn.execute("UPDATE courses SET built_at = NOW() WHERE id = $1", c["id"])
+    return len(ids)
+
+
+async def _courses_fresh(conn, only=None) -> None:
+    """Lessons follow the library: a course looked at is worked out again when that was a minute ago or more."""
+    rows = await conn.fetch(
+        "SELECT * FROM courses WHERE (built_at IS NULL OR built_at < NOW() - interval '60 seconds')"
+        + (" AND id = $1" if only else ""), *([only] if only else []))
+    for c in rows:
+        try:
+            await _course_build(conn, c)
+        except Exception as e:
+            log.info("[courses] %s: lessons not worked out: %s: %s", c["title"][:60], type(e).__name__, str(e)[:160])
+
+
+async def _course_list(conn, who: str, locked: bool) -> list:
+    """[{id, title, ..., lessons, done, next}] - for a locked browser only the courses ticked for it."""
+    await _courses_fresh(conn)
+    rows = await conn.fetch(
+        f"""SELECT c.*, EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'course' AND k.ref = c.id) AS allowed,
+                   (SELECT count(*) FROM course_items ci WHERE ci.course_id = c.id) AS lessons,
+                   (SELECT count(*) FROM course_items ci JOIN progress p ON p.msg_id = ci.msg_id AND p.who = $1 AND p.done
+                    WHERE ci.course_id = c.id) AS done,
+                   (SELECT ci.msg_id FROM course_items ci LEFT JOIN progress p ON p.msg_id = ci.msg_id AND p.who = $1
+                    WHERE ci.course_id = c.id AND NOT COALESCE(p.done, FALSE) ORDER BY ci.pos LIMIT 1) AS next
+            FROM courses c {"WHERE EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'course' AND k.ref = c.id)" if locked else ""}
+            ORDER BY c.added_at DESC, c.id DESC""", who)
+    return [dict(r) for r in rows]
+
+
+def _course_out(c: dict) -> dict:
+    parts = _json.loads(c.get("parts") or "[]") if c.get("kind") in ("pack", "list") else []
+    return {"id": c["id"], "slug": c["slug"], "title": c["title"], "about": c["about"] or "", "lang": c["lang"] or "",
+            "level": c["level"] or "all", "subject": c["subject"] or "other", "right": c["license"] or "", "credit": c["credit"] or "",
+            "kind": c["kind"], "parts": len(parts), "lessons": c.get("lessons", 0), "done": c.get("done", 0),
+            "next": c.get("next"), "allowed": bool(c.get("allowed"))}
+
+
+@app.get("/api/courses")
+async def api_courses(request: Request):
+    """The courses of this install, and - for the owner - the lists shipped with tgarr that are not added yet."""
+    locked = _LOCKED.get()
+    async with db_pool.acquire() as conn:
+        mine = await _course_list(conn, _progress_who(request), locked)
+    out = {"status": "ok", "courses": [_course_out(c) for c in mine]}
+    if not locked:
+        have = {c["slug"] for c in mine if c["slug"]}
+        out["packs"] = [{k: p[k] for k in ("slug", "title", "about", "lang", "level", "subject", "right", "credit")} | {"parts": len(p["parts"])}
+                        for p in _course_packs().values() if p["slug"] not in have]
+    return out
+
+
+@app.post("/api/courses")
+async def api_course_add(request: Request):
+    """Add a course: {"pack": slug} one of the shipped lists; {"folder": channel id, "path": ...}
+    a folder of one's own files; {"channel": id} a channel; {"import": {...}} a list somebody
+    exported. Title, language, level and subject may be given for the last three."""
+    def no(msg, code=400):
+        return JSONResponse({"status": "error", "message": msg}, status_code=code)
+    try:
+        b = await request.json()
+        assert isinstance(b, dict)
+    except Exception:
+        return no("bad request")
+    meta = {"about": "", "lang": "", "level": "all", "subject": "other", "license": "", "credit": ""}
+    slug = parts = ref = None
+    if b.get("import") is not None:
+        imp = b["import"]
+        if not isinstance(imp, dict) or imp.get("tgarr_course") != 1:
+            return no("this is not a course exported from tgarr")
+        if imp.get("parts") and all(isinstance(p, dict) and p.get("ia") for p in imp["parts"]):
+            try:
+                pk = courses.clean_pack(imp)
+            except ValueError as e:
+                return no(f"this list is not in order: {e}")
+            kind, title, slug, parts = "pack", pk["title"], None, _json.dumps(pk["parts"])
+            meta.update(about=pk["about"], lang=pk["lang"], level=pk["level"], subject=pk["subject"], license=pk["right"], credit=pk["credit"])
+        else:
+            names = [" ".join(str(p.get("name") or "").split())[:300] for p in (imp.get("parts") or []) if isinstance(p, dict)]
+            names = [n for n in names if n][:courses.PARTS_MOST]
+            if not names:
+                return no("this list names no files")
+            kind, title, parts = "list", " ".join(str(imp.get("title") or "").split())[:120] or "A course", _json.dumps([{"name": n} for n in names])
+            meta.update(about=str(imp.get("about") or "")[:600], lang=str(imp.get("lang") or "")[:12],
+                        level=imp.get("level") if imp.get("level") in courses.LEVELS else "all",
+                        subject=imp.get("subject") if imp.get("subject") in courses.SUBJECTS else "other")
+    elif b.get("pack"):
+        pk = _course_packs().get(str(b["pack"]))
+        if not pk:
+            return no("no such list", 404)
+        kind, title, slug, parts = "pack", pk["title"], pk["slug"], _json.dumps(pk["parts"])
+        meta.update(about=pk["about"], lang=pk["lang"], level=pk["level"], subject=pk["subject"], license=pk["right"], credit=pk["credit"])
+        if pk["channel"]:
+            # a list that is a public channel: the channel is followed (read without joining), and
+            # the course is that channel's posts - under the list's tag, when it names one
+            await api_channel_subscribe(pk["channel"])
+            kind, parts, ref = "channel", None, f"@{pk['channel']} {pk['tag'] or '-'} {pk['upto']}"
+    elif b.get("folder") is not None or b.get("channel") is not None:
+        try:
+            cid = int(b.get("folder") if b.get("folder") is not None else b.get("channel"))
+        except (TypeError, ValueError):
+            return no("which one?")
+        path = str(b.get("path") or "").strip("/")
+        if ".." in path.split("/") or len(path) > 500:
+            return no("which folder?")
+        async with db_pool.acquire() as conn:
+            ch = await conn.fetchrow("SELECT id, title FROM channels WHERE id = $1", cid)
+        if not ch:
+            return no("no such channel", 404)
+        kind = "folder" if b.get("folder") is not None else "channel"
+        ref = f"{cid}:{path}" if kind == "folder" else str(cid)
+        title = " ".join(str(b.get("title") or "").split())[:120] or (path.rsplit("/", 1)[-1] if path else ch["title"]) or "A course"
+        meta.update(lang=str(b.get("lang") or "")[:12], level=b.get("level") if b.get("level") in courses.LEVELS else "all",
+                    subject=b.get("subject") if b.get("subject") in courses.SUBJECTS else "other", about=str(b.get("about") or "")[:600])
+    else:
+        return no("what kind of course?")
+    async with db_pool.acquire() as conn:
+        if slug and await conn.fetchval("SELECT 1 FROM courses WHERE slug = $1", slug):
+            return no("this course is added already", 409)
+        if await conn.fetchval("SELECT count(*) FROM courses") >= 500:
+            return no("five hundred courses are here already", 429)
+        c = await conn.fetchrow(
+            """INSERT INTO courses (slug, title, about, lang, level, subject, license, credit, kind, ref, parts)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *""",
+            slug, title, meta["about"], meta["lang"], meta["level"], meta["subject"], meta["license"], meta["credit"], kind, ref, parts)
+        n = await _course_build(conn, c)
+    return {"status": "ok", "id": c["id"], "lessons": n}
+
+
+@app.post("/api/courses/{course_id}/delete")
+async def api_course_delete(course_id: int):
+    """Take a course away. Its files stay: a course is a list, not a folder."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM course_items WHERE course_id = $1", course_id)
+        await conn.execute("DELETE FROM kids_allow WHERE kind = 'course' AND ref = $1", course_id)
+        gone = await conn.fetchval("DELETE FROM courses WHERE id = $1 RETURNING id", course_id)
+    _KID_OK.clear()
+    _LESSON.clear()
+    return {"status": "ok"} if gone else JSONResponse({"status": "error", "message": "no such course"}, status_code=404)
+
+
+@app.post("/api/courses/{course_id}/fetch")
+async def api_course_fetch(course_id: int):
+    """Fetch what a list's course still lacks from the Internet Archive (at most 40 items a time)."""
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow("SELECT * FROM courses WHERE id = $1", course_id)
+        if not c or c["kind"] != "pack":
+            return JSONResponse({"status": "error", "message": "nothing to fetch for this course"}, status_code=400)
+        parts = _json.loads(c["parts"] or "[]")
+        have = {courses.ia_of(r["caption"]) for r in await conn.fetch(
+            "SELECT DISTINCT caption FROM messages WHERE caption LIKE '%archive.org/details/%'")}
+        busy = {r["item_id"] for r in await conn.fetch("SELECT item_id FROM archive_grabs WHERE state IN ('queued', 'working')")}
+        room = max(0, 50 - len(busy))
+        queued = 0
+        for p in parts:
+            if p["ia"] in have or p["ia"] in busy or not _archive_ok(p["title"], p["ia"]):
+                continue
+            if queued >= min(room, 40):
+                break
+            await conn.execute("INSERT INTO archive_grabs (item_id, name, kind) VALUES ($1, $2, NULL)", p["ia"], p["title"] or p["ia"])
+            queued += 1
+        left = sum(1 for p in parts if p["ia"] not in have) - queued
+    return {"status": "ok", "queued": queued, "waiting_already": len(busy), "left": max(0, left)}
+
+
+@app.get("/api/courses/{course_id}/export")
+async def api_course_export(course_id: int):
+    """A course as a small list somebody else can import: its structure and the names of its
+    files - never a file, and nothing about who learned what."""
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow("SELECT * FROM courses WHERE id = $1", course_id)
+        if not c:
+            return JSONResponse({"status": "error", "message": "no such course"}, status_code=404)
+        out = {"tgarr_course": 1, "title": c["title"], "about": c["about"] or "", "lang": c["lang"] or "",
+               "level": c["level"] or "all", "subject": c["subject"] or "other"}
+        if c["kind"] == "pack":
+            out.update(slug=c["slug"] or re.sub(r"[^a-z0-9]+", "-", c["title"].lower()).strip("-")[:60] or "course",
+                       right=c["license"] or "", credit=c["credit"] or "", parts=_json.loads(c["parts"] or "[]"))
+        else:
+            await _course_build(conn, c)
+            rows = await conn.fetch(
+                "SELECT m.file_name FROM course_items ci JOIN messages m ON m.id = ci.msg_id WHERE ci.course_id = $1 ORDER BY ci.pos", course_id)
+            out["parts"] = [{"name": r["file_name"]} for r in rows if r["file_name"]]
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", c["title"]).strip("-")[:60] or "course"
+    return Response(_json.dumps(out, ensure_ascii=False, indent=1), media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.tgarr-course.json"'})
+
+
+async def _course_report_once() -> str:
+    """Tell the registry which public courses this install uses (courses.report): those made
+    of Internet Archive items, and those of the signed catalogue that are our own channel. The
+    lists and two numbers each, never who learned what, and nothing of any other kind of
+    course. Returns what happened, for the log."""
+    async with db_pool.acquire() as conn:
+        if (await conn.fetchval("SELECT value FROM config WHERE key = 'share_courses'")) == "0":
+            return "switched off"
+        uuid_ = await conn.fetchval("SELECT value FROM config WHERE key = 'instance_uuid'")
+        if not uuid_:
+            return "this install has no name at the registry yet"
+        rows = [dict(r) for r in await conn.fetch(
+            """SELECT c.id, c.kind, c.slug, c.title, c.lang, c.level, c.subject, c.license, c.parts, c.ref,
+                      (SELECT count(*) FROM course_items ci WHERE ci.course_id = c.id) AS lessons
+               FROM courses c WHERE (c.kind = 'pack' AND c.parts IS NOT NULL) OR (c.kind = 'channel' AND c.slug IS NOT NULL)""")]
+        for r in rows:
+            r["done"] = [x["n"] for x in await conn.fetch(
+                """SELECT count(*) FILTER (WHERE p.done) AS n FROM course_items ci JOIN progress p ON p.msg_id = ci.msg_id
+                   WHERE ci.course_id = $1 GROUP BY p.who""", r["id"])]
+        lang = (await conn.fetchval("SELECT value FROM config WHERE key = 'ui_lang'")) or ""
+    _course_packs()
+    told = courses.report(rows, _course_packs(), _CATALOGUE["packs"])
+    body = _json.dumps({"instance_uuid": uuid_, "version": TGARR_VERSION, "lang": lang, "courses": told}).encode()
+
+    def send():
+        req = urllib.request.Request(UPDATE_REGISTRY_URL + "/api/v1/courses/report", data=body, method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": f"tgarr/{TGARR_VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status
+    try:
+        return f"{len(told)} courses told, answer {await asyncio.to_thread(send)}"
+    except Exception as e:
+        return f"not told ({type(e).__name__}: {str(e)[:80]})"
+
+
+async def _course_report_worker():
+    """Once a day, at a time of this install's own (so that installs do not all come at once)."""
+    import random
+    await asyncio.sleep(600 + random.random() * 3000)
+    while True:
+        try:
+            if db_pool is not None:
+                log.info("[courses] the registry: %s", await _course_report_once())
+        except Exception as e:
+            log.info("[courses] the registry was not told: %s: %s", type(e).__name__, str(e)[:120])
+        await asyncio.sleep(86400 + random.random() * 7200)
+
+
+@app.post("/api/kids/share_courses")
+async def api_kids_share_courses(request: Request):
+    """Whether the registry is told which Internet Archive courses this install uses."""
+    try:
+        on = bool((await request.json()).get("on"))
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('share_courses', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", "1" if on else "0")
+    return {"status": "ok", "on": on}
+
+
+@app.post("/api/kids/reward")
+async def api_kids_reward(request: Request):
+    """What learning earns (courses.clean_reward)."""
+    try:
+        rule = courses.clean_reward(await request.json())
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('mc_reward', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", _json.dumps(rule))
+    _REWARD.update(at=0.0)
+    _BONUS.clear()
+    return {"status": "ok", "reward": rule}
 
 
 _MC_KINDS = {
@@ -12305,6 +13011,7 @@ _MC_ICONS = {
     "video": _MC_SVG + '<rect x="3" y="5" width="18" height="14" rx="3.5"/><path d="M10.2 9.2v5.6l4.8-2.8z" fill="currentColor"/></svg>',
     "audio": _MC_SVG + '<path d="M4.5 14.5v-2.2a7.500 7.500 0 0 1 15 0v2.200"/><rect x="3" y="13.500" width="4.600" height="7" rx="2.200"/><rect x="16.400" y="13.500" width="4.600" height="7" rx="2.200"/></svg>',
     "book": _MC_SVG + '<path d="M12 6.8C10.200 5.500 7.900 4.900 4.900 5a.9.9 0 0 0-.9.9v11.300c0 .5.400.9.900.9 2.900-.1 5.200.5 7.100 1.800 1.900-1.300 4.200-1.900 7.100-1.800.5 0 .9-.4.9-.9V5.900a.9.9 0 0 0-.9-.9c-3-.1-5.300.5-7.100 1.800z"/><path d="M12 6.800v13.100"/></svg>',
+    "learn": _MC_SVG + '<path d="M2.500 9.500L12 5l9.500 4.500L12 14z"/><path d="M6.500 11.700v4.300c1.500 1.700 3.300 2.500 5.500 2.500s4-.8 5.500-2.500v-4.300"/><path d="M21.500 9.500v5"/></svg>',
     "photo": _MC_SVG + '<rect x="3" y="4.500" width="18" height="15" rx="3.500"/><circle cx="8.600" cy="9.700" r="1.700"/><path d="M21 15.300l-4.200-4.200a1.700 1.700 0 0 0-2.400 0L6.600 19.500"/></svg>',
 }
 _UI_LANG = {"at": 0.0, "v": ""}
@@ -12505,7 +13212,7 @@ a{color:inherit;text-decoration:none}
 html[dir=rtl] .hero::after{transform:scaleX(-1)}
 @media (max-width:560px){.hero .po{display:none}.hero{min-height:180px}}
 .find{padding:16px clamp(16px,4vw,44px) 0;display:flex;gap:10px}
-.find input{flex:1;max-width:440px;font:inherit;font-size:16.500px;padding:12px 18px;border-radius:12px;
+.find input{flex:1;min-width:0;max-width:440px;font:inherit;font-size:16.500px;padding:12px 18px;border-radius:12px;
   border:1.500px solid var(--line);background:var(--card);color:var(--ink);outline:none}
 .find input:focus{border-color:var(--accent)}
 .find button{font:inherit;font-size:16px;font-weight:700;padding:0 22px;border-radius:12px;border:0;
@@ -12540,6 +13247,18 @@ html.tv .play{opacity:0}html.tv .card:focus-visible .play{opacity:1;transform:no
   padding:4px 9px;border-radius:999px;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
 .saved::before{content:"";width:7px;height:7px;border-radius:50%;background:#34d399}
 .name{padding:11px 14px 14px;font-size:15px;font-weight:600;line-height:1.3;word-break:break-word}
+/* a course and its lessons: how far, which is done, which comes next */
+.card .num{position:absolute;right:10px;top:10px;min-width:26px;height:26px;padding:0 7px;border-radius:13px;display:grid;place-items:center;
+  background:rgba(8,10,16,.62);color:#fff;font-size:12.500px;font-weight:700;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.card.fin .num{background:#16a34a}
+.card .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.28)}
+.card .prog i{display:block;height:100%;background:var(--accent)}
+.card.fin .pic{opacity:.72}
+.card .sub{display:block;margin-top:4px;font-size:13px;font-weight:500;color:var(--soft)}
+.card.course .pic{aspect-ratio:16/9}
+.h2back{color:var(--soft);font-weight:600;margin-inline-end:10px}
+.earned{margin:14px clamp(16px,4vw,44px) 0;display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:999px;
+  background:color-mix(in srgb, #16a34a 16%, var(--card));color:var(--ink);font-weight:700;font-size:15px}
 .name span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .photo .name{display:none}
 .empty{margin:30px clamp(16px,4vw,44px);padding:46px 20px;text-align:center;background:var(--card);border-radius:var(--r);
@@ -12590,7 +13309,7 @@ html[data-th=playroom]{--bg:#e8f6ff;--card:#ffffff;--ink:#27314d;--soft:#62739a;
   --shadow:0 8px 0 rgba(39,49,77,.10);--r:30px;color-scheme:light}
 html[data-th=playroom] body{background:linear-gradient(180deg,#bfe6ff 0%,#e8f6ff 34%,#fff4d6 100%);background-attachment:fixed;
   font-family:"Baloo 2","Comic Neue",ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
-html[data-th=playroom] .cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);padding-top:14px;overflow:visible}
+html[data-th=playroom] .cats{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:clamp(6px,2vw,20px);padding-top:14px;overflow:visible}
 html[data-th=playroom] .cat{display:block;text-align:center;padding:clamp(14px,2.4vw,24px) 10px;border:4px solid var(--c);background:var(--card);
   border-radius:var(--r);box-shadow:var(--shadow);color:var(--ink);white-space:normal}
 html[data-th=playroom] .cat b{display:block;margin-top:10px;font-size:clamp(15px,2.2vw,21px)}
@@ -12598,6 +13317,8 @@ html[data-th=playroom] .cat .ic{width:clamp(56px,7.6vw,84px);height:clamp(56px,7
 html[data-th=playroom] .cat.on .ic{background:#fff;color:var(--c);box-shadow:none}
 html[data-th=playroom] .cat.on{background:var(--c);color:#fff}
 html[data-th=playroom] .cat.on small{color:#fff}
+@media (min-width:1200px){html[data-th=playroom] .cat{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;column-gap:clamp(10px,1.2vw,22px);text-align:left;padding:clamp(12px,1.5vw,22px) clamp(12px,1.5vw,26px)}html[data-th=playroom] .cat .ic{grid-row:1 / span 2;margin:0;width:clamp(52px,4.8vw,92px);height:clamp(52px,4.8vw,92px)}html[data-th=playroom] .cat b{margin-top:0;align-self:end;font-size:clamp(17px,1.5vw,27px);line-height:1.15;overflow:hidden;text-overflow:ellipsis}html[data-th=playroom] .cat small{align-self:start;font-size:clamp(13px,1vw,16px);margin-top:3px}}
+@media (max-width:560px){html[data-th=playroom] .cats{gap:6px}html[data-th=playroom] .cat{padding:10px 1px 9px;border-width:3px;border-radius:18px}html[data-th=playroom] .cat .ic{width:36px;height:36px}html[data-th=playroom] .cat .ic svg{width:20px;height:20px}html[data-th=playroom] .cat b{font-size:12px;margin-top:6px;overflow:hidden;text-overflow:ellipsis}html[data-th=playroom] .cat small{font-size:10px}}
 html[data-th=playroom] .card{border:4px solid #fff}
 html[data-th=playroom] .card:hover{transform:translateY(-6px) rotate(-1deg) scale(1.03)}
 html[data-th=playroom] .pill,html[data-th=playroom] .find input{border-width:3px;font-weight:700}
@@ -12860,16 +13581,18 @@ async def page_kids_old():
 
 
 @app.get("/mediacenter", response_class=HTMLResponse)
-async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
+async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0, course: int = 0):
     """What a locked browser gets: the items on the Media Center list, as a
     page of its own - large pictures, four big choices, nothing to configure."""
     lang = await _lang(request)
 
     def tr(text: str, **values) -> str:
         return html.escape(i18n.t(lang, text, **values))
-    kind = kind if kind in _MC_KINDS else "video"
+    kind = kind if kind in _MC_KINDS or kind == "learn" else "video"
     offset, per = max(0, int(offset)), 48
-    label, icon, colour, cond = _MC_KINDS[kind]
+    # the fifth shelf holds courses, not files: nothing is asked of the library for it here
+    label, icon, colour, cond = _MC_KINDS[kind] if kind != "learn" else ("Learn", "", "#16a34a", "FALSE")
+    who_learns = _progress_who(request)
     where, params = [_kid_sql(), cond], []
     for w in (q or "").split()[:6]:
         params.append(f"%{w}%")
@@ -12885,6 +13608,14 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
             SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
             WHERE {_kid_sql()} AND {v[3]}""") for k, v in _MC_KINDS.items()}
         theme = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_theme'")
+        my_courses = await _course_list(conn, who_learns, _LOCKED.get())
+        lessons = []
+        if kind == "learn" and course and any(c["id"] == course for c in my_courses):
+            lessons = await conn.fetch(
+                """SELECT ci.pos, m.id, m.file_name, m.caption, m.media_type, COALESCE(p.done, FALSE) AS done, p.frac
+                   FROM course_items ci JOIN messages m ON m.id = ci.msg_id
+                   LEFT JOIN progress p ON p.msg_id = m.id AND p.who = $2
+                   WHERE ci.course_id = $1 ORDER BY ci.pos""", course, who_learns)
     theme = theme if theme in _MC_THEME_KEYS else "auto"
     more, rows = len(rows) > per, rows[:per]
     locked = _LOCKED.get()
@@ -12892,6 +13623,9 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
         f'<a class="cat{" on" if k == kind else ""}" style="--c:{v[2]}" href="/mediacenter?kind={k}">'
         f'<span class="ic">{_MC_ICONS[k]}</span><b>{tr(v[0])}</b><small>{counts[k]:,}</small></a>'
         for k, v in _MC_KINDS.items())
+    if my_courses or not locked:                    # a shelf of its own, once there is a course (the owner sees it always)
+        cats += (f'<a class="cat{" on" if kind == "learn" else ""}" style="--c:#16a34a" href="/mediacenter?kind=learn">'
+                 f'<span class="ic">{_MC_ICONS["learn"]}</span><b>{tr("Learn")}</b><small>{len(my_courses):,}</small></a>')
     cards = []
     hero, ph = "", f'<span class="ph">{_MC_ICONS[kind]}</span>'
     for r in rows:
@@ -12920,13 +13654,64 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
             + (f'<span class="saved">{tr("ready")}</span>' if r["saved"] and kind != "photo" else "")
             + ('' if kind == "photo" else '<span class="play">▶</span>')
             + f'</div><div class="name"><span>{html.escape(name)}</span></div></a>')
+    back, earned = "", ""
+    if kind == "learn":
+        play = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.500v13l11-6.500z"/></svg>'
+        this = next((c for c in my_courses if c["id"] == course), None) if course else None
+        if this:
+            # one course: its lessons in their order, the next one in the banner
+            label, back = this["title"], f'<a class="h2back" href="/mediacenter?kind=learn">← {tr("Learn")}</a>'
+            nxt = next((r for r in lessons if not r["done"]), None)
+            for r in lessons:
+                name = _friendly_name(r["file_name"], r["caption"])
+                mt = "video" if r["media_type"] == "video" else ("audio" if r["media_type"] == "audio" else "book")
+                pic = f"/api/thumb/{r['id']}" if mt == "video" else (f"/ebook-cover/{r['id']}" if mt == "book" else "")
+                img = f'<img loading="lazy" src="{pic}" alt="" onerror="this.remove()"/>' if pic else ""
+                bar = f'<span class="prog"><i style="width:{int(100 * min(1, max(0, r["frac"] or 0)))}%"></i></span>' if (r["frac"] and not r["done"]) else ""
+                cards.append(
+                    f'<a class="card {mt}{" fin" if r["done"] else ""}" style="--c:{colour}" href="/watch/{r["id"]}">'
+                    f'<div class="pic"><span class="ph">{_MC_ICONS[{"book": "book", "audio": "audio"}.get(mt, "video")]}</span>{img}'
+                    f'<span class="num">{"✓" if r["done"] else r["pos"] + 1}</span>{bar}<span class="play">▶</span></div>'
+                    f'<div class="name"><span>{html.escape(name)}</span></div></a>')
+            if nxt and not q:
+                hero = (f'<section class="hero" style="--c:{colour};--img:url(data:,)"><div class="bk"></div><span class="hi">{_MC_ICONS["learn"]}</span>'
+                        f'<div class="tx"><span class="ey"><span class="hic">{_MC_ICONS["learn"]}</span>'
+                        f'{tr("Lesson {n} of {total}", n=nxt["pos"] + 1, total=len(lessons))}</span>'
+                        f'<h1>{html.escape(_friendly_name(nxt["file_name"], nxt["caption"]))}</h1>'
+                        f'<a class="hbtn" href="/watch/{nxt["id"]}">{play}{tr("Continue")}</a></div></section>')
+        else:
+            words_q = [w.lower() for w in (q or "").split()[:6]]
+            shown = [c for c in my_courses if all(w in (c["title"] or "").lower() for w in words_q)]
+            going = next((c for c in shown if c["next"] and 0 < c["done"] < c["lessons"]), None) or next((c for c in shown if c["next"]), None)
+            for c in shown:
+                pct = int(100 * c["done"] / c["lessons"]) if c["lessons"] else 0
+                cards.append(
+                    f'<a class="card course{" fin" if c["lessons"] and c["done"] >= c["lessons"] else ""}" style="--c:{colour}" href="/mediacenter?kind=learn&amp;course={c["id"]}">'
+                    f'<div class="pic"><span class="ph">{_MC_ICONS["learn"]}</span>'
+                    + (f'<span class="num">✓</span>' if c["lessons"] and c["done"] >= c["lessons"] else "")
+                    + (f'<span class="prog"><i style="width:{pct}%"></i></span>' if c["done"] else "")
+                    + f'</div><div class="name"><span>{html.escape(c["title"])}</span>'
+                    f'<small class="sub">{tr("{n} of {total} lessons", n=c["done"], total=c["lessons"])}</small></div></a>')
+            if going and not q:
+                hero = (f'<section class="hero" style="--c:{colour};--img:url(data:,)"><div class="bk"></div><span class="hi">{_MC_ICONS["learn"]}</span>'
+                        f'<div class="tx"><span class="ey"><span class="hic">{_MC_ICONS["learn"]}</span>'
+                        f'{tr("{n} of {total} lessons", n=going["done"], total=going["lessons"])}</span>'
+                        f'<h1>{html.escape(going["title"])}</h1>'
+                        f'<a class="hbtn" href="/watch/{going["next"]}">{play}{tr("Continue")}</a></div></section>')
+        if locked and (await _reward())["on"]:
+            got = await _bonus(who_learns, await _rules_now())
+            earned = f'<div class="earned">★ {tr("Earned today: {n} min", n=got // 60)}</div>'
     if cards:
-        grid = f'<div class="grid {kind}">{"".join(cards)}</div>'
+        grid = f'<div class="grid {"" if kind == "learn" and course else kind}">{"".join(cards)}</div>'
+    elif kind == "learn" and not q:
+        grid = (f'<div class="empty"><i>🎓</i>{tr("No courses yet.")}<br/>'
+                + (tr("A parent adds courses under Media Center & PIN.") if locked else
+                   f'<a href="/mediacenter/manage#courses" style="color:var(--accent);font-weight:700">{tr("Add a course")}</a>') + '</div>')
     elif q:
         grid = f'<div class="empty"><i>🔎</i>{tr("Nothing found. Try another word?")}</div>'
     else:
         grid = (f'<div class="empty"><i>🌱</i>{tr("Nothing here yet.")}<br/>{tr("Things show up here once they are added to the Media Center.")}</div>')
-    qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
+    qs = f"kind={kind}" + (f"&course={int(course)}" if kind == "learn" and course else "") + (f"&q={_q(q)}" if q else "")
     nav = ""
     if offset or more:
         nav = ('<div class="more">'
@@ -12942,13 +13727,14 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
              (f'<a class="pill" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else '')
              + f'<a class="pill" href="/mediacenter/manage">⚙ {tr("Choose what is shown")}</a>'
              f'<a class="pill" href="/">← {tr("Back to tgarr")}</a>')
-    heading = f'<span class="hic" style="--c:{colour}">{_MC_ICONS[kind]}</span>{tr(label)}' + (f' · “{html.escape(q)}”' if q else "")
+    heading = (back + f'<span class="hic" style="--c:{colour}">{_MC_ICONS[kind]}</span>'
+               + (html.escape(label) if back else tr(label)) + (f' · “{html.escape(q)}”' if q else ""))
     page = (i18n.fill(lang, _MEDIACENTER_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
             .replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
             .replace("__THEME__", theme).replace("__THEMES__", _json.dumps(list(_MC_THEME_KEYS)))
             .replace("__THEMEPANEL__", _mc_theme_panel(not locked, lang)).replace("__LANGPANEL__", _lang_panel(lang, not locked))
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
-            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading).replace("__HERO__", hero)
+            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading).replace("__HERO__", hero + earned)
             .replace("__GRID__", grid).replace("__MORE__", nav))
     return HTMLResponse(page)
 
@@ -13125,9 +13911,80 @@ async def page_kids_manage():
                   f'<small>{_fmt_time(o["at"])} · {who_label(o["who"])}</small></div>' for o in opened))
     n_chan = sum(1 for c in chans if c["allowed"])
     n_file = sum(1 for r in items if r["allowed"])
+    # ── courses: what there is, what can be added, what learning earns ──
+    async with db_pool.acquire() as conn:
+        my_courses = await _course_list(conn, "owner", False)
+    rw = await _reward()
+    async with db_pool.acquire() as conn:
+        share_on = (await conn.fetchval("SELECT value FROM config WHERE key = 'share_courses'")) != "0"
+    kind_word = {"pack": "from the Internet Archive", "folder": "a folder", "channel": "a channel", "list": "an imported list"}
+    course_rows = "".join(
+        f'<div class="km-row"><input type="checkbox" {"checked" if c["allowed"] else ""} title="{_t("shown in the Media Center")}" '
+        f'onchange="kmAllow(\'course\', {c["id"]}, this)"/>'
+        f'<span class="n"><b>{html.escape(c["title"])}</b> <small>{_t("{n} lessons", n=c["lessons"])} · {_t(kind_word.get(c["kind"], "a channel"))}'
+        + (f' · {html.escape(c["license"])}' if c["license"] else "") + '</small></span>'
+        + (f'<button class="btn ghost" onclick="kcFetch({c["id"]}, this)">{_t("Fetch its files")}</button>' if c["kind"] == "pack" else "")
+        + f'<a class="btn ghost" href="/api/courses/{c["id"]}/export">{_t("Export")}</a>'
+        f'<button class="btn ghost" style="color:#dc2626" onclick="kcDel({c["id"]})">{_t("Remove")}</button></div>'
+        for c in my_courses)
+    have_slugs = {c["slug"] for c in my_courses if c["slug"]}
+    ui_lang = _LANG.get().split("-")[0]
+    packs = sorted((pk for pk in _course_packs().values() if pk["slug"] not in have_slugs),
+                   key=lambda pk: (pk["lang"].split("-")[0] != ui_lang, pk["subject"] != "language", pk["lang"], pk["title"]))
+    pack_rows = "".join(
+        f'<div class="km-row"><span class="n"><b>{html.escape(pk["title"])}</b> <small>{html.escape(pk["lang"])} · '
+        f'{_t(_COURSE_SUBJECT[pk["subject"]])} · {_t(_COURSE_LEVEL[pk["level"]])} · {_t("{n} parts", n=len(pk["parts"]))} · {html.escape(pk["right"])}</small>'
+        + (f'<br/><small>{html.escape(pk["about"])}</small>' if pk["about"] else "") + '</span>'
+        f'<button class="btn" onclick="kcAdd({{pack: \'{pk["slug"]}\'}})">{_t("Add")}</button></div>' for pk in packs)
+    opt = lambda table, cur="": "".join(f'<option value="{k}"{" selected" if k == cur else ""}>{_t(v)}</option>' for k, v in table.items())  # noqa: E731
+    course_box = (
+        '<p class="note">' + _t("A course is a list of lessons in an order. Tick a course and all of it is shown on the Learn shelf of the Media Center; each child's place and what they finished is kept.") + '</p>'
+        + f'<div class="km-box km-list" style="max-height:none;min-height:0">{course_rows or "<div class=km-pad style=color:var(--muted)>" + _t("No courses yet.") + "</div>"}</div>'
+        # what learning earns
+        + f'<h2 class="section">{_t("What learning earns")}</h2><div class="km-box"><div class="km-pad">'
+        f'<label><input type="checkbox" id="rwOn" {"checked" if rw["on"] else ""}/> {_t("A lesson done earns time in the Media Center")}</label>'
+        '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0">'
+        + _t("for each lesson") + f' <input class="km-in" id="rwPer" type="number" min="0" max="240" value="{rw["per_lesson"]}" style="width:80px"/> ' + _t("minutes")
+        + ' · ' + _t("at most") + f' <input class="km-in" id="rwMost" type="number" min="0" max="720" value="{rw["most"]}" style="width:80px"/> ' + _t("minutes a day")
+        + '</div><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0">'
+        + _t("a film or a recording counts when its end was reached and this much of its length was really spent on it:")
+        + f' <input class="km-in" id="rwShare" type="number" min="10" max="100" value="{rw["share"]}" style="width:70px"/> %'
+        + '</div><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:12px 0">'
+        + _t("reading counts as one lesson for every") + f' <input class="km-in" id="rwBook" type="number" min="5" max="120" value="{rw["book_minutes"]}" style="width:70px"/> ' + _t("minutes")
+        + f'</div><label><input type="checkbox" id="rwFree" {"checked" if rw["learn_free"] else ""}/> '
+        + _t("Time spent on lessons is not taken from the day's minutes, and lessons stay open when those are used up") + '</label>'
+        f'<div style="margin-top:14px"><button class="btn" onclick="kcReward()">{_t("Save")}</button> <span id="rwMsg" style="color:var(--muted);margin-left:8px"></span></div>'
+        '<p style="color:var(--muted);font-size:13px;margin:12px 0 0">' + _t("Opening hours and breaks hold for lessons as for everything else. Time is counted only for a browser that has not entered your PIN.") + '</p>'
+        '</div></div>'
+        + '<div class="km-box"><div class="km-pad">'
+        f'<label><input type="checkbox" id="kcShare" {"checked" if share_on else ""} onchange="kcShare(this)"/> '
+        + _t("Tell tgarr.me which public courses this install uses") + '</label>'
+        '<p style="color:var(--muted);font-size:13px;margin:8px 0 0">'
+        + _t("Once a day, for each course made of Internet Archive items or published in tgarr's own channel: the list, how many people here began it and how far they got in the middle - so that good courses can be found by others. Never who, and nothing about a course made of any other channel, a folder or your own files: those are not told of at all.")
+        + '</p></div></div>'
+        # add a course
+        + f'<h2 class="section">{_t("Add a course")}</h2>'
+        + (f'<p class="note">{_t("Lists that come with tgarr. Their material is at the Internet Archive and is fetched to this machine when you ask for it.")}</p>'
+           f'<div class="km-box km-list" style="max-height:420px;min-height:0">{pack_rows}</div>' if pack_rows else "")
+        + '<div class="km-box"><div class="km-pad">'
+        f'<b>{_t("From a channel or a folder of your own")}</b>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">'
+        '<select class="km-in" id="kcChan">' + "".join(f'<option value="{c["id"]}">{html.escape(c["title"] or "?")}</option>' for c in chans) + '</select>'
+        f'<input class="km-in" id="kcPath" placeholder="{_t("folder inside it (optional)")}" style="width:220px"/>'
+        f'<input class="km-in" id="kcTitle" placeholder="{_t("name of the course")}" style="width:220px"/>'
+        f'<select class="km-in" id="kcSubject">{opt(_COURSE_SUBJECT, "other")}</select>'
+        f'<select class="km-in" id="kcLevel">{opt(_COURSE_LEVEL, "all")}</select>'
+        f'<button class="btn" onclick="kcMake()">{_t("Make a course")}</button></div>'
+        '<p style="color:var(--muted);font-size:13px;margin:10px 0 0">' + _t("Its lessons are the films, recordings and books there, in the order of their names (a channel: in the order they were posted). New files join by themselves.") + '</p>'
+        f'<div style="margin-top:18px"><b>{_t("From a list somebody shared")}</b> '
+        '<input type="file" id="kcFile" accept=".json,application/json" style="margin-left:8px"/> '
+        f'<button class="btn ghost" onclick="kcImport()">{_t("Import")}</button></div>'
+        '<p style="color:var(--muted);font-size:13px;margin:10px 0 0">' + _t("A shared list holds a course's order and the names of its files, never the files: the lessons you have are found by name.") + '</p>'
+        '</div></div>')
     tabs = (("pin", "PIN & time", ""), ("people", "People", f"{len(profs)}" if profs else ""),
             ("channels", "Channels", _t("{n} shown", n=f"{n_chan:,}") if n_chan else ""),
-            ("files", "Files", _t("{n} shown", n=f"{n_file:,}") if n_file else ""), ("usage", "Usage", ""))
+            ("files", "Files", _t("{n} shown", n=f"{n_file:,}") if n_file else ""),
+            ("courses", "Courses", f"{len(my_courses)}" if my_courses else ""), ("usage", "Usage", ""))
     body = (
         _KIDS_CSS
         + '<div class="km-tabs" role="tablist">'
@@ -13146,6 +14003,7 @@ async def page_kids_manage():
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
            + _t("Nothing is saved yet. Files you open in a player are kept and appear here.") + '</div></div>')
         + '</div>'
+        + f'<div class="km-pane" id="km-courses" hidden>{course_box}</div>'
         + '<div class="km-pane" id="km-usage" hidden>'
           '<p class="note">' + _t("Kept on this machine only: time per person or device, and what was opened in the Media Center.") + '</p>'
         + (f'<div class="km-box km-list">{used_rows}</div>' if used_rows else
@@ -13187,6 +14045,29 @@ function mcSave(){
     on: g("mcOn").checked, wd: part("wd"), we: part("we"), session: +g("mcSession").value, rest: +g("mcRest").value,
     tz: -new Date().getTimezoneOffset()})}).then(r => r.json())
     .then(j => { msg.textContent = j.status === "ok" ? "[[@js:saved]]" : (j.message || "[[@js:that did not work]]"); });
+}
+function kcSend(path, body){
+  return fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})}).then(r => r.json());
+}
+function kcAdd(body){ kcSend("/api/courses", body).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "[[@js:that did not work]]"); }); }
+function kcMake(){ kcAdd({channel: +G("kcChan").value, folder: G("kcPath").value.trim() ? +G("kcChan").value : undefined, path: G("kcPath").value.trim(),
+  title: G("kcTitle").value, subject: G("kcSubject").value, level: G("kcLevel").value}); }
+function kcDel(id){ if (confirm("[[@js:Remove this course? Its files stay where they are.]]")) kcSend("/api/courses/" + id + "/delete").then(() => location.reload()); }
+function kcFetch(id, b){
+  b.disabled = true;
+  kcSend("/api/courses/" + id + "/fetch").then(j => {
+    b.textContent = j.status === "ok" ? "[[@js:asked for %1, %2 still to come]]".replace("%1", j.queued).replace("%2", j.left) : (j.message || "[[@js:that did not work]]");
+  });
+}
+function kcImport(){
+  const f = G("kcFile").files[0]; if (!f) return;
+  f.text().then(t => { let j; try { j = JSON.parse(t); } catch (e) { alert("[[@js:This file is not a course list.]]"); return; } kcAdd({import: j}); });
+}
+function kcShare(el){ kcSend("/api/kids/share_courses", {on: el.checked}).then(j => { if (j.status !== "ok") el.checked = !el.checked; }); }
+function kcReward(){
+  kcSend("/api/kids/reward", {on: G("rwOn").checked, per_lesson: +G("rwPer").value, most: +G("rwMost").value, share: +G("rwShare").value,
+    book_minutes: +G("rwBook").value, learn_free: G("rwFree").checked})
+    .then(j => { G("rwMsg").textContent = j.status === "ok" ? "[[@js:saved]]" : (j.message || "[[@js:that did not work]]"); });
 }
 function kmShow(b){
   document.querySelectorAll(".km-chip").forEach(x => x.classList.toggle("on", x === b));

@@ -1,0 +1,36 @@
+{
+ "slug": "mcguffey-readers",
+ "title": "McGuffey's Eclectic Readers",
+ "about": "The readers American children learned to read from for a century, from the primer upward: short lessons that grow longer, each with its new words. Scanned books to read on the screen. The fifth reader is not in this list.",
+ "lang": "en",
+ "level": "5-8",
+ "subject": "reading",
+ "right": "NOCR",
+ "credit": "William Holmes McGuffey. Scans from American libraries and Project Gutenberg; not in copyright.",
+ "parts": [
+  {
+   "ia": "mcguffeyseclecti00mcgu",
+   "title": "Eclectic Primer"
+  },
+  {
+   "ia": "mcguffeysfirstec00mcgu2",
+   "title": "First Reader"
+  },
+  {
+   "ia": "mcguffeysseconde00mcgu",
+   "title": "Second Reader"
+  },
+  {
+   "ia": "mcguffeysthirdec14766gut",
+   "title": "Third Reader"
+  },
+  {
+   "ia": "newmcguffeyfour00mcgugoog",
+   "title": "Fourth Reader (The New McGuffey)"
+  },
+  {
+   "ia": "mcguffeyssixthec00mcgu",
+   "title": "Sixth Reader"
+  }
+ ]
+}

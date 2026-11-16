@@ -1,0 +1,60 @@
+{
+ "slug": "andrew-lang-fairy-books",
+ "title": "Andrew Lang's Fairy Books",
+ "about": "The twelve coloured fairy books, from the Blue to the Lilac: fairy tales from all over the world, collected for children, read aloud by volunteers.",
+ "lang": "en",
+ "level": "8-12",
+ "subject": "reading",
+ "right": "PD",
+ "credit": "Andrew Lang (1889-1910). Recordings by LibriVox volunteers, in the public domain.",
+ "parts": [
+  {
+   "ia": "blue_fairy_book_0707_librivox",
+   "title": "The Blue Fairy Book"
+  },
+  {
+   "ia": "red_fairy_book_0908_librivox",
+   "title": "The Red Fairy Book"
+  },
+  {
+   "ia": "green_fairy_book_1012_librivox",
+   "title": "The Green Fairy Book"
+  },
+  {
+   "ia": "yellow_fairy_book_0801_librivox",
+   "title": "The Yellow Fairy Book"
+  },
+  {
+   "ia": "pink_fairy_book_1010_librivox",
+   "title": "The Pink Fairy Book"
+  },
+  {
+   "ia": "grey_fairy_book_1105_librivox",
+   "title": "The Grey Fairy Book"
+  },
+  {
+   "ia": "violetfairy_1302_librivox",
+   "title": "The Violet Fairy Book"
+  },
+  {
+   "ia": "crimsonfairybook_1112_librivox",
+   "title": "The Crimson Fairy Book"
+  },
+  {
+   "ia": "brown_fairy_book_1207_librivox",
+   "title": "The Brown Fairy Book"
+  },
+  {
+   "ia": "orange_fairy_book_1005_librivox",
+   "title": "The Orange Fairy Book"
+  },
+  {
+   "ia": "olivefairybook_1205_librivox",
+   "title": "The Olive Fairy Book"
+  },
+  {
+   "ia": "lilac_fairy_0707_librivox",
+   "title": "The Lilac Fairy Book"
+  }
+ ]
+}
