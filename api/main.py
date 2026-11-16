@@ -14281,11 +14281,11 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
 
     if not rows:
         body = (
-            '<h2 class="section">Library <span class="count">0 cached</span></h2>'
+            f'<h2 class="section">{_t("Library")} <span class="count">{_t("{n} cached", n=0)}</span></h2>'
             '<div class="empty-state">'
             '<div class="icon">📚</div>'
-            '<div>No ebooks cached yet.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook indexed — click to fetch.</div>'
+            f'<div>{_t("No ebooks cached yet.")}</div>'
+            f'<div style="margin-top:8px;font-size:13px">{_t("{n} ebooks indexed — click to fetch.", n=f"{pending_n:,}")}</div>'
             '</div>'
         )
         return HTMLResponse(_layout("Library", "/library", body))
@@ -14313,7 +14313,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     lang_chips = (
         '<a class="btn ghost" href="/library" style="' +
         ('background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);' if not lang else '') +
-        'padding:5px 12px;font-size:12px">all</a>' +
+        f'padding:5px 12px;font-size:12px">{_t("all")}</a>' +
         "".join(_lang_chip(r["lang"], r["n"]) for r in lang_dist if r["lang"] != 'unknown' and r["n"] > 0)
     )
 
@@ -14324,30 +14324,30 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips = (
-        _sort_chip("quality", "★ Best") +
-        _sort_chip("recent",  "Recent") +
-        _sort_chip("size",    "Largest") +
-        _sort_chip("title",   "Title") +
+        _sort_chip("quality", "★ " + _t("Best")) +
+        _sort_chip("recent",  _t("Recent")) +
+        _sort_chip("size",    _t("Largest")) +
+        _sort_chip("title",   _t("Title")) +
         '<span style="margin-left:10px"></span>' + _src_chips("/library", _qs, src, src_n) + _saved_chip("/library", _qs, local) +
         '<a class="btn ghost" href="/music?book=1" style="padding:5px 12px;font-size:12px;margin-left:auto" '
-        'title="books that are listened to">🎧 Audiobooks</a>')
+        f'title="{_t("books that are listened to")}">🎧 {_t("Audiobooks")}</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">' +
         lang_chips + '</div>'
-        '<div style="display:flex;gap:6px;margin-bottom:18px;align-items:center">'
-        '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px;align-items:center">'
+        f'<span style="color:var(--muted);font-size:12px;margin-right:4px">{_t("Sort:")}</span>' +
         sort_chips + '</div>'
     )
 
     if not rows:
         body = (
-            f'<h2 class="section">Library <span class="count">0</span></h2>'
+            f'<h2 class="section">{_t("Library")} <span class="count">0</span></h2>'
             f'{toolbar}'
             '<div class="empty-state">'
             '<div class="icon">📚</div>'
-            '<div>No ebooks match these filters.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook indexed — click to fetch.</div>'
+            f'<div>{_t("No ebooks match these filters.")}</div>'
+            f'<div style="margin-top:8px;font-size:13px">{_t("{n} ebooks indexed — click to fetch.", n=f"{pending_n:,}")}</div>'
             '</div>'
         )
         return HTMLResponse(_layout("Library", "/library", body))
@@ -14365,7 +14365,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
            if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]).lower() in _COVER_KINDS
            else f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>')
         + f'<div class="book-body">'
-        f'<div class="book-title">{html.escape(r["file_name"] or "(untitled)")}</div>'
+        f'<div class="book-title">{html.escape(r["file_name"]) if r["file_name"] else _t("(untitled)")}</div>'
         f'<div class="book-meta">'
         f'{_dc_badge(r.get("file_dc"), _lib_my_dc)}'
         f'{_lang_badge(r.get("detected_lang"))}'
@@ -14376,16 +14376,16 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         f'</div>'
         f'</div>'
         f'<div class="book-actions">'
-        f'<a class="btn" href="/watch/{r["id"]}">Open</a>'
-        f'<a class="btn ghost" href="/media/{r["id"]}" download="{html.escape(r["file_name"] or "")}">Download</a>'
+        f'<a class="btn" href="/watch/{r["id"]}">{_t("Open")}</a>'
+        f'<a class="btn ghost" href="/media/{r["id"]}" download="{html.escape(r["file_name"] or "")}">{_t("Download")}</a>'
         f'</div>'
         f'</div>'
         for r in rows
     )
 
     body = (
-        f'<h2 class="section">Library <span class="count">{len(rows)} of {total:,}</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
+        f'<h2 class="section">{_t("Library")} <span class="count">{_t("{n} of {total}", n=len(rows), total=f"{total:,}")}</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{_t("{n} indexed (click to fetch)", n=f"{pending_n:,}")}</span>'
            if pending_n else '')
         + '</h2>'
         f'{toolbar}'
