@@ -12667,6 +12667,7 @@ html.tv .grid.book{grid-template-columns:repeat(auto-fill,minmax(clamp(150px,12v
 html.tv .cat b{font-size:clamp(18px,1.9vw,26px)}
 html.tv .th b{font-size:18px}html.tv .th small{font-size:14px}
 html.tv .thp{width:min(620px,calc(100vw - 24px))}
+@media (max-width:720px){.top{flex-wrap:wrap;row-gap:10px;column-gap:8px}.logo{flex:1 0 100%}.top .pill{padding:7px 11px;font-size:12.500px}}
 @media (max-width:560px){.cats{gap:4px}.cat{padding:8px 12px 8px 8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
 </style></head>
 <body>
