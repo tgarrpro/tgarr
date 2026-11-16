@@ -1,0 +1,68 @@
+{
+ "slug": "land-of-oz",
+ "title": "The Oz Books",
+ "about": "L. Frank Baum's fourteen books of Oz in the order they were written, beginning with The Wonderful Wizard of Oz, read aloud.",
+ "lang": "en",
+ "level": "8-12",
+ "subject": "reading",
+ "right": "PD",
+ "credit": "L. Frank Baum (1900-1920). Recordings by LibriVox volunteers, in the public domain.",
+ "parts": [
+  {
+   "ia": "wizard_of_oz",
+   "title": "The Wonderful Wizard of Oz"
+  },
+  {
+   "ia": "marvelous_land_of_oz_librivox",
+   "title": "The Marvelous Land of Oz"
+  },
+  {
+   "ia": "ozma_of_oz_librivox",
+   "title": "Ozma of Oz"
+  },
+  {
+   "ia": "dorothy_wizard_oz_librivox",
+   "title": "Dorothy and the Wizard in Oz"
+  },
+  {
+   "ia": "road_to_oz",
+   "title": "The Road to Oz"
+  },
+  {
+   "ia": "emerald_city_librivox",
+   "title": "The Emerald City of Oz"
+  },
+  {
+   "ia": "patchwork_girl_oz_1006_librivox",
+   "title": "The Patchwork Girl of Oz"
+  },
+  {
+   "ia": "tik-tok_oz_librivox",
+   "title": "Tik-Tok of Oz"
+  },
+  {
+   "ia": "scarecrow_of_oz_0802_librivox",
+   "title": "The Scarecrow of Oz"
+  },
+  {
+   "ia": "rinkitink_oz_jb_librivox",
+   "title": "Rinkitink in Oz"
+  },
+  {
+   "ia": "lost_princess_oz_librivox",
+   "title": "The Lost Princess of Oz"
+  },
+  {
+   "ia": "tinwoodmanofoz_1505_librivox",
+   "title": "The Tin Woodman of Oz"
+  },
+  {
+   "ia": "magic_ofoz_ph_librivox",
+   "title": "The Magic of Oz"
+  },
+  {
+   "ia": "glinda_oz_0908_librivox",
+   "title": "Glinda of Oz"
+  }
+ ]
+}

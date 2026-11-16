@@ -1,0 +1,20 @@
+{
+ "slug": "cuentos-de-hadas-grimm",
+ "title": "Cuentos de hadas de los hermanos Grimm",
+ "about": "Los cuentos de los hermanos Grimm leídos en voz alta, en dos volúmenes: Caperucita Roja, Hansel y Gretel, Blancanieves y muchos más.",
+ "lang": "es",
+ "level": "5-8",
+ "subject": "reading",
+ "right": "PD",
+ "credit": "Jacob y Wilhelm Grimm. Grabaciones de voluntarios de LibriVox, en el dominio público.",
+ "parts": [
+  {
+   "ia": "cuentos_grimm_01_1109_librivox",
+   "title": "Volumen 1"
+  },
+  {
+   "ia": "cuentos_grimm_02_1302_librivox",
+   "title": "Volumen 2"
+  }
+ ]
+}

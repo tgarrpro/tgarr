@@ -12581,14 +12581,23 @@ async def _course_build(conn, c) -> int:
     elif kind == "channel":
         # ref: "<channel id>" (one's own choice of a channel: all of it), or - a shipped list -
         # "<channel id> <#tag or -> <up to which post>"
+        # A shipped list names its channel by @name, not by this install's number for it: one channel
+        # can stand here under more than one row (followed by name while the account is in it too,
+        # a placeholder that is merged later), and its posts are under whichever row read them.
         bits = (c["ref"] or "").split(" ")
-        cid, tag = bits[0], (bits[1] if len(bits) > 1 and bits[1] != "-" else "")
+        tag = bits[1] if len(bits) > 1 and bits[1] != "-" else ""
         upto = int(bits[2]) if len(bits) > 2 and bits[2].isdigit() else 0
+        if bits[0].startswith("@"):
+            cids = [r["id"] for r in await conn.fetch("SELECT id FROM channels WHERE username ILIKE $1", bits[0][1:])]
+        else:
+            cids = [int(bits[0])] if bits[0].isdigit() else []
         rows = await conn.fetch(
-            f"""SELECT m.id FROM messages m WHERE m.channel_id = $1 AND {live} AND {playable}
+            f"""SELECT DISTINCT ON (m.tg_message_id, m.posted_at, m.file_name) m.id, m.posted_at
+                FROM messages m WHERE m.channel_id = ANY($1::bigint[]) AND {live} AND {playable}
                   AND ($2 = '' OR position(lower($2) IN lower(COALESCE(m.caption, ''))) > 0)
                   AND ($3 = 0 OR m.tg_message_id <= $3)
-                ORDER BY m.posted_at NULLS LAST, m.id LIMIT 2000""", int(cid or 0), tag, upto)
+                ORDER BY m.tg_message_id, m.posted_at, m.file_name, m.id LIMIT 2000""", cids, tag, upto)
+        rows = sorted(rows, key=lambda r: (r["posted_at"] is None, r["posted_at"], r["id"]))
         ids = [r["id"] for r in rows]
     elif kind == "list":
         names = [str(p.get("name") or "") for p in _json.loads(c["parts"] or "[]")]
@@ -12703,14 +12712,8 @@ async def api_course_add(request: Request):
         if pk["channel"]:
             # a list that is a public channel: the channel is followed (read without joining), and
             # the course is that channel's posts - under the list's tag, when it names one
-            r = await api_channel_subscribe(pk["channel"])
-            cid = r.get("channel_id") if isinstance(r, dict) else None
-            if not cid:
-                async with db_pool.acquire() as conn:
-                    cid = await conn.fetchval("SELECT id FROM channels WHERE username ILIKE $1", pk["channel"])
-            if not cid:
-                return no("the channel of this list could not be followed - try again in a moment", 503)
-            kind, parts, ref = "channel", None, f"{cid} {pk['tag'] or '-'} {pk['upto']}"
+            await api_channel_subscribe(pk["channel"])
+            kind, parts, ref = "channel", None, f"@{pk['channel']} {pk['tag'] or '-'} {pk['upto']}"
     elif b.get("folder") is not None or b.get("channel") is not None:
         try:
             cid = int(b.get("folder") if b.get("folder") is not None else b.get("channel"))

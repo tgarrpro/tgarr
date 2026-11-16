@@ -1,0 +1,56 @@
+{
+ "slug": "junior-classics",
+ "title": "The Junior Classics",
+ "about": "A library for children in ten volumes (1912): fairy and wonder tales, folk tales and myths, tales from Greece and Rome, heroes of chivalry, old-fashioned tales, stories of courage, animal and nature stories, and poems. Read aloud.",
+ "lang": "en",
+ "level": "8-12",
+ "subject": "reading",
+ "right": "PD",
+ "credit": "Edited by William Patten (1912). Recordings by LibriVox volunteers, in the public domain.",
+ "parts": [
+  {
+   "ia": "junior_classics_vol1_librivox",
+   "title": "The Junior Classics"
+  },
+  {
+   "ia": "juniorclassics_vol2_folktalesmyths_1902_librivox",
+   "title": "The Junior Classics Volume 2: Folk Tales & Myths"
+  },
+  {
+   "ia": "juniorclassics_v3_tales_greece_rome_2002_librivox",
+   "title": "The Junior Classics Volume 3: Tales from Greece and Rome"
+  },
+  {
+   "ia": "juniorclassics_vol4_heroesandheroinesofchivalry_1901_librivox",
+   "title": "The Junior Classics Volume 4: Heroes and Heroines of Chivalry"
+  },
+  {
+   "ia": "junior_classics_5_1401_librivox",
+   "title": "Junior Classics Volume 5: Stories That Never Grow Old"
+  },
+  {
+   "ia": "juniorclassicsv6_oldfashionedtales_2001_librivox",
+   "title": "The Junior Classics Volume 6: Old-Fashioned Tales"
+  },
+  {
+   "ia": "juniorclassicsvol7storiescourage_1501_librivox",
+   "title": "The Junior Classics Volume 7: Stories of Courage and Heroism"
+  },
+  {
+   "ia": "junior_classics_8_1307_librivox",
+   "title": "The Junior Classics- Volume 8: Animal and Nature Stories"
+  },
+  {
+   "ia": "juniorclassics_vol9_2010_librivox",
+   "title": "The Junior Classics Volume 9: Stories of To-day"
+  },
+  {
+   "ia": "juniorclassics10a_2003_librivox",
+   "title": "The Junior Classics Volume 10 Part 1: Poems Old and New"
+  },
+  {
+   "ia": "thejuniorclassics10part2_2005_librivox",
+   "title": "The Junior Classics Volume 10, part 2: Poems Old and New"
+  }
+ ]
+}

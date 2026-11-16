@@ -19,7 +19,7 @@ import re
 SLUG_RX = re.compile(r"^[a-z0-9][a-z0-9-]{1,60}$")
 IA_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 TG_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")          # a public channel's @name, without the @
-TAG_RX = re.compile(r"^#[^\s#%_]{1,40}$")                    # one tag: the posts of a channel that belong to this course
+TAG_RX = re.compile(r"^#[^\s#]{1,40}$")                    # one tag: the posts of a channel that belong to this course
 LEVELS = ("all", "5-8", "8-12", "12-16", "16+")
 SUBJECTS = ("reading", "language", "math", "science", "history", "arts", "music", "computing", "life", "other")
 RIGHTS = ("PD", "CC BY", "CC BY-SA", "CC BY-NC", "CC BY-NC-SA", "CC BY-ND", "CC BY-NC-ND", "OLD", "USGOV", "NOCR")
