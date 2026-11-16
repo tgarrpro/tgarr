@@ -1498,6 +1498,9 @@ PREVIEWS_DIR = "/downloads/previews"
 _THUMB_SAFE = _re.compile(r"^[A-Za-z0-9_\-]+\.jpg$")
 
 
+_PUBLIC_THUMB: dict = {}          # thumbnail file -> may it be shown to a browser that is not signed in
+
+
 @app.get("/thumbs/{fname}")
 async def serve_thumb(fname: str):
     if not _THUMB_SAFE.match(fname):
@@ -1505,6 +1508,22 @@ async def serve_thumb(fname: str):
     path = os.path.join(THUMBS_DIR, fname)
     if not os.path.exists(path):
         return Response("not found", status_code=404)
+    if not _signed_in() and db_pool is not None:
+        # signed out, a private chat's pictures are not shown - and a thumbnail's address can
+        # be kept from when they were. Only one that belongs to a public channel or to this
+        # machine's own files is given out.
+        ok = _PUBLIC_THUMB.get(fname)
+        if ok is None:
+            async with db_pool.acquire() as conn:
+                ok = bool(await conn.fetchval(
+                    """SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE (m.thumb_path = $1 OR m.preview_path = $1)
+                          AND (c.username IS NOT NULL OR c.local_root IS NOT NULL) LIMIT 1""", fname))
+            if len(_PUBLIC_THUMB) > 20000:
+                _PUBLIC_THUMB.clear()
+            _PUBLIC_THUMB[fname] = ok
+        if not ok:
+            return Response("not found", status_code=404)
     return FileResponse(path, media_type="image/jpeg",
                        headers={"Cache-Control": "public, max-age=604800"})
 
@@ -1754,16 +1773,27 @@ async def serve_media(msg_id: int, request: Request):
         # Partial file or unknown size: fall through to progressive streamer
         start, end = 0, (total_size - 1) if total_size else None
     else:
-        m = _re.match(r"bytes=(\d+)-(\d*)", range_header)
-        if not m:
+        m = _re.match(r"bytes=(\d{1,15})-(\d{0,15})\s*$", range_header)
+        last = _re.match(r"bytes=-(\d{1,15})\s*$", range_header)
+        if last and total_size and int(last.group(1)) > 0:
+            start, end = max(0, total_size - int(last.group(1))), total_size - 1       # "the last N bytes"
+        elif not m:
             return Response("bad range", status_code=416)
-        start = int(m.group(1))
-        end = int(m.group(2)) if m.group(2) else (
-            total_size - 1 if total_size else None)
+        else:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else (
+                total_size - 1 if total_size else None)
+        if total_size:
+            if start >= total_size:
+                return Response("no such bytes", status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
+            if end is not None:
+                end = min(end, total_size - 1)      # asked for more than there is: what there is
 
     if end is None:
         # Without TG size, just serve whatever\'s in the file now
         end = os.path.getsize(path) - 1
+    if end < start:
+        return Response("no such bytes", status_code=416)
 
     def _tail_read(pos: int, n: int) -> bytes:
         """Bytes at `pos` from the "<file>.tail" sidecar: the end of a file
@@ -1805,8 +1835,10 @@ async def serve_media(msg_id: int, request: Request):
                     # Partial file caught up — wait for crawler to write more.
                     # Abort if download appears stalled.
                     stuck_iters += 1
-                    if stuck_iters == 60 and not revived:
+                    if stuck_iters == 60 and not revived and not (total_size and current >= total_size):
                         # 30 s without a new byte: the fetch is not running
+                        # (never for a file that is here in full: asking for it again would
+                        #  take its place away from it - and an uploaded file has no other)
                         revived = True
                         await _revive_fetch(msg_id, _lp)
                     if stuck_iters > 600:  # 5 min no progress = give up
@@ -3382,6 +3414,18 @@ _EPUB_CSP = ("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline
 _EPUB_INDEX_CACHE: dict = {}      # path -> (mtime, index)
 
 
+_EPUB_PART_MOST = 32 * 1024 * 1024       # one page, list or style sheet of a book, unpacked
+_EPUB_ASSET_MOST = 64 * 1024 * 1024      # one picture or font
+
+
+def _zread(zf, name: str, most: int = _EPUB_PART_MOST) -> bytes:
+    """One member of a zip, if it is not larger unpacked than a part of a book ever is. (A few
+    kilobytes can unpack to gigabytes; the size is written in the zip and is looked at first.)"""
+    if zf.getinfo(name).file_size > most:
+        raise ValueError(f"a part of this book is too large to open ({name[-60:]})")
+    return zf.read(name)
+
+
 def _epub_index(epub_path: str) -> dict:
     """Reading order + chapter titles of a book. Cached per file."""
     mtime = os.path.getmtime(epub_path)
@@ -3390,14 +3434,14 @@ def _epub_index(epub_path: str) -> dict:
         return hit[1]
     from xml.etree import ElementTree as _ET
     with _zipfile.ZipFile(epub_path) as zf:
-        container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+        container = _zread(zf, "META-INF/container.xml").decode("utf-8", "replace")
         ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
         opf_node = _ET.fromstring(container).find(".//c:rootfile", ns_c)
         if opf_node is None:
             raise RuntimeError("OPF not declared in container.xml")
         opf_path = opf_node.attrib["full-path"]
         opf_dir = os.path.dirname(opf_path).replace("\\", "/")
-        opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+        opf_root = _ET.fromstring(_zread(zf, opf_path).decode("utf-8", "replace"))
         ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
 
         def _in_zip(base_dir, href):
@@ -3426,14 +3470,14 @@ def _epub_index(epub_path: str) -> dict:
             try:
                 if "nav" in (it.get("properties") or "").split():
                     nav_path = _in_zip(opf_dir, href)
-                    nav = zf.read(nav_path).decode("utf-8", "replace")
+                    nav = _zread(zf, nav_path).decode("utf-8", "replace")
                     nav_dir = os.path.dirname(nav_path)
                     for m in _re.finditer(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
                                           nav, _re.DOTALL | _re.IGNORECASE):
                         titles.setdefault(_in_zip(nav_dir, m.group(1)), _clean(m.group(2)))
                 elif it.get("media-type") == "application/x-dtbncx+xml":
                     ncx_path = _in_zip(opf_dir, href)
-                    ncx = zf.read(ncx_path).decode("utf-8", "replace")
+                    ncx = _zread(zf, ncx_path).decode("utf-8", "replace")
                     ncx_dir = os.path.dirname(ncx_path)
                     for m in _re.finditer(
                             r"<navLabel>\s*<text>(.*?)</text>\s*</navLabel>\s*"
@@ -3449,7 +3493,8 @@ def _epub_index(epub_path: str) -> dict:
                 if titles.get(c):
                     continue
                 try:
-                    head = zf.read(c)[:6000].decode("utf-8", "replace")
+                    with zf.open(c) as part:
+                        head = part.read(6000).decode("utf-8", "replace")
                 except KeyError:
                     continue
                 m = (_re.search(r"<h[1-3][^>]*>(.*?)</h[1-3]>", head, _re.DOTALL | _re.IGNORECASE)
@@ -3471,7 +3516,7 @@ def _epub_index(epub_path: str) -> dict:
 def _epub_chapter_body(zf, msg_id: int, chapter_path: str) -> str:
     """The <body> of one chapter, made safe to show: references rewritten to
     /epub/{id}/asset/..., style sheets, scripts and event handlers removed."""
-    raw_html = zf.read(chapter_path).decode("utf-8", errors="replace")
+    raw_html = _zread(zf, chapter_path).decode("utf-8", errors="replace")
     m = _re.search(r"<body[^>]*>(.*?)</body>", raw_html, _re.DOTALL | _re.IGNORECASE)
     body_html = m.group(1) if m else raw_html
     chapter_dir = os.path.dirname(chapter_path).replace("\\", "/")
@@ -4920,11 +4965,11 @@ async def epub_cover(msg_id: int):
     try:
         with _zipfile.ZipFile(epub_path) as zf:
             from xml.etree import ElementTree as _ET
-            container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+            container = _zread(zf, "META-INF/container.xml").decode("utf-8", "replace")
             ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
             opf_path = _ET.fromstring(container).find(".//c:rootfile", ns_c).attrib["full-path"]
             opf_dir = os.path.dirname(opf_path).replace("\\", "/")
-            opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+            opf_root = _ET.fromstring(_zread(zf, opf_path).decode("utf-8", "replace"))
             ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
             manifest = {item.attrib["id"]: item
                         for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf)}
@@ -4956,7 +5001,7 @@ async def epub_cover(msg_id: int):
                         chapter_href = _uq(chapter_item.attrib["href"])
                         chapter_path = (opf_dir + "/" + chapter_href).lstrip("/") if opf_dir else chapter_href
                         try:
-                            chap = zf.read(chapter_path).decode("utf-8", "replace")
+                            chap = _zread(zf, chapter_path).decode("utf-8", "replace")
                             m = _re.search(r"(?:xlink:)?href=[\"\']([^\"\']+\.(?:jpg|jpeg|png|webp|gif))[\"\']",
                                           chap, _re.IGNORECASE)
                             if not m:
@@ -4978,14 +5023,14 @@ async def epub_cover(msg_id: int):
                     cover_path = (opf_dir + "/" + cover_href).lstrip("/")
             cover_path = _re.sub(r"/+", "/", cover_path)
             try:
-                data = zf.read(cover_path)
-            except KeyError:
+                data = _zread(zf, cover_path, _EPUB_ASSET_MOST)
+            except (KeyError, ValueError):
                 # try common locations
                 for guess in [cover_href, "OEBPS/" + cover_href, "OPS/" + cover_href]:
                     try:
-                        data = zf.read(guess)
+                        data = _zread(zf, guess, _EPUB_ASSET_MOST)
                         break
-                    except KeyError:
+                    except (KeyError, ValueError):
                         continue
                 else:
                     return Response("cover file missing", status_code=404)
@@ -5022,8 +5067,8 @@ async def epub_asset(msg_id: int, asset_path: str):
                                  "X-Content-Type-Options": "nosniff"})
     try:
         with _zipfile.ZipFile(epub_path) as zf:
-            data = zf.read(_uq(asset_path))
-    except (KeyError, _zipfile.BadZipFile):
+            data = _zread(zf, _uq(asset_path), _EPUB_ASSET_MOST)
+    except (KeyError, ValueError, _zipfile.BadZipFile):
         return Response("asset not found", status_code=404)
     ext = asset_path.rsplit(".", 1)[-1].lower() if "." in asset_path else ""
     return Response(
@@ -6769,7 +6814,7 @@ def _local_picture_make(src: str, dst: str, px: int) -> None:
     tmp = dst + ".part.jpg"
     try:
         r = subprocess.run(
-            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src, "-frames:v", "1",
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file", "-i", src, "-frames:v", "1",
              "-vf", f"scale='min({int(px)},iw)':'min({int(px)},ih)':force_original_aspect_ratio=decrease", "-q:v", "3", tmp],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=60)
         if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:

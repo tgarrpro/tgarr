@@ -24,7 +24,8 @@ ok(T.needs("song.mp3") == "" and T.needs("noext") == "" and T.needs("") == "" an
 
 # ---- how a file is opened -------------------------------------------------------------------------
 ok(T.openings("/d/Film.iso") == [("dvd", ["-f", "dvdvideo", "-i", "/d/Film.iso"]), ("bluray", ["-i", "bluray:/d/Film.iso"])], "a disc image: as a DVD, then as a Blu-ray")
-ok(T.openings("/d/film.mkv") == [("file", ["-i", "/d/film.mkv"])], "anything else is a file")
+ok(T.openings("/d/film.mkv") == [("file", ["-protocol_whitelist", "file,crypto,data", "-i", "/d/film.mkv"])],
+   "anything else is a file - read from this disk only: a list of addresses named .ts fetches nothing")
 
 # ---- what ffprobe said ----------------------------------------------------------------------------
 dvd = {"streams": [{"codec_type": "video", "codec_name": "mpeg2video", "width": 720, "height": 480, "pix_fmt": "yuv420p"},

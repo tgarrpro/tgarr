@@ -59,7 +59,9 @@ def openings(path: str) -> list:
     (its longest title), then as a Blu-ray; anything else is a file."""
     if ext(path) == "iso":
         return [("dvd", ["-f", "dvdvideo", "-i", path]), ("bluray", ["-i", "bluray:" + path])]
-    return [("file", ["-i", path])]
+    # (a file is read from this disk and nothing else: a text file named .ts that lists
+    #  addresses must not make ffmpeg fetch them)
+    return [("file", ["-protocol_whitelist", "file,crypto,data", "-i", path])]
 
 
 def parse_probe(text) -> dict:
