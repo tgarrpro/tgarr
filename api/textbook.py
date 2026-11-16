@@ -63,7 +63,18 @@ def decode(data: bytes) -> tuple:
         # cut in the middle of a character at the very end (a file opened up to MOST_BYTES)
         if e.start >= len(data) - 4:
             return data[:e.start].decode("utf-8", "replace"), "utf-8"
-    sample = data[:120000]
+        first_high = e.start
+    # a few damaged bytes in a text that is otherwise UTF-8: it is UTF-8
+    probe = data[max(0, first_high - 2000):first_high + 200000]
+    as_utf8 = probe.decode("utf-8", "replace")
+    many = sum(1 for c in as_utf8 if ord(c) > 0x7f)
+    if many > 20 and as_utf8.count("\ufffd") * 50 < many:
+        return data.decode("utf-8", "replace"), "utf-8"
+    # judged from where the text stops being plain ASCII (a long English preface must not
+    # decide for the Chinese book behind it)
+    at = next((i for i, b in enumerate(data) if b > 0x7f), 0)
+    at = data.rfind(b"\n", 0, at) + 1
+    sample = data[at:at + 120000]
     high = sum(1 for b in sample if b > 0x7f)
     best, best_score = "gb18030", -9.0
     for enc in ("gb18030", "big5", "shift_jis", "euc_kr", "cp1251"):
@@ -105,6 +116,7 @@ def _width(s: str) -> int:
 
 _INDENT = " \t　 "
 _RULE_RX = re.compile(r"^[\s*＊\-—–_=~～·•.。#☆★◇◆※]{3,}$")
+_DOTS_RX = re.compile(r"^[.。…]{1,8}$")          # "......" on a line of its own is a pause somebody wrote, not a rule
 _END_RX = re.compile(r"[.!?。！？…:：;；\"'”’」』）)\]】》〉—]$")
 
 
@@ -136,11 +148,15 @@ def _wrapped_at(lines: list) -> int:
 
 
 def paragraphs(text: str) -> list:
-    """The text as a list of paragraphs. A scene break is the paragraph "***"; a line that
-    must stay as it was typed (a table, a drawing in characters) begins with a tab."""
+    """The text as a list of paragraphs. A scene break is the paragraph "***"."""
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "").replace("\x0c", "\n")
     lines = text.split("\n")
-    w = _wrapped_at(lines[:6000])
+    # whether the text was cut at a column, looked at in three places: a preface set one way
+    # must not decide for a book set the other
+    n = len(lines)
+    looks = [lines[:2500]] if n <= 7500 else [lines[:2500], lines[n // 2 - 1250:n // 2 + 1250], lines[-2500:]]
+    widths = [_wrapped_at(x) for x in looks]
+    w = max(widths) if sum(1 for x in widths if x) * 2 > len(widths) else 0
     out, cur = [], []
 
     def flush():
@@ -156,7 +172,7 @@ def paragraphs(text: str) -> list:
             flush()
             prev = ""
             continue
-        if _RULE_RX.match(bare):
+        if _RULE_RX.match(bare) and not _DOTS_RX.match(bare):
             flush()
             if out and out[-1] != "***":
                 out.append("***")
@@ -165,15 +181,15 @@ def paragraphs(text: str) -> list:
         if not w:
             out.append(bare)
             continue
-        indented = line[:1] in _INDENT and len(line) - len(line.lstrip(_INDENT)) >= 2
+        indented = line[:1] in "\t\u3000" or (line[:1] in _INDENT and len(line) - len(line.lstrip(_INDENT)) >= 2)
         # a heading in a text cut at a column: in Chinese it stands on a line of its own, in
         # English it also begins a block (or "part two of his plan" in mid-sentence would be one)
         head = is_heading(bare) and (not cur or _wide(bare[0]) or bare[0] == "#")
         joins = (cur and not indented and not head and not is_heading(prev)
                  and _width(prev) + 1 + _width(_first_word(bare)) > w - 2)
         if joins:
-            if cur[-1].endswith("-") and len(cur[-1]) > 1 and cur[-1][-2].isalpha() and bare[:1].islower():
-                cur[-1] = cur[-1][:-1]                 # a word cut in two at the line's end
+            if cur[-1].endswith("-") and len(cur[-1]) > 1 and cur[-1][-2].isalpha() and bare[:1].isalpha():
+                pass                                   # "twenty-" / "five": the hyphen is the word's own, no space
             elif not (_wide(cur[-1][-1]) and _wide(bare[0])):
                 cur.append(" ")
             cur.append(bare)
@@ -190,19 +206,25 @@ def paragraphs(text: str) -> list:
 # ── chapters ──────────────────────────────────────────────────────────────────────────
 _NUM = r"[0-9０-９零〇一二两兩三四五六七八九十百千万萬壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+"
 _ROMAN = r"[IVXLCDM]+"
-_WORDNUM = (r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
-            r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|the\s+first|the\s+second|the\s+third|the\s+last)")
+_WORDNUM = (r"(?i:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+            r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|"
+            r"the\s+first|the\s+second|the\s+third|the\s+last)")
 _HEAD_RXS = [
-    re.compile(r"^(?:正文\s*)?第\s*" + _NUM + r"\s*[章回卷节節部集篇幕话話折册冊季](?:$|[\s:：、.．·\-—]|[^\s，。！？；]).{0,40}$"),
+    # "第三章 风起", and "第三章风起" with nothing between - but then only after the words that
+    # are not also everyday ones (第一回见到他, 第二节课, 第一季度, 第一部分, 第三集团 are sentences)
+    re.compile(r"^(?:正文\s*)?第\s*" + _NUM + r"\s*[章回卷节節部集篇幕话話折册冊季](?:$|[\s:：、.．·\-—].{0,40}$)"),
+    re.compile(r"^(?:正文\s*)?第\s*" + _NUM + r"\s*[章卷篇幕话話折][^\s，。！？；的了是在].{0,14}$"),
     re.compile(r"^[卷册冊]\s*" + _NUM + r"(?:$|[\s:：、.．·\-—]).{0,40}$"),
     re.compile(r"^(?:序章|序幕|序言|自序|代序|序|楔子|引子|引言|前言|题记|題記|后记|後記|尾声|尾聲|终章|終章|"
                r"完本感言|番外|外传|外傳|附录|附錄|跋|简介|簡介|内容简介|內容簡介)(?:$|[\s:：、.．·\-—（(].{0,30}$)"),
-    re.compile(r"^(?:chapter|chap\.|part|book|volume|vol\.|section|act|canto|letter)\s+"
-               r"(?:\d+|" + _ROMAN + r"|" + _WORDNUM + r"(?:[\s-]\w+)?)\b.{0,60}$", re.I),
+    # (the Roman number in capitals only, and not followed by a small letter: "Part I liked
+    #  best" and "Act Civil" are sentences)
+    re.compile(r"^(?i:chapter|chap\.|part|book|volume|vol\.|section|act|canto|letter)\s+"
+               r"(?:\d+|" + _ROMAN + r"(?![A-Za-z'’])(?!\s+[a-z])|" + _WORDNUM + r"(?:[\s-]\w+)?)\b.{0,60}$"),
     re.compile(r"^(?:prologue|epilogue|preface|foreword|introduction|afterword|contents|interlude|"
                r"acknowledge?ments|author'?s note|appendix(?:\s+\w+)?)\b.{0,40}$", re.I),
     re.compile(r"^#{1,3}\s+\S.{0,80}$"),
-    re.compile(r"^(?:\d{1,4}|" + _ROMAN + r")[.．、]?$"),
+    re.compile(r"^(?:\d{1,4}|" + _ROMAN + r")[.．、]?$"),      # (last: chapters() asks for it by place)
 ]
 _HEAD_NOT_END = "。，,；;！？!?"
 
@@ -247,7 +269,8 @@ def chapters(paras: list) -> list:
     # front lists every heading once more with nothing under it, and is dropped
     bare = [i for i in marks if _HEAD_RXS[-1].match(paras[i].strip(_INDENT))]
     if len(bare) < 3 or len(bare) * 4 < len(marks):
-        marks = [i for i in marks if i not in set(bare)]
+        gone = set(bare)
+        marks = [i for i in marks if i not in gone]
     out = []
     if len(marks) >= 2:
         if marks[0] > 0:

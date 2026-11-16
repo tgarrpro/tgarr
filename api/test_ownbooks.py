@@ -50,6 +50,45 @@ ok(B.clean("a < b &amp; c") == "a &lt; b &amp; c", "text is escaped")
 ok(B.clean('<td colspan="2" rowspan="900">x</td>') == '<td colspan="2">x</td>', "a table cell keeps a sane span")
 ok(B.kind_of("War.FB2") == "fb2" and B.kind_of("a.epub") == "" and B.kind_of("noext") == "", "which files are read here")
 
+# (what the read-through found)
+ok(B.clean("<p>a</p><embed src=x><p>b</p>") == "<p>a</p><p>b</p>", "a tag with no end does not swallow the rest of the page")
+ok(B.clean("<html><head><title>T</title><body><p>text</p></body></html>") == "<p>text</p>", "a <head> nobody closed ends where the body begins")
+ok(B.clean('<form action="x"><p>all of the page</p><input name=q></form>') == "<p>all of the page</p>", "a page wrapped in a form keeps its text")
+ok(B.clean("<script>x()</script><p>a</p><script/><p>b</p><style>p{}</style>c") == "<p>a</p><p>b</p>c", "script and style still go, and what follows stays")
+ok(B.clean('<table><tr><td colspan="²">x</td></tr></table><p>after</p>').endswith("<p>after</p>"), "a span that is not a number does not cut the page short")
+ok(B.clean("<p>" * 2000 + "deep" + "</p>" * 2000).count("<p>") == B._DEPTH_MOST, "nesting deeper than any book is not followed")
+ok(B._num("12") == 12 and B._num("²") is None and B._num("", 7) == 7 and B._num("-1") is None, "a number written in a file: plain digits only")
+import time as _time  # noqa: E402
+t0 = _time.time()
+B.clean("<p>x<b>y" * 30000 + "</i>" * 30000)
+ok(_time.time() - t0 < 8, "30,000 paragraphs nobody closed do not take minutes")
+hp = B.build(put("c.html", b"<html><body><h1 align=center>One</h1><p>a</p><h1 align=center>Two</h1><p>b</p></body></html>"), "html")
+ok(hp.titles == ["One", "Two"], f"a centred heading is a heading: {hp.titles}")
+odd = B.build(put("o.html", b'<html><head><meta charset="undefined"></head><body><p>plain page</p></body></html>'), "html")
+ok("plain page" in odd.chapter(0), "characters declared by a name nobody knows: worked out from the bytes")
+ok(refused(lambda: B.build(put("late.fb2", b"<?xml version='1.0'?><!--" + b"x" * 30000 + b"--><!DOCTYPE a [<!ENTITY b 'c'>]><FictionBook><body/></FictionBook>"), "fb2"), "entities"),
+   "entities declared far into the file are seen too")
+ok(B._sheet_number("1e999", False, False) == "1e999" and B._sheet_number("nan", True, False) == "nan", "a number too large to be one is left as written")
+ps2 = B.rtf_paragraphs(rb"{\rtf1\ansi one\par {\u8212?}x two\par \u-99999? three\par {\bin5 }{}{}four\par}")
+ok(ps2 == ["one", "—x two", "three", "four"], f"RTF: a character by number does not eat what follows its group; bytes kept as they are do not upset the braces: {ps2}")
+import threading as _threading  # noqa: E402
+seen, errs = [], []
+
+
+def _open_it():
+    try:
+        seen.append(B.load(os.path.join(tmp, "conc.html"), "html"))
+    except Exception as e:      # noqa: BLE001
+        errs.append(e)
+
+
+put("conc.html", b"<html><body>" + b"<h1>T</h1><p>some text here</p>" * 4000 + b"</body></html>")
+ts = [_threading.Thread(target=_open_it) for _ in range(8)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+ok(not errs and len(seen) == 8 and all(x is seen[0] for x in seen), "eight requests for one book at once: built once, the same book for all")
+ok(refused(lambda: B.load(put("bad2.docx", b"PK\x03\x04broken"), "docx")) and os.path.join(tmp, "bad2.docx") in B._refused, "a book that cannot be opened is remembered as such")
+
 # ── FictionBook ──
 fb2 = f"""<?xml version="1.0" encoding="utf-8"?>
 <FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">

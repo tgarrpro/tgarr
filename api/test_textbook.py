@@ -110,6 +110,28 @@ one = "He was 42\n42\nyears old."
 ok(len(T.chapters(T.paragraphs(one))) == 1, "one bare number is not a chapter")
 ok(T.chapters([]) == [{"title": "", "paras": []}], "an empty book has one empty section")
 
+# ── what the read-through found ──
+dirty = zh.encode("utf-8")
+dirty = dirty[:300] + b"\xff\xfe" + dirty[300:]
+ok(T.decode(dirty)[1] == "utf-8" and "这是一个关于他们的故事" in T.decode(dirty)[0], "two damaged bytes in a UTF-8 text: still UTF-8")
+late = ("The Project Gutenberg eBook, a very long licence in English.\n" * 3000 + zh).encode("gb18030")
+ok(T.decode(late)[1] == "gb18030" and "这是一个关于他们的故事" in T.decode(late)[0], "a Chinese book behind 180 KB of English: judged from where the Chinese begins")
+late5 = ("The Project Gutenberg eBook, a very long licence in English.\n" * 3000 + tw).encode("big5")
+ok(T.decode(late5)[1] == "big5", "and a Big5 one likewise")
+for s in ("Chapter Sixty-One", "Chapter Ninety", "Part I", "Part IV. The Return", "Act V", "第三章风起", "第十二卷龙战于野", "第一回 大闹天宫", "第二节 课后"):
+    ok(T.is_heading(s), f"a heading: {s}")
+for s in ("Part I liked best.", "Part I'm not proud of", "Act Civil", "Book I read last year", "第一回见到他", "第二节课下课后", "第一季度营收增长",
+          "第一部分人先走了", "第三集团军司令部", "第一章的内容很长"):
+    ok(not T.is_heading(s), f"not a heading: {s}")
+ok(T.paragraphs("一\n......\n二\n") == ["一", "......", "二"], "a line of dots is a pause somebody wrote, not a scene break")
+tw5 = "\n\n".join(wrap(para, 70).replace("of hope,", "of twenty-\nfive,") for _ in range(12))
+ok("twenty-five" in T.paragraphs(tw5)[0] or "twenty- five" not in T.paragraphs(tw5)[0], "a hyphen at a line's end stays, without a space after it")
+mixed = "\n\n".join(wrap(para, 70) for _ in range(40)) + "\n\n" + "\n".join("这是正文里很长很长的一段话，没有在任何固定的宽度处断开，一段就是一行。" * 3 for _ in range(9000))
+got = T.paragraphs(mixed)
+ok(len(got) > 9000, f"a preface cut at a column in front of a book that is not: the book keeps its paragraphs ({len(got)})")
+tabbed = "\n".join("\t" + wrap(para, 70).replace("\n", "\n") for _ in range(12))
+ok(len(T.paragraphs(tabbed)) == 12, "a tab in front of a paragraph begins it")
+
 # ── HTML ──
 h = T.chapter_html({"title": "第一章 <风>", "paras": ["a < b & c", "***", "完"]})
 ok("<h2" in h and "&lt;风&gt;" in h and "a &lt; b &amp; c" in h and "tb-rule" in h, "escaped, with a heading and a break")

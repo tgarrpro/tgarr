@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 
 RAR_MAGIC = b"Rar!\x1a\x07"
 CHM_MAGIC = b"ITSF"
@@ -37,17 +38,34 @@ def magic(path: str, n: int = 8) -> bytes:
 def _run(args: list, most: int, timeout: int) -> bytes:
     """What a program prints, up to `most` bytes (more is an error). Raises OSError."""
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    late = threading.Timer(timeout, p.kill)
+    late.start()
+    out, size = [], 0
     try:
-        out, _ = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.communicate()
+        # read as it comes and stop at the limit: a member that unpacks to gigabytes must not
+        # be held in memory before anybody looks at how long it is
+        while True:
+            piece = p.stdout.read(256 * 1024)
+            if not piece:
+                break
+            size += len(piece)
+            if size > most:
+                p.kill()
+                raise OSError("more came out of the archive than is taken")
+            out.append(piece)
+        code = p.wait()
+    finally:
+        took_too_long = not late.is_alive()
+        late.cancel()
+        if p.poll() is None:
+            p.kill()
+        p.stdout.close()
+        p.wait()
+    if took_too_long and code != 0:
         raise OSError("the archive took too long to read")
-    if len(out) > most:
-        raise OSError("more came out of the archive than is taken")
-    if p.returncode != 0 and not out:
-        raise OSError(f"the archive could not be read (code {p.returncode})")
-    return out
+    if code != 0 and not out:
+        raise OSError(f"the archive could not be read (code {code})")
+    return b"".join(out)
 
 
 # ── RAR ───────────────────────────────────────────────────────────────────────────────
@@ -80,7 +98,7 @@ def seven_list(path: str) -> list:
     tool = _which("7zz")
     if not tool:
         raise OSError("no program here opens this kind of archive")
-    out = _run([tool, "l", "-slt", "-ba", "-sccUTF-8", path], 16 * 1024 * 1024, 60).decode("utf-8", "replace")
+    out = _run([tool, "l", "-slt", "-ba", "-sccUTF-8", "--", path], 16 * 1024 * 1024, 60).decode("utf-8", "replace")
     files, name, size, is_dir = [], None, 0, False
 
     def push():
@@ -104,8 +122,11 @@ def seven_extract(path: str, into: str, timeout: int = 180) -> None:
     tool = _which("7zz")
     if not tool:
         raise OSError("no program here opens this kind of archive")
-    p = subprocess.run([tool, "x", "-y", "-bd", "-bso0", "-bsp0", "-o" + into, path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=timeout)
+    try:
+        p = subprocess.run([tool, "x", "-y", "-bd", "-bso0", "-bsp0", "-o" + into, "--", path],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise OSError("the archive took too long to unpack")
     if p.returncode not in (0, 1):          # 1 = warnings (a file it could not name, a locked one)
         raise OSError(f"the archive could not be unpacked (code {p.returncode})")
 

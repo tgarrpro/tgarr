@@ -29,6 +29,8 @@ import html
 import os
 import re
 import struct
+import threading
+import urllib.parse
 import zipfile
 from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
@@ -40,7 +42,7 @@ KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html
 XML_MOST = 80 * 1024 * 1024         # one XML part, unpacked
 TEXT_MOST = 120 * 1024 * 1024       # the text of one book
 _CACHE: dict = {}                   # path -> (mtime, Book)
-_CACHE_MOST = 3
+_CACHE_MOST = 4
 
 CSS = (textbook.CSS +
        "p.tb-c,h4.tb-c{text-indent:0;text-align:center}p.tb-r{text-indent:0;text-align:right}"
@@ -50,6 +52,13 @@ CSS = (textbook.CSS +
        "table.tb-sheet td{white-space:nowrap;max-width:26em;overflow:hidden;text-overflow:ellipsis}"
        "table{border-collapse:collapse;margin:1em auto}td,th{border:1px solid rgba(120,140,170,.45);"
        "padding:.25em .6em;vertical-align:top}td p,th p{text-indent:0;margin:.2em 0}")
+
+
+def _num(v, default=None):
+    """The number a file wrote as text, or `default`: plain digits only. (str.isdigit() also
+    says yes to a superscript two, which int() then refuses.)"""
+    v = v or ""
+    return int(v) if v.isascii() and v.isdigit() and len(v) < 12 else default
 
 
 class NotReadable(Exception):
@@ -89,6 +98,8 @@ class Book:
                         return None
                     data = zf.read(src[2])
             else:
+                if src[3] > 40 * 1024 * 1024:
+                    return None
                 with open(src[1], "rb") as f:
                     f.seek(src[2])
                     data = f.read(src[3])
@@ -121,20 +132,28 @@ _KEEP = {"p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "b", "i", "em", "s
 _SAME = {"strike": "s", "del": "s", "tt": "code", "font": "span", "center": "div", "a": "span", "section": "div",
          "article": "div", "figure": "div", "figcaption": "p", "caption": "p", "ins": "span", "q": "span"}
 _VOID = {"br", "hr", "img"}
-_DROP_WITH_TEXT = {"script", "style", "head", "title", "iframe", "object", "embed", "svg", "math", "form", "guide",
-                   "select", "textarea", "noscript", "template", "audio", "video", "canvas", "applet", "frameset"}
+_DROP_WITH_TEXT = {"script", "style", "head", "title", "iframe", "object", "svg", "math", "guide",
+                   "select", "textarea", "noscript", "template", "audio", "video", "canvas", "applet"}
+# (not <form>: old pages wrap everything in one, and without its fields it is only text.
+#  not <embed>, <frameset>: they have no end, so nothing after them would ever be shown)
+_DEPTH_MOST = 400
 
 
 class _Cleaner(HTMLParser):
     def __init__(self, picture):
         super().__init__(convert_charrefs=True)
-        self.out, self.open, self.drop, self.picture = [], [], 0, picture
+        self.out, self.open, self.picture = [], [], picture
+        self.dropping = []            # the dropped tags we are inside of, outermost first
+        self.count = {}               # how many of each tag are open (so an end tag is looked up at once)
 
     def handle_starttag(self, tag, attrs):
+        if tag == "body" and self.dropping:
+            self.dropping.clear()     # a <head> nobody closed ends where the body begins
         if tag in _DROP_WITH_TEXT:
-            self.drop += 1
+            if len(self.dropping) < 50:
+                self.dropping.append(tag)
             return
-        if self.drop:
+        if self.dropping:
             return
         was = tag
         tag = _SAME.get(tag, tag)
@@ -153,38 +172,46 @@ class _Cleaner(HTMLParser):
             extra = ' class="tb-r"'
         if tag in ("td", "th"):
             for k in ("colspan", "rowspan"):
-                if (a.get(k) or "").isdigit() and 1 < int(a[k]) <= 50:
-                    extra += f' {k}="{int(a[k])}"'
+                if 1 < _num(a.get(k), 0) <= 50:
+                    extra += f' {k}="{_num(a.get(k))}"'
+        if tag in _VOID:
+            self.out.append(f"<{tag}{extra}>")
+            return
+        if len(self.open) >= _DEPTH_MOST:
+            return                    # nested deeper than any book: the text is kept, the tag is not
         self.out.append(f"<{tag}{extra}>")
-        if tag not in _VOID:
-            self.open.append(tag)
+        self.open.append(tag)
+        self.count[tag] = self.count.get(tag, 0) + 1
 
     def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
         if tag in _DROP_WITH_TEXT:
-            self.drop -= 1
-        elif not self.drop:
-            t = _SAME.get(tag, tag)
-            if t in _KEEP and t not in _VOID and self.open and self.open[-1] == t:
-                self.open.pop()
-                self.out.append(f"</{t}>")
+            return                    # <script/>: nothing inside it, nothing to wait for
+        self.handle_starttag(tag, attrs)
+        t = _SAME.get(tag, tag)
+        if not self.dropping and t in _KEEP and t not in _VOID and self.open and self.open[-1] == t:
+            self.open.pop()
+            self.count[t] -= 1
+            self.out.append(f"</{t}>")
 
     def handle_endtag(self, tag):
         if tag in _DROP_WITH_TEXT:
-            self.drop = max(0, self.drop - 1)
+            if tag in self.dropping:
+                while self.dropping and self.dropping.pop() != tag:
+                    pass
             return
-        if self.drop:
+        if self.dropping:
             return
         tag = _SAME.get(tag, tag)
-        if tag in self.open:
+        if self.count.get(tag):
             while self.open:
                 t = self.open.pop()
+                self.count[t] -= 1
                 self.out.append(f"</{t}>")
                 if t == tag:
                     break
 
     def handle_data(self, data):
-        if not self.drop:
+        if not self.dropping:
             self.out.append(html.escape(data, quote=False))
 
 
@@ -263,7 +290,7 @@ def _latin(blocks: list) -> bool:
 def _xml(data: bytes):
     if len(data) > XML_MOST:
         raise NotReadable("this document is too large to open here")
-    if b"<!ENTITY" in data[:20000] or b"<!entity" in data[:20000]:
+    if any(mark in data for mark in (b"<!ENTITY", b"<!entity", "<!ENTITY".encode("utf-16-le"), "<!ENTITY".encode("utf-16-be"))):
         raise NotReadable("this document declares entities of its own and is not opened")
     try:
         return ET.fromstring(data)
@@ -529,8 +556,8 @@ def _docx(path: str) -> Book:
             st = pr.find(_W + "pStyle")
             lv = heading.get(st.get(_W + "val") if st is not None else "", 0)
             ol = pr.find(_W + "outlineLvl")
-            if not lv and ol is not None and (ol.get(_W + "val") or "").isdigit() and int(ol.get(_W + "val")) < 6:
-                lv = int(ol.get(_W + "val")) + 1
+            if not lv and ol is not None and 0 <= _num(ol.get(_W + "val"), 9) < 6:
+                lv = _num(ol.get(_W + "val")) + 1
             jc = pr.find(_W + "jc")
             jc = (jc.get(_W + "val") if jc is not None else "") or ""
             cls = "tb-c" if jc == "center" else "tb-r" if jc in ("right", "end") else ""
@@ -634,7 +661,7 @@ def _odt(path: str) -> Book:
                 out.append("".join(f"<{t}>" for t in tags) + inline(ch) + "".join(f"</{t}>" for t in reversed(tags)))
             elif tag == _T + "s":
                 c = ch.get(_T + "c") or "1"
-                out.append("\u00a0" * min(int(c) if c.isdigit() else 1, 40))
+                out.append("\u00a0" * min(_num(c, 1), 40))
             elif tag == _T + "tab":
                 out.append("\u2003")
             elif tag == _T + "line-break":
@@ -671,7 +698,7 @@ def _odt(path: str) -> Book:
             tag = ch.tag
             if tag == _T + "h":
                 lv = ch.get(_T + "outline-level") or "1"
-                lv = min(int(lv), 6) if lv.isdigit() else 1
+                lv = max(1, min(_num(lv, 1), 6))
                 inner = inline(ch)
                 if _plain(inner).strip():
                     blocks.append((lv, f'<h{min(lv + 1, 5)} class="tb-h">{inner}</h{min(lv + 1, 5)}>', _plain(inner).strip()))
@@ -741,18 +768,27 @@ def rtf_paragraphs(data: bytes) -> list:
         if text:
             paras.extend(x.strip() for x in text.split("\n") if x.strip())
 
-    for m in _RTF_TOKEN.finditer(data):
+    pos, end = 0, len(data)
+    while pos < end:
+        m = _RTF_TOKEN.match(data, pos)
+        if not m:
+            pos += 1
+            continue
+        pos = m.end()
         word, num, hx, sym, brace, text = m.groups()
+        if word == b"bin" and num:
+            pos = min(end, pos + max(0, int(num[:10])))     # that many bytes follow as they are: not RTF
+            continue
         if brace == b"{":
             flush()
             stack.append((skip, uc))
-            star = False
+            star, to_skip = False, 0
             continue
         if brace == b"}":
             flush()
             if stack:
                 skip, uc = stack.pop()
-            star = False
+            star, to_skip = False, 0
             continue
         if sym is not None:
             if sym == b"*":
@@ -792,9 +828,11 @@ def rtf_paragraphs(data: bytes) -> list:
                 continue
             elif w == "u" and num:
                 flush()
-                n = int(num)
+                n = int(num[:8])
                 n = n + 65536 if n < 0 else n
-                if 0xd800 <= n <= 0xdbff:
+                if n < 0:
+                    pass                        # no such character
+                elif 0xd800 <= n <= 0xdbff:
                     cur.append(chr(n))          # the first half of a pair: joined below
                 elif 0xdc00 <= n <= 0xdfff and cur and len(cur[-1]) == 1 and 0xd800 <= ord(cur[-1]) <= 0xdbff:
                     hi = ord(cur.pop())
@@ -898,6 +936,8 @@ def _mobi(path: str) -> Book:
             raise NotReadable("this book is damaged (its list of parts is out of order)")
 
         def rec(i: int) -> bytes:
+            if offs[i + 1] - offs[i] > 16 * 1024 * 1024:
+                raise NotReadable("this book is damaged (a part of it is far too large)")
             f.seek(offs[i])
             return f.read(offs[i + 1] - offs[i])
 
@@ -915,8 +955,15 @@ def _mobi(path: str) -> Book:
         kf8, fdst, flow_end = False, None, None
         if head[60:68] == b"BOOKMOBI" and r0[16:20] == b"MOBI" and len(r0) >= 0x74:
             mlen = struct.unpack(">L", r0[20:24])[0]
-            if struct.unpack(">L", r0[28:32])[0] == 65001:
+            page = struct.unpack(">L", r0[28:32])[0]
+            if page == 65001:
                 codec = "utf-8"
+            elif page != 1252:
+                try:
+                    codecs.lookup(f"cp{page}")
+                    codec = f"cp{page}"
+                except LookupError:
+                    pass
             version = struct.unpack(">L", r0[0x68:0x6c])[0]
             first_img = struct.unpack(">L", r0[0x6c:0x70])[0]
             name_off, name_len = struct.unpack(">LL", r0[0x54:0x5c])
@@ -1011,8 +1058,8 @@ def _mobi(path: str) -> Book:
 
     def picture(a):
         v = a.get("recindex") or ""
-        if v.isdigit() and f"i{int(v)}" in assets:
-            return f"../asset/i{int(v)}"
+        if _num(v) is not None and f"i{_num(v)}" in assets:
+            return f"../asset/i{_num(v)}"
         m = re.match(r"kindle:embed:([0-9A-Va-v]{1,6})", a.get("src") or "")       # KF8: the number in base 32
         if m and f"i{int(m.group(1), 32)}" in assets:
             return f"../asset/i{int(m.group(1), 32)}"
@@ -1044,21 +1091,12 @@ def _mobi(path: str) -> Book:
 
 
 # ── a saved page ──────────────────────────────────────────────────────────────────────
-_HTML_CUT = re.compile(r"(?=<h[1-6]>)|(?<=</h[1-6]>)|(?<=</p>)|(?<=</table>)|(?<=</blockquote>)|(?<=</pre>)"
+_HTML_CUT = re.compile(r"(?=<h[1-6][ >])|(?<=</h[1-6]>)|(?<=</p>)|(?<=</table>)|(?<=</blockquote>)|(?<=</pre>)"
                        r"|(?<=</ul>)|(?<=</ol>)")
 
 
 def _html(data: bytes) -> Book:
-    m = re.search(rb"<meta[^>]+charset\s*=\s*[\"']?\s*([A-Za-z0-9_\-]+)", data[:4096], re.I)
-    text = None
-    if m and data[:3] != b"\xef\xbb\xbf" and data[:2] not in (b"\xff\xfe", b"\xfe\xff"):
-        try:
-            name = m.group(1).decode("ascii").lower()
-            text = data.decode("gb18030" if name in ("gb2312", "gbk") else name)
-        except (LookupError, UnicodeDecodeError):
-            text = None
-    if text is None:
-        text = textbook.decode(data)[0]
+    text = _decode_page(data)
     t = re.search(r"<title[^>]*>(.*?)</title>", text[:20000], re.I | re.S)
     title = re.sub(r"\s+", " ", html.unescape(t.group(1))).strip()[:200] if t else None
     body = clean(text)
@@ -1067,7 +1105,7 @@ def _html(data: bytes) -> Book:
     for piece in _HTML_CUT.split(body):
         if not piece or not piece.strip():
             continue
-        h = re.match(r"\s*<h([1-6])>", piece)
+        h = re.match(r"\s*<h([1-6])[ >]", piece)
         plain = _plain(piece).strip()
         if not plain and "<img" not in piece:
             continue
@@ -1082,14 +1120,24 @@ _CHM_PAGE = re.compile(r"\.(html?|xhtml)$", re.I)
 _CHM_PICTURE = re.compile(r"\.(jpe?g|png|gif|bmp|webp)$", re.I)
 
 
+_PAGE_CODECS = {"utf-8": "utf-8", "utf8": "utf-8", "gb2312": "gb18030", "gbk": "gb18030", "gb18030": "gb18030", "big5": "big5",
+                "big5-hkscs": "big5hkscs", "shift_jis": "shift_jis", "shift-jis": "shift_jis", "sjis": "shift_jis", "x-sjis": "shift_jis",
+                "euc-jp": "euc_jp", "euc-kr": "euc_kr", "ks_c_5601-1987": "cp949", "koi8-r": "koi8_r", "koi8-u": "koi8_u",
+                "iso-8859-1": "cp1252", "latin1": "cp1252", "us-ascii": "cp1252", "ascii": "cp1252"}
+_PAGE_CODECS.update({f"windows-{n}": f"cp{n}" for n in range(1250, 1259)})
+_PAGE_CODECS.update({f"iso-8859-{n}": f"iso8859_{n}" for n in (2, 5, 7, 9, 15)})
+
+
 def _decode_page(data: bytes) -> str:
-    m = re.search(rb"<meta[^>]+charset\s*=\s*[\"']?\s*([A-Za-z0-9_\-]+)", data[:4096], re.I)
+    """A page as text: by the characters it declares, when that is a name we know and the
+    page reads as such; otherwise worked out from the bytes."""
+    m = re.search(rb"<meta[^>]{0,200}charset\s*=\s*[\"']?\s*([A-Za-z0-9_\-]{2,24})", data[:4096], re.I)
     if m and data[:3] != b"\xef\xbb\xbf" and data[:2] not in (b"\xff\xfe", b"\xfe\xff"):
-        try:
-            name = m.group(1).decode("ascii").lower()
-            return data.decode("gb18030" if name in ("gb2312", "gbk") else name)
-        except (LookupError, UnicodeDecodeError):
-            pass
+        codec = _PAGE_CODECS.get(m.group(1).decode("ascii").lower())
+        if codec:
+            text = data.decode(codec, "replace")
+            if text.count("\ufffd") * 200 <= len(text):
+                return text
     return textbook.decode(data)[0]
 
 
@@ -1098,7 +1146,7 @@ def _page_blocks(body: str) -> list:
     for piece in _HTML_CUT.split(body):
         if not piece or not piece.strip():
             continue
-        h = re.match(r"\s*<h([1-6])>", piece)
+        h = re.match(r"\s*<h([1-6])[ >]", piece)
         plain = _plain(piece).strip()
         if plain or "<img" in piece:
             blocks.append((int(h.group(1)) if h else 0, piece, re.sub(r"\s+", " ", plain)))
@@ -1117,7 +1165,7 @@ def _chm(path: str) -> Book:
         listing = unpack.seven_list(path)
     except (OSError, ValueError) as e:
         raise NotReadable(f"this .chm could not be opened ({e})")
-    if sum(sz for _, sz in listing) > _CHM_MOST:
+    if len(listing) >= unpack.LIST_MOST or sum(sz for _, sz in listing) > _CHM_MOST:
         raise NotReadable("this .chm is too large to open here")
     members = {n.lstrip("/").lower(): n.lstrip("/") for n, _ in listing}
     tmp = tempfile.mkdtemp(prefix="chm-")
@@ -1145,13 +1193,13 @@ def _chm(path: str) -> Book:
         for rel in sorted(on_disk):
             if rel.endswith(".hhc"):
                 toc = _decode_page(read(rel) or b"")
-                for obj in re.finditer(r"<object\b[^>]*>(.*?)</object>", toc, re.I | re.S):
+                for obj in re.finditer(r"<object\b[^>]{0,300}>(.{0,4000}?)</object>", toc[:8 * 1024 * 1024], re.I | re.S):
                     name = re.search(r"<param\s+name=[\"']?Name[\"']?\s+value=\"([^\"]*)\"", obj.group(1), re.I)
                     local = re.search(r"<param\s+name=[\"']?Local[\"']?\s+value=\"([^\"]*)\"", obj.group(1), re.I)
                     if not local:
                         continue
-                    target = os.path.normpath(os.path.join(os.path.dirname(rel), html.unescape(local.group(1)).split("#")[0])
-                                              ).replace("\\", "/").lstrip("/").lower()
+                    target = os.path.normpath(os.path.join(os.path.dirname(rel), urllib.parse.unquote(
+                        html.unescape(local.group(1)).replace("\\", "/")).split("#")[0])).replace("\\", "/").lstrip("/").lower()
                     if target in on_disk and target not in seen and _CHM_PAGE.search(target):
                         seen.add(target)
                         order.append((target, html.unescape(name.group(1)).strip()[:120] if name else ""))
@@ -1176,7 +1224,8 @@ def _chm(path: str) -> Book:
                 src = (a.get("src") or "").split("?")[0].split("#")[0]
                 if not src or re.match(r"[a-z][a-z0-9+.\-]*:", src, re.I):
                     return None
-                target = os.path.normpath(os.path.join(os.path.dirname(rel), src.replace("\\", "/"))).replace("\\", "/").lstrip("/").lower()
+                src = urllib.parse.unquote(src).replace("\\", "/")
+                target = os.path.normpath(os.path.join(os.path.dirname(rel), src)).replace("\\", "/").lstrip("/").lower()
                 if target not in members or not _CHM_PICTURE.search(target):
                     return None
                 if target not in numbers:
@@ -1341,6 +1390,8 @@ def _sheet_number(v: str, is_date: bool, epoch_1904: bool) -> str:
         x = float(v)
     except ValueError:
         return v
+    if x != x or x in (float("inf"), float("-inf")):
+        return v
     if is_date and 0 <= x < 2958466:
         import datetime
         base = datetime.datetime(1904, 1, 1) if epoch_1904 else datetime.datetime(1899, 12, 30)
@@ -1386,7 +1437,7 @@ def _xlsx(path: str) -> Book:
             xfs = st.find(_S + "cellXfs")
             for xf in (xfs if xfs is not None else []):
                 fid = xf.get("numFmtId") or "0"
-                dates.append(custom.get(fid, fid.isdigit() and int(fid) in _DATE_FORMATS))
+                dates.append(custom.get(fid, _num(fid, -1) in _DATE_FORMATS))
         sheets = []
         for sh in wb.iter(_S + "sheet"):
             got = rels.get(sh.get(_R_ID + "id"))
@@ -1416,7 +1467,7 @@ def _xlsx(path: str) -> Book:
                     v = c.find(_S + "v")
                     raw = (v.text if v is not None else "") or ""
                     if kind == "s":
-                        text = shared[int(raw)] if raw.isdigit() and int(raw) < len(shared) else ""
+                        text = shared[_num(raw)] if 0 <= _num(raw, -1) < len(shared) else ""
                     elif kind == "inlineStr":
                         text = "".join(t.text or "" for t in c.iter(_S + "t"))
                     elif kind == "b":
@@ -1425,7 +1476,7 @@ def _xlsx(path: str) -> Book:
                         text = raw
                     else:
                         style = c.get("s") or ""
-                        text = _sheet_number(raw, style.isdigit() and int(style) < len(dates) and dates[int(style)], epoch_1904)
+                        text = _sheet_number(raw, 0 <= _num(style, -1) < len(dates) and dates[_num(style)], epoch_1904)
                     if text.strip():
                         cells[col] = text.strip()[:500]
                 if cells:
@@ -1486,19 +1537,48 @@ def build(path: str, kind: str) -> Book:
     raise NotReadable("not a kind of book read here")
 
 
+COVER_KINDS = ("fb2", "mobi", "azw", "azw3", "prc")     # the kinds of book that can bring a cover
+_lock = threading.Lock()
+_building: dict = {}                # path -> a lock held while that book is being made
+_refused: dict = {}                 # path -> (mtime, why): a book that cannot be opened is not tried on every request
+
+
 def load(path: str, kind: str) -> Book:
-    """The book of a file, kept for the next chapter asked for. Raises NotReadable."""
+    """The book of a file, kept for the next chapter asked for. Raises NotReadable.
+    Safe to call from several threads: one of them builds, the others wait for it."""
     mtime = os.path.getmtime(path)
-    hit = _CACHE.get(path)
-    if hit and hit[0] == mtime:
-        return hit[1]
-    try:
-        book = build(path, kind)
-    except NotReadable:
-        raise
-    except (struct.error, IndexError, ValueError, KeyError, zipfile.BadZipFile, RecursionError, MemoryError) as e:
-        raise NotReadable(f"this book is damaged ({type(e).__name__})")
-    while len(_CACHE) >= _CACHE_MOST:
-        _CACHE.pop(next(iter(_CACHE)))
-    _CACHE[path] = (mtime, book)
+    with _lock:
+        hit = _CACHE.get(path)
+        if hit and hit[0] == mtime:
+            _CACHE[path] = _CACHE.pop(path)           # the one read last is kept longest
+            return hit[1]
+        no = _refused.get(path)
+        if no and no[0] == mtime:
+            raise NotReadable(no[1])
+        one = _building.setdefault(path, threading.Lock())
+    with one:
+        with _lock:
+            hit = _CACHE.get(path)
+            if hit and hit[0] == mtime:
+                return hit[1]
+        try:
+            book = build(path, kind)
+        except NotReadable as e:
+            why = str(e)
+            book = None
+        except Exception as e:                        # a damaged file in a way nobody thought of
+            why = f"this book is damaged ({type(e).__name__})"
+            book = None
+        with _lock:
+            _building.pop(path, None)
+            if book is None:
+                if len(_refused) > 500:
+                    _refused.clear()
+                _refused[path] = (mtime, why)
+            else:
+                while len(_CACHE) >= _CACHE_MOST:
+                    _CACHE.pop(next(iter(_CACHE)))
+                _CACHE[path] = (mtime, book)
+    if book is None:
+        raise NotReadable(why)
     return book
