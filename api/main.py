@@ -3559,8 +3559,10 @@ def _epub_chapter_body(zf, msg_id: int, chapter_path: str) -> str:
 
 _EPUB_CHAPTER_CSS = (
     "html,body{margin:0;padding:0}"
-    "body{font-family:'PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Hiragino Sans GB',"
-    "Georgia,system-ui,sans-serif;line-height:1.9;word-break:break-word}"
+    # Latin letters first, from a Latin face: with a Chinese face first, an English book is set in
+    # it and every ’ and “ comes out a full square wide ("there’ s"). Chinese falls through to its own.
+    "body{font-family:-apple-system,'Segoe UI','Helvetica Neue',Roboto,'PingFang SC','Microsoft YaHei',"
+    "'Noto Sans CJK SC','Hiragino Sans GB',system-ui,sans-serif;line-height:1.9;word-break:break-word}"
     "h1,h2,h3,h4{font-weight:600;margin:1.2em 0 .6em;line-height:1.4}"
     "h1{font-size:1.5em}h2{font-size:1.3em}h3{font-size:1.12em}"
     "p{margin:.9em 0;text-indent:2em}"
