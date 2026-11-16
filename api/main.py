@@ -7736,8 +7736,15 @@ def _fmt_count(n) -> str:
     return str(n)
 
 
+_N_THINGS = {"films": "{n} films", "videos": "{n} videos", "songs": "{n} songs", "files": "{n} files",
+             "photos": "{n} photos", "books": "{n} books"}
+
+
 def _n_things(n, word: str) -> str:
-    """ "1 film", "3.1K films" """
+    """ "1 film", "3.1K films" - in the language of the request (the other languages have a
+    wording that reads right for any number) """
+    if _LANG.get() != "en" and word in _N_THINGS:
+        return _t(_N_THINGS[word], n=_fmt_count(n))
     return f"{_fmt_count(n)} {word[:-1] if n == 1 and word.endswith('s') else word}"
 
 
@@ -7827,14 +7834,17 @@ def _ls_head(cols, sort: str, order: str, href) -> str:
     newest first for numbers and dates, A-Z for names)."""
     out = ['<div class="ls-head"><span style="width:40px;flex:none"></span>']
     for key, label, css, first in cols:
+        plain = i18n.t(_LANG.get(), label) if label else ""        # the label is the English: a key of the catalogue
+        label = html.escape(plain)
         if not key:
             out.append(f'<span class="{css}">{label}</span>')
             continue
         on = key == sort
         nxt = ("asc" if order == "desc" else "desc") if on else first
         arrow = ("▲" if order == "asc" else "▼") if on else ""
+        tip = _t("sort by {label} (click again to reverse)", label=plain) if on else _t("sort by {label}", label=plain)
         out.append(f'<a class="{css}{" on" if on else ""}" href="{href(key, nxt)}" '
-                   f'title="sort by {label}{" (click again to reverse)" if on else ""}">'
+                   f'title="{tip}">'
                    f'{label}<i>{arrow}</i></a>')
     return "".join(out) + "</div>"
 
@@ -9278,39 +9288,39 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
         return "?" + "&".join(bits) if bits else ""
 
+    _tip = html.unescape              # _chip_link escapes its tooltip itself: hand it the plain word
+
     def _n(k):
         return f' <span style="opacity:.6">{counts[k]:,}</span>'
     chips = (
-        _chip_link("all" + _n("all"), "/channels" + _cqs(show=None, offset=None), show == "all")
-        + _chip_link("🎬 with films" + _n("films"), "/channels" + _cqs(show="films", offset=None),
-                     show == "films", "channels that carry recognised films or episodes")
-        + _chip_link("joined" + _n("joined"), "/channels" + _cqs(show="joined", offset=None),
-                     show == "joined", "channels your Telegram account is a member of")
-        + _chip_link("followed" + _n("subscribed"), "/channels" + _cqs(show="subscribed", offset=None),
-                     show == "subscribed", "public channels tgarr reads without joining")
-        + _chip_link("shared" + _n("shared"), "/channels" + _cqs(show="shared", offset=None),
+        _chip_link(_t("all") + _n("all"), "/channels" + _cqs(show=None, offset=None), show == "all")
+        + _chip_link("🎬 " + _t("with films") + _n("films"), "/channels" + _cqs(show="films", offset=None),
+                     show == "films", _tip(_t("channels that carry recognised films or episodes")))
+        + _chip_link(_t("joined") + _n("joined"), "/channels" + _cqs(show="joined", offset=None),
+                     show == "joined", _tip(_t("channels your Telegram account is a member of")))
+        + _chip_link(_t("followed") + _n("subscribed"), "/channels" + _cqs(show="subscribed", offset=None),
+                     show == "subscribed", _tip(_t("public channels tgarr reads without joining")))
+        + _chip_link(_t("shared") + _n("shared"), "/channels" + _cqs(show="shared", offset=None),
                      show == "shared",
-                     f"{CONTRIB_MIN_MEMBERS}+ members and {CONTRIB_MIN_MEDIA}+ files: listed on tgarr.me "
-                     "for other people to find. Private chats and small groups never are.")
-        + (_chip_link("not followed" + _n("loose"), "/channels" + _cqs(show="loose", offset=None),
+                     _tip(_t("{members}+ members and {files}+ files: listed on tgarr.me for other people to find. Private chats and small groups never are.", members=CONTRIB_MIN_MEMBERS, files=CONTRIB_MIN_MEDIA)))
+        + (_chip_link(_t("not followed") + _n("loose"), "/channels" + _cqs(show="loose", offset=None),
                       show == "loose",
-                      "channels this install knows but no longer reads"
-                      + (": their files are being cleared from this index" if purge_on else ""))
+                      _tip(_t("channels this install knows but no longer reads: their files are being cleared from this index")
+                           if purge_on else _t("channels this install knows but no longer reads")))
            if counts["loose"] else "")
-        + _chip_link("no files" + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
-        + (_chip_link("gone" + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
-                      show == "dead", "channels Telegram no longer serves") if counts["dead"] else "")
-        + (_chip_link("being cleared" + _n("clearing"), "/channels" + _cqs(show="clearing", offset=None),
+        + _chip_link(_t("no files") + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
+        + (_chip_link(_t("gone") + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
+                      show == "dead", _tip(_t("channels Telegram no longer serves"))) if counts["dead"] else "")
+        + (_chip_link(_t("being cleared") + _n("clearing"), "/channels" + _cqs(show="clearing", offset=None),
                       show == "clearing",
-                      "channels you unfollowed: their index is being cleared and they then disappear. "
-                      "Follow one again here to keep it.") if counts["clearing"] else "")
+                      _tip(_t("channels you unfollowed: their index is being cleared and they then disappear. Follow one again here to keep it."))) if counts["clearing"] else "")
         # on a phone there is no room for the column header: the same sorts as chips
-        + '<span class="sort-chips"><span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("films", "/channels" + _cqs(sort=None, order=None, offset=None), sort == "films")
-        + _chip_link("files", "/channels" + _cqs(sort="media", order=None, offset=None), sort == "media")
-        + _chip_link("members", "/channels" + _cqs(sort="members", order=None, offset=None), sort == "members")
-        + _chip_link("latest post", "/channels" + _cqs(sort="recent", order=None, offset=None), sort == "recent")
-        + _chip_link("name", "/channels" + _cqs(sort="name", order=None, offset=None), sort == "name")
+        + '<span class="sort-chips"><span class="sep"></span><span class="lbl">' + _t("Sort:") + '</span>'
+        + _chip_link(_t("films"), "/channels" + _cqs(sort=None, order=None, offset=None), sort == "films")
+        + _chip_link(_t("files"), "/channels" + _cqs(sort="media", order=None, offset=None), sort == "media")
+        + _chip_link(_t("members"), "/channels" + _cqs(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link(_t("latest post"), "/channels" + _cqs(sort="recent", order=None, offset=None), sort == "recent")
+        + _chip_link(_t("name"), "/channels" + _cqs(sort="name", order=None, offset=None), sort == "name")
         + '</span>')
     head = _ls_head(
         (("name", "Channel", "ls-main", "asc"), ("films", "Films", "ls-num", "desc"),
@@ -9326,54 +9336,45 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                                ("sort", sort if sort != "films" else None),
                                ("order", order if order != first_dir.get(sort, "desc") else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-          'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
-          '<button class="btn" type="submit">Search</button>'
-        + (f'<a class="btn ghost" href="/channels{_cqs(q=None, offset=None)}">clear</a>' if q else '')
+          f'placeholder="{_t("find a channel by name or @username…")}" style="flex:1;max-width:420px"/>'
+          f'<button class="btn" type="submit">{_t("Search")}</button>'
+        + (f'<a class="btn ghost" href="/channels{_cqs(q=None, offset=None)}">{_t("clear")}</a>' if q else '')
         + '</form>')
 
     def _row(r):
-        title = r["title"] or (("@" + r["username"]) if r["username"] else "(untitled)")
+        title = r["title"] or (("@" + r["username"]) if r["username"] else html.unescape(_t("(untitled)")))
         handle = (f'<a href="https://t.me/{html.escape(r["username"])}" target="_blank" rel="noopener" '
-                  f'title="open in Telegram">@{html.escape(r["username"])}</a>'
-                  if r["username"] else '<span>private chat</span>')
+                  f'title="{_t("open in Telegram")}">@{html.escape(r["username"])}</a>'
+                  if r["username"] else f'<span>{_t("private chat")}</span>')
         tags = []
         if r["dead_at"]:
-            tags.append('<span class="tag bad" title="Telegram no longer serves this channel">gone</span>')
+            tags.append(f'<span class="tag bad" title="{_t("Telegram no longer serves this channel")}">{_t("gone")}</span>')
         elif r["is_joined"]:
-            tags.append('<span class="tag ok" title="your account is a member">joined</span>')
+            tags.append(f'<span class="tag ok" title="{_t("your account is a member")}">{_t("joined")}</span>')
         elif r["subscribed"] and not r["handle_known"]:
-            tags.append('<span class="tag acc" title="read from tgarr.me and Telegram\'s public web page; '
-                        'your account is not used until you open one of its files">'
-                        + ('followed · web' if r["web_preview"] else 'followed · listed') + '</span>')
+            tags.append(f'<span class="tag acc" title="{_t("read from tgarr.me and Telegram’s public web page; your account is not used until you open one of its files")}">'
+                        + (_t("followed · web") if r["web_preview"] else _t("followed · listed")) + '</span>')
         elif r["subscribed"]:
-            tags.append('<span class="tag acc" title="read without joining">followed</span>')
+            tags.append(f'<span class="tag acc" title="{_t("read without joining")}">{_t("followed")}</span>')
         elif r["unfollowed_at"]:
-            tags.append('<span class="tag warn" title="you unfollowed it: its films and files are being '
-                        'cleared from this index and it will leave this list. Follow it again to keep it.">'
-                        'unfollowed · being cleared</span>')
+            tags.append(f'<span class="tag warn" title="{_t("you unfollowed it: its films and files are being cleared from this index and it will leave this list. Follow it again to keep it.")}">{_t("unfollowed · being cleared")}</span>')
         elif r["purged_at"] and not purge_on:
-            tags.append('<span class="tag" title="unfollowed and cleared; only files you saved or marked '
-                        'as favourite are still here">not followed · cleared</span>')
+            tags.append(f'<span class="tag" title="{_t("unfollowed and cleared; only files you saved or marked as favourite are still here")}">{_t("not followed · cleared")}</span>')
         elif purge_on and r["purged_at"]:
-            tags.append('<span class="tag" title="not followed any more; its files have been cleared '
-                        'from this index. tgarr.me still lists it: follow it again to get them back.">'
-                        'not followed · cleared</span>')
+            tags.append(f'<span class="tag" title="{_t("not followed any more; its files have been cleared from this index. tgarr.me still lists it: follow it again to get them back.")}">{_t("not followed · cleared")}</span>')
         elif purge_on:
-            tags.append('<span class="tag warn" title="not followed any more: its films and files are '
-                        'being cleared from this index (tgarr.me keeps the record). Follow it again '
-                        'to keep them.">not followed · being cleared</span>')
+            tags.append(f'<span class="tag warn" title="{_t("not followed any more: its films and files are being cleared from this index (tgarr.me keeps the record). Follow it again to keep them.")}">{_t("not followed · being cleared")}</span>')
         else:
-            tags.append('<span class="tag" title="not read any more; what was indexed stays">'
-                        'not followed</span>')
+            tags.append(f'<span class="tag" title="{_t("not read any more; what was indexed stays")}">{_t("not followed")}</span>')
         if _shared(r):
-            tags.append('<span class="tag" title="listed on tgarr.me">shared</span>')
+            tags.append(f'<span class="tag" title="{_t("listed on tgarr.me")}">{_t("shared")}</span>')
         if (r["audience"] or "sfw") == "nsfw":
             tags.append('<span class="tag warn">18+</span>')
         if not r["backfilled"] and not r["dead_at"]:
-            tags.append('<span class="tag warn" title="still reading its history">reading…</span>')
+            tags.append(f'<span class="tag warn" title="{_t("still reading its history")}">{_t("reading…")}</span>')
         if r["subscribe_error"] and not r["dead_at"]:
             tags.append(f'<span class="tag bad" title="{html.escape(r["subscribe_error"], quote=True)}">'
-                        'cannot read</span>')
+                        f'{_t("cannot read")}</span>')
         has = []
         for n, ico, word, href in (
                 (r["films"], "🎬", "films", None),
@@ -9390,19 +9391,19 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                 f'data-uname="{html.escape(r["username"] or "", quote=True)}"')
         if r["subscribed"] and not r["is_joined"]:
             act = (f'<button class="abtn" {_ids} onclick="tgUnfollow(this)" '
-                   f'title="stop reading this channel">Unfollow</button>')
+                   f'title="{_t("stop reading this channel")}">{_t("Unfollow")}</button>')
         elif not r["is_joined"] and not r["dead_at"] and r["username"]:
             act = (f'<button class="abtn pri" {_ids} onclick="tgFollow(this)" '
-                   f'title="read this public channel again, without joining it">+ Follow</button>')
+                   f'title="{_t("read this public channel again, without joining it")}">+ {_t("Follow")}</button>')
             if not r["unfollowed_at"]:
                 # not followed, not joined, and nobody ever unfollowed it: it can be taken off the list
                 act += (f' <button class="abtn" {_ids} onclick="tgRemove(this)" '
-                        f'title="take this channel and its index off this tgarr">Remove</button>')
+                        f'title="{_t("take this channel and its index off this tgarr")}">{_t("Remove")}</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
             f'{" ".join(tags)}</div>'
-            f'<div class="ls-sub">{handle}{"".join(has) or "<span>no files indexed</span>"}</div></div>'
+            f'<div class="ls-sub">{handle}{"".join(has) or "<span>" + _t("no files indexed") + "</span>"}</div></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["films"]) if r["films"] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["media"]) if r["media"] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
@@ -9412,26 +9413,25 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
 
     if not page:
         listing = ('<div class="empty-state"><div class="icon">📡</div><div>'
-                   + ("No channel matches." if (q or show != "all") else
-                      "No channels yet. Join channels in Telegram, or follow some from Discover.")
+                   + (_t("No channel matches.") if (q or show != "all") else
+                      _t("No channels yet. Join channels in Telegram, or follow some from Discover."))
                    + '</div></div>')
     else:
         listing = (f'<div class="ls">{head}{"".join(_row(r) for r in page)}</div>'
                    + _page_nav("/channels", _cqs, page_offset, page_size, len(page), len(view)))
     body = (
         f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
-        f'<h2 class="section">Channels <span class="count">{len(view):,}'
-        + (f' of {len(rows):,}' if len(view) != len(rows) else '') + '</span>'
+        f'<h2 class="section">{_t("Channels")} <span class="count">'
+        + (_t("{n} of {total}", n=f"{len(view):,}", total=f"{len(rows):,}") if len(view) != len(rows) else f'{len(view):,}') + '</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
-        'letter-spacing:0;margin-left:10px"><a href="/discover">find more on Discover →</a></span></h2>'
+        'letter-spacing:0;margin-left:10px"><a href="/discover">' + _t("find more on Discover →") + '</a></span></h2>'
         f'{search}<div class="bar-tools">{chips}</div>{listing}'
         # The button changes where it is. Reloading the page for one click
         # threw the reader back to the top of a long list every time.
         '<script>var tgUnfollowAsk=' + _js_str(
-            "Stop reading this channel and take it off this list?\n\n"
-            "Its films and files are cleared from this index within a few hours. Files you saved to "
-            "this machine and your favourites are kept. You can find the channel again on Discover.")
-        + r""";
+            html.unescape(_t("Stop reading this channel and take it off this list?")) + "\n\n"
+            + html.unescape(_t("Its films and files are cleared from this index within a few hours. Files you saved to this machine and your favourites are kept. You can find the channel again on Discover.")))
+        + _fill(r""";
 function tgChGone(b, note) {
   var row = b.closest(".ls-row");
   b.disabled = true; b.textContent = note;
@@ -9444,36 +9444,36 @@ function tgChGone(b, note) {
 }
 function tgChSet(b, following) {
   // unfollowed: it has left the list. Followed again from "being cleared": it has left that view.
-  if (!following) { tgChGone(b, "Removed"); return; }
-  if (location.search.indexOf("show=clearing") >= 0) { tgChGone(b, "Following"); return; }
+  if (!following) { tgChGone(b, "[[@js:Removed]]"); return; }
+  if (location.search.indexOf("show=clearing") >= 0) { tgChGone(b, "[[@js:Following]]"); return; }
   b.disabled = false;
   if (following) {
-    b.className = "abtn"; b.textContent = "Unfollow"; b.title = "stop reading this channel";
+    b.className = "abtn"; b.textContent = "[[@js:Unfollow]]"; b.title = "[[@js:stop reading this channel]]";
     b.onclick = function () { tgUnfollow(b); };
   } else if (b.dataset.uname) {
-    b.className = "abtn pri"; b.textContent = "+ Follow";
-    b.title = "read this public channel again, without joining it";
+    b.className = "abtn pri"; b.textContent = "+ [[@js:Follow]]";
+    b.title = "[[@js:read this public channel again, without joining it]]";
     b.onclick = function () { tgFollow(b); };
   } else { b.remove(); }
 }
 function tgChFail(b, label, why) {
-  b.disabled = false; b.textContent = "Failed - retry"; b.title = why || "the request did not go through";
-  setTimeout(function () { if (b.textContent === "Failed - retry") b.textContent = label; }, 4000);
+  b.disabled = false; b.textContent = "[[@js:Failed - retry]]"; b.title = why || "[[@js:the request did not go through]]";
+  setTimeout(function () { if (b.textContent === "[[@js:Failed - retry]]") b.textContent = label; }, 4000);
 }
 function tgUnfollow(b) {
   if (!confirm(tgUnfollowAsk)) return;
   b.disabled = true; b.textContent = "…";
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChSet(b, false); })
-    .catch(function (e) { tgChFail(b, "Unfollow", e.message); });
+    .catch(function (e) { tgChFail(b, "[[@js:Unfollow]]", e.message); });
 }
 function tgRemove(b) {
-  if (!confirm("Remove this channel from tgarr?\n\nIts films and files leave the index within a few hours. "
-               + "Files you saved and favourites stay. It can be followed again from Discover.")) return;
+  if (!confirm("[[@js:Remove this channel from tgarr?]]\n\n"
+               + "[[@js:Its films and files leave the index within a few hours. Files you saved and favourites stay. It can be followed again from Discover.]]")) return;
   b.disabled = true; b.textContent = "…";
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
-    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChGone(b, "Removed"); })
-    .catch(function (e) { tgChFail(b, "Remove", e.message); });
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChGone(b, "[[@js:Removed]]"); })
+    .catch(function (e) { tgChFail(b, "[[@js:Remove]]", e.message); });
 }
 function tgFollow(b) {
   b.disabled = true; b.textContent = "…";
@@ -9483,9 +9483,9 @@ function tgFollow(b) {
     .then(function (r) { return r.json().then(function (j) {
       if (!r.ok || j.status === "error") throw new Error(j.message || ("HTTP " + r.status));
       tgChSet(b, true); }); })
-    .catch(function (e) { tgChFail(b, "+ Follow", e.message); });
+    .catch(function (e) { tgChFail(b, "+ [[@js:Follow]]", e.message); });
 }
-</script>""")
+</script>"""))
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 
@@ -9580,26 +9580,26 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         return "?" + "&".join(bits) if bits else ""
 
     chips = (
-        _chip_link("All", "/discover" + _dq(kind=None, offset=None), not kind)
-        + _chip_link("🎬 Movies &amp; TV", "/discover" + _dq(kind="video", offset=None), kind == "video")
-        + _chip_link("📚 Books", "/discover" + _dq(kind="books", offset=None), kind == "books")
-        + _chip_link("🎵 Music", "/discover" + _dq(kind="music", offset=None), kind == "music")
+        _chip_link(_t("All"), "/discover" + _dq(kind=None, offset=None), not kind)
+        + _chip_link("🎬 " + _t("Movies & TV"), "/discover" + _dq(kind="video", offset=None), kind == "video")
+        + _chip_link("📚 " + _t("Books"), "/discover" + _dq(kind="books", offset=None), kind == "books")
+        + _chip_link("🎵 " + _t("Music"), "/discover" + _dq(kind="music", offset=None), kind == "music")
         + ('<span class="sep"></span>'
-           + _chip_link("SFW", "/discover" + _dq(audience=None, offset=None), audience == "sfw")
+           + _chip_link(_t("SFW"), "/discover" + _dq(audience=None, offset=None), audience == "sfw")
            + _chip_link("18+", "/discover" + _dq(audience="nsfw", offset=None), audience == "nsfw")
            if nsfw_on else '')
         + '<span class="sep"></span>'
-        + _chip_link("best match", "/discover" + _dq(sort=None, order=None, offset=None), sort == "best",
-                     "most of what you are looking at, then how many installs vouch for it")
-        + '<span class="sort-chips"><span class="lbl">Sort:</span>'
-        + _chip_link("most seen", "/discover" + _dq(sort="seen", order=None, offset=None), sort == "seen",
-                     "indexed by the most tgarr installs")
-        + _chip_link("members", "/discover" + _dq(sort="members", order=None, offset=None), sort == "members")
-        + _chip_link("files", "/discover" + _dq(sort="files", order=None, offset=None), sort == "files")
-        + _chip_link("latest file", "/discover" + _dq(sort="recent", order=None, offset=None), sort == "recent")
+        + _chip_link(_t("best match"), "/discover" + _dq(sort=None, order=None, offset=None), sort == "best",
+                     html.unescape(_t("most of what you are looking at, then how many installs vouch for it")))
+        + '<span class="sort-chips"><span class="lbl">' + _t("Sort:") + '</span>'
+        + _chip_link(_t("most seen"), "/discover" + _dq(sort="seen", order=None, offset=None), sort == "seen",
+                     html.unescape(_t("indexed by the most tgarr installs")))
+        + _chip_link(_t("members"), "/discover" + _dq(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link(_t("files"), "/discover" + _dq(sort="files", order=None, offset=None), sort == "files")
+        + _chip_link(_t("latest file"), "/discover" + _dq(sort="recent", order=None, offset=None), sort == "recent")
         + '</span>'
         + '<span class="sep"></span>'
-        + _chip_link(f'include the {len(have):,} I already have', "/discover" + _dq(mine=None if mine else 1, offset=None),
+        + _chip_link(_t("include the {n} I already have", n=f"{len(have):,}"), "/discover" + _dq(mine=None if mine else 1, offset=None),
                      bool(mine)))
     search = (
         '<form method="GET" action="/discover" style="display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;align-items:center">'
@@ -9609,13 +9609,13 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
                                ("order", order if order != dfirst.get(sort, "desc") else None),
                                ("mine", 1 if mine else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-          'placeholder="find a channel by name or @username…" style="flex:1;min-width:150px;max-width:420px"/>'
-          '<button class="btn" type="submit">Search</button>'
-        + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">clear</a>' if q else '')
+          f'placeholder="{_t("find a channel by name or @username…")}" style="flex:1;min-width:150px;max-width:420px"/>'
+          f'<button class="btn" type="submit">{_t("Search")}</button>'
+        + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">{_t("clear")}</a>' if q else '')
         + '<span style="flex:1"></span>'
           '<span id="tgPullToast" style="font-size:13px;color:var(--muted);display:none"></span>'
         + ('<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
-           'title="ask tgarr.me for its current list now">↻ Refresh list</button>' if _signed_in() else '')
+           f'title="{_t("ask tgarr.me for its current list now")}">↻ {_t("Refresh list")}</button>' if _signed_in() else '')
         + '</form>')
 
     _in = _signed_in()
@@ -9623,11 +9623,11 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
     def _card(r):
         u = r["username"]
         mine_ = known.get(u.lower())
-        btn = ('<button class="abtn" disabled>✓ Following</button>' if mine_ else
+        btn = (f'<button class="abtn" disabled>✓ {_t("Following")}</button>' if mine_ else
                f'<button class="abtn pri" data-uname="{html.escape(u, quote=True)}" '
                f'onclick="tgDiscoverSubscribe(this)" '
-               + ('title="tgarr reads this public channel without your account joining it">+ Follow</button>' if _in else
-                  'title="tgarr lists what this public channel holds without an account; playing a file needs one">+ Follow</button>'))
+               + (f'title="{_t("tgarr reads this public channel without your account joining it")}">+ {_t("Follow")}</button>' if _in else
+                  f'title="{_t("tgarr lists what this public channel holds without an account; playing a file needs one")}">+ {_t("Follow")}</button>'))
         title = r["title"] or ("@" + u)
         has = []
         for n, ico, word in ((r["release_files"], "🎬", "films"), (r["book_files"], "📚", "books"),
@@ -9640,31 +9640,30 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
-            + ('<span class="tag ok" title="tgarr.me checked that this channel exists and is public">✓ verified</span> '
+            + (f'<span class="tag ok" title="{_t("tgarr.me checked that this channel exists and is public")}">✓ {_t("verified")}</span> '
                if r["verified"] else '')
             + ('<span class="tag warn">18+</span>' if r["audience"] == "nsfw" else '')
             + f'</div><div class="ls-sub"><a href="https://t.me/{html.escape(u)}" target="_blank" rel="noopener" '
-            f'title="open in Telegram">@{html.escape(u)}</a>{"".join(has)}</div></div>'
+            f'title="{_t("open in Telegram")}">@{html.escape(u)}</a>{"".join(has)}</div></div>'
             f'<div class="ls-num"><b>{_fmt_count(r[lead]) if r[lead] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["media_count"]) if r["media_count"] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
-            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b></div>'
-            f'<div class="ls-num lp" title="when the newest file that tgarr installs have reported for this '
-            f'channel was posted"><b style="font-size:13px;font-weight:500">'
+            f'<div class="ls-num" title="{_t("tgarr installs that index this channel")}"><b>{seen:,}</b></div>'
+            f'<div class="ls-num lp" title="{_t("when the newest file that tgarr installs have reported for this channel was posted")}">'
+            f'<b style="font-size:13px;font-weight:500">'
             f'{_ago(r["last_file_at"]) or "–"}</b></div>'
             f'<div class="ls-act">{btn}</div></div>')
 
     if not rows and not total:
         listing = ('<div class="empty-state"><div class="icon">🔭</div>'
-                   '<div>The list from tgarr.me has not arrived yet.</div>'
-                   '<div style="margin-top:8px;font-size:13px">It is fetched every 12 hours; '
-                   '“Refresh list” asks for it now.</div></div>')
+                   f'<div>{_t("The list from tgarr.me has not arrived yet.")}</div>'
+                   f'<div style="margin-top:8px;font-size:13px">{_t("It is fetched every 12 hours; “Refresh list” asks for it now.")}</div></div>')
     elif not page:
         listing = ('<div class="empty-state"><div class="icon">🔭</div><div>'
-                   + ("No channel matches." if (q or kind) else
-                      "This part of the list has not arrived yet." if not rows else
-                      "You already follow everything on the list.") + '</div>'
-                   + ('<div style="margin-top:8px;font-size:13px">“Refresh list” asks tgarr.me for it now.</div>'
+                   + (_t("No channel matches.") if (q or kind) else
+                      _t("This part of the list has not arrived yet.") if not rows else
+                      _t("You already follow everything on the list.")) + '</div>'
+                   + (f'<div style="margin-top:8px;font-size:13px">{_t("“Refresh list” asks tgarr.me for it now.")}</div>'
                       if not rows and not (q or kind) else '') + '</div>')
     else:
         dhead = _ls_head(
@@ -9680,39 +9679,40 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
 
     body = (
         f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
-        f'<h2 class="section">Discover <span class="count">{len(view):,}</span>'
+        f'<h2 class="section">{_t("Discover")} <span class="count">{len(view):,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
-        f'letter-spacing:0;margin-left:10px">public channels other tgarr installs index · '
-        f'{total or 0:,} on tgarr.me'
-        + (f' · list from {_ago(last_pull)}' if last_pull else '') + '</span></h2>'
+        f'letter-spacing:0;margin-left:10px">{_t("public channels other tgarr installs index")} · '
+        + _t("{n} on tgarr.me", n=f"{total or 0:,}")
+        + (' · ' + _t("list from {when}", when=html.unescape(_ago(last_pull))) if last_pull else '') + '</span></h2>'
         f'{search}<div class="bar-tools">{chips}</div>{listing}'
+        + _fill(
         '<script>'
         '(() => {'
         '  window.tgRegistryPull = async function(btn) {'
         '    const toast = document.getElementById("tgPullToast");'
-        '    btn.disabled = true; btn.textContent = "Refreshing…";'
+        '    btn.disabled = true; btn.textContent = "[[@js:Refreshing…]]";'
         '    toast.style.display = "inline";'
-        '    toast.textContent = "asking tgarr.me (up to a minute)…";'
+        '    toast.textContent = "[[@js:asking tgarr.me (up to a minute)…]]";'
         '    toast.style.color = "var(--muted)";'
         '    try {'
         '      const r = await fetch("/api/registry/pull-now", {method:"POST"});'
         '      const j = await r.json();'
         '      if (j.status === "ok") {'
-        '        toast.textContent = "✓ " + j.affected + " channel(s) updated";'
+        '        toast.textContent = "✓ " + "[[@js:channels updated: %1]]".replace("%1", j.affected);'
         '        toast.style.color = "var(--ok)";'
         '        if (j.affected > 0) setTimeout(() => location.reload(), 1200);'
         '      } else if (j.status === "queued") {'
-        '        toast.textContent = "queued — it will run shortly";'
+        '        toast.textContent = "[[@js:queued — it will run shortly]]";'
         '        toast.style.color = "var(--warn)";'
         '      } else {'
-        '        toast.textContent = "✗ " + (j.message || "error");'
+        '        toast.textContent = "✗ " + (j.message || "[[@js:error]]");'
         '        toast.style.color = "var(--err)";'
         '      }'
         '    } catch (e) {'
-        '      toast.textContent = "✗ network error";'
+        '      toast.textContent = "✗ [[@js:network error]]";'
         '      toast.style.color = "var(--err)";'
         '    } finally {'
-        '      btn.disabled = false; btn.textContent = "↻ Refresh list";'
+        '      btn.disabled = false; btn.textContent = "↻ [[@js:Refresh list]]";'
         '    }'
         '  };'
         '  window.tgDiscoverSubscribe = async function(btn) {'
@@ -9724,12 +9724,12 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         '          body: "username=" + encodeURIComponent(u)});'
         '      const j = await r.json();'
         '      if (j.status === "queued" || j.status === "ok") {'
-        '        btn.textContent = "✓ Following"; btn.classList.remove("pri");'
-        '      } else { btn.disabled = false; btn.textContent = "✗ " + (j.message || "error"); }'
-        '    } catch(e) { btn.disabled = false; btn.textContent = "✗ network"; }'
+        '        btn.textContent = "✓ [[@js:Following]]"; btn.classList.remove("pri");'
+        '      } else { btn.disabled = false; btn.textContent = "✗ " + (j.message || "[[@js:error]]"); }'
+        '    } catch(e) { btn.disabled = false; btn.textContent = "✗ [[@js:network error]]"; }'
         '  };'
         '})();'
-        '</script>'
+        '</script>')
     )
     return HTMLResponse(_layout("Discover", "/discover", body))
 
