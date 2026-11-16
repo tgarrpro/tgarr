@@ -6705,13 +6705,13 @@ async def page_exports():
         fetching = j["status"] == "fetching"
         busy = busy or fetching
         pct = int(100 * (st["ready"] + st["missed"]) / max(1, st["total"]))
-        line = f'{st["ready"]:,} of {st["total"]:,} files here'
+        line = _t("{n} of {total} files here", n=f'{st["ready"]:,}', total=f'{st["total"]:,}')
         if st["bytes"]:
             line += f' · {export.human(st["bytes"])}'
         if st["missed"]:
-            line += f' · {st["missed"]:,} could not be fetched'
+            line += ' · ' + _t("{n} could not be fetched", n=f'{st["missed"]:,}')
         if fetching:
-            line += ' · fetching the rest from Telegram…'
+            line += ' · ' + _t("fetching the rest from Telegram…")
         items.append(
             '<div class="dl-item"><div class="icon">🗜</div><div class="info">'
             f'<div class="name">{html.escape(j["title"])}</div><div class="meta">{line}</div>'
@@ -6719,30 +6719,36 @@ async def page_exports():
                f'<div style="height:100%;width:{pct}%;background:var(--accent)"></div></div>' if fetching else '')
             + '</div><div class="right" style="display:flex;gap:8px;align-items:center">'
             + (f'<a class="btn{" ghost" if fetching else ""}" href="/export/{j["id"]}/download">'
-               + ('⬇ What is here so far' if fetching else '⬇ Download zip') + '</a>' if st["ready"] else '')
+               + '⬇ ' + (_t("What is here so far") if fetching else _t("Download zip")) + '</a>' if st["ready"] else '')
             + f'<button type="button" class="btn ghost" onclick="exDel({j["id"]})">'
-            + ('Stop' if fetching else 'Remove') + '</button></div></div>')
+            + (_t("Stop") if fetching else _t("Remove")) + '</button></div></div>')
     opts = "".join(
         f'<option value="{c["id"]}">{html.escape(c["title"] or ("@" + (c["username"] or "chat")))}'
         + ('' if c["username"] else ' 🔒') + '</option>' for c in chats)
-    kinds = "".join(f'<option value="{k}">{html.escape(v)}</option>' for k, v in _EXPORT_KIND_NAME.items())
-    form = ('<div class="empty-state"><div>Sign in to Telegram to download many files at once.</div></div>'
+    # (the names of the kinds are English in _EXPORT_KIND_NAME, which the zip's own name is
+    #  made of too: they are put into the reader's language here, where they are shown)
+    kinds = "".join(f'<option value="{k}">{_t(v)}</option>' for k, v in _EXPORT_KIND_NAME.items())
+    # one sentence with the two lists and the button inside it, so that each language can
+    # put them in its own order
+    form = (f'<div class="empty-state"><div>{_t("Sign in to Telegram to download many files at once.")}</div></div>'
             if me is None else
             '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;'
             'margin-bottom:22px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
-            '<span>Download</span>'
-            f'<select id="exKind">{kinds}</select><span>of</span>'
-            f'<select id="exChat" style="max-width:min(360px,70vw)"><option value="saved">everything already saved here</option>'
-            f'<option value="private">all my private chats</option>{opts}</select>'
-            '<button type="button" class="btn" onclick="exGo()">as one zip</button></div>')
+            + re.sub(r"<span>\s*</span>", "", '<span>' + _dl_html(
+                _t("Download {what} of {where} {go}as one zip{end}", what="\x01", where="\x02", go="\x03", end="\x04"),
+                f'</span><select id="exKind">{kinds}</select><span>',
+                f'</span><select id="exChat" style="max-width:min(360px,70vw)"><option value="saved">{_t("everything already saved here")}</option>'
+                f'<option value="private">{_t("all my private chats")}</option>{opts}</select><span>',
+                '</span><button type="button" class="btn" onclick="exGo()">', '</button><span>') + '</span>')
+            + '</div>')
     body = (
-        '<p style="color:var(--muted);margin-top:0">A whole chat, or everything you have saved, as one zip. '
-        'Files that are not on this machine yet are fetched from Telegram first; the zip can be downloaded when they are here. '
-        'What gets fetched stays in <a href="/downloads">Downloads</a> afterwards.</p>'
+        '<p style="color:var(--muted);margin-top:0">'
+        + _dl_html(_t("A whole chat, or everything you have saved, as one zip. Files that are not on this machine yet are fetched from Telegram first; the zip can be downloaded when they are here. What gets fetched stays in {a}Downloads{b} afterwards.", a="\x01", b="\x02"),
+                   '<a href="/downloads">', '</a>') + '</p>'
         + form
-        + '<h2 class="section">Downloads prepared <span class="count">' + str(len(jobs)) + '</span></h2>'
+        + f'<h2 class="section">{_t("Downloads prepared")} <span class="count">' + str(len(jobs)) + '</span></h2>'
         + ('<div class="dl-list">' + "".join(items) + '</div>' if items else
-           '<div class="empty-state"><div class="icon">🗜</div><div>Nothing prepared yet.</div></div>')
+           f'<div class="empty-state"><div class="icon">🗜</div><div>{_t("Nothing prepared yet.")}</div></div>')
         + _EXPORT_JS
         + '<script>function exGo(){var c=document.getElementById("exChat").value,k=document.getElementById("exKind").value;'
           'tgExport(c==="saved"||c==="private"?{scope:c,kind:k}:{scope:"chat",ch:c,kind:k})}'
@@ -14930,6 +14936,16 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 # ════════════════════════════════════════════════════════════════════
 # Page: Downloads (queue + history)
 # ════════════════════════════════════════════════════════════════════
+def _dl_html(sentence: str, *tags) -> str:
+    """A translated sentence with a link, bold words or a control inside it. The sentence is
+    one text in the catalogue, with blanks where the tags go; the blanks are filled with
+    chr(1), chr(2) ... when the word is looked up (so that the tags are not escaped with the
+    words around them), and those are replaced here by the tags, in that order."""
+    for i, tag in enumerate(tags, 1):
+        sentence = sentence.replace(chr(i), tag)
+    return sentence
+
+
 async def _archive_activity() -> tuple:
     """(html, how many are under way): everything tgarr is fetching or has fetched from the
     Internet Archive, whoever asked - the Get button or Radarr - newest first, the ones under
@@ -14971,32 +14987,35 @@ async def _archive_activity() -> tuple:
         if r["pct"] is not None:
             bar = (f'<div style="height:6px;border-radius:999px;background:var(--border);overflow:hidden;margin-top:8px;max-width:520px">'
                    f'<div style="height:100%;width:{r["pct"]}%;background:var(--accent)"></div></div>'
-                   f'<div style="font-size:12px;color:var(--muted);margin-top:4px">{r["pct"]}%'
-                   + (f' of {_fmt_size(r["size"])}' if r["size"] else "")
+                   f'<div style="font-size:12px;color:var(--muted);margin-top:4px">'
+                   + (_t("{pct}% of {size}", pct=r["pct"], size=_fmt_size(r["size"])) if r["size"] else f'{r["pct"]}%')
                    + (f' · {r["speed"] / 1024:.1f} MB/s' if r["speed"] >= 1024 else f' · {r["speed"]} kB/s' if r["speed"] else "") + '</div>')
         note = f'<div style="font-size:12.5px;color:#b45309;margin-top:4px">{html.escape(r["note"])}</div>' if r["note"] else ""
         return (
             f'<div class="dl-item"><div class="icon">{r["sign"]}</div><div class="info">'
             f'<div class="name">{html.escape(r["name"])}</div><div class="meta">'
-            f'<span class="pill {"bad" if r["bad"] else "accent" if r["busy"] else "ok"}">{r["state"]}</span>'
-            f'<span class="pill muted" title="who asked for it">{r["who"]}</span>'
+            # (the state is put into the reader's language here, where it is shown; what is
+            #  stored and compared stays as it is)
+            f'<span class="pill {"bad" if r["bad"] else "accent" if r["busy"] else "ok"}">{_t(r["state"])}</span>'
+            f'<span class="pill muted" title="{_t("who asked for it")}">{_t(r["who"])}</span>'
             + (f'<span>· {_fmt_size(r["size"])}</span>' if r["size"] and r["pct"] is None else "")
-            + (f'<span>· {r["files"]} files</span>' if r["files"] > 1 else "")
-            + f'<span>· asked {_ago(r["at"])}</span>'
+            + (f'<span>· {_t("{n} files", n=r["files"])}</span>' if r["files"] > 1 else "")
+            + f'<span>· {_t("asked {when}", when=_ago(r["at"]))}</span>'
             + f'<span>· <a href="https://archive.org/details/{html.escape(r["item"], quote=True)}" target="_blank" rel="noopener noreferrer">archive.org ↗</a></span>'
             + f'</div>{bar}{note}</div><div class="right">'
-            + (f'<a class="dl-btn" href="{r["open"]}">Open</a>' if r["open"] else "")
+            + (f'<a class="dl-btn" href="{r["open"]}">{_t("Open")}</a>' if r["open"] else "")
             + (f'<div class="dl-time">{_fmt_time(r["done"])}</div>' if r["done"] and not r["busy"] else "")
             + '</div></div>')
     under = [r for r in rows if r["busy"]]
     past = [r for r in rows if not r["busy"]]
-    out = (f'<h2 class="section">Under way <span class="count">{len(under)}</span></h2>'
+    out = (f'<h2 class="section">{_t("Under way")} <span class="count">{len(under)}</span></h2>'
            + (f'<div class="dl-list">{"".join(one(r) for r in under)}</div>' if under else
-              '<div style="color:var(--muted);margin-bottom:22px">Nothing is being fetched from the Internet Archive right now. '
-              'Find something on the <a href="/archive">Archive</a> page and press Get - or let Radarr ask.</div>')
-           + f'<h2 class="section">Arrived, or not <span class="count">last {len(past)}</span></h2>'
+              '<div style="color:var(--muted);margin-bottom:22px">'
+              + _dl_html(_t("Nothing is being fetched from the Internet Archive right now. Find something on the {a}Archive{b} page and press Get - or let Radarr ask.", a="\x01", b="\x02"),
+                         '<a href="/archive">', '</a>') + '</div>')
+           + f'<h2 class="section">{_t("Arrived, or not")} <span class="count">{_t("last {n}", n=len(past))}</span></h2>'
            + (f'<div class="dl-list">{"".join(one(r) for r in past)}</div>' if past else
-              '<div style="color:var(--muted)">Nothing yet.</div>'))
+              f'<div style="color:var(--muted)">{_t("Nothing yet.")}</div>'))
     return out, busy
 
 
@@ -15060,48 +15079,48 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
         def cnt(n):
             return f' <span style="opacity:.6">{n:,}</span>'
         chips = (
-            chip("all", _dqs(kind=None, offset=None), not kind, cnt(all_n))
-            + chip("🎬 films", _dqs(kind="video", offset=None), kind == "video", cnt(kinds.get("video", 0)))
-            + chip("🎵 songs", _dqs(kind="audio", offset=None), kind == "audio", cnt(kinds.get("audio", 0)))
-            + chip("📄 books", _dqs(kind="book", offset=None), kind == "book", cnt(kinds.get("library", 0)))
+            chip(_t("all"), _dqs(kind=None, offset=None), not kind, cnt(all_n))
+            + chip("🎬 " + _t("films"), _dqs(kind="video", offset=None), kind == "video", cnt(kinds.get("video", 0)))
+            + chip("🎵 " + _t("songs"), _dqs(kind="audio", offset=None), kind == "audio", cnt(kinds.get("audio", 0)))
+            + chip("📄 " + _t("books"), _dqs(kind="book", offset=None), kind == "book", cnt(kinds.get("library", 0)))
             + '<span style="margin-left:8px"></span>'
-            + chip("♥ favourites", _dqs(fav=None if fav else 1, offset=None), bool(fav))
-            + '<span style="margin-left:14px;color:var(--muted);font-size:12px">Sort:</span>'
-            + chip("last opened", _dqs(sort=None, offset=None), sort == "recent")
-            + chip("oldest", _dqs(sort="oldest", offset=None), sort == "oldest")
-            + chip("largest", _dqs(sort="size", offset=None), sort == "size")
-            + chip("name", _dqs(sort="name", offset=None), sort == "name"))
+            + chip("♥ " + _t("favourites"), _dqs(fav=None if fav else 1, offset=None), bool(fav))
+            + f'<span style="margin-left:14px;color:var(--muted);font-size:12px">{_t("Sort:")}</span>'
+            + chip(_t("last opened"), _dqs(sort=None, offset=None), sort == "recent")
+            + chip(_t("oldest"), _dqs(sort="oldest", offset=None), sort == "oldest")
+            + chip(_t("largest"), _dqs(sort="size", offset=None), sort == "size")
+            + chip(_t("name"), _dqs(sort="name", offset=None), sort == "name"))
         search = (
             '<form method="GET" action="/downloads" style="display:flex;gap:8px;margin:0 0 12px">'
             + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
                       for k, v in (("kind", kind), ("sort", sort if sort != "recent" else None),
                                    ("fav", 1 if fav else None)) if v)
             + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-              'placeholder="find a saved file by name…" style="flex:1;max-width:420px"/>'
-              '<button class="btn" type="submit">Search</button>'
-            + (f'<a class="btn ghost" href="/downloads{_dqs(q=None, offset=None)}">clear</a>' if q else '')
+              f'placeholder="{_t("find a saved file by name…")}" style="flex:1;max-width:420px"/>'
+              f'<button class="btn" type="submit">{_t("Search")}</button>'
+            + (f'<a class="btn ghost" href="/downloads{_dqs(q=None, offset=None)}">{_t("clear")}</a>' if q else '')
             + '</form>')
-        head = (f'<h2 class="section">Saved from players <span class="count">{saved["total"]:,}</span>'
+        head = (f'<h2 class="section">{_t("Saved from players")} <span class="count">{saved["total"]:,}</span>'
                 f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
                 f'text-transform:none;letter-spacing:0;margin-left:10px">'
                 f'{_fmt_size(saved["bytes"]) or "0 MB"}'
-                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>'
-                   ' · <a href="/exports">download many at once</a>') + '</span></h2>'
+                + ('' if ro else f' · <a href="/settings#cache">{_t("clean-up rules")}</a>'
+                   f' · <a href="/exports">{_t("Download many at once")}</a>') + '</span></h2>'
                 f'{search}'
                 f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
         if not saved["rows"]:
             return head + ('<div class="empty-state"><div class="icon">💾</div><div>'
-                           + ("Nothing saved matches." if (q or kind or fav or page_offset) else
-                              "Films, songs and books you open are kept here so they open "
-                              "instantly next time.") + '</div></div>')
+                           + (_t("Nothing saved matches.") if (q or kind or fav or page_offset) else
+                              _t("Films, songs and books you open are kept here so they open instantly next time."))
+                           + '</div></div>')
         ico = {"video": "🎬", "audio": "🎵"}
         trs = []
         for r, have in zip(saved["rows"], saved["have"]):
             total = r["file_size"] or 0
             if have is None:
-                state = '<span class="pill bad" title="the file is no longer on disk">missing</span>'
+                state = f'<span class="pill bad" title="{_t("the file is no longer on disk")}">{_t("missing")}</span>'
             elif total and have < total:
-                state = (f'<span class="pill warn" title="not all of it has arrived">'
+                state = (f'<span class="pill warn" title="{_t("not all of it has arrived")}">'
                          f'{have * 100 // total}%</span>')
             else:
                 state = ""
@@ -15116,10 +15135,10 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<td class="num">{_fmt_time(r["used"]) if r["used"] else ""}</td>'
                 f'<td class="ac"><div class="dl-ctrls">'
                 f'<a class="dl-btn sq" href="/media/{r["id"]}" download '
-                f'title="download to this device">⬇</a>'
+                f'title="{_t("download to this device")}">⬇</a>'
                 + ('' if ro else
                    f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
-                   f'title="remove from the server">✗</button>') + '</div></td></tr>')
+                   f'title="{_t("remove from the server")}">✗</button>') + '</div></td></tr>')
         table = (
             '<style>.sv-list{width:100%;border-collapse:collapse;background:var(--surface);'
             'border:1px solid var(--border);border-radius:10px;overflow:hidden}'
@@ -15142,21 +15161,24 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             '.sv-list td.ac{grid-column:3;grid-row:1 / span 2}.sv-list .dl-ctrls{flex-wrap:nowrap}}</style>'
             + ('' if ro else
                '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
-               '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
-               '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
+               f'<label style="cursor:pointer"><input type="checkbox" id="svAll"/> {_t("select this page")}</label>'
+               f'<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ {_t("Remove selected")}</button>'
                '<span id="svN" style="color:var(--muted)"></span></div>')
-            + '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
-            '<th>last opened</th><th></th></tr></thead>'
+            + f'<table class="sv-list"><thead><tr><th></th><th></th><th>{_t("name")}</th><th>{_t("size")}</th>'
+            f'<th>{_t("last opened")}</th><th></th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table>'
             + _page_nav("/downloads", _dqs, page_offset, page_size, len(saved["rows"]), saved["total"])
+            # (%1 in a sentence of the script is where the script puts the number)
             + ('' if ro else '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
               'n=document.getElementById("svN");const boxes=()=>[...document.querySelectorAll(".sv")];'
-              'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;n.textContent=c?c+" selected":""}'
+              'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;'
+              'n.textContent=c?"' + _tj("%1 selected") + '".replace("%1",c):""}'
               'all.onchange=()=>{boxes().forEach(b=>b.checked=all.checked);upd()};'
               'boxes().forEach(b=>b.onchange=upd);'
               'window.svRemove=function(){const ids=boxes().filter(b=>b.checked).map(b=>+b.closest("tr").dataset.id);'
-              'if(!ids.length||!confirm("Remove "+ids.length+" file(s) from the server? They stay in the index '
-              'and can be fetched again."))return;'
+              'if(!ids.length||!confirm("'
+              + _tj("Remove the selected files (%1) from the server? They stay in the index and can be fetched again.")
+              + '".replace("%1",ids.length)))return;'
               'fetch("/api/fetch/remove",{method:"POST",headers:{"Content-Type":"application/json"},'
               'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>'))
         return head + table
@@ -15165,8 +15187,9 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                  '.then(()=>location.reload())}'
                  'function fetchAct(id,a){fetch("/api/fetch/"+id+"/"+a,{method:"POST"})'
                  '.then(()=>setTimeout(()=>location.reload(),600))}'
-                 'function fetchRemove(id){if(confirm("Remove this file from the server? '
-                 'It stays in the index and can be fetched again."))fetchCancel(id)}</script>')
+                 'function fetchRemove(id){if(confirm("'
+                 + _tj("Remove this file from the server? It stays in the index and can be fetched again.")
+                 + '"))fetchCancel(id)}</script>')
 
     def _render_fetches():
         if not fetches:
@@ -15181,19 +15204,20 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 "stopped": ("stopped — nobody is watching", "muted", "⏸"),
                 "paused": ("paused", "muted", "⏸"),
             }[it["state"]]
+            label = _t(label)
             if it.get("pinned") and it["state"] in ("queued", "fetching"):
-                label += " · will finish on its own"
+                label += " · " + _t("will finish on its own")
             if it["state"] in ("queued", "fetching"):
                 act = (f'<button class="dl-btn" onclick="fetchAct({r["id"]},\'pause\')" '
-                       f'title="stop for now and keep what has arrived">⏸ Pause</button>')
+                       f'title="{_t("stop for now and keep what has arrived")}">⏸ {_t("Pause")}</button>')
             else:
                 act = (f'<button class="dl-btn ok" onclick="fetchAct({r["id"]},\'resume\')" '
-                       f'title="fetch the rest, even with no player open">▶ Resume</button>')
+                       f'title="{_t("fetch the rest, even with no player open")}">▶ {_t("Resume")}</button>')
             dc = _dc_badge(r["file_dc"], _my_dc) if r["file_dc"] else ""
             items.append(
                 f'<div class="dl-item"><div class="icon">{icon}</div><div class="info">'
                 f'<div class="name"><a href="/watch/{r["id"]}" style="color:inherit;text-decoration:none">'
-                f'{html.escape(r["file_name"] or "(no name)")}</a></div>'
+                f'{html.escape(r["file_name"]) if r["file_name"] else _t("(no name)")}</a></div>'
                 f'<div class="meta"><span class="pill {cls}">{label}</span>{dc}'
                 f'<span>· {_fmt_size(total)}</span></div>'
                 f'<div class="dl-progress"><div class="dl-progress-bar"><div class="dl-progress-fill" '
@@ -15201,20 +15225,18 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<div class="dl-progress-meta">{pct:.1f}% · {_fmt_size(have) or "0"} / {_fmt_size(total)}</div></div>'
                 f'</div><div class="right"><div class="dl-ctrls">{act}'
                 f'<button class="dl-btn bad" onclick="fetchCancel({r["id"]})" '
-                f'title="stop, and remove what has arrived">✗ Cancel</button></div></div></div>')
+                f'title="{_t("stop, and remove what has arrived")}">✗ {_t("Cancel")}</button></div></div></div>')
         return (
-            f'<h2 class="section">Opened in a player <span class="count">{len(fetches)}</span></h2>'
+            f'<h2 class="section">{_t("Opened in a player")} <span class="count">{len(fetches)}</span></h2>'
             '<div style="color:var(--muted);font-size:13px;margin:-6px 0 12px">'
-            'Opening a film fetches it from Telegram. It keeps arriving while its player is open, '
-            'stops when it is closed, and continues from the same point when it is opened again. '
-            '<b>Resume</b> here fetches the rest with no player open; <b>Pause</b> stops it and keeps '
-            'what has arrived.</div>'
+            + _dl_html(_t("Opening a film fetches it from Telegram. It keeps arriving while its player is open, stops when it is closed, and continues from the same point when it is opened again. {b}Resume{e} here fetches the rest with no player open; {b}Pause{e} stops it and keeps what has arrived.", b="\x01", e="\x02"),
+                       '<b>', '</b>') + '</div>'
             f'<div class="dl-list">{"".join(items)}</div>')
 
     def _render(rows, show_finished):
         if not rows:
             return ('<div class="empty-state"><div class="icon">⬇</div>'
-                   '<div>nothing here yet</div></div>')
+                   f'<div>{_t("nothing here yet")}</div></div>')
         items = []
         for d in rows:
             icon = ({"pending": "⏳", "downloading": "⬇", "completed": "✓",
@@ -15253,7 +15275,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                     f'style="width:{pct}%"></div></div>'
                     f'<div class="dl-progress-meta">'
                     f'{pct:.1f}% · {_fmt_size(done_b)} / {_fmt_size(size_b)} '
-                    f'· {speed_str} · ETA {eta_str}'
+                    f'· {speed_str} · {_t("ETA {t}", t=eta_str)}'
                     f'</div></div>'
                 )
             # DC badge: same-DC = fast direct download, cross-DC = slow
@@ -15262,9 +15284,9 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             file_dc = d["file_dc"] if "file_dc" in d.keys() else None
             if file_dc:
                 if _my_dc and file_dc == _my_dc:
-                    dc_html = f'<span class="pill ok" title="same DC — fast">DC{file_dc} ⚡</span>'
+                    dc_html = f'<span class="pill ok" title="{_t("same DC — fast")}">DC{file_dc} ⚡</span>'
                 else:
-                    dc_html = f'<span class="pill warn" title="cross-DC — slower">DC{file_dc} ✗</span>'
+                    dc_html = f'<span class="pill warn" title="{_t("cross-DC — slower")}">DC{file_dc} ✗</span>'
             # Per-row controls. Buttons depend on status:
             #   pending/downloading → Pause + Delete
             #   paused/failed       → Resume + Delete
@@ -15273,11 +15295,11 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             st = d["status"]
             if st in ("pending", "downloading"):
                 btns.append(f'<button class="dl-btn" '
-                           f'onclick="dlAct({d["id"]},\'pause\')">⏸ Pause</button>')
+                           f'onclick="dlAct({d["id"]},\'pause\')">⏸ {_t("Pause")}</button>')
             if st in ("paused", "failed"):
                 btns.append(f'<button class="dl-btn ok" '
-                           f'onclick="dlAct({d["id"]},\'resume\')">▶ Resume</button>')
-            btns.append(f'<button class="dl-btn bad" '
+                           f'onclick="dlAct({d["id"]},\'resume\')">▶ {_t("Resume")}</button>')
+            btns.append(f'<button class="dl-btn bad" title="{_t("Delete")}" '
                        f'onclick="dlAct({d["id"]},\'delete\')">✗</button>')
             ctrls = f'<div class="dl-ctrls">{" ".join(btns)}</div>'
             items.append(
@@ -15286,7 +15308,8 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<div class="info">'
                 f'<div class="name">{html.escape(d["name"])}</div>'
                 f'<div class="meta">'
-                f'<span class="pill {pill_cls}">{d["status"]}</span>'
+                # (the word shown; the status itself stays as the database has it)
+                f'<span class="pill {pill_cls}">{_t(d["status"])}</span>'
                 f'{dc_html}'
                 f'<span>· {_fmt_size(d["size_bytes"])}</span>'
                 f'<span>· {_fmt_time(d["requested_at"])}{local}</span>'
@@ -15305,16 +15328,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                   if ((tab == "archive" and ar_busy) or (tab == "grabs" and active) or
                       (tab == "players" and any(f["state"] != "stopped" for f in fetches)
                        and not page_offset and not q)) else '')
-    ctrl_js = '''<script>
+    ctrl_js = _fill('''<script>
 function dlAct(id, action){
-  if(action==='delete' && !confirm('Delete this download?')) return;
+  if(action==='delete' && !confirm("[[@js:Delete this download?]]")) return;
   fetch('/api/downloads/'+id+'/'+action,{method:'POST'})
     .then(r=>r.json())
     .then(_=>location.reload())
-    .catch(e=>alert('failed: '+e));
+    .catch(e=>alert("[[@js:That did not work: %1]]".replace("%1", e)));
 }
 </script>
-'''
+''')
     # one look for every action button on this page: same height, same width
     # for the worded ones, square for the icon-only ones in the table
     dl_css = """<style>
@@ -15344,25 +15367,25 @@ function dlAct(id, action){
                 f'text-decoration:none;font-size:15px">{label}'
                 + (f' <span style="font-size:12px;opacity:.7">{n}</span>' if n else '') + '</a>')
     tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
-            + _tab("players", "Opened in players", len(fetches))
-            + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active))
-            + _tab("archive", "🏛 Internet Archive", ar_busy) + '</div>')
+            + _tab("players", _t("Opened in players"), len(fetches))
+            + _tab("grabs", _t("Grabs (Sonarr · Radarr · Grab button)"), len(active))
+            + _tab("archive", "🏛 " + _t("Internet Archive"), ar_busy) + '</div>')
     if ro:
         tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
-                + _tab("players", "Opened in players", len(fetches)) + _tab("archive", "🏛 Internet Archive", ar_busy) + '</div>'
+                + _tab("players", _t("Opened in players"), len(fetches)) + _tab("archive", "🏛 " + _t("Internet Archive"), ar_busy) + '</div>'
                 '<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;'
                 'padding:12px 16px;margin-bottom:20px;color:var(--muted);font-size:14px">'
-                'Not signed in: files already saved from public channels can be opened and downloaded. '
-                '<a href="/login">Sign in to Telegram</a> to fetch more or to remove any.</div>')
+                + _dl_html(_t("Not signed in: files already saved from public channels can be opened and downloaded. {a}Sign in to Telegram{b} to fetch more or to remove any.", a="\x01", b="\x02"),
+                           '<a href="/login">', '</a>') + '</div>')
     if tab == "archive":
         body = f'{dl_css}{tabs}{ar_html}{refresh_js}'
     elif tab == "players":
         body = f'{dl_css}{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
     else:
         body = (f'{dl_css}{tabs}'
-                f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
+                f'<h2 class="section">{_t("Queue")} <span class="count">{len(active)}</span></h2>'
                 f'{_render(active, show_finished=False)}'
-                f'<h2 class="section">History <span class="count">last 100</span></h2>'
+                f'<h2 class="section">{_t("History")} <span class="count">{_t("last {n}", n=100)}</span></h2>'
                 f'{_render(done, show_finished=True)}'
                 f'{ctrl_js}'
                 f'{refresh_js}')
