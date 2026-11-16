@@ -5202,7 +5202,7 @@ function tgFavBtn(){
   if (bk) bk.onclick = e => { e.preventDefault(); tgBack(MEDIA_TYPE === "video" ? "/videos" : MEDIA_TYPE === "audio" ? "/music" : "/library"); };
   const b = document.getElementById("favBtn"); if (!b) return;
   b.onclick = () => fetch("/api/fav/" + MSG_ID, {method: "POST"}).then(r => r.json()).then(j => {
-    if (j.fav === undefined) return; b.classList.toggle("on", j.fav); b.title = j.fav ? "in your favourites" : "add to favourites"; });
+    if (j.fav === undefined) return; b.classList.toggle("on", j.fav); b.title = j.fav ? "[[@js:in your favourites]]" : "[[@js:add to favourites]]"; });
 }
 function tgVideo(main){
   let prefs = {}; try { prefs = JSON.parse(localStorage.getItem("tgarr.video") || "{}"); } catch (e) {}
@@ -5212,16 +5212,16 @@ function tgVideo(main){
   main.innerHTML =
     '<div class="vshell"><div class="vstage" id="vStage"><video id="v" controls autoplay playsinline src="/media/' + MSG_ID + '"></video></div>' +
     '<div class="vbar">' +
-    '<button id="vBack" title="back 10 seconds (left arrow)">&#8630; 10s</button>' +
-    '<button id="vFwd" title="forward 10 seconds (right arrow)">10s &#8631;</button>' +
-    '<select id="vSpeed" title="playback speed (&lt; and &gt;)">' +
+    '<button id="vBack" title="[[@back 10 seconds (left arrow)]]">&#8630; 10s</button>' +
+    '<button id="vFwd" title="[[@forward 10 seconds (right arrow)]]">10s &#8631;</button>' +
+    '<select id="vSpeed" title="[[@playback speed (< and >)]]">' +
       [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(x => '<option value="' + x + '">' + x + '&times;</option>').join("") + '</select>' +
-    '<button id="vRot" title="turn the picture a quarter turn (r) - for phone videos lying on their side">&#8635; Rotate</button>' +
-    '<button id="vMir" title="mirror the picture left-right (h) - for selfie videos">&#8646; Mirror</button>' +
-    '<button id="vFill" title="fill the frame, cropping the edges (c)">Fill</button>' +
-    '<button id="vWide" title="fill the window (w)">Full width</button>' +
-    '<button id="vPip" title="keep playing in a small floating window">Picture-in-picture</button>' +
-    '<button id="vFull" title="full screen (f)">Full screen</button>' +
+    '<button id="vRot" title="[[@turn the picture a quarter turn (r) - for phone videos lying on their side]]">&#8635; [[@Rotate]]</button>' +
+    '<button id="vMir" title="[[@mirror the picture left-right (h) - for selfie videos]]">&#8646; [[@Mirror]]</button>' +
+    '<button id="vFill" title="[[@fill the frame, cropping the edges (c)]]">[[@Fill]]</button>' +
+    '<button id="vWide" title="[[@fill the window (w)]]">[[@Full width]]</button>' +
+    '<button id="vPip" title="[[@keep playing in a small floating window]]">[[@Picture-in-picture]]</button>' +
+    '<button id="vFull" title="[[@full screen (f)]]">[[@Full screen]]</button>' +
     '<span class="arr" id="vArr" style="display:none"><i><b id="vArrBar"></b></i><span id="vArrTxt"></span></span>' +
     '</div></div>';
   const v = document.getElementById("v"), $ = id => document.getElementById(id);
@@ -5263,7 +5263,7 @@ function tgVideo(main){
     let pos = 0; try { pos = +localStorage.getItem(KEY) || 0; } catch (e) {}
     if (pos > 30 && (!v.duration || pos < v.duration - 30)) {
       v.currentTime = pos;
-      const t = toast("continued from " + fmt(pos) + ' <a id="vRestart">start over</a>', 8000);
+      const t = toast('[[@continued from %1]]'.replace("%1", fmt(pos)) + ' <a id="vRestart">[[@start over]]</a>', 8000);
       t.querySelector("#vRestart").onclick = () => { v.currentTime = 0; t.remove(); };
     }
   });
@@ -5302,8 +5302,8 @@ function tgVideo(main){
         const pct = Math.min(100, j.bytes / j.total * 100);
         $("vArr").style.display = "flex"; $("vArrBar").style.width = pct + "%";
         $("vArrTxt").textContent = j.paused
-          ? "paused at " + pct.toFixed(0) + "% — resume it on the Downloads page, or reopen this film"
-          : "still arriving: " + pct.toFixed(0) + "% here — skipping further ahead will wait";
+          ? "[[@js:paused at %1% — resume it on the Downloads page, or reopen this film]]".replace("%1", pct.toFixed(0))
+          : "[[@js:still arriving: %1% here — skipping further ahead will wait]]".replace("%1", pct.toFixed(0));
       } else if (j.status === "ready") { $("vArr").style.display = "none"; return; }
     } catch (e) {}
     setTimeout(arrival, 3000);
@@ -5507,17 +5507,17 @@ video{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;b
 .time{font-variant-numeric:tabular-nums;font-size:13px;color:#cbd5e1;white-space:nowrap}
 @media (max-width:640px){.bar .hide-s{display:none}.ctl{gap:8px;padding:8px 10px 12px}}
 </style></head><body>
-<div class="bar"><a href="#" id="back">&larr; back</a><div class="title">__TITLE__</div>
-<span class="hide-s" id="what" style="color:#64748b"></span><a href="/media/__ID__" download>&#11015; download</a></div>
-<div class="stage"><video id="v" playsinline></video><div class="msg" id="msg">getting ready…</div></div>
+<div class="bar"><a href="#" id="back">&larr; [[@back]]</a><div class="title">__TITLE__</div>
+<span class="hide-s" id="what" style="color:#64748b"></span><a href="/media/__ID__" download>&#11015; [[@download]]</a></div>
+<div class="stage"><video id="v" playsinline></video><div class="msg" id="msg">[[@getting ready…]]</div></div>
 <div class="ctl">
-  <button id="pp" title="play or pause (space)">&#9654;</button>
-  <button id="b10" title="back ten seconds (left arrow)">&minus;10</button>
+  <button id="pp" title="[[@play or pause (space)]]">&#9654;</button>
+  <button id="b10" title="[[@back 10 seconds (left arrow)]]">&minus;10</button>
   <input type="range" id="bar" min="0" max="1" step="1" value="0" disabled>
-  <button id="f10" title="on thirty seconds (right arrow)">+30</button>
+  <button id="f10" title="[[@on thirty seconds (right arrow)]]">+30</button>
   <span class="time" id="time">0:00 / 0:00</span>
-  <select id="q" title="how tall the picture is made: smaller is lighter on this server and on the connection"></select>
-  <button id="fs" title="full screen (F)">&#9974;</button>
+  <select id="q" title="[[@how tall the picture is made: smaller is lighter on this server and on the connection]]"></select>
+  <button id="fs" title="[[@full screen (F)]]">&#9974;</button>
 </div>
 <script>
 const ID = __ID__, v = document.getElementById("v"), bar = document.getElementById("bar"), msg = document.getElementById("msg");
@@ -5529,9 +5529,9 @@ const now = () => Math.min(dur, base + (v.currentTime || 0));
 function say(t){ msg.textContent = t || ""; msg.style.display = t ? "flex" : "none"; }
 function from(t, keep){
   base = Math.max(0, Math.min(dur ? dur - 1 : 0, t));
-  say("converting…");
+  say("[[@js:converting…]]");
   v.src = "/transcode/" + ID + "?t=" + base.toFixed(2) + (height ? "&h=" + height : "");
-  v.play().catch(() => { document.getElementById("pp").innerHTML = "&#9654;"; say("press play"); });
+  v.play().catch(() => { document.getElementById("pp").innerHTML = "&#9654;"; say("[[@js:press play]]"); });
 }
 function tick(){
   if (!drag) bar.value = Math.floor(now());
@@ -5541,12 +5541,12 @@ function tick(){
 v.addEventListener("timeupdate", tick);
 v.addEventListener("playing", () => { tries = 0; say(""); document.getElementById("pp").innerHTML = "&#10074;&#10074;"; });
 v.addEventListener("pause", () => { document.getElementById("pp").innerHTML = "&#9654;"; });
-v.addEventListener("waiting", () => say("converting…"));
-v.addEventListener("ended", () => { if (dur - now() > 15 && tries++ < 3) from(now()); else { say("the end"); try { localStorage.removeItem(KEY); } catch (e) {} } });
+v.addEventListener("waiting", () => say("[[@js:converting…]]"));
+v.addEventListener("ended", () => { if (dur - now() > 15 && tries++ < 3) from(now()); else { say("[[@js:the end]]"); try { localStorage.removeItem(KEY); } catch (e) {} } });
 v.addEventListener("error", () => {
   if (!v.src) return;
   if (tries++ < 2) setTimeout(() => from(now()), 1500 * tries);
-  else say("it could not be played here - too many films are being converted at once, or this file cannot be read");
+  else say("[[@js:it could not be played here - too many films are being converted at once, or this file cannot be read]]");
 });
 bar.addEventListener("input", () => { drag = true; tick(); });
 bar.addEventListener("change", () => { drag = false; from(+bar.value); });
@@ -5564,19 +5564,19 @@ document.addEventListener("keydown", e => {
 });
 document.getElementById("back").onclick = e => { e.preventDefault(); if (history.length > 1) history.back(); else location.href = "/videos"; };
 fetch("/transcode/" + ID + "/info").then(r => r.json()).then(j => {
-  if (j.status !== "ok") { say(j.message || "this cannot be played"); return; }
+  if (j.status !== "ok") { say(j.message || "[[@js:this cannot be played]]"); return; }
   dur = j.duration; bar.max = Math.floor(dur); bar.disabled = false;
-  document.getElementById("what").textContent = [({dvd: "DVD image", bluray: "Blu-ray image", file: ""})[j.kind] || "",
-    j.hw ? "converted on the graphics card" : ""].filter(Boolean).join(" · ");
+  document.getElementById("what").textContent = [({dvd: "[[@js:DVD image]]", bluray: "[[@js:Blu-ray image]]", file: ""})[j.kind] || "",
+    j.hw ? "[[@js:converted on the graphics card]]" : ""].filter(Boolean).join(" · ");
   const q = document.getElementById("q"); let want = 0;
   try { want = +(localStorage.getItem("tgarr.play.h") || 0); } catch (e) {}
-  q.innerHTML = '<option value="0">' + (j.height ? j.height + "p" : "as it is") + '</option>'
+  q.innerHTML = '<option value="0">' + (j.height ? j.height + "p" : '[[@as it is]]') + '</option>'
     + j.heights.slice().reverse().map(h => '<option value="' + h + '">' + h + 'p</option>').join("");
   if (j.heights.includes(want)) { height = want; q.value = String(want); }
   if (!j.heights.length) q.style.display = "none";
   let at = 0; try { at = +(localStorage.getItem(KEY) || 0); } catch (e) {}
   from(at > 5 && at < dur - 30 ? at : 0);
-}).catch(() => say("this server did not answer"));
+}).catch(() => say("[[@js:this server did not answer]]"));
 </script></body></html>"""
 
 
@@ -5585,7 +5585,8 @@ async def page_play(msg_id: int):
     f = await _tc_file(msg_id)
     if not f:
         return RedirectResponse(f"/watch/{msg_id}")           # not here yet: the watch page fetches it and comes back
-    return HTMLResponse(_PLAY_HTML.replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
+    # the words first, the file's name after: a name is never read for marks
+    return HTMLResponse(_fill(_PLAY_HTML).replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
 
 
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
@@ -5600,7 +5601,7 @@ async def watch_page(msg_id: int):
                FROM messages m LEFT JOIN channels c ON c.id=m.channel_id
                WHERE m.id=$1""", msg_id)
     if not row:
-        return HTMLResponse("<h1>404 — message not indexed</h1>", status_code=404)
+        return HTMLResponse("<h1>404 — " + _t("message not indexed") + "</h1>", status_code=404)
     title = row["file_name"] or f"msg-{msg_id}"
     mt = row["media_type"] or "document"
     await _want_fetch(msg_id, opened=True)
@@ -5639,18 +5640,18 @@ audio {{ width:600px; max-width:96vw; }}
 {_WATCH_PLAYER_CSS}
 </style></head><body>
 <div class="bar">
-  <a href="#" id="backBtn">← back</a>
+  <a href="#" id="backBtn">← {_t("back")}</a>
   <div class="title">{html.escape(title)}</div>
-  <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{'in your favourites' if row["fav"] else 'add to favourites'}">♥ Favourite</button>
-  {f'<a href="/play/{msg_id}" title="no picture or no sound? this plays it converted for this device">▶ play converted</a>' if (transcode.available() and transcode.needs(title) == "maybe") else ""}
-  <a href="/media/{msg_id}" download>⬇ download</a>
+  <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{_t("in your favourites") if row["fav"] else _t("add to favourites")}">♥ {_t("Favourite")}</button>
+  {f'<a href="/play/{msg_id}" title="{_t("no picture or no sound? this plays it converted for this device")}">▶ {_t("play converted")}</a>' if (transcode.available() and transcode.needs(title) == "maybe") else ""}
+  <a href="/media/{msg_id}" download>⬇ {_t("download")}</a>
 </div>
 <main id="main">
   <div class="loader">
     <div class="ico">⏳</div>
-    <div class="status" id="status">requesting from Telegram CDN…</div>
+    <div class="status" id="status">{_t("requesting from Telegram CDN…")}</div>
     <div class="progress"><div id="progBar"></div></div>
-    <div class="hint" id="hint">on-demand download — first chunk usually starts within seconds</div>
+    <div class="hint" id="hint">{_t("on-demand download — first chunk usually starts within seconds")}</div>
     <div class="hint" id="dchint" style="margin-top:6px"></div>
   </div>
 </main>
@@ -5662,7 +5663,7 @@ const MEDIA_TYPE = {_js_str(mt)};
 const CONVERT = {_js_str(transcode.needs(title) if transcode.available() else "")};
 const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
 const OWN_KINDS = {_json.dumps(list(ownbooks.KINDS))};
-{_WATCH_PLAYER_JS}
+{_fill(_WATCH_PLAYER_JS)}
 tgFavBtn();
 let started = false, comicTried = false, ownTried = false, ownWhy = "";
 function fmtBytes(b) {{
@@ -5730,10 +5731,9 @@ function renderPlayer() {{
     loader.className = "loader";
     loader.innerHTML =
       '<div class="ico">📚</div>' +
-      '<div class="status" id="ebookStatus">checking…</div>' +
+      '<div class="status" id="ebookStatus">{_t("checking…")}</div>' +
       '<div class="progress"><div id="ebookBar"></div></div>' +
-      '<div class="hint">a scanned book is made into pages the first time it is opened: seconds for most, a few minutes for a very thick one. ' +
-      'You may leave this page; it goes on. After that it opens at once.</div>' +
+      '<div class="hint">{_t("a scanned book is made into pages the first time it is opened: seconds for most, a few minutes for a very thick one. You may leave this page; it goes on. After that it opens at once.")}</div>' +
       '<div class="hint" id="ebookElapsed" style="margin-top:6px"></div>';
     main.innerHTML = "";
     main.appendChild(loader);
@@ -5744,31 +5744,31 @@ function renderPlayer() {{
         const r = await fetch(`/api/ebook-status/${{MSG_ID}}`, {{cache: "no-store"}});
         const j = await r.json();
         const elapsed = ((Date.now()-startedAt)/1000).toFixed(0);
-        document.getElementById("ebookElapsed").textContent = `elapsed: ${{elapsed}}s`;
+        document.getElementById("ebookElapsed").textContent = "{_tj("elapsed: %1s")}".replace("%1", elapsed);
         if (j.state === "ready") {{
           location.replace("/pdf/" + MSG_ID);
           return;
         }}
         if (j.state === "failed") {{
           document.getElementById("ebookStatus").textContent =
-            "✗ " + (j.reason || "this book could not be made into pages");
+            "✗ " + (j.reason || "{_tj("this book could not be made into pages")}");
           return;
         }}
         if (j.state === "no_source") {{
-          document.getElementById("ebookStatus").textContent = "✗ source not cached";
+          document.getElementById("ebookStatus").textContent = "✗ {_tj("source not cached")}";
           return;
         }}
 
         let msg;
         if (j.state === "downloading") {{
-          msg = "downloading…";
+          msg = "{_tj("downloading…")}";
         }} else if (j.state === "queued") {{
-          msg = `queued — position ${{j.position || 1}} in line`;
-          if (j.eta_s) msg += ` · est wait ~${{Math.ceil(j.eta_s/60)}} min`;
+          msg = "{_tj("queued — position %1 in line")}".replace("%1", j.position || 1);
+          if (j.eta_s) msg += " · " + "{_tj("est wait ~%1 min")}".replace("%1", Math.ceil(j.eta_s/60));
         }} else {{
-          msg = "converting…";
+          msg = "{_tj("converting…")}";
         }}
-        if (j.src_size) msg += ` (source ${{fmtBytes(j.src_size)}})`;
+        if (j.src_size) msg += " (" + "{_tj("source %1")}".replace("%1", fmtBytes(j.src_size)) + ")";
         document.getElementById("ebookStatus").textContent = msg;
         if (j.out_size && j.out_size !== lastSize) {{
           lastSize = j.out_size;
@@ -5778,7 +5778,7 @@ function renderPlayer() {{
         document.getElementById("ebookBar").style.width = pct + "%";
         setTimeout(tick, 2000);
       }} catch (e) {{
-        document.getElementById("ebookStatus").textContent = "✗ status check failed";
+        document.getElementById("ebookStatus").textContent = "✗ {_tj("status check failed")}";
         setTimeout(tick, 5000);
       }}
     }}
@@ -5792,18 +5792,18 @@ function renderPlayer() {{
     box.className = "loader";
     const why = document.createElement("div");
     why.className = "status";
-    why.textContent = ownWhy || "This kind of book cannot be shown here.";
+    why.textContent = ownWhy || "{_tj("This kind of book cannot be shown here.")}";
     box.innerHTML = '<div class="ico">📚</div>';
     box.appendChild(why);
-    box.insertAdjacentHTML("beforeend", '<div class="hint">It is kept as it is: download it to read it with another program.</div>' +
-      `<div style="margin-top:12px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download</a></div>`);
+    box.insertAdjacentHTML("beforeend", '<div class="hint">{_t("It is kept as it is: download it to read it with another program.")}</div>' +
+      `<div style="margin-top:12px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ {_t("download")}</a></div>`);
     main.innerHTML = "";
     main.appendChild(box);
     return;
   }}
   // fallback: try iframe but offer download as escape hatch
   main.innerHTML = `<iframe sandbox src="/media/${{MSG_ID}}" style="height:85vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>
-    <div style="margin-top:8px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5;font-size:13px">⬇ download raw</a></div>`;
+    <div style="margin-top:8px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5;font-size:13px">⬇ {_t("download raw")}</a></div>`;
 }}
 async function poll() {{
   try {{
@@ -5815,31 +5815,31 @@ async function poll() {{
         dh.dataset.set = "1";
         const sameDc = !j.cross_dc;
         dh.innerHTML = sameDc
-          ? `<span style="color:#10b981">● file DC ${{j.file_dc}} = your DC ${{j.my_dc}} — fast path</span>`
-          : `<span style="color:#f59e0b">● file DC ${{j.file_dc}} ≠ your DC ${{j.my_dc}} — cross-DC, may hit FloodWait</span>`;
+          ? '<span style="color:#10b981">● ' + "{_t("file DC %1 = your DC %2 — fast path")}".replace("%1", j.file_dc).replace("%2", j.my_dc) + '</span>'
+          : '<span style="color:#f59e0b">● ' + "{_t("file DC %1 ≠ your DC %2 — cross-DC, may hit FloodWait")}".replace("%1", j.file_dc).replace("%2", j.my_dc) + '</span>';
       }}
     }}
     if (j.status === "signedout") {{
-      document.getElementById("status").textContent = "This file is not saved on this machine";
+      document.getElementById("status").textContent = "{_tj("This file is not saved on this machine")}";
       document.getElementById("hint").innerHTML =
-        'Fetching it needs a Telegram account. <a href="/login" style="color:#5eb6e5">Sign in</a> to play it.';
+        "{_t("Fetching it needs a Telegram account. %1Sign in%2 to play it.")}".replace("%1", '<a href="/login" style="color:#5eb6e5">').replace("%2", '</a>');
       return;
     }}
     if (j.status === "failed") {{
-      document.getElementById("status").textContent = "✗ could not fetch this file";
+      document.getElementById("status").textContent = "✗ {_tj("could not fetch this file")}";
       document.getElementById("hint").textContent =
-        "The source message may have been deleted or the channel is no longer reachable.";
+        "{_tj("The source message may have been deleted or the channel is no longer reachable.")}";
       return;
     }}
     if (j.status === "ready") {{
-      document.getElementById("status").textContent = "✓ ready — opening player…";
+      document.getElementById("status").textContent = "✓ {_tj("ready — opening player…")}";
       renderPlayer();
       return;
     }}
     if (j.status === "downloading") {{
       const pct = j.total > 0 ? (j.bytes / j.total * 100) : 0;
       document.getElementById("status").textContent =
-        `downloading ${{fmtBytes(j.bytes)}}${{j.total ? " / " + fmtBytes(j.total) : ""}} (${{pct.toFixed(0)}}%)`;
+        "{_tj("downloading %1")}".replace("%1", `${{fmtBytes(j.bytes)}}${{j.total ? " / " + fmtBytes(j.total) : ""}} (${{pct.toFixed(0)}}%)`);
       document.getElementById("progBar").style.width = pct + "%";
       // Start the player as soon as ~2MB or 10% is on disk — progressive
       // playback can then keep up with the download. Only for video and
@@ -5853,16 +5853,15 @@ async function poll() {{
       if (j.tg_wait && j.tg_wait.seconds_left > 0) {{
         const mins = Math.max(1, Math.round(j.tg_wait.seconds_left / 60));
         document.getElementById("status").textContent =
-          "⏸ Telegram asked us to slow down — starts by itself in about " + mins + " min";
+          "⏸ " + "{_tj("Telegram asked us to slow down — starts by itself in about %1 min")}".replace("%1", mins);
         document.getElementById("hint").textContent =
-          "Your request stays queued. Nothing is wrong with the file or your account; " +
-          "tgarr is waiting instead of pushing, to keep your Telegram account in good standing.";
+          "{_tj("Your request stays queued. Nothing is wrong with the file or your account; tgarr is waiting instead of pushing, to keep your Telegram account in good standing.")}";
       }} else {{
-        document.getElementById("status").textContent = "queued — waiting for crawler…";
+        document.getElementById("status").textContent = "{_tj("queued — waiting for crawler…")}";
       }}
     }}
   }} catch(e) {{
-    document.getElementById("status").textContent = "network error — retrying…";
+    document.getElementById("status").textContent = "{_tj("network error — retrying…")}";
   }}
   setTimeout(poll, 1500);
 }}
