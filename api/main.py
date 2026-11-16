@@ -5883,8 +5883,8 @@ poll();
 # Login (Telegram QR + SMS)
 # ════════════════════════════════════════════════════════════════════
 LOGIN_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>tgarr — sign in to Telegram</title>
+<html lang="__LANG__" dir="__DIR__"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>tgarr — [[@Sign in to Telegram]]</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <style>
 :root { --bg:#f5f7fa; --bg2:#ffffff; --fg:#1e293b; --muted:#64748b; --accent:#229ED9; --tg-blue:#229ED9; --border:#e2e8f0; --ok:#15803d; --bad:#b91c1c; }
@@ -5922,31 +5922,31 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
     <svg class="mark" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
     <h1>tg<span>arr</span></h1>
   </div>
-  <div class="tag">sign in to Telegram</div>
-  <div class="sub">tgarr needs to log in to your Telegram account once. Session is stored locally — never leaves your tgarr instance.</div>
+  <div class="tag">[[@Sign in to Telegram]]</div>
+  <div class="sub">[[@tgarr needs to log in to your Telegram account once. Session is stored locally — never leaves your tgarr instance.]]</div>
 
   <div class="tabs">
-    <div class="tab active" onclick="show('qr')">Scan QR</div>
-    <div class="tab" onclick="show('sms')">Phone + SMS</div>
+    <div class="tab active" onclick="show('qr')">[[@Scan QR]]</div>
+    <div class="tab" onclick="show('sms')">[[@Phone + SMS]]</div>
   </div>
 
   <div id="panel-qr" class="panel active">
-    <p class="hint">Open Telegram on your phone → <b>Settings → Devices → Link Desktop Device</b>, then scan:</p>
-    <img id="qrimg" alt="QR code" />
-    <div id="qr-status" class="status">starting…</div>
+    <p class="hint">__QRHINT__</p>
+    <img id="qrimg" alt="[[@QR code]]" />
+    <div id="qr-status" class="status">[[@starting…]]</div>
   </div>
 
   <div id="panel-sms" class="panel">
-    <p class="hint">tgarr will send a code to your Telegram account.</p>
-    <label>Phone (with country code)</label>
+    <p class="hint">[[@tgarr will send a code to your Telegram account.]]</p>
+    <label>[[@Phone (with country code)]]</label>
     <input id="phone" type="tel" placeholder="+12815551234" />
-    <button id="send-btn" onclick="smsSend()">Send code</button>
+    <button id="send-btn" onclick="smsSend()">[[@Send code]]</button>
     <div id="code-row" style="display:none">
-      <label>Code from Telegram</label>
+      <label>[[@Code from Telegram]]</label>
       <input id="code" type="text" placeholder="12345" />
-      <label id="pw-label" style="display:none">2FA password (if you set one)</label>
+      <label id="pw-label" style="display:none">[[@2FA password (if you set one)]]</label>
       <input id="password" type="password" style="display:none" />
-      <button onclick="smsVerify()">Sign in</button>
+      <button onclick="smsVerify()">[[@Sign in]]</button>
     </div>
     <div id="sms-status" class="status"></div>
   </div>
@@ -5968,10 +5968,10 @@ async function qrStart() {
     setStatus('qr', r.message, '');
     qrPoll();
   } else if (r.status === 'already_authed') {
-    setStatus('qr', 'already signed in — redirecting…', 'ok');
+    setStatus('qr', "[[@js:already signed in — redirecting…]]", 'ok');
     setTimeout(() => location.href = '/', 1000);
   } else {
-    setStatus('qr', r.message || 'error', 'error');
+    setStatus('qr', r.message || "[[@js:error]]", 'error');
   }
 }
 async function qrPoll() {
@@ -5988,7 +5988,7 @@ async function qrPoll() {
       if (s.message) setStatus('qr', s.message, '');
     }
     if (s.status === 'success') {
-      setStatus('qr', s.message + ' — redirecting…', 'ok');
+      setStatus('qr', "[[@js:%1 — redirecting…]]".replace("%1", s.message), 'ok');
       setTimeout(() => location.href = '/', 1500);
       return;
     }
@@ -6010,7 +6010,7 @@ async function smsSend() {
     setStatus('sms', r.message, 'ok');
     document.getElementById('code-row').style.display = 'block';
   } else {
-    setStatus('sms', r.message || 'error', 'error');
+    setStatus('sms', r.message || "[[@js:error]]", 'error');
     document.getElementById('send-btn').disabled = false;
   }
 }
@@ -6025,14 +6025,14 @@ async function smsVerify() {
     body: body,
   }).then(r => r.json());
   if (r.status === 'success') {
-    setStatus('sms', r.message + ' — redirecting…', 'ok');
+    setStatus('sms', "[[@js:%1 — redirecting…]]".replace("%1", r.message), 'ok');
     setTimeout(() => location.href = '/', 1500);
   } else if (r.status === 'needs_2fa') {
     document.getElementById('pw-label').style.display = 'block';
     document.getElementById('password').style.display = 'block';
-    setStatus('sms', '2FA password required — enter then click Sign in again', '');
+    setStatus('sms', "[[@js:2FA password required — enter it, then click Sign in again]]", '');
   } else {
-    setStatus('sms', r.message || 'error', 'error');
+    setStatus('sms', r.message || "[[@js:error]]", 'error');
   }
 }
 function setStatus(tab, msg, cls) {
@@ -6042,14 +6042,14 @@ function setStatus(tab, msg, cls) {
 }
 qrStart();
 </script>
-<a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">Not now - look around first &rarr;</a>
+<a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">[[@Not now - look around first]] &rarr;</a>
 </body></html>"""
 
 
 APP_SETUP_HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/>
+<html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>tgarr - first-time setup</title>
+<title>tgarr - [[@first-time setup]]</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
   display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
@@ -6069,23 +6069,20 @@ button:disabled{opacity:.6;cursor:default}
 small{color:#64748b;font-size:12.5px;line-height:1.5;display:block;margin-top:16px}
 a{color:#0284c7}
 </style></head><body><div class="card">
-<h1>tg<span>arr</span> - one step before signing in</h1>
-<p>Telegram asks every program that connects to it for an <b>app id</b> and <b>app hash</b>.
-They are free, belong to your own account, and take a minute to get:</p>
+<h1>tg<span>arr</span> - [[@one step before signing in]]</h1>
+<p>__APPWHY__</p>
 <ol>
-<li>Open <a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>
-and sign in with your phone number (the code arrives in Telegram itself).</li>
-<li>Fill in "Create new application" - any title and short name will do - and press Create.</li>
-<li>Copy <b>App api_id</b> and <b>App api_hash</b> into the two boxes below.</li>
+<li>__APPSTEP1__</li>
+<li>[[@Fill in "Create new application" - any title and short name will do - and press Create.]]</li>
+<li>__APPSTEP3__</li>
 </ol>
 <form id="f" autocomplete="off">
 <label for="i">App api_id</label><input id="i" name="api_id" inputmode="numeric" placeholder="1234567" required/>
-<label for="h">App api_hash</label><input id="h" name="api_hash" placeholder="32 letters and digits" required/>
-<button id="b" type="submit">Save and continue to sign-in</button>
+<label for="h">App api_hash</label><input id="h" name="api_hash" placeholder="[[@32 letters and digits]]" required/>
+<button id="b" type="submit">[[@Save and continue to sign-in]]</button>
 <div id="err"></div>
 </form>
-<small>The two values stay on this machine, beside the Telegram session. Setting TG_API_ID and
-TG_API_HASH in the .env file does the same thing and takes precedence.</small>
+<small>[[@The two values stay on this machine, beside the Telegram session. Setting TG_API_ID and TG_API_HASH in the .env file does the same thing and takes precedence.]]</small>
 </div>
 <script>
 document.getElementById("f").addEventListener("submit", async function (e) {
@@ -6095,11 +6092,11 @@ document.getElementById("f").addEventListener("submit", async function (e) {
   try {
     const r = await fetch("/api/login/app", {method: "POST", body: new FormData(e.target)}).then(r => r.json());
     if (r.status === "ok") { location.href = "/login"; return; }
-    err.textContent = r.message || "That did not work.";
-  } catch (x) { err.textContent = "Could not reach tgarr: " + x; }
+    err.textContent = r.message || "[[@js:That did not work.]]";
+  } catch (x) { err.textContent = "[[@js:Could not reach tgarr: %1]]".replace("%1", x); }
   b.disabled = false;
 });
-</script><a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">Not now - look around first &rarr;</a></body></html>"""
+</script><a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">[[@Not now - look around first]] &rarr;</a></body></html>"""
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -6108,9 +6105,19 @@ async def login_page(preview: Optional[int] = None):
     # account was logged out upstream, must re-auth before doing anything.
     if login.session_exists() and not preview and not _is_revoked():
         return RedirectResponse("/")
+    def page(text: str) -> str:
+        return _fill(text).replace("__LANG__", _LANG.get()).replace("__DIR__", i18n.direction(_LANG.get()))
     if not login.app_configured():
-        return HTMLResponse(APP_SETUP_HTML)
-    return HTMLResponse(LOGIN_HTML)
+        return HTMLResponse(
+            page(APP_SETUP_HTML)
+            .replace("__APPWHY__", _t("Telegram asks every program that connects to it for an %1 and an %2. They are free, belong to your own account, and take a minute to get:")
+                     .replace("%1", "<b>app id</b>").replace("%2", "<b>app hash</b>"))
+            .replace("__APPSTEP1__", _t("Open %1 and sign in with your phone number (the code arrives in Telegram itself).")
+                     .replace("%1", '<a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>'))
+            .replace("__APPSTEP3__", _t("Copy %1 and %2 into the two boxes below.")
+                     .replace("%1", "<b>App api_id</b>").replace("%2", "<b>App api_hash</b>")))
+    return HTMLResponse(page(LOGIN_HTML).replace(
+        "__QRHINT__", _t("Open Telegram on your phone → %1, then scan:").replace("%1", "<b>" + _t("Settings → Devices → Link Desktop Device") + "</b>")))
 
 
 @app.post("/api/login/app")
@@ -6993,18 +7000,18 @@ _FILES_JS = (
     'function fAdd(l){for(var i=0;i<l.length;i++){fq.push(l[i]);fTotal++}fNext()}'
     'function fErr(t){fBad++;var d=document.createElement("div");d.textContent=t;document.getElementById("fErr").appendChild(d)}'
     'function fNext(){if(fBusy)return;var f=fq.shift(),s=document.getElementById("fState"),b=document.getElementById("fBar");'
-    'if(!f){if(fTotal){s.textContent=fDone+" of "+fTotal+" uploaded";if(!fBad){var t0=Date.now(),iv=setInterval(function(){'
+    'if(!f){if(fTotal){s.textContent="[[@js:%1 of %2 uploaded]]".replace("%1",fDone).replace("%2",fTotal);if(!fBad){var t0=Date.now(),iv=setInterval(function(){'
     'if(fPend<=0||Date.now()-t0>20000){clearInterval(iv);location.reload()}},400)}}return}'
     'fBusy=true;document.getElementById("fProg").style.display="block";var x=new XMLHttpRequest();'
     'x.open("PUT","/api/files/upload?name="+encodeURIComponent(f.name));'
     'x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(100*e.loaded/e.total);b.style.width=p+"%";'
-    's.textContent=(fDone+1)+" of "+fTotal+": "+f.name+" "+p+"%"}};'
+    's.textContent="[[@js:%1 of %2]]".replace("%1",fDone+1).replace("%2",fTotal)+": "+f.name+" "+p+"%"}};'
     'x.onload=function(){fBusy=false;if(x.status===200){fDone++;var r={};try{r=JSON.parse(x.responseText)}catch(e){}'
     'if(r.id&&r.kind==="video")fThumb(f,r.id)}else{var m="";try{m=JSON.parse(x.responseText).message}catch(e){}'
-    'fErr(f.name+": "+(m||"not uploaded"))}fNext()};'
-    'x.onerror=function(){fBusy=false;fErr(f.name+": the connection was lost");fNext()};x.send(f)}'
+    'fErr(f.name+": "+(m||"[[@js:not uploaded]]"))}fNext()};'
+    'x.onerror=function(){fBusy=false;fErr(f.name+": "+"[[@js:the connection was lost]]");fNext()};x.send(f)}'
     'function fDel(){var ids=[];document.querySelectorAll(".f-ck:checked").forEach(function(c){ids.push(+c.value)});'
-    'if(!ids.length||!confirm("Delete "+ids.length+" uploaded file(s) from this machine for good?"))return;'
+    'if(!ids.length||!confirm("[[@js:Delete the ticked files (%1) from this machine for good?]]".replace("%1",ids.length)))return;'
     'fetch("/api/files/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:ids})})'
     '.then(function(){location.reload()})}'
     'var dz=document.getElementById("fDrop");if(dz){'
@@ -7014,7 +7021,7 @@ _FILES_JS = (
     '</script>')
 _FILE_ICON = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
 FILES_PAGE = 100
-_FILE_TABS = {"": "All", "video": "🎬 Videos", "audio": "🎵 Music", "photo": "🖼 Photos", "document": "📄 Documents"}
+_FILE_TABS = {"": ("", "All"), "video": ("🎬 ", "Videos"), "audio": ("🎵 ", "Music"), "photo": ("🖼 ", "Photos"), "document": ("📄 ", "Documents")}
 
 
 def _file_href(r) -> str:
@@ -7053,21 +7060,21 @@ async def page_files(offset: int = 0, kind: str = "", q: str = ""):
         return "?" + "&".join(bits) if bits else ""
     # one tab per kind: an upload goes to its tab by itself, by what the file is
     tabs = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px">' + "".join(
-        _chip_link(f'{label} <span style="opacity:.6">{(per.get(k, {"n": 0})["n"] if k else everything["n"]):,}</span>',
+        _chip_link(f'{icon}{_t(label)} <span style="opacity:.6">{(per.get(k, {"n": 0})["n"] if k else everything["n"]):,}</span>',
                    "/files" + _fqs(kind=k or None, offset=None), k == kind)
-        for k, label in _FILE_TABS.items()) + '</div>'
+        for k, (icon, label) in _FILE_TABS.items()) + '</div>'
     find = ('<form method="get" action="/files" style="display:flex;gap:8px;margin:0 0 12px">'
             + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else '')
-            + f'<input type="text" name="q" value="{html.escape(q, quote=True)}" placeholder="find an uploaded file by name…" '
-              'style="flex:1;max-width:420px"/><button class="btn" type="submit">Find</button>'
-            + (f'<a class="btn ghost" href="/files{_fqs(q=None, offset=None)}">clear</a>' if q else '') + '</form>')
+            + f'<input type="text" name="q" value="{html.escape(q, quote=True)}" placeholder="{_t("find an uploaded file by name…")}" '
+              f'style="flex:1;max-width:420px"/><button class="btn" type="submit">{_t("Find")}</button>'
+            + (f'<a class="btn ghost" href="/files{_fqs(q=None, offset=None)}">{_t("clear")}</a>' if q else '') + '</form>')
     rows = "".join(
         '<div class="f-card">'
-        f'<a class="f-pic" href="{_file_href(r)}" title="{html.escape(r["file_name"] or "file", quote=True)}">'
+        f'<a class="f-pic" href="{_file_href(r)}" title="{html.escape(r["file_name"], quote=True) if r["file_name"] else _t("file")}">'
         f'<span>{_FILE_ICON.get(r["media_type"], "📄")}</span>'
         f'<img src="/api/thumb/{r["id"]}" loading="lazy" alt="" onerror="this.remove()"/></a>'
-        f'<label class="f-tick" title="tick to delete"><input type="checkbox" class="f-ck" value="{r["id"]}"/></label>'
-        f'<a class="f-name" href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a>'
+        f'<label class="f-tick" title="{_t("tick to delete")}"><input type="checkbox" class="f-ck" value="{r["id"]}"/></label>'
+        f'<a class="f-name" href="{_file_href(r)}">{html.escape(r["file_name"]) if r["file_name"] else _t("file")}</a>'
         f'<div class="f-meta">{export.human(r["file_size"])} · {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
         '</div>' for r in mine)
     pager = _page_nav("/files", _fqs, offset, FILES_PAGE, len(mine), tot["n"])
@@ -7086,27 +7093,26 @@ async def page_files(offset: int = 0, kind: str = "", q: str = ""):
         'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.f-name:hover{color:var(--accent)}'
         '.f-meta{padding:0 10px 9px;font-size:12px;color:var(--muted)}'
         '@media (max-width:640px){.f-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}</style>'
-        '<p style="color:var(--muted);margin-top:0">Your own films, music, photos and books, played and read here like '
-        'everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.</p>'
-        '<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">Drop files here</div>'
-        '<div style="color:var(--muted);font-size:13px;margin-top:4px">or choose them - as many as you like, of any size</div>'
-        '<label class="btn">Choose files<input type="file" multiple style="display:none" onchange="fAdd(this.files)"/></label>'
-        '<label class="btn ghost">Choose a whole folder<input type="file" webkitdirectory multiple style="display:none" '
+        f'<p style="color:var(--muted);margin-top:0">{_t("Your own films, music, photos and books, played and read here like everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.")}</p>'
+        f'<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">{_t("Drop files here")}</div>'
+        f'<div style="color:var(--muted);font-size:13px;margin-top:4px">{_t("or choose them - as many as you like, of any size")}</div>'
+        f'<label class="btn">{_t("Choose files")}<input type="file" multiple style="display:none" onchange="fAdd(this.files)"/></label>'
+        f'<label class="btn ghost">{_t("Choose a whole folder")}<input type="file" webkitdirectory multiple style="display:none" '
         'onchange="fAdd(this.files)"/></label>'
         '<div id="fProg" style="display:none;margin-top:14px"><div style="height:8px;border-radius:4px;background:var(--border);'
         'overflow:hidden"><div id="fBar" style="height:100%;width:0;background:var(--accent)"></div></div>'
         '<div id="fState" style="font-size:13px;color:var(--muted);margin-top:6px"></div></div>'
         '<div id="fErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>'
-        f'<h2 class="section">Uploaded <span class="count">{tot["n"]:,}</span>'
+        f'<h2 class="section">{_t("Uploaded")} <span class="count">{tot["n"]:,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
         f'margin-left:10px">{export.human(tot["b"]) or "0 MB"}'
-        + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
+        + (f' · <a href="#" onclick="fDel();return false">{_t("delete the ticked ones")}</a>' if mine else '') + '</span></h2>'
         + (find + tabs if (everything["n"] or q) else '')
         + ('<div class="f-grid">' + rows + '</div>' + pager if mine else
            '<div class="empty-state"><div class="icon">📂</div><div>'
-           + ('Nothing found by that name.' if q else 'Nothing of this kind uploaded yet.' if kind
-              else 'Nothing uploaded yet.') + '</div></div>')
-        + _FILES_JS)
+           + (_t("Nothing found by that name.") if q else _t("Nothing of this kind uploaded yet.") if kind
+              else _t("Nothing uploaded yet.")) + '</div></div>')
+        + _fill(_FILES_JS))
     return HTMLResponse(_layout("My files", "/files", body))
 
 
@@ -8424,8 +8430,8 @@ async def _usenet_system_html() -> str:
         return ""
     h3 = 'style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em"'
     if not cfg.get("enabled"):
-        return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
-                '<div style="color:var(--muted)">Switched off. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
+        return (f'<section style="margin-bottom:28px"><h3 {h3}>{_t("Usenet")}</h3>'
+                f'<div style="color:var(--muted)">{_t("Switched off.")} <a href="/settings/usenet">{_t("Settings → Usenet")}</a></div></section>')
     ready = await _usenet_ready()
     async with db_pool.acquire() as conn:
         kept = await conn.fetchrow(
@@ -8435,30 +8441,36 @@ async def _usenet_system_html() -> str:
     day = lambda t: time.strftime("%Y-%m-%d", time.gmtime(t))
     w, last, state = _UN_INDEX.get("window"), _UN_INDEX.get("last"), _UN_INDEX.get("state") or ""
     if state == "reading" and w:
-        now = (f'reading <b>{html.escape(w["grp"])}</b>, {day(w["t_from"])} to {day(w["t_to"])} '
-               f'({html.escape(str(w["mode"]))}, {int(w.get("connections") or 1)} connection{"" if int(w.get("connections") or 1) == 1 else "s"} allowed)')
+        now = (_t("reading {grp}, {a} to {b} ({mode}; connections allowed: {n})", grp="%1", a=day(w["t_from"]), b=day(w["t_to"]),
+                  mode=str(w["mode"]), n=int(w.get("connections") or 1))
+               .replace("%1", f'<b>{html.escape(w["grp"])}</b>'))
+    elif state.startswith("waiting after a problem: "):
+        now = _t("waiting after a problem: {why}", why=state[len("waiting after a problem: "):])
     else:
-        now = html.escape(state)
-    rows = [("News server", ('<span class="pill ok">answering</span> ' if ready else
-                             f'<span class="pill bad">not answering</span> {html.escape(_USENET.get("msg") or "")} ')
+        now = _t(state)                   # what the index reader says of itself (see _usenet_index_loop), in the reader's language
+    rows = [(_t("News server"), (f'<span class="pill ok">{_t("answering")}</span> ' if ready else
+                                 f'<span class="pill bad">{_t("not answering")}</span> {html.escape(_USENET.get("msg") or "")} ')
              + html.escape(cfg["host"])),
-            ("Index reading", now or "starting")]
+            (_t("Index reading"), now or _t("starting"))]
     if last:
         st = last.get("stats") or {}
-        rows.append(("Last window",
-                     f'<b>{html.escape(str(last.get("grp")))}</b> ({html.escape(str(last.get("mode")))}) · {int(st.get("headers") or 0):,} headers in '
-                     f'{int(st.get("seconds") or 0):,} s, {(st.get("bytes") or 0) / 1e6:.1f} MB · {int(last.get("cards") or 0):,} cards found, '
-                     f'{int(last.get("accepted") or 0):,} taken by tgarr.me'
-                     + (f' · {int(st["unread"]):,} stretches unread' if st.get("unread") else "")
+        rows.append((_t("Last window"),
+                     f'<b>{html.escape(str(last.get("grp")))}</b> ({html.escape(str(last.get("mode")))}) · '
+                     + _t("{n} headers in {s} s, {mb} MB", n=f'{int(st.get("headers") or 0):,}', s=f'{int(st.get("seconds") or 0):,}',
+                          mb=f'{(st.get("bytes") or 0) / 1e6:.1f}')
+                     + ' · ' + _t("{n} cards found, {m} taken by tgarr.me", n=f'{int(last.get("cards") or 0):,}', m=f'{int(last.get("accepted") or 0):,}')
+                     + (' · ' + _t("{n} stretches unread", n=f'{int(st["unread"]):,}') if st.get("unread") else "")
                      + f' · {_ago(_dt.datetime.fromtimestamp(last["at"], _dt.timezone.utc))}'))
-    rows.append(("Cards kept here", f'{kept["n"]:,} ({kept["exact"]:,} read in full' + (f', {kept["adult"]:,} adult' if kept["adult"] else "") + ')'))
-    rows.append(("Connections for an NZB", f'{usenet_scan.next_connections(level, {})} next time - as many as the provider gives'))
+    rows.append((_t("Cards kept here"),
+                 _t("{n} ({exact} read in full, {adult} adult)", n=f'{kept["n"]:,}', exact=f'{kept["exact"]:,}', adult=f'{kept["adult"]:,}') if kept["adult"]
+                 else _t("{n} ({exact} read in full)", n=f'{kept["n"]:,}', exact=f'{kept["exact"]:,}')))
+    rows.append((_t("Connections for an NZB"), _t("{n} next time - as many as the provider gives", n=usenet_scan.next_connections(level, {}))))
     body = "".join(f'<tr><td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;color:#64748b;white-space:nowrap;width:1%">{k}</td>'
                    f'<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0">{v}</td></tr>' for k, v in rows)
-    return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
+    return (f'<section style="margin-bottom:28px"><h3 {h3}>{_t("Usenet")}</h3>'
             f'<table style="width:100%;border-collapse:collapse;font-size:14px">{body}</table>'
-            '<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr reads headers only and makes NZBs; the downloading is '
-            'your downloader\'s. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
+            f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">{_t("tgarr reads headers only and makes NZBs; the downloading is done by your downloader.")} '
+            f'<a href="/settings/usenet">{_t("Settings → Usenet")}</a></div></section>')
 
 
 @app.get("/system", response_class=HTMLResponse)
@@ -8499,46 +8511,47 @@ async def page_system():
         _parts = []
         for _k, _n in sorted(_by.items(), key=lambda x: -x[1]):
             _bg = _k.startswith("bg:")
-            _name = _who.get(_k[3:] if _bg else _k, (_k[3:] if _bg else _k))
-            _parts.append(f'{html.escape(_name)} <b>{_n}</b>' + (' <span class="pill muted">background</span>' if _bg else ''))
+            _name = _k[3:] if _bg else _k
+            _name = _t(_who[_name]) if _name in _who else html.escape(_name)
+            _parts.append(f'{_name} <b>{_n}</b>' + (f' <span class="pill muted">{_t("background")}</span>' if _bg else ''))
         _pct = min(100, _used * 100 // _cap) if _cap else 0
         _col = "#ef4444" if _pct >= 100 else "#f59e0b" if _pct >= 75 else "#10b981"
         _rows.append(
-            f'<tr><td><b>{_label}</b><div style="font-size:12px;color:var(--muted)">{_hint}</div></td>'
-            f'<td style="white-space:nowrap"><b>{_used}</b> of {_cap if _cap else "–"}'
+            f'<tr><td><b>{_t(_label)}</b><div style="font-size:12px;color:var(--muted)">{_t(_hint)}</div></td>'
+            f'<td style="white-space:nowrap">{_t("{n} of {total}", n="%1", total=_cap if _cap else "–").replace("%1", f"<b>{_used}</b>")}'
             f'<div style="height:6px;width:120px;background:var(--border);border-radius:3px;margin-top:5px">'
             f'<div style="height:6px;width:{_pct}%;background:{_col};border-radius:3px"></div></div></td>'
-            f'<td style="font-size:13px">{" · ".join(_parts) or "<span style=color:var(--muted)>nothing yet today</span>"}</td></tr>')
+            f'<td style="font-size:13px">{" · ".join(_parts) or "<span style=color:var(--muted)>" + _t("nothing yet today") + "</span>"}</td></tr>')
     _share = int(float(_caps.get("bg_share", 0.4)) * 100)
     allowances_html = (
         '<section style="margin-bottom:28px">'
         '<h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 8px">'
-        'Telegram allowances today (resets at 00:00 UTC)</h3>'
-        '<table><thead><tr><th>what</th><th>used</th><th>who used it</th></tr></thead>'
+        f'{_t("Telegram allowances today (resets at 00:00 UTC)")}</h3>'
+        f'<table><thead><tr><th>{_t("what")}</th><th>{_t("used")}</th><th>{_t("who used it")}</th></tr></thead>'
         f'<tbody>{"".join(_rows)}</tbody></table>'
-        f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr keeps well inside what Telegram '
-        f'tolerates so that your account is never slowed down. Background work may use at most {_share}% of an '
-        'allowance; the rest is kept for what you open yourself.</div></section>')
+        f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">'
+        + _t("tgarr keeps well inside what Telegram tolerates so that your account is never slowed down. Background work may use at most {share}% of an allowance; the rest is kept for what you open yourself.", share=_share)
+        + '</div></section>')
     body = """
-<h2 class="section">System</h2>
+<h2 class="section">[[@System]]</h2>
 __ALLOWANCES__
 __USENET__
 <section style="margin-bottom:28px">
-  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Workers</h3>
-  <div id="workersTable">loading...</div>
+  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">[[@Workers]]</h3>
+  <div id="workersTable">[[@loading…]]</div>
 </section>
 <section>
-  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Deep backfill progress</h3>
-  <div id="deepBackfillTable">loading...</div>
+  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">[[@Deep backfill progress]]</h3>
+  <div id="deepBackfillTable">[[@loading…]]</div>
 </section>
 <script>
 function fmtAgo(iso) {
-  if (!iso) return "never";
+  if (!iso) return "[[@js:never]]";
   const sec = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (sec < 60) return Math.floor(sec) + "s ago";
-  if (sec < 3600) return Math.floor(sec/60) + "m ago";
-  if (sec < 86400) return Math.floor(sec/3600) + "h ago";
-  return Math.floor(sec/86400) + "d ago";
+  if (sec < 60) return "[[@js:%1 s ago]]".replace("%1", Math.floor(sec));
+  if (sec < 3600) return "[[@js:{n} min ago]]".replace("{n}", Math.floor(sec/60));
+  if (sec < 86400) return "[[@js:{n} h ago]]".replace("{n}", Math.floor(sec/3600));
+  return "[[@js:{n} d ago]]".replace("{n}", Math.floor(sec/86400));
 }
 function healthDot(h) {
   const c = {healthy:"#22c55e",idle:"#eab308",stale:"#ef4444",never:"#94a3b8",off:"#cbd5e1"}[h] || "#94a3b8";
@@ -8563,13 +8576,13 @@ async function loadWorkers() {
         <td style="color:#64748b;font-size:13px">${esc(w.last_action) || "—"}</td>
         <td style="text-align:right;color:#64748b">${w.iter_count.toLocaleString()}</td>
         <td style="text-align:right;color:${w.error_count ? errColor : "#64748b"}"
-            title="lifetime total">${w.error_count}</td>
+            title="[[@lifetime total]]">${w.error_count}</td>
         <td style="color:${errColor};font-size:12px">${errText}</td></tr>`; });
   document.getElementById("workersTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
-    <th>Worker</th><th>Last seen</th><th>Last action</th>
-    <th style="text-align:right">Iters</th><th style="text-align:right">Errors</th>
-    <th>Last error</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+    <th>[[@Worker]]</th><th>[[@Last seen]]</th><th>[[@Last action]]</th>
+    <th style="text-align:right">[[@Iters]]</th><th style="text-align:right">[[@Errors]]</th>
+    <th>[[@Last error]]</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 async function loadDeepBackfill() {
   const r = await fetch("/api/deep-backfill-progress");
@@ -8585,8 +8598,8 @@ async function loadDeepBackfill() {
     const s = m==="JOIN" ? "background:#fef3c7;color:#92400e"
             : m==="SUB"  ? "background:#dcfce7;color:#166534"
             : "background:#f1f5f9;color:#94a3b8";
-    const t = m==="JOIN" ? "加入+爬 (账号成员, 占 join 槽)"
-            : m==="SUB"  ? "订阅+爬 (公开轮询, 不 join)" : "未订阅/未加入";
+    const t = m==="JOIN" ? "[[@js:joined and read (the account is a member; takes one of its join slots)]]"
+            : m==="SUB"  ? "[[@js:followed and read (read as a public channel, without joining)]]" : "[[@js:neither followed nor joined]]";
     return `<span title="${t}" style="${s};padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600">${m}</span>`;
   };
   const rows = (j.channels || []).map(c => {
@@ -8607,15 +8620,15 @@ async function loadDeepBackfill() {
   });
   document.getElementById("deepBackfillTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
-    <th>Status</th><th>Mode</th><th>Title</th>
-    <th style="text-align:right">Media (local/remote)</th>
-    <th>Progress</th>
-    <th style="text-align:right">Photos</th>
-    <th style="text-align:right">Videos</th>
-    <th style="text-align:right">Audio</th>
-    <th style="text-align:right">Docs</th>
-    <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
-    + (j.private_count ? `<div style="font-size:12.5px;color:#64748b;margin-top:8px">Your ${j.private_count} private chat${j.private_count == 1 ? " is" : "s are"} read and kept whole; they are not listed here.</div>` : "");
+    <th>[[@Status]]</th><th>[[@Mode]]</th><th>[[@Name]]</th>
+    <th style="text-align:right">[[@Media (local/remote)]]</th>
+    <th>[[@Progress]]</th>
+    <th style="text-align:right">[[@Photos]]</th>
+    <th style="text-align:right">[[@Videos]]</th>
+    <th style="text-align:right">[[@Audio]]</th>
+    <th style="text-align:right">[[@Documents]]</th>
+    <th style="text-align:right">[[@Last run]]</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    + (j.private_count ? `<div style="font-size:12.5px;color:#64748b;margin-top:8px">${"[[@js:Your private chats (%1) are read and kept whole; they are not listed here.]]".replace("%1", j.private_count)}</div>` : "");
 }
 loadWorkers(); loadDeepBackfill();
 setInterval(loadWorkers, 30000);
@@ -8628,7 +8641,7 @@ setInterval(loadDeepBackfill, 60000);
 }
 </style>
 """
-    body = body.replace("__ALLOWANCES__", allowances_html)
+    body = _fill(body).replace("__ALLOWANCES__", allowances_html)
     try:
         body = body.replace("__USENET__", await _usenet_system_html())
     except Exception as e:
@@ -12937,26 +12950,27 @@ async def page_kids_manage():
         return (f'<input type="checkbox" {"checked" if on else ""} {dis} '
                 f'onchange="kmAllow(\'{kind}\',{ref},this)"/>')
     pin_box = (
-        '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">PIN</h3>'
-        + ('<p style="color:var(--muted);margin:0 0 12px">A PIN is set. Any browser that has not entered it sees only '
-           'the Media Center with what is ticked below. This browser is unlocked.</p>' if cfg["pin"] else
-           '<p style="color:var(--muted);margin:0 0 12px"><b style="color:#b45309">No PIN is set:</b> anybody who opens '
-           'this address sees everything you see. Set a PIN and other browsers get only the Media Center.</p>')
+        '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">' + _t("PIN") + '</h3>'
+        + ('<p style="color:var(--muted);margin:0 0 12px">'
+           + _t("A PIN is set. Any browser that has not entered it sees only the Media Center with what is ticked below. This browser is unlocked.") + '</p>' if cfg["pin"] else
+           '<p style="color:var(--muted);margin:0 0 12px">'
+           + _t("%1 anybody who opens this address sees everything you see. Set a PIN and other browsers get only the Media Center.")
+           .replace("%1", '<b style="color:#b45309">' + _t("No PIN is set:") + '</b>') + '</p>')
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-        + ('<input class="km-in" id="kmCur" type="password" inputmode="numeric" maxlength="12" placeholder="current PIN" style="width:140px"/>'
+        + (f'<input class="km-in" id="kmCur" type="password" inputmode="numeric" maxlength="12" placeholder="{_t("current PIN")}" style="width:140px"/>'
            if cfg["pin"] else "")
         + '<input class="km-in" id="kmNew" type="password" inputmode="numeric" maxlength="12" '
-          f'placeholder="{"new PIN" if cfg["pin"] else "PIN, 4 to 12 digits"}" style="width:170px"/>'
-        + f'<button class="btn" onclick="kmPin(false)">{"Change PIN" if cfg["pin"] else "Set PIN"}</button>'
-        + ('<button class="btn ghost" onclick="kmPin(true)">Remove PIN</button>'
-           '<button class="btn ghost" onclick="kmLock()">Lock this browser now</button>' if cfg["pin"] else "")
+          f'placeholder="{_t("new PIN") if cfg["pin"] else _t("PIN, 4 to 12 digits")}" style="width:170px"/>'
+        + f'<button class="btn" onclick="kmPin(false)">{_t("Change PIN") if cfg["pin"] else _t("Set PIN")}</button>'
+        + (f'<button class="btn ghost" onclick="kmPin(true)">{_t("Remove PIN")}</button>'
+           f'<button class="btn ghost" onclick="kmLock()">{_t("Lock this browser now")}</button>' if cfg["pin"] else "")
         + '<span id="kmMsg" style="color:var(--muted);font-size:13px"></span></div></div></div>')
     chan_rows = "".join(
         f'<label class="km-row">{box("channel", c["id"], c["allowed"], "disabled" if c["audience"] != "sfw" else "")}'
-        f'<span class="n">{html.escape(c["title"] or c["username"] or "chat")}'
-        + (f' <small>@{html.escape(c["username"])}</small>' if c["username"] else ' <small>🔒 private</small>')
-        + (' <small>· 18+, never shown there</small>' if c["audience"] != "sfw" else "")
-        + f'</span><small>{c["n"]:,} items</small></label>' for c in chans)
+        f'<span class="n">{html.escape(c["title"] or c["username"] or "") or _t("chat")}'
+        + (f' <small>@{html.escape(c["username"])}</small>' if c["username"] else f' <small>🔒 {_t("private")}</small>')
+        + (f' <small>· {_t("18+, never shown there")}</small>' if c["audience"] != "sfw" else "")
+        + f'</span><small>{_t("{n} items", n=format(c["n"], ","))}</small></label>' for c in chans)
     ico = {"video": "🎬", "audio": "🎵", "photo": "🖼"}
 
     def kind_of(r):
@@ -12968,41 +12982,44 @@ async def page_kids_manage():
         + (box("message", r["id"], True, "disabled") if r["by_channel"] and not r["allowed"]
            else box("message", r["id"], r["allowed"]))
         + f'<span class="n">{ico.get(r["media_type"], "📄")} '
-          f'{html.escape(r["file_name"] or "item " + str(r["id"]))} <small>{html.escape(r["title"] or "")}</small>'
-        + (' <small>· shown already: its channel is ticked</small>' if r["by_channel"] and not r["allowed"] else "")
-        + ("" if r["saved"] else ' <small>· no longer saved here</small>')
+          f'{html.escape(r["file_name"]) if r["file_name"] else _t("item {n}", n=r["id"])} <small>{html.escape(r["title"] or "")}</small>'
+        + (f' <small>· {_t("shown already: its channel is ticked")}</small>' if r["by_channel"] and not r["allowed"] else "")
+        + ("" if r["saved"] else f' <small>· {_t("no longer saved here")}</small>')
         + f'</span><small>{_fmt_size(r["file_size"]) or ""}</small></label>' for r in items)
     n_kind = {k: sum(1 for r in items if kind_of(r) == k) for k in ("video", "audio", "book")}
     chips = "".join(
-        f'<button type="button" class="btn ghost km-chip{" on" if k == "all" else ""}" data-k="{k}" onclick="kmShow(this)">{lbl} '
+        f'<button type="button" class="btn ghost km-chip{" on" if k == "all" else ""}" data-k="{k}" onclick="kmShow(this)">{ic}{_t(lbl)} '
         f'<span style="opacity:.6">{n:,}</span></button>'
-        for k, lbl, n in (("all", "All", len(items)), ("video", "🎬 Videos", n_kind["video"]),
-                          ("audio", "🎵 Music", n_kind["audio"]), ("book", "📄 Books", n_kind["book"])))
+        for k, ic, lbl, n in (("all", "", "All", len(items)), ("video", "🎬 ", "Videos", n_kind["video"]),
+                              ("audio", "🎵 ", "Music", n_kind["audio"]), ("book", "📄 ", "Books", n_kind["book"])))
+    lang = _LANG.get()
+
     def mins(x):
         x = int(x or 0)
-        return f"{x // 3600} h {x % 3600 // 60:02d} min" if x >= 3600 else f"{x // 60} min"
+        # (not yet made safe for HTML: it goes into a sentence that is)
+        return i18n.t(lang, "{h} h {m} min", h=x // 3600, m=f"{x % 3600 // 60:02d}") if x >= 3600 else i18n.t(lang, "{n} min", n=x // 60)
     time_box = (
         '<div class="km-box"><div class="km-pad">'
-        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><h3 style="margin:0;flex:1">Time</h3>'
-        f'<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="mcOn" {"checked" if rules["on"] else ""}/> <b>use time rules</b></label></div>'
-        '<p style="color:var(--muted);margin:0 0 12px">For browsers that have not entered your PIN. Counted per person where a child has entered their own, otherwise per device; '
-        'only while a page is in front or something is playing.</p>'
+        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><h3 style="margin:0;flex:1">' + _t("Time") + '</h3>'
+        f'<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="mcOn" {"checked" if rules["on"] else ""}/> <b>{_t("use time rules")}</b></label></div>'
+        f'<p style="color:var(--muted);margin:0 0 12px">{_t("For browsers that have not entered your PIN. Counted per person where a child has entered their own, otherwise per device; only while a page is in front or something is playing.")}</p>'
         '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
-        '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
+        f'<span></span><small>{_t("open from")}</small><small>{_t("until")}</small><small>{_t("minutes a day (0 = no limit)")}</small>'
         + "".join(
-            f'<b>{lbl}</b><input class="km-in" type="time" id="mc_{k}_from" value="{rules[k]["from"]}"/>'
+            f'<b>{_t(lbl)}</b><input class="km-in" type="time" id="mc_{k}_from" value="{rules[k]["from"]}"/>'
             f'<input class="km-in" type="time" id="mc_{k}_to" value="{rules[k]["to"]}"/>'
             f'<input class="km-in" type="number" min="0" max="1440" id="mc_{k}_limit" value="{rules[k]["limit"]}"/>'
             for k, lbl in (("wd", "Monday to Friday"), ("we", "Saturday, Sunday")))
         + '</div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px">'
-        f'<span>A break of <input class="km-in" type="number" min="0" max="240" id="mcRest" value="{rules["rest"]}" style="width:74px"/> minutes '
-        f'after <input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/> minutes in one go</span>'
-        '<button class="btn" onclick="mcSave()">Save</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
+        '<span>' + _t("A break of %1 minutes after %2 minutes in one go")
+        .replace("%1", f'<input class="km-in" type="number" min="0" max="240" id="mcRest" value="{rules["rest"]}" style="width:74px"/>')
+        .replace("%2", f'<input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/>') + '</span>'
+        f'<button class="btn" onclick="mcSave()">{_t("Save")}</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
         '</div></div>')
     def who_label(w):
         if w[:1] == "p" and w[1:].isdigit():
             p = profs.get(int(w[1:]))
-            return "👤 " + html.escape(p["name"] if p else "someone since removed")
+            return "👤 " + (html.escape(p["name"]) if p else _t("someone since removed"))
         return "📱 " + html.escape(w)
     used_today = {u["who"]: u["today"] for u in usage}
     levels = (("kid", "Little: only what is ticked"), ("teen", "Older: everything from all-ages channels"))
@@ -13010,80 +13027,78 @@ async def page_kids_manage():
     def person(p):
         r, i = p["rules"] or rules, p["id"]
         return (
-            f'<div class="km-row"><span class="n">👤 <b>{html.escape(p["name"])}</b> <small>today {mins(used_today.get("p" + str(i)))}'
-            + (" · own time rules" if p["rules"] else "") + '</small></span>'
+            f'<div class="km-row"><span class="n">👤 <b>{html.escape(p["name"])}</b> <small>{_t("today {t}", t=mins(used_today.get("p" + str(i))))}'
+            + (" · " + _t("own time rules") if p["rules"] else "") + '</small></span>'
             + f'<select class="km-in" onchange="kpPost({{id:{i},level:this.value}})">'
-            + "".join(f'<option value="{k}"{" selected" if p["level"] == k else ""}>{lbl}</option>' for k, lbl in levels)
-            + f'</select><button class="btn ghost" onclick="kpTime({i})">Time</button>'
-              f'<button class="btn ghost" onclick="kpPin({i})">New PIN</button>'
-              f'<button class="btn ghost" onclick="kpDel({i})">Remove</button></div>'
+            + "".join(f'<option value="{k}"{" selected" if p["level"] == k else ""}>{_t(lbl)}</option>' for k, lbl in levels)
+            + f'</select><button class="btn ghost" onclick="kpTime({i})">{_t("Time")}</button>'
+              f'<button class="btn ghost" onclick="kpPin({i})">{_t("New PIN")}</button>'
+              f'<button class="btn ghost" onclick="kpDel({i})">{_t("Remove")}</button></div>'
             + f'<div class="km-pad" id="kpT{i}" hidden style="border-bottom:1px solid var(--border)">'
               f'<label style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><input type="checkbox" id="kp{i}_own" {"checked" if p["rules"] else ""}/> '
-              f'<b>{html.escape(p["name"])} has time rules of their own</b> <small style="color:var(--muted)">(otherwise the ones under PIN &amp; time; breaks are always those)</small></label>'
+              f'<b>{_t("{name} has time rules of their own", name=p["name"])}</b> <small style="color:var(--muted)">{_t("(otherwise the ones under PIN & time; breaks are always those)")}</small></label>'
               '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
-              '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
+              f'<span></span><small>{_t("open from")}</small><small>{_t("until")}</small><small>{_t("minutes a day (0 = no limit)")}</small>'
             + "".join(
-                f'<b>{lbl}</b><input class="km-in" type="time" id="kp{i}_{k}_from" value="{r[k]["from"]}"/>'
+                f'<b>{_t(lbl)}</b><input class="km-in" type="time" id="kp{i}_{k}_from" value="{r[k]["from"]}"/>'
                 f'<input class="km-in" type="time" id="kp{i}_{k}_to" value="{r[k]["to"]}"/>'
                 f'<input class="km-in" type="number" min="0" max="1440" id="kp{i}_{k}_limit" value="{r[k]["limit"]}"/>'
                 for k, lbl in (("wd", "Monday to Friday"), ("we", "Saturday, Sunday")))
-            + f'</div><div style="margin-top:12px"><button class="btn" onclick="kpSave({i})">Save</button></div></div>')
+            + f'</div><div style="margin-top:12px"><button class="btn" onclick="kpSave({i})">{_t("Save")}</button></div></div>')
     people_box = (
-        '<p class="note">Give each child a PIN of their own. A browser where it is entered still shows only the Media Center, but tgarr '
-        'knows whose it is: time is counted per person, on whatever device, and an older child gets more than what is ticked - everything '
-        'from all-ages public channels and the folders of this machine, never your private chats, never a picture found adult. '
-        'A browser with no PIN at all stays as it was: only what is ticked.</p>'
+        '<p class="note">' + _t("Give each child a PIN of their own. A browser where it is entered still shows only the Media Center, but tgarr knows whose it is: time is counted per person, on whatever device, and an older child gets more than what is ticked - everything from all-ages public channels and the folders of this machine, never your private chats, never a picture found adult. A browser with no PIN at all stays as it was: only what is ticked.") + '</p>'
         + ('<div class="km-box">' + "".join(person(p) for p in profs.values()) + '</div>' if profs else "")
-        + ('<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 10px">Add a person</h3>'
+        + ('<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 10px">' + _t("Add a person") + '</h3>'
            '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-           '<input class="km-in" id="kpName" maxlength="40" placeholder="name" style="width:150px"/>'
-           '<select class="km-in" id="kpLevel">' + "".join(f'<option value="{k}">{lbl}</option>' for k, lbl in levels) + '</select>'
-           '<input class="km-in" id="kpNewPin" type="password" inputmode="numeric" maxlength="12" placeholder="their PIN, 4 to 12 digits" style="width:200px"/>'
-           '<button class="btn" onclick="kpAdd()">Add</button></div></div></div>' if cfg["pin"] else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Set your own PIN first (under PIN &amp; time).</div></div>'))
+           f'<input class="km-in" id="kpName" maxlength="40" placeholder="{_t("name")}" style="width:150px"/>'
+           '<select class="km-in" id="kpLevel">' + "".join(f'<option value="{k}">{_t(lbl)}</option>' for k, lbl in levels) + '</select>'
+           f'<input class="km-in" id="kpNewPin" type="password" inputmode="numeric" maxlength="12" placeholder="{_t("their PIN, 4 to 12 digits")}" style="width:200px"/>'
+           f'<button class="btn" onclick="kpAdd()">{_t("Add")}</button></div></div></div>' if cfg["pin"] else
+           f'<div class="km-box"><div class="km-pad" style="color:var(--muted)">{_t("Set your own PIN first (under PIN & time).")}</div></div>'))
     used_rows = (
         "".join(f'<div class="km-row"><span class="n">{who_label(u["who"])}</span>'
-                f'<small>today {mins(u["today"])} · last 7 days {mins(u["week"])}</small></div>' for u in usage)
+                f'<small>{_t("today {t}", t=mins(u["today"]))} · {_t("last 7 days {t}", t=mins(u["week"]))}</small></div>' for u in usage)
         + "".join(f'<div class="km-row"><span class="n">{html.escape(_friendly_name(o["file_name"], o["caption"]))}</span>'
                   f'<small>{_fmt_time(o["at"])} · {who_label(o["who"])}</small></div>' for o in opened))
     n_chan = sum(1 for c in chans if c["allowed"])
     n_file = sum(1 for r in items if r["allowed"])
-    tabs = (("pin", "PIN &amp; time", ""), ("people", "People", f"{len(profs)}" if profs else ""), ("channels", "Channels", f"{n_chan:,} shown" if n_chan else ""),
-            ("files", "Files", f"{n_file:,} shown" if n_file else ""), ("usage", "Usage", ""))
+    tabs = (("pin", "PIN & time", ""), ("people", "People", f"{len(profs)}" if profs else ""),
+            ("channels", "Channels", _t("{n} shown", n=f"{n_chan:,}") if n_chan else ""),
+            ("files", "Files", _t("{n} shown", n=f"{n_file:,}") if n_file else ""), ("usage", "Usage", ""))
     body = (
         _KIDS_CSS
         + '<div class="km-tabs" role="tablist">'
         + "".join(f'<button type="button" class="km-tab{" on" if k == "pin" else ""}" role="tab" data-t="{k}" onclick="kmTab(\'{k}\')">'
-                  f'{lbl}{f"<span class=c>{c}</span>" if c else ""}</button>' for k, lbl, c in tabs)
+                  f'{_t(lbl)}{f"<span class=c>{c}</span>" if c else ""}</button>' for k, lbl, c in tabs)
         + '</div>'
         + f'<div class="km-pane" id="km-pin">{pin_box}{time_box}</div>'
         + f'<div class="km-pane" id="km-people" hidden>{people_box}</div>'
         + '<div class="km-pane" id="km-channels" hidden>'
-          '<p class="note">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
-        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div></div>'
+          '<p class="note">' + _t("Everything in a ticked channel is shown in the Media Center, now and as it grows.") + '</p>'
+        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>" + _t("no channels yet") + "</div>"}</div></div>'
         + '<div class="km-pane" id="km-files" hidden>'
-          '<p class="note">The files already saved on this machine. Tick the ones to show in the Media Center.</p>'
+          '<p class="note">' + _t("The files already saved on this machine. Tick the ones to show in the Media Center.") + '</p>'
         + (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">{chips}</div>'
            f'<div class="km-box km-list" id="kmItems">{item_rows}</div>' if items else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing is saved yet. Files you open in a player '
-           'are kept and appear here.</div></div>')
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
+           + _t("Nothing is saved yet. Files you open in a player are kept and appear here.") + '</div></div>')
         + '</div>'
         + '<div class="km-pane" id="km-usage" hidden>'
-          '<p class="note">Kept on this machine only: time per person or device, and what was opened in the Media Center.</p>'
+          '<p class="note">' + _t("Kept on this machine only: time per person or device, and what was opened in the Media Center.") + '</p>'
         + (f'<div class="km-box km-list">{used_rows}</div>' if used_rows else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing yet. Time and what was opened are listed '
-           'here once a browser without the PIN has used the Media Center.</div></div>')
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
+           + _t("Nothing yet. Time and what was opened are listed here once a browser without the PIN has used the Media Center.") + '</div></div>')
         + '</div>'
-        + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
-        + """<script>
+        + '<p><a class="btn ghost" href="/mediacenter">' + _t("Open the Media Center") + ' &rarr;</a></p>'
+        + _fill("""<script>
 const G = id => document.getElementById(id);
 function kpPost(b){
   return fetch("/api/kids/profile", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(b)})
-    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "that did not work"); });
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "[[@js:that did not work]]"); });
 }
 function kpAdd(){ kpPost({name: G("kpName").value, level: G("kpLevel").value, pin: G("kpNewPin").value}); }
-function kpPin(id){ const p = prompt("A new PIN for this person, 4 to 12 digits"); if (p) kpPost({id: id, pin: p}); }
-function kpDel(id){ if (confirm("Remove this person? Their PIN stops working; what they used stays in the record.")) kpPost({id: id, delete: true}); }
+function kpPin(id){ const p = prompt("[[@js:A new PIN for this person, 4 to 12 digits]]"); if (p) kpPost({id: id, pin: p}); }
+function kpDel(id){ if (confirm("[[@js:Remove this person? Their PIN stops working; what they used stays in the record.]]")) kpPost({id: id, delete: true}); }
 function kpTime(id){ const e = G("kpT" + id); e.hidden = !e.hidden; }
 function kpSave(id){
   const part = k => ({from: G("kp" + id + "_" + k + "_from").value, to: G("kp" + id + "_" + k + "_to").value, limit: +G("kp" + id + "_" + k + "_limit").value});
@@ -13097,10 +13112,10 @@ function kmAllow(kind, ref, el){
 }
 function kmPin(remove){
   const cur = document.getElementById("kmCur"), nw = document.getElementById("kmNew"), msg = document.getElementById("kmMsg");
-  if (remove && !confirm("Remove the PIN? Anybody who opens this address will see everything again.")) return;
+  if (remove && !confirm("[[@js:Remove the PIN? Anybody who opens this address will see everything again.]]")) return;
   fetch("/api/kids/pin", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({pin: remove ? "" : nw.value, current: cur ? cur.value : ""})}).then(r => r.json())
-    .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "that did not work"; });
+    .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "[[@js:that did not work]]"; });
 }
 function mcSave(){
   const g = id => document.getElementById(id), msg = g("mcMsg");
@@ -13108,7 +13123,7 @@ function mcSave(){
   fetch("/api/kids/rules", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({
     on: g("mcOn").checked, wd: part("wd"), we: part("we"), session: +g("mcSession").value, rest: +g("mcRest").value,
     tz: -new Date().getTimezoneOffset()})}).then(r => r.json())
-    .then(j => { msg.textContent = j.status === "ok" ? "saved" : (j.message || "that did not work"); });
+    .then(j => { msg.textContent = j.status === "ok" ? "[[@js:saved]]" : (j.message || "[[@js:that did not work]]"); });
 }
 function kmShow(b){
   document.querySelectorAll(".km-chip").forEach(x => x.classList.toggle("on", x === b));
@@ -13124,7 +13139,7 @@ function kmTab(t, quiet){
 }
 kmTab((location.hash || "#pin").slice(1), true);
 window.addEventListener("hashchange", () => kmTab((location.hash || "#pin").slice(1), true));
-</script>""")
+</script>"""))
     return HTMLResponse(_layout("Media Center", "/settings", body, page_title="Media Center & PIN", top_actions_html=""))
 
 
