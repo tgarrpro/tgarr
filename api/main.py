@@ -7957,7 +7957,13 @@ def _color_for(s: str) -> str:
 
 
 _LANG_JS = ('<script>'
-            'function tgLang(c){document.cookie="tgarr_lang="+c+"; path=/; max-age=31536000; SameSite=Lax";location.reload()}'
+            # the language chosen here is also what the Media Center starts in on every screen that has
+            # not chosen one of its own (the household's language). A locked browser is refused that
+            # part by the guard, and keeps its choice to itself.
+            'function tgLang(c){document.cookie="tgarr_lang="+c+"; path=/; max-age=31536000; SameSite=Lax";'
+            'var go=function(){location.reload()},t=setTimeout(go,2500);'
+            'fetch("/api/kids/lang",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang:c})})'
+            '.catch(function(){}).then(function(){clearTimeout(t);go()})}'
             'function tgLangOpen(e){e.stopPropagation();var l=document.getElementById("tgLangList");if(l)l.hidden=!l.hidden}'
             '</script>')
 
