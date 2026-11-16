@@ -13771,9 +13771,9 @@ _MUSIC_PLAYER_HTML = r"""
 <div class="np-panel" id="npPanel">
   <div class="bgimg" id="npBg"></div>
   <div class="top">
-    <button id="vizBtn" title="moving spectrum on / off">Spectrum</button>
-    <button id="lyrBtn" title="lyrics on / off">Lyrics</button>
-    <button id="npClose">Close ✕</button>
+    <button id="vizBtn" title="[[@moving spectrum on / off]]">[[@Spectrum]]</button>
+    <button id="lyrBtn" title="[[@lyrics on / off]]">[[@Lyrics]]</button>
+    <button id="npClose">[[@Close]] ✕</button>
   </div>
   <div class="mid">
     <div class="art"><div class="cv" id="npCover">🎵</div><div class="t" id="npT2"></div><div class="a" id="npA2"></div></div>
@@ -13782,22 +13782,22 @@ _MUSIC_PLAYER_HTML = r"""
   <canvas id="viz"></canvas>
 </div>
 <div class="player-bar">
-  <div class="np" id="npOpen" title="open the now-playing view">
+  <div class="np" id="npOpen" title="[[@open the now-playing view]]">
     <div class="np-icon" id="npIcon">🎵</div>
-    <div class="np-text"><div class="np-t" id="npT">— select a track —</div><div class="np-a" id="npA"></div></div>
+    <div class="np-text"><div class="np-t" id="npT">[[@— select a track —]]</div><div class="np-a" id="npA"></div></div>
   </div>
   <div class="ctl">
-    <button class="ghost" id="prevBtn" title="previous (p)">⏮</button>
-    <button id="pp" title="play / pause (space)">▶</button>
-    <button class="ghost" id="nextBtn" title="next (n)">⏭</button>
+    <button class="ghost" id="prevBtn" title="[[@previous (p)]]" aria-label="[[@previous (p)]]">⏮</button>
+    <button id="pp" title="[[@play / pause (space)]]" aria-label="[[@play / pause (space)]]">▶</button>
+    <button class="ghost" id="nextBtn" title="[[@next (n)]]" aria-label="[[@next (n)]]">⏭</button>
   </div>
   <div class="seek"><span id="tCur">0:00</span><input type="range" id="seek" min="0" max="1000" value="0"><span id="tDur">0:00</span></div>
   <canvas id="mini"></canvas>
   <div class="ctl">
-    <button class="ghost" id="shuffleBtn" title="shuffle">🔀</button>
-    <button class="ghost" id="favBtn" title="favourite (f)">♥</button>
-    <a class="btn ghost" id="dlBtn" title="download this file" download>⬇</a>
-    <button class="ghost" id="npBtn" title="cover, lyrics and spectrum (l)">♪ Now playing</button>
+    <button class="ghost" id="shuffleBtn" title="[[@shuffle]]" aria-label="[[@shuffle]]">🔀</button>
+    <button class="ghost" id="favBtn" title="[[@favourite (f)]]" aria-label="[[@favourite (f)]]">♥</button>
+    <a class="btn ghost" id="dlBtn" title="[[@download this file]]" aria-label="[[@download this file]]" download>⬇</a>
+    <button class="ghost" id="npBtn" title="[[@cover, lyrics and spectrum (l)]]">♪ [[@Now playing]]</button>
   </div>
   <audio id="audio" preload="metadata"></audio>
 </div>
@@ -13864,11 +13864,11 @@ _MUSIC_PLAYER_HTML = r"""
   $("lyrBtn").onclick = () => { prefs.lyr = !prefs.lyr; save(); lyrUi(); if (prefs.lyr && cur >= 0 && lines === null) loadLyrics(rows[cur].dataset.id); };
   function loadLyrics(id){
     const box = $("lyr"); lines = null; lineEls = []; lineIdx = -1;
-    box.className = "lyr"; box.innerHTML = '<div class="none">looking for lyrics…</div>';
+    box.className = "lyr"; box.innerHTML = '<div class="none">' + esc("[[@js:looking for lyrics…]]") + "</div>";
     if (!prefs.lyr) return;
     fetch("/api/lyrics/" + id).then(r => r.json()).then(j => {
       if (cur < 0 || rows[cur].dataset.id !== String(id)) return;
-      if (!j.found) { lines = []; box.innerHTML = '<div class="none">No lyrics found for this track.</div>'; return; }
+      if (!j.found) { lines = []; box.innerHTML = '<div class="none">' + esc("[[@js:No lyrics found for this track.]]") + "</div>"; return; }
       if (j.synced) {
         lines = j.lines;
         box.innerHTML = lines.map((l, i) => '<div data-i="' + i + '">' + (esc(l[1]) || "♪") + "</div>").join("");
@@ -13878,7 +13878,7 @@ _MUSIC_PLAYER_HTML = r"""
         lines = []; box.className = "lyr plain";
         box.innerHTML = j.text.split("\n").map(t => "<div>" + (esc(t) || "&nbsp;") + "</div>").join("");
       }
-    }).catch(() => { lines = []; box.innerHTML = '<div class="none">Could not load lyrics.</div>'; });
+    }).catch(() => { lines = []; box.innerHTML = '<div class="none">' + esc("[[@js:Could not load lyrics.]]") + "</div>"; });
   }
   function lyrTick(){
     if (!lines || !lines.length || !lineEls.length) return;
@@ -13936,7 +13936,7 @@ _MUSIC_PLAYER_HTML = r"""
   audio.addEventListener("play", () => { $("pp").textContent = "⏸"; vizStart(); });
   audio.addEventListener("pause", () => { $("pp").textContent = "▶"; });
   audio.addEventListener("ended", tgMusicNext);
-  audio.addEventListener("error", () => { if (cur >= 0) $("npA").textContent = "could not play this file — try the next one"; });
+  audio.addEventListener("error", () => { if (cur >= 0) $("npA").textContent = "[[@js:could not play this file — try the next one]]"; });
   audio.addEventListener("timeupdate", () => {
     $("tCur").textContent = fmt(audio.currentTime); $("tDur").textContent = fmt(audio.duration);
     if (audio.duration && !seeking) $("seek").value = Math.round(audio.currentTime / audio.duration * 1000);
@@ -13988,7 +13988,8 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
 
     _music_my_dc = await _get_my_dc()
     book = 1 if book else 0
-    what = "Audiobooks" if book else "Music"
+    what = "Audiobooks" if book else "Music"              # the title: _layout puts it into words
+    what_t = _t("Audiobooks") if book else _t("Music")
     # Composite quality: MB-canonical hit + has cover + duration > 1min
     sort_clause = {
         "quality": (
@@ -14088,7 +14089,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     lang_chips_html = (
         f'<a class="btn ghost" href="/music{"?book=1" if book else ""}" style="' +
         ('background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);' if not lang else '') +
-        'padding:5px 12px;font-size:12px">all</a>' +
+        f'padding:5px 12px;font-size:12px">{_t("all")}</a>' +
         "".join(_music_lang_chip(r["lang"], r["n"]) for r in lang_dist if r["lang"] != 'unknown' and r["n"] > 0)
     )
 
@@ -14099,44 +14100,48 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips_html = (
-        _music_sort_chip("quality", "In order" if book else "★ Best") +
-        _music_sort_chip("recent",  "Recent") +
-        _music_sort_chip("longest", "Longest") +
-        _music_sort_chip("size",    "Largest") +
+        _music_sort_chip("quality", _t("In order") if book else "★ " + _t("Best")) +
+        _music_sort_chip("recent",  _t("Recent")) +
+        _music_sort_chip("longest", _t("Longest")) +
+        _music_sort_chip("size",    _t("Largest")) +
         '<span style="margin-left:10px"></span>' + _src_chips("/music", _music_qs, src, src_n) + _saved_chip("/music", _music_qs, local) +
         f'<a class="btn ghost" href="/music{_music_qs(fav=None if fav else 1)}" '
         f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
-        f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>')
+        f'padding:5px 12px;font-size:12px" title="{_t("only my favourites")}">♥ {_t("favourites")}</a>')
     # the other shelf: books that are listened to stand apart from songs
     shelf_chip = (f'<a class="btn ghost" href="/music{"" if book else "?book=1"}" style="padding:5px 12px;font-size:12px;margin-left:auto" '
-                  f'title="{"back to the songs" if book else "books that are listened to"}">'
-                  + ("🎵 Music" if book else f'🎧 Audiobooks <span style="opacity:.6">{books_n:,}</span>') + '</a>')
+                  f'title="{_t("back to the songs") if book else _t("books that are listened to")}">'
+                  + ("🎵 " + _t("Music") if book else f'🎧 {_t("Audiobooks")} <span style="opacity:.6">{books_n:,}</span>') + '</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
         + lang_chips_html + shelf_chip + '</div>'
         '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;align-items:center">'
-        '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>'
+        f'<span style="color:var(--muted);font-size:12px;margin-right:4px">{_t("Sort:")}</span>'
         + sort_chips_html + '</div>'
     )
 
     if not rows:
+        # (the link is put in after the sentence is translated: a blank is filled with text, not HTML)
+        why_empty = _t("A sound file stands here when it is an .m4b, when its name, title or album calls it an audiobook, or when it was fetched from the Audiobooks shelf of {usenet}.",
+                       usenet="%USENET%").replace("%USENET%", '<a href="/usenet?kind=audiobook">Usenet</a>')
         body = (
-            f'<h2 class="section">{what} <span class="count">0</span></h2>'
+            f'<h2 class="section">{what_t} <span class="count">0</span></h2>'
             f'{toolbar}'
             '<div class="empty-state">'
             f'<div class="icon">{"🎧" if book else "🎵"}</div>'
-            + ('<div>No audiobooks here yet.</div><div style="margin-top:8px;font-size:13px">A sound file stands here when it is an '
-               '.m4b, when its name, title or album calls it an audiobook, or when it was fetched from the Audiobooks shelf of '
-               '<a href="/usenet?kind=audiobook">Usenet</a>.</div>' if book and not (q or lang or local or fav) else
-               '<div>No audio matches these filters.</div>'
-               f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio indexed — click to fetch.</div>')
+            + (f'<div>{_t("No audiobooks here yet.")}</div><div style="margin-top:8px;font-size:13px">{why_empty}</div>'
+               if book and not (q or lang or local or fav) else
+               f'<div>{_t("No audio matches these filters.")}</div>'
+               f'<div style="margin-top:8px;font-size:13px">{_t("{n} audio indexed — click to fetch.", n=f"{pending_n:,}")}</div>')
             + '</div>'
         )
         return HTMLResponse(_layout(what, "/music", body))
 
+    untitled, tip_fav, tip_dl = i18n.t(_LANG.get(), "(untitled)"), _t("favourite"), _t("download this file")
+
     def _row(r):
-        title = r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)"
+        title = r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or untitled
         artist = r["audio_performer"] or ""
         album = r["audio_album"] or (os.path.basename(os.path.dirname(r["local_path"] or "")) if book else "") or r["ch_title"] or ""
         sub = artist + ((" · " + album) if album else "") + \
@@ -14156,9 +14161,9 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
             f'<td class="num">{_fmt_size(r["file_size"])}</td>'
             f'<td class="num">{_fmt_time(r["posted_at"])[:10]}</td>'
             f'<td class="act">'
-            f'<button class="mbtn fav{" on" if r["fav"] else ""}" title="favourite" '
+            f'<button class="mbtn fav{" on" if r["fav"] else ""}" title="{tip_fav}" aria-label="{tip_fav}" '
             f'onclick="event.stopPropagation();tgFav(this.closest(\'tr\'))">♥</button>'
-            f'<a class="mbtn" title="download this file" href="/media/{r["id"]}" '
+            f'<a class="mbtn" title="{tip_dl}" aria-label="{tip_dl}" href="/media/{r["id"]}" '
             f'download="{html.escape(r["file_name"] or "", quote=True)}" '
             f'onclick="event.stopPropagation()">⬇</a>'
             f'</td>'
@@ -14167,18 +14172,18 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     rows_html = "".join(_row(r) for r in rows)
 
     body = (
-        f'<h2 class="section">{what} <span class="count">{len(rows)} of {total:,}</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
+        f'<h2 class="section">{what_t} <span class="count">{_t("{n} of {total}", n=len(rows), total=f"{total:,}")}</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{_t("{n} indexed (click to fetch)", n=f"{pending_n:,}")}</span>'
            if pending_n else '')
         + '</h2>'
         f'{toolbar}'
         '<table class="music-list">'
-        '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th>'
-        '<th>posted</th><th style="width:84px"></th></tr></thead>'
+        f'<thead><tr><th style="width:40px"></th><th>{_t("title")}</th><th>{_t("duration")}</th><th>{_t("size")}</th>'
+        f'<th>{_t("posted")}</th><th style="width:84px"></th></tr></thead>'
         f'<tbody>{rows_html}</tbody></table>'
         + _page_nav("/music", _music_qs, page_offset, page_size, len(rows), total)
         + ('<script>window.tgBook=1</script>' if book else '')
-        + _MUSIC_PLAYER_HTML
+        + _fill(_MUSIC_PLAYER_HTML)
     )
     return HTMLResponse(_layout(what, "/music", body))
 
