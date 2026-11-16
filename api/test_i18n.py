@@ -57,6 +57,7 @@ src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), 
 asked = set(m.group(2) for m in I._MARK.finditer(src))
 asked |= set(re.findall(r'\btr\("((?:[^"\\]|\\.)+)"', src))
 asked |= set(re.findall(r'i18n\.t\(lang, "((?:[^"\\]|\\.)+)"', src))
+asked |= set(re.findall(r'\b_tj?\("((?:[^"\\]|\\.)+)"', src))            # _t("Open"), _tj("Saved")
 themes = re.search(r"_MC_THEMES = \((.*?)\n\)\n", src, re.S).group(1)
 for key, name, about in re.findall(r'\("(\w+)", "([^"]+)", "([^"]*)"', themes):
     asked |= {name} | ({about} if about else set())
@@ -69,6 +70,17 @@ asked |= set(re.findall(r'"/\w+":\s+\("/\w+",\s*"(Search [^"]+)"\)', src)) | {"S
 ok(len(asked) > 40, f"the pages ask for {len(asked)} words")
 missing = sorted(a for a in asked if a not in I.T)
 ok(not missing, f"asked for by a page, not in the catalogue: {missing}")
-unused = sorted(k for k in I.T if k not in asked)
+# (a word may reach a page through a list or a table of the code rather than a call: it is
+#  enough that the English stands somewhere in main.py, in quotes)
+unused = sorted(k for k in I.T if k not in asked and ('"' + k + '"') not in src and ("'" + k + "'") not in src)
 ok(not unused, f"in the catalogue, asked for by no page: {unused}")
+# the same English is not given two translations in two files
+import glob
+seen = {}
+for path in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "words_*.py"))):
+    ns = {}
+    exec(compile(open(path, encoding="utf-8").read(), path, "exec"), ns)
+    for text, row in ns.get("T", {}).items():
+        ok(text not in seen or seen[text][1] == row, f"{text!r} is translated differently in {seen.get(text, ('', ''))[0]} and {os.path.basename(path)}")
+        seen.setdefault(text, (os.path.basename(path), row))
 print(f"test_i18n: {n} checks passed")

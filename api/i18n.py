@@ -137,6 +137,26 @@ T = {
 }
 
 
+def _more_words() -> None:
+    """The words of the other pages live in files of their own beside this one, one for each
+    part of tgarr (words_library.py, words_reader.py ...), each with a T of the same shape. They
+    are added to the catalogue here. A word this file already has is not replaced: the same
+    English on two pages reads the same everywhere."""
+    import glob
+    import importlib.util
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in sorted(glob.glob(os.path.join(here, "words_*.py"))):
+        spec = importlib.util.spec_from_file_location("tgarr_" + os.path.basename(path)[:-3], path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for text, row in getattr(mod, "T", {}).items():
+            T.setdefault(text, row)
+
+
+_more_words()
+
+
 def norm(code: str) -> str:
     """'zh-CN' -> 'zh-Hans', 'pt-BR' -> 'pt', 'EN_us' -> 'en'; '' for a language not spoken here."""
     c = (code or "").strip().replace("_", "-").lower()

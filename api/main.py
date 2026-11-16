@@ -12200,6 +12200,24 @@ _MC_KINDS = {
 _UI_LANG = {"at": 0.0, "v": ""}
 
 
+def _t(text: str, **values) -> str:
+    """A word of a page in the language of this request, safe to put into HTML (as text or
+    inside a quoted attribute). `text` is the English, written out where it is used, with
+    {blanks} for what is filled in. What the catalogue does not have comes back in English."""
+    return html.escape(i18n.t(_LANG.get(), text, **values), quote=True)
+
+
+def _tj(text: str, **values) -> str:
+    """The same, for the inside of a quoted string in a script."""
+    return _json.dumps(i18n.t(_LANG.get(), text, **values), ensure_ascii=False)[1:-1].replace("</", "<" + chr(92) + "/").replace("'", chr(92) + "'")
+
+
+def _fill(page: str) -> str:
+    """A long page or script kept as one text, with its words marked the way i18n.fill reads
+    them: filled in for this request."""
+    return i18n.fill(_LANG.get(), page)
+
+
 async def _lang(request: Request) -> str:
     """The language this request is answered in: this screen's own choice (a cookie), else
     the household's (config `ui_lang`), else what the browser asks for, else English."""
