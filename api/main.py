@@ -1915,7 +1915,7 @@ def _local_pill(lp) -> str:
     if not _is_local(lp):
         return ""
     return ('<span class="pill ok" style="font-size:11px" '
-            'title="already downloaded: opens instantly">● saved</span>')
+            f'title="{_t("already downloaded: opens instantly")}">● {_t("saved")}</span>')
 
 
 async def _touch_local(msg_id: int) -> None:
@@ -2435,14 +2435,14 @@ def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> 
     links = []
     if offset > 0:
         prev = max(0, offset - size)
-        links.append(f'<a class="btn ghost" href="{path}{qs(offset=prev if prev else None)}">← prev</a>')
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=prev if prev else None)}">← {_t("Prev")}</a>')
     if offset + size < total:
-        links.append(f'<a class="btn ghost" href="{path}{qs(offset=offset + size)}">next →</a>')
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=offset + size)}">{_t("Next")} →</a>')
     return (
         '<div style="display:flex;justify-content:space-between;align-items:center;'
         'margin-top:18px;padding:12px 0 90px;border-top:1px solid var(--border, #e2e8f0)">'
         f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {offset + 1 if shown else 0}–{offset + shown} of {total:,}</span>'
+        f'{_t("showing {a}–{b} of {total}", a=offset + 1 if shown else 0, b=offset + shown, total=f"{total:,}")}</span>'
         f'<div style="display:flex;gap:8px">{"".join(links)}</div></div>')
 
 
@@ -2450,10 +2450,10 @@ def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> 
 # folders. Videos, Music and the Library can be narrowed to one of them. A source is told by
 # the made-up chat id its folder stands under (localfiles.chat_id), so the condition needs
 # nothing but the message row.
-_SRC_NAMES = (("tg", "✈ Telegram", "from Telegram channels and chats"),
-              ("usenet", "📰 Usenet", "fetched from the newsgroups"),
-              ("archive", "🏛 Internet Archive", "fetched from the Internet Archive"),
-              ("mine", "📁 My files", "uploaded to this server, or found in its folders"))
+_SRC_NAMES = (("tg", "✈", "Telegram", "from Telegram channels and chats"),
+              ("usenet", "📰", "Usenet", "fetched from the newsgroups"),
+              ("archive", "🏛", "Internet Archive", "fetched from the Internet Archive"),
+              ("mine", "📁", "My files", "uploaded to this server, or found in its folders"))
 
 
 def _src_ids() -> tuple:
@@ -2483,13 +2483,14 @@ async def _src_counts(conn, from_sql: str, where: list, params: list) -> dict:
 def _src_chips(path: str, qs, src: str, counts: dict) -> str:
     """The sources as chips - only when there is a choice to make: two sources or more have
     something, or one is chosen already."""
-    if not src and sum(1 for k, _, _ in _SRC_NAMES if counts.get(k)) < 2:
+    if not src and sum(1 for k, *_ in _SRC_NAMES if counts.get(k)) < 2:
         return ""
     on = "background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);"
     out = ""
-    for k, label, tip in _SRC_NAMES:
+    for k, sign, name, tip in _SRC_NAMES:
         if not counts.get(k) and k != src:
             continue
+        label, tip = f"{sign} {_t(name)}", _t(tip)
         out += (f'<a class="btn ghost" href="{path}{qs(src=None if src == k else k, offset=None)}" '
                 f'style="{on if src == k else ""}padding:5px 12px;font-size:12px" title="{tip}">'
                 f'{label} <span style="opacity:.6">{counts.get(k, 0):,}</span></a>')
@@ -2501,11 +2502,11 @@ def _saved_chip(path: str, qs, local: int) -> str:
              if local else "")
     chip = (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
             f'style="{style}padding:5px 12px;font-size:12px" '
-            f'title="only what is already downloaded">● saved</a>')
+            f'title="{_t("only what is already downloaded")}">● {_t("saved")}</a>')
     # with "saved" chosen: everything of this kind that is on this machine, as one zip, at once
     kind = {"/music": "audio", "/library": "book", "/videos": "video"}.get(path)
     if local and kind and _signed_in():
-        chip += _export_btn({"scope": "saved", "kind": kind}, "⬇ Download all")
+        chip += _export_btn({"scope": "saved", "kind": kind}, "⬇ " + _t("Download all"))
     return chip
 
 
@@ -8057,18 +8058,18 @@ async function tgGrab(btn) {{
     const r = await fetch('/api/grab/' + guid, {{method: 'POST'}});
     const j = await r.json();
     if (j.status === 'queued') {{
-      btn.textContent = '✓ Queued';
+      btn.textContent = '✓ {_tj("Queued")}';
       btn.style.background = 'var(--ok)';
     }} else if (j.status === 'exists') {{
-      btn.textContent = '· already ' + j.existing_status;
+      btn.textContent = '· {_tj("already there")}';
       btn.style.background = 'var(--muted)';
     }} else {{
-      btn.textContent = '✗ ' + (j.message || 'error');
+      btn.textContent = '✗ ' + (j.message || '{_tj("that did not work")}');
       btn.style.background = 'var(--bad)';
       setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
     }}
   }} catch (e) {{
-    btn.textContent = '✗ network';
+    btn.textContent = '✗ {_tj("network error")}';
     btn.style.background = 'var(--bad)';
     setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
   }}
@@ -14568,10 +14569,10 @@ def _dc_badge(file_dc, my_dc) -> str:
     """Tiny DC indicator: 🟢 same DC (fast), 🟡 cross-DC (may hit FloodWait),
     ⚪ unknown (file_dc not yet recorded — backfills on first click)."""
     if not file_dc:
-        return '<span class="pill muted" title="DC unknown — backfills on first click" style="font-size:11px">⚪</span>'
+        return f'<span class="pill muted" title="{_t("data centre unknown: found out on the first click")}" style="font-size:11px">⚪</span>'
     if not my_dc or file_dc == my_dc:
-        return f'<span class="pill ok" title="same DC {file_dc} — fast" style="font-size:11px">🟢 DC{file_dc}</span>'
-    return f'<span class="pill warn" title="cross-DC ({file_dc} vs your {my_dc}) — may hit FloodWait" style="font-size:11px">🟡 DC{file_dc}</span>'
+        return f'<span class="pill ok" title="{_t("same data centre ({dc}): fast", dc=file_dc)}" style="font-size:11px">🟢 DC{file_dc}</span>'
+    return f'<span class="pill warn" title="{_t("another data centre ({dc}, yours is {mine}): Telegram may make it wait", dc=file_dc, mine=my_dc)}" style="font-size:11px">🟡 DC{file_dc}</span>'
 
 
 def _part_pill(r) -> str:
