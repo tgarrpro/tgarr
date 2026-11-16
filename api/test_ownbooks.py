@@ -302,4 +302,12 @@ ok(B.load(os.path.join(tmp, "c.fb2"), "fb2") is b1, "a book is kept for the next
 t = B.load(put("n.txt", "第一章 一\n正文。\n第二章 二\n正文。\n".encode("gb18030")), "txt")
 ok(t.titles == ["第一章 一", "第二章 二"] and "<h2" in t.chapter(0), "a .txt comes through the same door")
 ok(refused(lambda: B.load(put("bad.docx", b"PK\x03\x04broken"), "docx")), "a broken zip is NotReadable, nothing else")
+# ── compiled help ──
+ok(B.kind_of("Manual.CHM") == "chm", "a .chm is read here")
+ok(refused(lambda: B.load(put("fake.chm", b"<html>not a chm</html>"), "chm")), "what is not a .chm (or no program to open one) is NotReadable")
+import unpack  # noqa: E402
+BS = chr(92)
+ok(unpack._literal("a[1]*?.jpg") == f"a{BS}[1{BS}]{BS}*{BS}?.jpg", "a name with pattern characters is asked for as that one file")
+ok(unpack.magic(put("r.rar", unpack.RAR_MAGIC + bytes(2)), 6) == unpack.RAR_MAGIC and unpack.magic(os.path.join(tmp, "nowhere")) == b"",
+   "an archive by its first bytes")
 print(f"ownbooks: {n} checks passed")

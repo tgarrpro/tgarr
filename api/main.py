@@ -33,6 +33,7 @@ import screentime  # local module
 import export  # local module
 import localfiles  # local module
 import ownbooks  # local module: books read here without converting (.txt .fb2 .docx .odt .rtf .mobi .html)
+import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
 import contextvars
 
 
@@ -2910,6 +2911,13 @@ _EBOOK_CONVERTIBLE = ("epub", "mobi", "azw", "azw3", "djvu", "fb2",
                       # plain documents a household uploads: readable, and read aloud, like a book
                       "txt", "docx", "odt")
 
+def _djvu_tool(src: str):
+    """The program that turns a scanned .djvu into a PDF by itself (ddjvu, a few megabytes in
+    the image), so those need no calibre; None for another kind of book or an older image."""
+    import shutil
+    return shutil.which("ddjvu") if src.lower().endswith((".djvu", ".djv")) else None
+
+
 def _ebook_paths(local_path: str):
     """Return (source_abs, pdf_abs, cover_abs) for a cached ebook."""
     src = os.path.join("/downloads", local_path)
@@ -2989,7 +2997,8 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
     import time as _t
     # calibre is no longer in the image: it is fetched when a book first needs it (packs.py).
     # Until then nothing is queued - the page that asked says so and offers to fetch it.
-    convert = packs.program("ebook-convert")
+    djvu = _djvu_tool(src)
+    convert = djvu or packs.program("ebook-convert")
     if not convert:
         _EBOOK_JOBS[msg_id] = {"state": "needs_converter", "started_at": _t.time()}
         return False
@@ -3022,7 +3031,7 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
             except OSError:
                 pass
         proc = await asyncio.create_subprocess_exec(
-            convert, src, tmp,
+            *([djvu, "-format=pdf", "-quality=85", src, tmp] if djvu else [convert, src, tmp]),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=env, preexec_fn=_set_limits, start_new_session=True)
@@ -3101,7 +3110,7 @@ async def ebook_status(msg_id: int, request: Request):
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
                 "size": os.path.getsize(pdf)}
-    if not packs.program("ebook-convert"):
+    if not packs.program("ebook-convert") and not _djvu_tool(src):
         st = packs.status("books")
         return {"state": "needs_converter", "installing": st["installing"], "done": st["done"], "bytes": st["bytes"],
                 "error": st["error"], "possible": st["possible"]}
@@ -3433,16 +3442,25 @@ _COMIC_PAGE_MOST = 80 * 1024 * 1024
 _COMIC_CACHE: dict = {}           # path -> (mtime, [names in reading order])
 
 
+def _comic_is_rar(path: str) -> bool:
+    return unpack.magic(path, 6) == unpack.RAR_MAGIC
+
+
 def _comic_pages(path: str) -> list:
-    """The pictures of a comic in reading order. Raises when the file is not a zip."""
+    """The pictures of a comic in reading order. Raises when the file is neither a zip nor
+    (where the image has bsdtar) a RAR archive."""
     mtime = os.path.getmtime(path)
     hit = _COMIC_CACHE.get(path)
     if hit and hit[0] == mtime:
         return hit[1]
-    with _zipfile.ZipFile(path) as zf:
-        names = [i.filename for i in zf.infolist()
-                 if not i.is_dir() and _COMIC_PAGE_RX.search(i.filename) and i.file_size <= _COMIC_PAGE_MOST
-                 and "__MACOSX" not in i.filename and not os.path.basename(i.filename).startswith(".")]
+    if _comic_is_rar(path):
+        names = [n for n in unpack.rar_names(path)
+                 if _COMIC_PAGE_RX.search(n) and "__MACOSX" not in n and not os.path.basename(n).startswith(".")]
+    else:
+        with _zipfile.ZipFile(path) as zf:
+            names = [i.filename for i in zf.infolist()
+                     if not i.is_dir() and _COMIC_PAGE_RX.search(i.filename) and i.file_size <= _COMIC_PAGE_MOST
+                     and "__MACOSX" not in i.filename and not os.path.basename(i.filename).startswith(".")]
     names.sort(key=lambda s: [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", s)])
     if len(_COMIC_CACHE) > 200:
         _COMIC_CACHE.clear()
@@ -3480,6 +3498,11 @@ async def comic_page(msg_id: int, n: int):
     name = c[2][n]
 
     def _read():
+        if _comic_is_rar(c[0]):
+            data = unpack.rar_read(c[0], name, _COMIC_PAGE_MOST)
+            if not ownbooks.picture_type(data):
+                raise ValueError("not a picture")
+            return data
         with _zipfile.ZipFile(c[0]) as zf:
             return zf.read(name)
     try:

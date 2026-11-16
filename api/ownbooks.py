@@ -5,6 +5,8 @@
     .docx  .odt          a zip of XML (Word, LibreOffice)
     .rtf                 text and paragraphs (type faces, pictures and tables are let go)
     .html  .htm          a saved page: its text and structure (pictures kept beside it are not in the file)
+    .chm                 Windows' compiled help: its pages in the order of its contents, its pictures
+                         (unpacked by 7-Zip, see unpack.py)
     .mobi  .azw  .prc    Mobipocket, the old Kindle format, when it is not protected
     .azw3                KF8, the newer one: its pages of XHTML, its pictures (its style sheets are let go)
 
@@ -31,7 +33,7 @@ from xml.etree import ElementTree as ET
 
 import textbook
 
-KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml")
+KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml", "chm")
 XML_MOST = 80 * 1024 * 1024         # one XML part, unpacked
 TEXT_MOST = 120 * 1024 * 1024       # the text of one book
 _CACHE: dict = {}                   # path -> (mtime, Book)
@@ -73,6 +75,9 @@ class Book:
         try:
             if src[0] == "bytes":
                 data = src[1]
+            elif src[0] == "7z":
+                import unpack
+                data = unpack.seven_read(src[1], src[2], 40 * 1024 * 1024)
             elif src[0] == "zip":
                 with zipfile.ZipFile(src[1]) as zf:
                     if zf.getinfo(src[2]).file_size > 40 * 1024 * 1024:
@@ -1066,6 +1071,137 @@ def _html(data: bytes) -> Book:
     return Book(title, titles, chapters, _latin(blocks))
 
 
+# ── Windows' compiled help ────────────────────────────────────────────────────────────
+_CHM_MOST = 400 * 1024 * 1024
+_CHM_PAGE = re.compile(r"\.(html?|xhtml)$", re.I)
+_CHM_PICTURE = re.compile(r"\.(jpe?g|png|gif|bmp|webp)$", re.I)
+
+
+def _decode_page(data: bytes) -> str:
+    m = re.search(rb"<meta[^>]+charset\s*=\s*[\"']?\s*([A-Za-z0-9_\-]+)", data[:4096], re.I)
+    if m and data[:3] != b"\xef\xbb\xbf" and data[:2] not in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            name = m.group(1).decode("ascii").lower()
+            return data.decode("gb18030" if name in ("gb2312", "gbk") else name)
+        except (LookupError, UnicodeDecodeError):
+            pass
+    return textbook.decode(data)[0]
+
+
+def _page_blocks(body: str) -> list:
+    blocks = []
+    for piece in _HTML_CUT.split(body):
+        if not piece or not piece.strip():
+            continue
+        h = re.match(r"\s*<h([1-6])>", piece)
+        plain = _plain(piece).strip()
+        if plain or "<img" in piece:
+            blocks.append((int(h.group(1)) if h else 0, piece, re.sub(r"\s+", " ", plain)))
+    return blocks
+
+
+def _chm(path: str) -> Book:
+    import shutil
+    import tempfile
+    import unpack
+    if not unpack.have("7zz"):
+        raise NotReadable("the program that opens .chm files is not part of this install yet")
+    if unpack.magic(path, 4) != unpack.CHM_MAGIC:
+        raise NotReadable("this is not a compiled help file (.chm)")
+    try:
+        listing = unpack.seven_list(path)
+    except (OSError, ValueError) as e:
+        raise NotReadable(f"this .chm could not be opened ({e})")
+    if sum(sz for _, sz in listing) > _CHM_MOST:
+        raise NotReadable("this .chm is too large to open here")
+    members = {n.lstrip("/").lower(): n.lstrip("/") for n, _ in listing}
+    tmp = tempfile.mkdtemp(prefix="chm-")
+    try:
+        try:
+            unpack.seven_extract(path, tmp)
+        except (OSError, ValueError) as e:
+            raise NotReadable(f"this .chm could not be unpacked ({e})")
+        on_disk = {}
+        for base, _, files in os.walk(tmp):
+            for f in files:
+                full = os.path.join(base, f)
+                if not os.path.islink(full):
+                    on_disk[os.path.relpath(full, tmp).replace("\\", "/").lower()] = full
+
+        def read(rel: str):
+            full = on_disk.get(rel.lstrip("/").lower())
+            if not full or os.path.getsize(full) > XML_MOST:
+                return None
+            with open(full, "rb") as f:
+                return f.read()
+
+        # the order of the pages and their names: the contents file of the help
+        order, seen = [], set()
+        for rel in sorted(on_disk):
+            if rel.endswith(".hhc"):
+                toc = _decode_page(read(rel) or b"")
+                for obj in re.finditer(r"<object\b[^>]*>(.*?)</object>", toc, re.I | re.S):
+                    name = re.search(r"<param\s+name=[\"']?Name[\"']?\s+value=\"([^\"]*)\"", obj.group(1), re.I)
+                    local = re.search(r"<param\s+name=[\"']?Local[\"']?\s+value=\"([^\"]*)\"", obj.group(1), re.I)
+                    if not local:
+                        continue
+                    target = os.path.normpath(os.path.join(os.path.dirname(rel), html.unescape(local.group(1)).split("#")[0])
+                                              ).replace("\\", "/").lstrip("/").lower()
+                    if target in on_disk and target not in seen and _CHM_PAGE.search(target):
+                        seen.add(target)
+                        order.append((target, html.unescape(name.group(1)).strip()[:120] if name else ""))
+                break
+        for rel in sorted(on_disk):          # pages the contents do not name come after, in order of name
+            if _CHM_PAGE.search(rel) and rel not in seen:
+                order.append((rel, ""))
+        if not order:
+            raise NotReadable("this .chm has no pages in it")
+        assets, numbers = {}, {}
+        titles, chapters, sample, book_title = [], [], [], None
+        for rel, name in order[:5000]:
+            data = read(rel)
+            if not data:
+                continue
+            text = _decode_page(data)
+            if book_title is None:
+                t = re.search(r"<title[^>]*>(.*?)</title>", text[:20000], re.I | re.S)
+                book_title = re.sub(r"\s+", " ", html.unescape(t.group(1))).strip()[:200] if t else ""
+
+            def picture(a, rel=rel):
+                src = (a.get("src") or "").split("?")[0].split("#")[0]
+                if not src or re.match(r"[a-z][a-z0-9+.\-]*:", src, re.I):
+                    return None
+                target = os.path.normpath(os.path.join(os.path.dirname(rel), src.replace("\\", "/"))).replace("\\", "/").lstrip("/").lower()
+                if target not in members or not _CHM_PICTURE.search(target):
+                    return None
+                if target not in numbers:
+                    numbers[target] = f"c{len(numbers) + 1}"
+                    assets[numbers[target]] = ("7z", path, members[target])
+                return "../asset/" + numbers[target]
+
+            body = clean(text, picture)
+            blocks = _page_blocks(body)
+            if not blocks:
+                continue
+            if not name:
+                h = next((t for lv, _, t in blocks if lv), "")
+                name = h[:120]
+            if sum(len(t) for _, _, t in blocks) > textbook.CHAPTER_MOST:
+                t2, c2 = _from_blocks([(0, h, t) for _, h, t in blocks])
+                titles.extend([name] + [f"{name} ({k + 2})" if name else "" for k in range(len(c2) - 1)])
+                chapters.extend(c2)
+            else:
+                titles.append(name)
+                chapters.append("".join(h for _, h, _ in blocks))
+            if len(sample) < 40:
+                sample.append(" ".join(t for _, _, t in blocks)[:2000])
+        if not chapters:
+            raise NotReadable("this .chm has no text in it")
+        return Book(book_title or None, titles, chapters, textbook.is_latin(sample), assets)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ── one way in ────────────────────────────────────────────────────────────────────────
 def kind_of(name: str) -> str:
     """'fb2' for 'War and Peace.FB2'; '' for what is not read here."""
@@ -1079,6 +1215,8 @@ def build(path: str, kind: str) -> Book:
         return Book(None, b["titles"], b["chapters"], b["latin"])
     if kind in ("mobi", "azw", "azw3", "prc"):
         return _mobi(path)
+    if kind == "chm":
+        return _chm(path)
     if kind == "docx":
         return _docx(path)
     if kind == "odt":
