@@ -12922,8 +12922,9 @@ async def api_course_export(course_id: int):
 
 
 async def _course_report_once() -> str:
-    """Tell the registry which Internet Archive courses this install uses (courses.report):
-    the lists and two numbers each, never who learned what, and nothing of any other kind of
+    """Tell the registry which public courses this install uses (courses.report): those made
+    of Internet Archive items, and those of the signed catalogue that are our own channel. The
+    lists and two numbers each, never who learned what, and nothing of any other kind of
     course. Returns what happened, for the log."""
     async with db_pool.acquire() as conn:
         if (await conn.fetchval("SELECT value FROM config WHERE key = 'share_courses'")) == "0":
@@ -12932,15 +12933,16 @@ async def _course_report_once() -> str:
         if not uuid_:
             return "this install has no name at the registry yet"
         rows = [dict(r) for r in await conn.fetch(
-            """SELECT c.id, c.kind, c.slug, c.title, c.lang, c.level, c.subject, c.license, c.parts,
+            """SELECT c.id, c.kind, c.slug, c.title, c.lang, c.level, c.subject, c.license, c.parts, c.ref,
                       (SELECT count(*) FROM course_items ci WHERE ci.course_id = c.id) AS lessons
-               FROM courses c WHERE c.kind = 'pack' AND c.parts IS NOT NULL""")]
+               FROM courses c WHERE (c.kind = 'pack' AND c.parts IS NOT NULL) OR (c.kind = 'channel' AND c.slug IS NOT NULL)""")]
         for r in rows:
             r["done"] = [x["n"] for x in await conn.fetch(
                 """SELECT count(*) FILTER (WHERE p.done) AS n FROM course_items ci JOIN progress p ON p.msg_id = ci.msg_id
                    WHERE ci.course_id = $1 GROUP BY p.who""", r["id"])]
         lang = (await conn.fetchval("SELECT value FROM config WHERE key = 'ui_lang'")) or ""
-    told = courses.report(rows, _course_packs())
+    _course_packs()
+    told = courses.report(rows, _course_packs(), _CATALOGUE["packs"])
     body = _json.dumps({"instance_uuid": uuid_, "version": TGARR_VERSION, "lang": lang, "courses": told}).encode()
 
     def send():
@@ -13954,9 +13956,9 @@ async def page_kids_manage():
         '</div></div>'
         + '<div class="km-box"><div class="km-pad">'
         f'<label><input type="checkbox" id="kcShare" {"checked" if share_on else ""} onchange="kcShare(this)"/> '
-        + _t("Tell tgarr.me which Internet Archive courses this install uses") + '</label>'
+        + _t("Tell tgarr.me which public courses this install uses") + '</label>'
         '<p style="color:var(--muted);font-size:13px;margin:8px 0 0">'
-        + _t("Once a day: the list of each such course, how many people here began it and how far they got in the middle - so that good courses can be found by others. Never who, and nothing about a course made of a channel, a folder or your own files: those are not told of at all.")
+        + _t("Once a day, for each course made of Internet Archive items or published in tgarr's own channel: the list, how many people here began it and how far they got in the middle - so that good courses can be found by others. Never who, and nothing about a course made of any other channel, a folder or your own files: those are not told of at all.")
         + '</p></div></div>'
         # add a course
         + f'<h2 class="section">{_t("Add a course")}</h2>'

@@ -95,6 +95,20 @@ ok("parts" not in rep[0] and rep[1]["parts"] == ["abc_item", "def_item"] and "sl
 ok(rep[2].get("parts") == ["only_one"] and "slug" not in rep[2], "a shipped name over other items is not passed off as the shipped list")
 told = json.dumps(rep)
 ok(not any(w in told for w in ("Anna", "Ben", "piano", "a_private_thing", "family", "maths")), "nothing of a channel's, a folder's or a file list's course is in it")
+# a course of the signed catalogue that is our own channel is told of - by its name, and nothing else
+cat = {"zh-pinyin-1": C.clean_catalogue_pack({"slug": "zh-pinyin-1", "title": "拼音入门", "right": "CC BY-SA", "channel": "tgarr0", "tag": "#zh_pinyin1", "upto": 57})}
+chan = [{"kind": "channel", "slug": "zh-pinyin-1", "title": "拼音入门", "ref": "@tgarr0 #zh_pinyin1 57", "parts": None, "lessons": 30, "done": [2, 9, 30]},
+        {"kind": "channel", "slug": "zh-pinyin-1", "title": "an older state", "ref": "@tgarr0 #zh_pinyin1 40", "parts": None, "lessons": 20, "done": [1]},
+        {"kind": "channel", "slug": None, "title": "the whole channel, chosen by hand", "ref": "17", "parts": None, "lessons": 99, "done": [5]},
+        {"kind": "channel", "slug": "not-in-it", "title": "Anna's piano", "ref": "@a_private_thing - 9", "parts": None, "lessons": 3, "done": [1]}]
+ok(C.report(rows + chan, shipped) == rep, "without a catalogue no channel's course is told of")
+r2 = C.report(rows + chan, shipped, cat)
+ok(r2[:3] == rep and r2[3:] == [{"slug": "zh-pinyin-1", "lessons": 30, "learners": 3, "done_median": 9}],
+   "with it: the one course that is the catalogue's list as it stands - its name and the numbers, no title, no channel")
+ok(not any(w in json.dumps(r2, ensure_ascii=False) for w in ("Anna", "piano", "a_private_thing", "tgarr0", "the whole channel", "older")), "and still nothing of any other")
+other = {"x-y": dict(cat["zh-pinyin-1"], slug="x-y", channel="some_other_channel")}
+ok(C.report([{"kind": "channel", "slug": "x-y", "ref": "@some_other_channel #zh_pinyin1 57", "lessons": 1, "done": []}], shipped, other) == [],
+   "a list over any other channel is not told of, whatever calls itself a catalogue")
 ok(C.report([], shipped) == [] and C.report([{"kind": "pack", "parts": "[]"}], shipped) == [], "no courses, nothing told")
 
 # ── rewards ──

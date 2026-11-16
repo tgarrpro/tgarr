@@ -195,7 +195,7 @@ def order_lessons(parts, files) -> list:
     return out
 
 
-def report(rows, shipped: dict) -> list:
+def report(rows, shipped: dict, catalogue: dict = None) -> list:
     """What the registry is told about this install's courses. rows: [{kind, slug, title,
     lang, level, subject, license, parts (JSON text), lessons, done: [lessons done by each
     person who began it]}].
@@ -204,9 +204,23 @@ def report(rows, shipped: dict) -> list:
     by its name, any other by the items it names (pointers to what is public at archive.org).
     A course over a channel, a folder or file names is not in what comes back: nothing of it
     leaves the install. With each go two numbers: how many began it, and the middle of how
-    many lessons they did. Never who."""
+    many lessons they did. Never who.
+
+    One kind of channel course is told of: a list of the signed catalogue (`catalogue`:
+    {slug: pack} as open_catalogue gave it) - a course we published ourselves, in our own
+    channel, whose name says nothing of the household. It is told of by that name alone, and
+    only while the course is what the catalogue says it is (the same channel, tag and post).
+    A channel a family chose - also that same channel, taken whole - is never told of."""
     out = []
     for r in rows:
+        if r.get("kind") == "channel":
+            pk = (catalogue or {}).get(r.get("slug") or "")
+            if pk and pk.get("channel") and pk["channel"].lower() in CATALOGUE_CHANNELS \
+                    and (r.get("ref") or "") == f"@{pk['channel']} {pk['tag'] or '-'} {pk['upto']}":
+                done = sorted(int(d) for d in (r.get("done") or []))
+                out.append({"slug": pk["slug"], "lessons": int(r.get("lessons") or 0), "learners": len(done),
+                            "done_median": done[len(done) // 2] if done else 0})
+            continue
         if r.get("kind") != "pack":
             continue
         try:
