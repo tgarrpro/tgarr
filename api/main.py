@@ -32,7 +32,7 @@ import access  # local module
 import screentime  # local module
 import export  # local module
 import localfiles  # local module
-import textbook  # local module: a .txt read as a book
+import ownbooks  # local module: books read here without converting (.txt .fb2 .docx .odt .rtf .mobi .html)
 import contextvars
 
 
@@ -3407,9 +3407,20 @@ def _epub_row_sql():
     return "SELECT local_path, file_name FROM messages WHERE id=$1"
 
 
-def _is_txt(row) -> bool:
-    """A plain text file: read in the e-book reader, as a book (textbook.py)."""
-    return bool(row) and (row["file_name"] or row["local_path"] or "").lower().endswith(".txt")
+def _own_kind(row) -> str:
+    """'fb2', 'mobi', 'txt' ... for a file the e-book reader opens by itself (ownbooks.py);
+    '' for an EPUB and for everything else."""
+    return ownbooks.kind_of(row["file_name"] or row["local_path"] or "") if row else ""
+
+
+async def _own_book(path: str, kind: str):
+    """The book, or the sentence that says why it cannot be opened here."""
+    try:
+        return await asyncio.to_thread(ownbooks.load, path, kind), ""
+    except ownbooks.NotReadable as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"this book could not be opened ({type(e).__name__})"
 
 
 # ── comics ─────────────────────────────────────────────────────────────────────────────
@@ -3528,12 +3539,13 @@ async def epub_toc(msg_id: int):
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return JSONResponse({"error": "not cached"}, status_code=404)
-    if _is_txt(row):
-        try:
-            book = await asyncio.to_thread(textbook.load, epub_path)
-        except Exception as e:
-            return JSONResponse({"error": f"cannot read this text: {e}"}, status_code=422)
-        return JSONResponse({"title": textbook.book_title(row["file_name"] or ""), "chapters": book["titles"]})
+    kind = _own_kind(row)
+    if kind:
+        book, why = await _own_book(epub_path, kind)
+        if not book:
+            return JSONResponse({"error": why}, status_code=422)
+        return JSONResponse({"title": book.title or _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or "") or f"book-{msg_id}",
+                             "chapters": book.titles})
     try:
         idx = await asyncio.to_thread(_epub_index, epub_path)
     except Exception as e:
@@ -3549,20 +3561,20 @@ async def epub_chapter(msg_id: int, n: int):
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return HTMLResponse("not cached", status_code=404)
-    if _is_txt(row):
-        try:
-            book = await asyncio.to_thread(textbook.load, epub_path)
-        except Exception as e:
-            return HTMLResponse(f"<p>cannot show this text: {html.escape(str(e))}</p>",
-                                status_code=500, headers={"Content-Security-Policy": _EPUB_CSP})
-        if not 0 <= n < len(book["chapters"]):
+    kind = _own_kind(row)
+    if kind:
+        book, why = await _own_book(epub_path, kind)
+        if not book:
+            return HTMLResponse(f"<p>{html.escape(why)}</p>",
+                                status_code=422, headers={"Content-Security-Policy": _EPUB_CSP})
+        if not 0 <= n < len(book):
             return HTMLResponse("no such chapter", status_code=404)
+        body = await asyncio.to_thread(book.chapter, n)
         await _touch_local(msg_id)
         return HTMLResponse(
             "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            f"<style>{_EPUB_CHAPTER_CSS}{textbook.CSS}</style></head>"
-            f"<body class='{'tb-latin' if book['latin'] else 'tb-cjk'}'>"
-            f"{textbook.chapter_html(book['chapters'][n])}</body></html>",
+            f"<style>{_EPUB_CHAPTER_CSS}{ownbooks.CSS}</style></head>"
+            f"<body class='{'tb-latin' if book.latin else 'tb-cjk'}'>{body}</body></html>",
             headers={"Content-Security-Policy": _EPUB_CSP,
                      "X-Content-Type-Options": "nosniff",
                      "Cache-Control": "private, max-age=3600"})
@@ -4161,11 +4173,17 @@ async def epub_render(msg_id: int):
     """The e-book reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
-    if not _epub_locate(msg_id, row):
+    path = _epub_locate(msg_id, row)
+    if not path:
         return HTMLResponse(
             f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
-    title = _re.sub(r"\.(epub|txt)$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
+    kind = _own_kind(row)
+    if kind and kind != "txt" and not (await _own_book(path, kind))[0]:
+        # one this reader cannot open after all (packed in a way not read here ...): the old
+        # way, a PDF made of it, still can for some
+        return RedirectResponse(f"/pdf/{msg_id}?conv=1", status_code=307)
+    title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"book-{msg_id}")
     return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
@@ -4695,13 +4713,15 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
 
 
 @app.get("/pdf/{msg_id}", response_class=HTMLResponse)
-async def pdf_reader(msg_id: int):
+async def pdf_reader(msg_id: int, conv: int = 0):
     """The PDF reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
-    if _is_txt(row) and _epub_locate(msg_id, row):
-        # a text file is read as a book, with type that can be set: not as pictures of pages
-        # (links kept from before it was led here)
+    kind = _own_kind(row)
+    if kind and not conv and _epub_locate(msg_id, row) \
+            and (kind == "txt" or (await _own_book(_epub_locate(msg_id, row), kind))[0]):
+        # read as a book, with type that can be set: not as pictures of pages (links kept
+        # from before these were led to the e-book reader)
         return RedirectResponse(f"/epub/{msg_id}", status_code=307)
     if not _pdf_source(row) and row and _is_local(row["local_path"]):
         # here, but not a PDF yet (a text file, a .docx, a book in another
@@ -4728,10 +4748,18 @@ async def epub_cover(msg_id: int):
     """
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return Response("not cached", status_code=404)
+    kind = _own_kind(row)
+    if kind:
+        book, _ = await _own_book(epub_path, kind)
+        got = await asyncio.to_thread(book.asset, book.cover) if book and book.cover else None
+        if not got:
+            return Response("no cover", status_code=404)
+        return Response(content=got[0], media_type=got[1],
+                        headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
     try:
         with _zipfile.ZipFile(epub_path) as zf:
             from xml.etree import ElementTree as _ET
@@ -4819,10 +4847,20 @@ async def epub_asset(msg_id: int, asset_path: str):
     """Serve embedded asset (image / css / etc) from inside the .epub zip."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return Response("not cached", status_code=404)
+    kind = _own_kind(row)
+    if kind:
+        book, _ = await _own_book(epub_path, kind)
+        got = await asyncio.to_thread(book.asset, asset_path) if book else None
+        if not got:
+            return Response("asset not found", status_code=404)
+        return Response(content=got[0], media_type=got[1],
+                        headers={"Cache-Control": "public, max-age=3600",
+                                 "Content-Security-Policy": "sandbox; " + _EPUB_CSP,
+                                 "X-Content-Type-Options": "nosniff"})
     try:
         with _zipfile.ZipFile(epub_path) as zf:
             data = zf.read(_uq(asset_path))
@@ -5416,9 +5454,10 @@ const MEDIA_TYPE = {_js_str(mt)};
 // while it is watched, on /play. 'maybe': tried as it is first, converted if that fails.
 const CONVERT = {_js_str(transcode.needs(title) if transcode.available() else "")};
 const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
+const OWN_KINDS = {_json.dumps(list(ownbooks.KINDS))};
 {_WATCH_PLAYER_JS}
 tgFavBtn();
-let started = false, comicTried = false;
+let started = false, comicTried = false, ownTried = false;
 function fmtBytes(b) {{
   if (!b) return "0 B";
   const u = ["B","KB","MB","GB"]; let i = 0; let v = b;
@@ -5450,6 +5489,16 @@ function renderPlayer() {{
   if (ext === "epub" || ext === "txt") {{
     // Read in the built-in reader: instant, and no conversion to run.
     location.replace("/epub/" + MSG_ID);
+    return;
+  }}
+  if (OWN_KINDS.includes(ext) && !ownTried) {{
+    // also read there as they are; the few that cannot be (packed in a way not read
+    // here) go on to be converted
+    ownTried = true;
+    fetch("/epub/" + MSG_ID + "/toc").then(r => {{
+      if (r.ok) location.replace("/epub/" + MSG_ID);
+      else {{ started = false; renderPlayer(); }}
+    }}).catch(() => {{ started = false; renderPlayer(); }});
     return;
   }}
   if ((ext === "cbz" || ext === "cbr") && !comicTried) {{
@@ -6738,7 +6787,7 @@ def _file_href(r) -> str:
     e = localfiles.ext(r["file_name"] or "")
     if r["media_type"] == "video":
         return f'/watch/{r["id"]}'
-    if e in ("epub", "txt"):
+    if e == "epub" or e in ownbooks.KINDS:
         return f'/epub/{r["id"]}'
     if e == "pdf" or e in _EBOOK_CONVERTIBLE:
         return f'/pdf/{r["id"]}'          # read here (anything else is converted on first opening)
