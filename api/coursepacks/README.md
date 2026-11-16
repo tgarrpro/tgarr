@@ -34,12 +34,18 @@ an item with several files gives several lessons, in the order of their names.
 **A public Telegram channel**
 
 ```json
-"channel": "your_channel", "tag": "#pinyin1"
+"channel": "your_channel", "tag": "#de_lesen1", "upto": 120
 ```
 
 The lessons are the files posted in the channel, in the order they were posted - with `tag`, only the posts whose
-caption carries it, so that one channel can hold several courses. Leave `tag` out for the whole channel. Post the
-lessons in the order they are to be taken; a file's name is the lesson's name.
+caption carries it, so that one channel can hold many courses in many languages (begin a tag with the language:
+`#zh_pinyin1`, `#de_lesen1`, `#es_lectura2`). Post the lessons in the order they are to be taken; a file's name is
+the lesson's name.
+
+`upto` is the number of the last post that was read when the list was checked (the number at the end of a post's
+link, `t.me/your_channel/120`). The course takes the channel's posts **up to that one and no further**: whoever
+may post in a channel could post anything under a tag tomorrow, and it would be on a child's screen the same day.
+When lessons are added, send the list in again with a higher `upto`; they are read, and then they appear.
 
 ## Rights: what may be listed
 

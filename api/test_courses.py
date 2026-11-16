@@ -45,9 +45,11 @@ ok(bad(dict(good, parts=[{"ia": f"i{i}"} for i in range(C.PARTS_MOST + 1)]), "mo
 ok(bad([], "object") and bad(None, "object"), "a list is an object")
 ok(p["channel"] == "" and p["tag"] == "", "a list of Archive items names no channel")
 ch = C.clean_pack({"slug": "zh-pinyin", "title": "拼音入门", "lang": "zh-Hans", "level": "5-8", "subject": "reading", "right": "CC BY-SA",
-                   "channel": "@tgarr_courses", "tag": "#拼音"})
-ok(ch["channel"] == "tgarr_courses" and ch["tag"] == "#拼音" and ch["parts"] == [], "a list may be a public channel, or the posts of it under one tag")
-chan = {"slug": "x-y", "title": "t", "right": "CC BY", "channel": "tgarr_courses"}
+                   "channel": "@tgarr_courses", "tag": "#拼音", "upto": 120})
+ok(ch["channel"] == "tgarr_courses" and ch["tag"] == "#拼音" and ch["parts"] == [] and ch["upto"] == 120, "a list may be a public channel, or the posts of it under one tag")
+chan = {"slug": "x-y", "title": "t", "right": "CC BY", "channel": "tgarr_courses", "upto": 50}
+ok(bad({k: v for k, v in chan.items() if k != "upto"}, "upto") and bad(dict(chan, upto=0), "upto") and bad(dict(chan, upto="9"), "upto") and bad(dict(chan, upto=True), "upto"),
+   "a channel's list is taken up to the last post that was read: without that number it is not loaded")
 ok(C.clean_pack(chan)["tag"] == "", "the tag is optional: then it is all of the channel")
 ok(bad(dict(chan, channel="ab"), "channel") and bad(dict(chan, channel="has space"), "channel"), "the channel is an @name")
 ok(bad(dict(chan, tag="two words"), "tag") and bad(dict(chan, tag="notag"), "tag") and bad(dict(chan, tag="#a%b"), "tag"), "the tag is one #tag")

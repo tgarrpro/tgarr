@@ -61,9 +61,15 @@ def clean_pack(raw) -> dict:
             raise ValueError("channel: the @name of a public channel")
         if tag and not TAG_RX.match(tag):
             raise ValueError("tag: one #tag without spaces")
+        # Whoever may post in the channel could post anything under the tag tomorrow, and it would be a
+        # lesson on a child's screen the same day. So a list is taken up to one post - the last that was
+        # read when the list was checked - and what is posted later waits for the list to be raised.
+        upto = raw.get("upto")
+        if isinstance(upto, bool) or not isinstance(upto, int) or not 0 < upto < 2 ** 31:
+            raise ValueError("upto: the number of the last post that was read (a channel's list is taken up to it)")
         return {"slug": slug, "title": title, "about": " ".join(str(raw.get("about") or "").split())[:600],
                 "lang": str(raw.get("lang") or "en")[:12], "level": level, "subject": subject, "right": right,
-                "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": [], "channel": channel, "tag": tag}
+                "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": [], "channel": channel, "tag": tag, "upto": upto}
     parts, seen = [], set()
     for p in raw.get("parts") or []:
         if not isinstance(p, dict):
@@ -81,7 +87,7 @@ def clean_pack(raw) -> dict:
         raise ValueError(f"more than {PARTS_MOST} parts")
     return {"slug": slug, "title": title, "about": " ".join(str(raw.get("about") or "").split())[:600],
             "lang": str(raw.get("lang") or "en")[:12], "level": level, "subject": subject, "right": right,
-            "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": parts, "channel": "", "tag": ""}
+            "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": parts, "channel": "", "tag": "", "upto": 0}
 
 
 def load_packs(folder: str, log=None) -> dict:

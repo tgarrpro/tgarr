@@ -9,5 +9,6 @@
   "credit": "Who made the material",
 
   "channel": "your_public_channel",
-  "tag": "#course1"
+  "tag": "#course1",
+  "upto": 120
 }

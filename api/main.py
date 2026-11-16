@@ -12579,11 +12579,16 @@ async def _course_build(conn, c) -> int:
                   AND ($2 = '' OR m.local_path LIKE $3)""", int(cid or 0), path, path.replace("%", "\\%").replace("_", "\\_") + "/%")
         ids = [r["id"] for r in sorted(rows, key=lambda r: courses.natural_key(r["name"]))]
     elif kind == "channel":
-        cid, _, tag = (c["ref"] or "").partition(" ")
+        # ref: "<channel id>" (one's own choice of a channel: all of it), or - a shipped list -
+        # "<channel id> <#tag or -> <up to which post>"
+        bits = (c["ref"] or "").split(" ")
+        cid, tag = bits[0], (bits[1] if len(bits) > 1 and bits[1] != "-" else "")
+        upto = int(bits[2]) if len(bits) > 2 and bits[2].isdigit() else 0
         rows = await conn.fetch(
             f"""SELECT m.id FROM messages m WHERE m.channel_id = $1 AND {live} AND {playable}
                   AND ($2 = '' OR position(lower($2) IN lower(COALESCE(m.caption, ''))) > 0)
-                ORDER BY m.posted_at NULLS LAST, m.id LIMIT 2000""", int(cid or 0), tag)
+                  AND ($3 = 0 OR m.tg_message_id <= $3)
+                ORDER BY m.posted_at NULLS LAST, m.id LIMIT 2000""", int(cid or 0), tag, upto)
         ids = [r["id"] for r in rows]
     elif kind == "list":
         names = [str(p.get("name") or "") for p in _json.loads(c["parts"] or "[]")]
@@ -12705,7 +12710,7 @@ async def api_course_add(request: Request):
                     cid = await conn.fetchval("SELECT id FROM channels WHERE username ILIKE $1", pk["channel"])
             if not cid:
                 return no("the channel of this list could not be followed - try again in a moment", 503)
-            kind, parts, ref = "channel", None, f"{cid}" + (f" {pk['tag']}" if pk["tag"] else "")
+            kind, parts, ref = "channel", None, f"{cid} {pk['tag'] or '-'} {pk['upto']}"
     elif b.get("folder") is not None or b.get("channel") is not None:
         try:
             cid = int(b.get("folder") if b.get("folder") is not None else b.get("channel"))
