@@ -34,6 +34,15 @@ import export  # local module
 import localfiles  # local module
 import ownbooks  # local module: books read here without converting (.txt .fb2 .docx .odt .rtf .mobi .html)
 import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
+
+# What counts as a book on every shelf, count and export: everything a reader here opens.
+# (This list used to be written out in seven places, each a little different.)
+BOOK_KINDS = tuple(dict.fromkeys(("pdf", "epub", "djvu", "djv", "cbz", "cbr") + ownbooks.KINDS))
+_BOOK_RX = "\\.(" + "|".join(BOOK_KINDS) + ")$"          # for PostgreSQL's ~*
+
+
+def _book_sql(col: str = "file_name") -> str:
+    return f"{col} ~* '{_BOOK_RX}'"
 import contextvars
 
 
@@ -104,7 +113,7 @@ def _cross_site(request) -> bool:
 #   * anything that acts through the account: follow, unfollow, grab, fetch,
 #     settings. The pages hide those buttons; this refuses the requests.
 _PRIVATE_ID_RX = re.compile(
-    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/lyrics|api/fav|"
+    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/ebook-status|api/lyrics|api/fav|"
     r"ebook-pdf|ebook-cover|epub|comic|pdf|play|transcode)/(\d+)(?:/|$)")
 _PUBLIC_MSG: dict = {}
 
@@ -480,7 +489,7 @@ import vision  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.12"
+TGARR_VERSION = "0.5.13"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -1215,7 +1224,7 @@ async def _stats_snapshot_worker():
         "photos":    "SELECT count(*) FROM messages WHERE media_type='photo'",
         "audio":     "SELECT count(*) FROM messages WHERE media_type='audio'",
         "books":     ("SELECT count(*) FROM messages WHERE media_type='document'"
-                      " AND file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"),
+                      " AND " + _book_sql()),
         "completed": "SELECT count(*) FROM downloads WHERE status='completed'",
     }
     await asyncio.sleep(60)  # let startup settle
@@ -1652,7 +1661,18 @@ async def lazy_preview(msg_id: int):
                    media_type="image/gif")
 
 
+_ACTIVE_TYPES = ("text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml", "text/javascript",
+                 "application/javascript", "application/x-javascript", "text/css", "application/x-shockwave-flash",
+                 "multipart/related", "message/rfc822", "application/x-mimearchive")
+
+
 def _mime_for(media_type, mime):
+    """The type a file is served as. What Telegram says a file is, is what its sender said:
+    a file that calls itself a web page (or a drawing with script in it) would run in this
+    site's name if it were handed to the browser as one. Those are served as plain bytes."""
+    mime = (mime or "").split(";")[0].strip().lower()
+    if mime in _ACTIVE_TYPES or mime.endswith("+xml"):
+        return "application/octet-stream"
     if mime:
         return mime
     return ("audio/mpeg" if media_type == "audio"
@@ -3056,6 +3076,12 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         return False
 
 
+# The kinds of book whose cover can be had at all. (For the others nobody is asked: opening a
+# whole .txt or a spreadsheet to learn that it has no cover is a book parsed for nothing.)
+_COVER_KINDS = ("pdf", "epub", "djvu", "djv") + ownbooks.COVER_KINDS
+_NO_COVER: dict = {}              # file -> its mtime when it was found to have no cover
+
+
 def _cover_bytes(src: str):
     """The cover of a book as the bytes of a picture, or None: an EPUB's or another book's own
     (ownbooks.py), the first page of a PDF or of a scanned .djvu."""
@@ -3063,6 +3089,8 @@ def _cover_bytes(src: str):
     import tempfile
     low = src.lower()
     kind = ownbooks.kind_of(src)
+    if kind and kind not in ownbooks.COVER_KINDS:
+        return None
     if kind:
         try:
             book = ownbooks.load(src, kind)
@@ -3107,10 +3135,19 @@ async def _ebook_cover(src: str, cover: str) -> bool:
     for. False when the book has none."""
     if os.path.exists(cover):
         return True
+    try:
+        mtime = os.path.getmtime(src)
+    except OSError:
+        return False
+    if _NO_COVER.get(src) == mtime:
+        return False
 
     def _make() -> bool:
         data = _cover_bytes(src)
         if not data:
+            if len(_NO_COVER) > 20000:
+                _NO_COVER.clear()
+            _NO_COVER[src] = mtime
             return False
         try:
             import io
@@ -3233,11 +3270,39 @@ async def ebook_pdf(msg_id: int):
                                  "Cache-Control": "private, max-age=86400"})
 
 
+_WAS_CONVERTED = ("epub", "mobi", "azw", "azw3", "fb2", "lit", "cbr", "cbz", "rtf", "lrf", "pdb", "txt", "docx", "odt")
+
+
+def _calibre_pdfs_sweep(root: str = "/downloads") -> tuple:
+    """Delete `<book>.<ext>.pdf` (and the marks of a conversion) beside a book of a kind calibre
+    used to convert: nothing opens those PDFs any more. Only a PDF whose own book lies next to
+    it goes - never a PDF somebody saved. Returns (how many, bytes)."""
+    n = size = 0
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        have = set(files)
+        for f in files:
+            for tail in (".pdf", ".queue", ".pdf.inprogress.pdf"):
+                if not f.endswith(tail):
+                    continue
+                book = f[:-len(tail)]
+                if book in have and "." in book and book.rsplit(".", 1)[-1].lower() in _WAS_CONVERTED:
+                    full = os.path.join(base, f)
+                    try:
+                        if not os.path.islink(full):
+                            size += os.path.getsize(full)
+                            os.unlink(full)
+                            n += 1
+                    except OSError:
+                        pass
+                break
+    return n, size
+
+
 async def _packs_heal():
     """An install that was using what the image used to carry gets it back without being asked:
-    the models' runtime if a voice or the picture model is installed, the book converter if
-    there are books here it is needed for (looked at once, at the first start of a version
-    that no longer carries it; a new install fetches it when a book first asks)."""
+    the models' runtime if a voice or the picture model is installed. And what calibre left
+    behind is cleared away once: calibre itself, and the PDFs it made of books."""
     await asyncio.sleep(90)
     try:
         if (tts.installed("voice") or vision.installed()) and not packs.installed("runtime"):
@@ -3246,6 +3311,14 @@ async def _packs_heal():
         freed = await asyncio.to_thread(packs.forget_books)
         if freed:
             log.info("[packs] calibre is not used any more: the %d MB an older version fetched are given back", freed // (1024 * 1024))
+        async with db_pool.acquire() as conn:
+            swept = await conn.fetchval("SELECT value FROM config WHERE key = 'calibre_pdfs_swept'")
+        if not swept:
+            n, size = await asyncio.to_thread(_calibre_pdfs_sweep)
+            async with db_pool.acquire() as conn:
+                await conn.execute("INSERT INTO config (key, value) VALUES ('calibre_pdfs_swept', '1') ON CONFLICT (key) DO NOTHING")
+            if n:
+                log.info("[packs] %d PDFs calibre once made of books that are now read as they are: deleted, %d MB given back", n, size // (1024 * 1024))
     except Exception as e:
         log.warning("[packs] looking what is needed: %s", e)
 
@@ -3405,8 +3478,10 @@ def _epub_chapter_body(zf, msg_id: int, chapter_path: str) -> str:
 
     def fix_ref(match):
         src = _uq(match.group(1))
-        if src.startswith(("http://", "https://", "data:", "/")):
-            return match.group(0)
+        if src.startswith("/"):
+            return match.group(0).replace(match.group(1), "data:,")
+        if src.startswith(("http://", "https://", "data:")):
+            return match.group(0)        # (the chapter's policy lets nothing from outside load)
         abs_in_zip = os.path.normpath(os.path.join(chapter_dir, src)).replace("\\", "/")
         return match.group(0).replace(match.group(1), f"/epub/{msg_id}/asset/{_q(abs_in_zip)}")
 
@@ -3450,7 +3525,16 @@ _EPUB_CHAPTER_CSS = (
 
 
 def _epub_row_sql():
-    return "SELECT local_path, file_name FROM messages WHERE id=$1"
+    return "SELECT local_path, file_name, file_size FROM messages WHERE id=$1"
+
+
+def _arriving(row, path: str) -> bool:
+    """Is this file still on its way from Telegram? (It is written in place, so it exists
+    from the first byte; a reader that opened it now would call a good book damaged.)"""
+    try:
+        return bool(row and row["file_size"]) and os.path.getsize(path) < row["file_size"]
+    except (OSError, KeyError):
+        return False
 
 
 def _own_kind(row) -> str:
@@ -3599,6 +3683,8 @@ async def epub_toc(msg_id: int):
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return JSONResponse({"error": "not cached"}, status_code=404)
+    if _arriving(row, epub_path):
+        return JSONResponse({"error": "this book is still arriving - a moment", "arriving": True}, status_code=409)
     kind = _own_kind(row)
     if kind:
         book, why = await _own_book(epub_path, kind)
@@ -4218,7 +4304,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
   list.appendChild(fragm);
   let pos = {}; try { pos = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
   // /epub/123#40 opens chapter 40
-  const h = parseInt((location.hash || "").slice(1), 10);
+  const h = /[?&]was=pdf/.test(location.search) ? 0 : parseInt((location.hash || "").slice(1), 10);
   if (h >= 1 && h <= titles.length) pos = {ch: h - 1, frac: 0};
   load(pos.ch || 0, pos.frac || 0);
 }).catch(() => { $("msg").textContent = "✗ could not open this book"; });
@@ -4238,6 +4324,8 @@ async def epub_render(msg_id: int):
         return HTMLResponse(
             f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
+    if _arriving(row, path):
+        return RedirectResponse(f"/watch/{int(msg_id)}", status_code=307)      # that page waits for it
     kind = _own_kind(row)
     if kind and kind != "txt":
         why = (await _own_book(path, kind))[1]
@@ -4784,11 +4872,14 @@ async def pdf_reader(msg_id: int, conv: int = 0):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
     kind = _own_kind(row)
-    if kind and not conv and _epub_locate(msg_id, row) \
-            and (kind == "txt" or (await _own_book(_epub_locate(msg_id, row), kind))[0]):
+    here = _epub_locate(msg_id, row)
+    if here and _arriving(row, here):
+        return RedirectResponse(f"/watch/{int(msg_id)}", status_code=307)      # that page waits for it
+    if kind and not conv and here and (kind == "txt" or (await _own_book(here, kind))[0]):
         # read as a book, with type that can be set: not as pictures of pages (links kept
-        # from before these were led to the e-book reader)
-        return RedirectResponse(f"/epub/{msg_id}", status_code=307)
+        # from before these were led to the e-book reader; "was=pdf" tells the reader that a
+        # #40 on such a link meant page 40 of the PDF, not chapter 40)
+        return RedirectResponse(f"/epub/{msg_id}?was=pdf", status_code=307)
     if not _pdf_source(row) and row and _is_local(row["local_path"]):
         # here, but not a PDF yet (a text file, a .docx, a book in another
         # format opened straight from a list): make the PDF now, once
@@ -4899,11 +4990,13 @@ async def epub_cover(msg_id: int):
                 else:
                     return Response("cover file missing", status_code=404)
 
-            ext = cover_path.rsplit(".", 1)[-1].lower() if "." in cover_path else "jpg"
+            kind = ownbooks.picture_type(data)      # by its first bytes: a "cover.svg" or "cover.html" is not shown
+            if not kind:
+                return Response("no cover", status_code=404)
             return Response(
                 content=data,
-                media_type=_EPUB_MIME.get(ext, "image/jpeg"),
-                headers={"Cache-Control": "public, max-age=86400"})
+                media_type=kind,
+                headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
     except Exception as e:
         return Response(f"cover error: {e}", status_code=500)
 
@@ -5656,7 +5749,7 @@ function renderPlayer() {{
     return;
   }}
   // fallback: try iframe but offer download as escape hatch
-  main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:85vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>
+  main.innerHTML = `<iframe sandbox src="/media/${{MSG_ID}}" style="height:85vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>
     <div style="margin-top:8px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5;font-size:13px">⬇ download raw</a></div>`;
 }}
 async function poll() {{
@@ -6347,7 +6440,7 @@ _EXPORT_KIND_SQL = {
     "video": "m.media_type = 'video'",
     "audio": "m.media_type = 'audio'",
     "document": "m.media_type = 'document'",
-    "book": "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'",
+    "book": _book_sql("m.file_name"),
     "all": "(m.file_unique_id IS NOT NULL OR m.file_name IS NOT NULL)",
 }
 _EXPORT_KIND_NAME = {"photo": "photos", "video": "videos", "audio": "music", "document": "documents", "book": "books", "all": "all files"}
@@ -6681,7 +6774,7 @@ async def _local_picture(msg_id: int, col: str, folder: str, px: int):
         pic = src + ".cover.jpg"
         if not os.path.exists(pic) and row["media_type"] == "document":
             e = localfiles.ext(src)
-            if e in ("pdf", "epub") or e in _EBOOK_CONVERTIBLE or ownbooks.kind_of(src):
+            if e in _COVER_KINDS:
                 try:
                     await _ebook_cover(src, pic)
                 except Exception:
@@ -8426,7 +8519,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                          WHERE media_type='audio' AND channel_id NOT IN {_GOING}) AS audio,
                       (SELECT count(*) FROM messages
                          WHERE media_type='document' AND channel_id NOT IN {_GOING}
-                           AND file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$') AS books,
+                           AND {_book_sql()}) AS books,
                       (SELECT count(*) FROM downloads
                          WHERE status='pending')                     AS pending,
                       (SELECT count(*) FROM downloads
@@ -9777,7 +9870,7 @@ def _usenet_item_xml(c, base_url: str, apikey: str) -> str:
 @app.get("/newznab/usenet/api", response_class=PlainTextResponse)
 @app.get("/newznab/usenet", response_class=PlainTextResponse)
 async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional[str] = Query(None),
-                         season: Optional[int] = None, ep: Optional[int] = None, cat: Optional[str] = None,
+                         season: Optional[str] = None, ep: Optional[str] = None, cat: Optional[str] = None,
                          limit: int = 100, offset: int = 0, apikey: Optional[str] = "tgarr",
                          id: Optional[str] = None):
     base_url = _base_url(request)
@@ -9847,11 +9940,18 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
             where.append(f"name ILIKE ${len(params)}")
     if t == "tvsearch":
         where.append(r"kind = 'video' AND name ~* 'S\d{1,2}E\d{1,3}|\d{4}[. ]\d{2}[. ]\d{2}'")
-        if season is not None and ep is not None:
-            params.append(rf"S0*{int(season)}E0*{int(ep)}(?!\d)")
+        def _n(v):
+            return int(v) if v and v.isascii() and v.isdigit() and len(v) < 6 else None
+        day = re.fullmatch(r"(\d{1,2})/(\d{1,2})", ep or "")
+        if _n(season) is not None and day:
+            # a show named by its date: 2026.11.15, 2026-11-15, 2026 11 15
+            params.append(rf"{_n(season)}[. _-]0?{int(day.group(1))}[. _-]0?{int(day.group(2))}(?!\d)")
             where.append(f"name ~* ${len(params)}")
-        elif season is not None:
-            params.append(rf"S0*{int(season)}(E\d|\M)")
+        elif _n(season) is not None and _n(ep) is not None:
+            params.append(rf"S0*{_n(season)}E0*{_n(ep)}(?!\d)")
+            where.append(f"name ~* ${len(params)}")
+        elif _n(season) is not None:
+            params.append(rf"S0*{_n(season)}(E\d|\M)")
             where.append(f"name ~* ${len(params)}")
     elif t == "movie":
         where.append(r"kind = 'video' AND name !~* 'S\d{1,2}E\d{1,3}'")
@@ -11995,7 +12095,7 @@ _MC_KINDS = {
     # key: (label, icon, colour, SQL)
     "video": ("Watch", "🎬", "#f97066", "m.media_type = 'video'"),
     "audio": ("Listen", "🎧", "#12b5a6", "m.media_type = 'audio'"),
-    "book": ("Read", "📖", "#f5a524", r"m.file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz)$'"),
+    "book": ("Read", "📖", "#f5a524", _book_sql("m.file_name")),
     "photo": ("Photos", "🖼️", "#8b6cf6", "m.media_type = 'photo'"),
 }
 _MC_JUNK_RX = re.compile(
@@ -13698,7 +13798,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
     where_parts = ["m.media_type = 'document'" + _pub_m(),
-                   "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"]
+                   _book_sql("m.file_name")]
     params = []
     if q:
         params.append(f"%{q}%")
@@ -13723,16 +13823,13 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
             f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
         src_n = await _src_counts(conn, "messages m", where_nosrc, params)
         pending_n = await conn.fetchval(
-            r"""SELECT count(*) FROM messages
-               WHERE media_type='document' AND local_path IS NULL
-                 AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'""")
+            "SELECT count(*) FROM messages m WHERE m.media_type='document' AND m.local_path IS NULL"
+            f" AND {_book_sql('m.file_name')}{_pub_m()}")
         # Language distribution chips
         lang_dist = await conn.fetch(
-            r"""SELECT COALESCE(detected_lang,'unknown') AS lang, count(*) AS n
-               FROM messages
-               WHERE media_type='document'
-                 AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'
-               GROUP BY detected_lang ORDER BY count(*) DESC""")
+            "SELECT COALESCE(m.detected_lang,'unknown') AS lang, count(*) AS n FROM messages m"
+            f" WHERE m.media_type='document' AND {_book_sql('m.file_name')}{_pub_m()}"
+            " GROUP BY m.detected_lang ORDER BY count(*) DESC")
         rows = await conn.fetch(f"""
             SELECT m.id, m.file_name, m.file_size, m.mime_type, m.posted_at,
                    m.local_path, m.file_dc, m.detected_lang,
@@ -13747,9 +13844,10 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     def _ext(fn):
         return (fn or "").rsplit(".", 1)[-1].upper() if "." in (fn or "") else "DOC"
     def _ico(ext):
-        return {"PDF": "📄", "EPUB": "📘", "MOBI": "📕", "AZW3": "📕", "AZW": "📕",
-                "DJVU": "📃", "CBR": "📚", "CBZ": "📚", "FB2": "📖",
-                "TXT": "📝"}.get(ext, "📄")
+        return {"PDF": "📄", "EPUB": "📘", "MOBI": "📕", "AZW3": "📕", "AZW": "📕", "PRC": "📕",
+                "DJVU": "📃", "DJV": "📃", "CBR": "📚", "CBZ": "📚", "FB2": "📖", "CHM": "📖",
+                "TXT": "📝", "RTF": "📝", "DOCX": "📝", "ODT": "📝", "HTML": "🌐", "HTM": "🌐",
+                "PPTX": "📊", "PPSX": "📊", "XLSX": "📈", "XLSM": "📈"}.get(ext, "📄")
 
     if not rows:
         body = (
@@ -13834,7 +13932,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         f'<div class="book-card">'
         + (f'<img class="book-cover" src="/ebook-cover/{r["id"]}" alt="" '
            f'onerror="this.outerHTML=\'<div class=&quot;book-ico&quot;>{_ico(_ext(r["file_name"]))}</div>\'" />'
-           if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]) in ("EPUB","MOBI","AZW","AZW3")
+           if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]).lower() in _COVER_KINDS
            else f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>')
         + f'<div class="book-body">'
         f'<div class="book-title">{html.escape(r["file_name"] or "(untitled)")}</div>'
@@ -15159,7 +15257,7 @@ async def page_settings(request: Request):
             f'<div class="sys-s">of {_gb(m["total"])} in this machine</div></div>')
         if m["level"] == "bad":
             alerts.append(("bad", f'<b>Memory: only {_gb(m["avail"])} available.</b> '
-                                  'Converting e-books and playing several files at once may fail.'))
+                                  'Making a scanned book into pages and playing several files at once may fail.'))
     if host["load"]:
         ld = host["load"]
         tiles.append(

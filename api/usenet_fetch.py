@@ -18,7 +18,7 @@ import re
 import zlib
 import xml.etree.ElementTree as ET
 
-TAKEN = {"ebook": "epub mobi azw azw3 pdf djvu fb2 cbz cbr".split(),
+TAKEN = {"ebook": "epub mobi azw azw3 prc pdf djvu fb2 cbz cbr chm docx rtf".split(),
          "audio": "mp3 flac m4a m4b ogg opus aac wav ape wv".split(),
          "photo": "jpg jpeg png gif webp".split()}
 _KIND = {e: k for k, v in TAKEN.items() for e in v}

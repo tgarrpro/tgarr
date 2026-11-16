@@ -187,7 +187,7 @@ def plan(meta: dict) -> dict:
     elif out["shelf"] == "book":
         # (plain text last, and only the uploader's own: the Archive's own .txt of a scan is what a
         # machine read off the pages, misprints and all)
-        take = (_first_kind(files, ("epub", "pdf", "cbz", "cbr", "mobi", "azw3"))
+        take = (_first_kind(files, ("epub", "pdf", "cbz", "cbr", "mobi", "azw3", "djvu", "fb2", "azw", "prc", "chm", "docx", "rtf"))
                 or [f for f in files if f["ext"] == "txt" and f["original"]][:1])
         if take and take[0]["ext"] == "epub":
             take = take[:1]                                  # one book: the Archive makes several of the same

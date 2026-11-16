@@ -260,7 +260,7 @@ def release_key(p: dict) -> str:
 EXT = {
     "video": "mkv mp4 avi m4v ts m2ts wmv mpg mpeg vob mov divx ogm flv webm".split(),
     "audio": "mp3 flac ape wav m4a ogg wv aac alac opus m4b".split(),
-    "ebook": "epub mobi azw azw3 pdf djvu cbr cbz fb2 lit chm".split(),
+    "ebook": "epub mobi azw azw3 prc pdf djvu cbr cbz fb2 chm docx rtf".split(),     # (what a reader here opens)
     "photo": "jpg jpeg png gif tif tiff bmp webp".split(),
 }
 RX_VIDEO = re.compile(r"S\d{1,2}E\d{1,3}|\b\d{1,2}x\d{2}\b|\b(480|576|720|1080|2160)[pi]\b|x26[45]|h\.?26[45]|xvid|divx|"
