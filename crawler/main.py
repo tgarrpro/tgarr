@@ -708,7 +708,8 @@ async def _web_ingest(channel_id: int, tg_chat_id: int, username: str, posts: li
             for it in post.get("items") or []:
                 kind = it["kind"]
                 fname = (it.get("file_name") or "").replace("\x00", "") or None
-                keep, _why = _quality_check(fname, it.get("file_size"), kind, text)
+                keep, _why = _quality_check(fname, it.get("file_size"), kind, text,
+                                            lessons=(username or "").lower() in COURSE_CHANNELS)
                 if not keep:
                     continue
                 new_id = await conn.fetchval(
@@ -1180,8 +1181,14 @@ _MIN_SIZES = {
 PRIVATE_CHAT_SQL = "username IS NULL AND COALESCE(members_count, 0) < 200"
 
 
+# Channels where volunteers publish courses (the api's courses.CATALOGUE_CHANNELS). A lesson is
+# often a film of two minutes and three megabytes: what the size floors below take for an
+# advert or a teaser. In these channels the floors do not apply (the advert words still do).
+COURSE_CHANNELS = frozenset({"tgarr0"})
+
+
 def _quality_check(file_name: str | None, file_size: int | None,
-                   media_type: str | None, caption: str | None) -> tuple[bool, str | None]:
+                   media_type: str | None, caption: str | None, lessons: bool = False) -> tuple[bool, str | None]:
     """Multi-signal quality gate. Returns (keep?, reject_reason_if_drop).
 
     Composite scoring: any single hard signal → reject. Cheap O(1) checks only.
@@ -1199,7 +1206,7 @@ def _quality_check(file_name: str | None, file_size: int | None,
     floor = _MIN_SIZES.get(media_type)
     if media_type == "document" and file_name and BOOK_RX.search(file_name):
         floor = BOOK_MIN_BYTES        # a short story in a .txt is 5 KB
-    if floor and file_size and file_size < floor:
+    if floor and file_size and file_size < floor and not lessons:
         return False, f"micro-{media_type}"
     return True, None
 
@@ -2214,7 +2221,8 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
             return False
         # QUALITY GATE: ad-keyword / micro-size junk rejected before persist.
         keep, reason = (True, None) if is_private else _quality_check(
-            file_name, file_size, media_type, caption)
+            file_name, file_size, media_type, caption,
+            lessons=(getattr(msg.chat, "username", None) or "").lower() in COURSE_CHANNELS)
         if not keep:
             return False
         # Caption = the human-written description of the resource (title,
