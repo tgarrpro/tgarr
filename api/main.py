@@ -2372,27 +2372,27 @@ async def page_settings_update():
 .up-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .up-msg{margin-top:12px;line-height:1.6}.up-msg code{background:rgba(127,127,127,.14);padding:2px 6px;border-radius:5px}
 </style>
-<div class="up-box"><h3>This install <span id="upPill"></span></h3>
+<div class="up-box"><h3>[[@This install]] <span id="upPill"></span></h3>
 <p id="upLine">…</p>
-<div class="up-row"><button class="btn" id="upNow" onclick="upNow()">Update now</button>
-<button class="btn ghost" id="upChk" onclick="upCheck()">Check for a new version</button></div>
+<div class="up-row"><button class="btn" id="upNow" onclick="upNow()">[[@Update now]]</button>
+<button class="btn ghost" id="upChk" onclick="upCheck()">[[@Check for a new version]]</button></div>
 <div class="up-msg" id="upMsg"></div></div>
-<div class="up-box"><h3>How tgarr is kept current</h3>
-<p>A small updater runs beside tgarr and looks every half hour whether a newer version was released; when there is one it fetches it and
-restarts tgarr - your data is not touched. <b>Update now</b> has it look at once. If the updater is not running, or this install was set up
-from an older docker-compose.yml, the message above says what to type instead.</p></div>
+<div class="up-box"><h3>[[@How tgarr is kept current]]</h3>
+<p>[[@A small updater runs beside tgarr and looks every half hour whether a newer version was released; when there is one it fetches it and restarts tgarr - your data is not touched.]]
+__UPNOW__ [[@If the updater is not running, or this install was set up from an older docker-compose.yml, the message above says what to type instead.]]</p></div>
 <script>
 const esc = t => String(t).replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
 const code = t => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>");
 const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
+const fmt = (s, ...a) => s.replace(/%([1-9])/g, (m, i) => a[i - 1]);
 let was = null, waiting = false;
 function show(j){
   if (was === null) was = j.running;
   const newer = j.kind && j.kind !== "current";
-  document.getElementById("upPill").innerHTML = newer ? pill("bad", esc(j.latest) + " is out") : pill("ok", "current");
-  document.getElementById("upLine").innerHTML = "Running <b>" + esc(j.running) + "</b>" + (newer ? " - <b>" + esc(j.latest) + "</b> was released." : ".")
-    + (j.checked_at ? " tgarr.me was last asked " + new Date(j.checked_at * 1000).toLocaleString() + "." : "")
-    + (j.kind === "pinned" ? " Held at <code>" + esc(j.tag) + "</code> by TGARR_TAG in .env." : "");
+  document.getElementById("upPill").innerHTML = newer ? pill("bad", fmt("[[@js:%1 is out]]", esc(j.latest))) : pill("ok", "[[@js:current]]");
+  document.getElementById("upLine").innerHTML = (newer ? fmt("[[@js:Running %1 - %2 was released.]]", "<b>" + esc(j.running) + "</b>", "<b>" + esc(j.latest) + "</b>") : fmt("[[@js:Running %1.]]", "<b>" + esc(j.running) + "</b>"))
+    + (j.checked_at ? " " + fmt("[[@js:tgarr.me was last asked %1.]]", new Date(j.checked_at * 1000).toLocaleString()) : "")
+    + (j.kind === "pinned" ? " " + fmt("[[@js:Held at %1 by TGARR_TAG in .env.]]", "<code>" + esc(j.tag) + "</code>") : "");
   if (waiting && j.running !== was) location.reload();
 }
 function poll(){ fetch("/api/update").then(r => r.json()).then(show).catch(() => {}).finally(() => setTimeout(poll, waiting ? 3000 : 30000)); }
@@ -2400,19 +2400,20 @@ function say(t, bad){ const m = document.getElementById("upMsg"); m.style.color 
 function upCheck(){
   const b = document.getElementById("upChk"); b.disabled = true;
   fetch("/api/update/check", {method: "POST"}).then(r => r.json()).then(j => {
-    say(j.status !== "ok" ? j.message : j.newer ? "tgarr " + j.latest + " is out; this install runs " + j.running + "." : "This is the current version (" + j.running + ").", j.status !== "ok");
+    say(j.status !== "ok" ? j.message : j.newer ? fmt("[[@js:tgarr %1 is out; this install runs %2.]]", j.latest, j.running) : fmt("[[@js:This is the current version (%1).]]", j.running), j.status !== "ok");
     return fetch("/api/update").then(r => r.json()).then(show);
-  }).catch(() => say("this server did not answer", true)).finally(() => { b.disabled = false; });
+  }).catch(() => say("[[@js:this server did not answer]]", true)).finally(() => { b.disabled = false; });
 }
 function upNow(){
-  const b = document.getElementById("upNow"); b.disabled = true; say("Asking the updater…");
+  const b = document.getElementById("upNow"); b.disabled = true; say("[[@js:Asking the updater…]]");
   fetch("/api/update/now", {method: "POST"}).then(r => r.json()).then(j => {
     say(j.message || "", !["asked", "current"].includes(j.state));
     if (j.state === "asked") { waiting = true; poll(); setTimeout(() => { b.disabled = false; }, 240000); } else b.disabled = false;
-  }).catch(() => { say("tgarr is restarting - this page comes back by itself."); waiting = true; poll(); });
+  }).catch(() => { say("[[@js:tgarr is restarting - this page comes back by itself.]]"); waiting = true; poll(); });
 }
 poll();
 </script>"""
+    body = _fill(body).replace("__UPNOW__", _t("%1 has it look at once.").replace("%1", f'<b>{_t("Update now")}</b>'))
     return HTMLResponse(_layout("Update", "/settings", body, page_title="Updating tgarr", top_actions_html=""))
 
 
@@ -11675,18 +11676,15 @@ async def page_settings_pictures():
 .vi-cap{{padding:6px 8px 0;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .vi-card button{{margin:6px 8px 8px;font-size:12px;padding:4px 10px}}
 </style>
-<div class="vi-box"><h3>Looking at the pictures themselves <span id="viState"></span></h3>
-<p>Whether something is adult has so far been a matter of what its channel is called. With this installed, tgarr looks at every
-picture - at the picture, not its name - and decides for itself: adult or not, drawn or photographed. A picture found adult is never
-shown in the Media Center, whatever was ticked, and is left out of the gallery unless adult content is switched on. A channel that
-calls itself harmless and turns out to be mostly adult pictures is labelled 18+.</p>
-<p>Two small models do it, on this machine's processor; nothing is sent anywhere. They are fetched once, {mb}, from Hugging Face,
-and checked. A picture takes most of a second, so a large library is gone through once over some hours, quietly, newest first.
-What they cannot do is tell a person's age.</p>
+<div class="vi-box"><h3>[[@Looking at the pictures themselves]] <span id="viState"></span></h3>
+<p>[[@Whether something is adult has so far been a matter of what its channel is called. With this installed, tgarr looks at every picture - at the picture, not its name - and decides for itself: adult or not, drawn or photographed.]]
+[[@A picture found adult is never shown in the Media Center, whatever was ticked, and is left out of the gallery unless adult content is switched on. A channel that calls itself harmless and turns out to be mostly adult pictures is labelled 18+.]]</p>
+<p>{_t("Two small models do it, on this machine's processor; nothing is sent anywhere. They are fetched once, {mb}, from Hugging Face, and checked.", mb=mb)}
+[[@A picture takes most of a second, so a large library is gone through once over some hours, quietly, newest first. What they cannot do is tell a person's age.]]</p>
 <div class="vi-row" id="viRow"></div></div>
-<div class="vi-box"><h3>So far</h3><div class="vi-n" id="viNum"></div><div id="viCh" style="margin-top:12px;font-size:14px"></div></div>
-<div class="vi-box"><h3>Found adult</h3>
-<p>Blurred until the pointer is on them. Only what the model is very sure of (90% and up) is listed. It can still be wrong: say so, and your word stands, whatever a model says later.</p>
+<div class="vi-box"><h3>[[@So far]]</h3><div class="vi-n" id="viNum"></div><div id="viCh" style="margin-top:12px;font-size:14px"></div></div>
+<div class="vi-box"><h3>[[@Found adult]]</h3>
+<p>[[@Blurred until the pointer is on them. Only what the model is very sure of (90% and up) is listed. It can still be wrong: say so, and your word stands, whatever a model says later.]]</p>
 <div class="vi-grid" id="viFlag"></div><p id="viFlagNone" style="margin-top:8px"></p>
 <h3 style="margin-top:18px" id="viHandH"></h3><div class="vi-grid" id="viHand"></div></div>
 <script>
@@ -11695,38 +11693,39 @@ const post = (path, body) => fetch(path, {{method: "POST", headers: {{"Content-T
 const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
 const esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
 const n = x => (x || 0).toLocaleString();
+const fmt = (s, ...a) => s.replace(/%([1-9])/g, (m, i) => a[i - 1]);
 function show(j){{
-  document.getElementById("viState").innerHTML = j.installed ? (j.available ? pill("ok", j.state === "looking" ? "looking" : "installed") : pill("bad", "installed, but this build cannot run it")) : pill("muted", "not installed");
+  document.getElementById("viState").innerHTML = j.installed ? (j.available ? pill("ok", j.state === "looking" ? "[[@js:looking]]" : "[[@js:installed]]") : pill("bad", "[[@js:installed, but this build cannot run it]]")) : pill("muted", "[[@js:not installed]]");
   const row = document.getElementById("viRow");
   if (j.installing) {{
     const pc = Math.min(100, Math.round(j.done * 100 / SZ));
-    row.innerHTML = '<div class="vi-bar"><i style="width:' + pc + '%"></i></div><span>fetching, ' + pc + '%</span>';
+    row.innerHTML = '<div class="vi-bar"><i style="width:' + pc + '%"></i></div><span>' + fmt("[[@js:fetching, %1%]]", pc) + '</span>';
   }} else if (j.installed) {{
-    row.innerHTML = '<button class="btn ghost" onclick="viRemove(false)">Remove the models</button><button class="btn ghost" onclick="viRemove(true)">Remove, and forget what they found</button>';
+    row.innerHTML = '<button class="btn ghost" onclick="viRemove(false)">' + "[[@js:Remove the models]]" + '</button><button class="btn ghost" onclick="viRemove(true)">' + "[[@js:Remove, and forget what they found]]" + '</button>';
   }} else {{
-    row.innerHTML = '<button class="btn" onclick="viInstall()">Install (' + Math.round(SZ / 1e6) + ' MB)</button>' + (j.error ? '<span style="color:#b45309">' + esc(j.error) + '</span>' : "");
+    row.innerHTML = '<button class="btn" onclick="viInstall()">' + fmt("[[@js:Install (%1 MB)]]", Math.round(SZ / 1e6)) + '</button>' + (j.error ? '<span style="color:#b45309">' + esc(j.error) + '</span>' : "");
   }}
-  document.getElementById("viNum").innerHTML = '<div><b>' + n(j.looked) + '</b>pictures looked at</div><div><b>' + n(j.waiting) + '</b>waiting</div>'
-    + '<div><b>' + n(j.adult) + '</b>found adult</div><div><b>' + n(j.drawn) + '</b>drawn, not photographed</div>';
-  document.getElementById("viCh").innerHTML = (j.relabelled || []).map(c => 'Labelled 18+: <b>' + esc(c.name) + '</b> - ' + n(c.adult) + ' of ' + n(c.n) + ' pictures looked at were adult').join("<br/>");
+  document.getElementById("viNum").innerHTML = '<div><b>' + n(j.looked) + '</b>' + "[[@js:pictures looked at]]" + '</div><div><b>' + n(j.waiting) + '</b>' + "[[@js:waiting]]" + '</div>'
+    + '<div><b>' + n(j.adult) + '</b>' + "[[@js:found adult]]" + '</div><div><b>' + n(j.drawn) + '</b>' + "[[@js:drawn, not photographed]]" + '</div>';
+  document.getElementById("viCh").innerHTML = (j.relabelled || []).map(c => fmt("[[@js:Labelled 18+: %1 - %2 of %3 pictures looked at were adult]]", '<b>' + esc(c.name) + '</b>', n(c.adult), n(c.n))).join("<br/>");
   return j.installing || j.state === "looking";
 }}
 let timer = null;
 function poll(){{ fetch("/api/vision/status").then(r => r.json()).then(j => {{ clearTimeout(timer); timer = setTimeout(poll, show(j) ? 2500 : 20000); }}).catch(() => {{ timer = setTimeout(poll, 6000); }}); }}
 function viInstall(){{ post("/api/vision/install").then(poll); }}
 function viRemove(forget){{
-  if (!confirm(forget ? "Remove the models and forget what they found? Pictures will again be judged by their channel alone." : "Remove the models? What they found so far is kept.")) return;
+  if (!confirm(forget ? "[[@js:Remove the models and forget what they found? Pictures will again be judged by their channel alone.]]" : "[[@js:Remove the models? What they found so far is kept.]]")) return;
   post("/api/vision/remove", {{forget: forget}}).then(poll);
 }}
 function flagged(){{
   fetch("/api/vision/flagged").then(r => r.json()).then(j => {{
     const card = p => '<div class="vi-card' + (p.by_hand ? ' hand' : '') + '"><div class="vi-img"><img loading="lazy" src="/thumbs/' + encodeURIComponent(p.thumb) + '"/></div>'
-      + '<div class="vi-cap">' + esc(p.channel) + (p.by_hand ? (p.adult >= 0.5 ? ' - adult, you said' : ' - not adult, you said') + (p.model != null ? ' (model: ' + Math.round(p.model * 100) + '%)' : '') : ' - ' + Math.round(p.adult * 100) + '%') + '</div>'
-      + '<button class="btn ghost" data-t="' + encodeURIComponent(p.thumb) + '" data-a="' + (p.by_hand ? 'undo' : 'no') + '">' + (p.by_hand ? 'Take back' : 'Not adult') + '</button></div>';
+      + '<div class="vi-cap">' + esc(p.channel) + (p.by_hand ? ' - ' + (p.adult >= 0.5 ? "[[@js:adult, you said]]" : "[[@js:not adult, you said]]") + (p.model != null ? ' (' + fmt("[[@js:model: %1%]]", Math.round(p.model * 100)) + ')' : '') : ' - ' + Math.round(p.adult * 100) + '%') + '</div>'
+      + '<button class="btn ghost" data-t="' + encodeURIComponent(p.thumb) + '" data-a="' + (p.by_hand ? 'undo' : 'no') + '">' + (p.by_hand ? "[[@js:Take back]]" : "[[@js:Not adult]]") + '</button></div>';
     const ps = j.pictures || [], found = ps.filter(p => !p.by_hand), hand = ps.filter(p => p.by_hand);
     document.getElementById("viFlag").innerHTML = found.map(card).join("");
-    document.getElementById("viFlagNone").textContent = found.length ? (found.length >= 300 ? "The first 300." : "") : "None.";
-    document.getElementById("viHandH").textContent = hand.length ? "Decided by you" : "";
+    document.getElementById("viFlagNone").textContent = found.length ? (found.length >= 300 ? "[[@js:The first 300.]]" : "") : "[[@js:None.]]";
+    document.getElementById("viHandH").textContent = hand.length ? "[[@js:Decided by you]]" : "";
     document.getElementById("viHand").innerHTML = hand.map(card).join("");
   }}).catch(() => {{}});
 }}
@@ -11740,7 +11739,7 @@ poll();
 flagged();
 setInterval(flagged, 30000);
 </script>"""
-    return HTMLResponse(_layout("Pictures", "/settings", body, page_title="Looking at pictures", top_actions_html=""))
+    return HTMLResponse(_layout("Pictures", "/settings", _fill(body), page_title="Looking at pictures", top_actions_html=""))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -11847,68 +11846,67 @@ async def page_settings_voice():
 .vo-bar i{{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}}
 .vo-in{{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
 </style>
-<div class="vo-box"><h3>A voice of this machine's own <span id="voState"></span></h3>
-<p>A browser reads a book aloud with whatever voices it happens to have: natural ones in Edge, a robot in most others, none on many
-televisions. With this voice installed, tgarr makes the audio itself - on this machine's processor, nothing is sent anywhere - for
-every browser that has no natural voice of its own. Edge goes on reading with Microsoft's voices, which are better. The voice
-(Kokoro, an open model) reads Chinese and English; for other languages the browser's voice is used.</p>
-<p>The voice is not part of tgarr: it is fetched once, {mb(tts.SIZES["voice"])}, from GitHub (the sherpa-onnx project's files), checked,
-and kept in the downloads folder. It needs about 600 MB of memory while a book is being read, and lets go of it a quarter of an hour
-after. A sentence takes about a third of its length to make on an ordinary processor - on a small one, reading may halt between sentences.</p>
+<div class="vo-box"><h3>[[@A voice of this machine's own]] <span id="voState"></span></h3>
+<p>[[@A browser reads a book aloud with whatever voices it happens to have: natural ones in Edge, a robot in most others, none on many televisions.]]
+[[@With this voice installed, tgarr makes the audio itself - on this machine's processor, nothing is sent anywhere - for every browser that has no natural voice of its own.]]
+[[@Edge goes on reading with Microsoft's voices, which are better. The voice (Kokoro, an open model) reads Chinese and English; for other languages the browser's voice is used.]]</p>
+<p>{_t("The voice is not part of tgarr: it is fetched once, {mb}, from GitHub (the sherpa-onnx project's files), checked, and kept in the downloads folder.", mb=mb(tts.SIZES["voice"]))}
+[[@It needs about 600 MB of memory while a book is being read, and lets go of it a quarter of an hour after.]]
+[[@A sentence takes about a third of its length to make on an ordinary processor - on a small one, reading may halt between sentences.]]</p>
 <div class="vo-row" id="voVoice"></div></div>
-<div class="vo-box"><h3>Hard Chinese pronunciations <span id="prState"></span></h3>
-<p>长 in 路还长着呢, 得 in 你得去: which reading a character has depends on the sentence. tgarr decides the common cases by rules of
-its own. A second model that reads the whole sentence gets more of them right. It is large - {mb(tts.SIZES["pronunciation"])}, from Hugging Face
-(the g2pW project) - and needs about a gigabyte of memory while reading.</p>
+<div class="vo-box"><h3>[[@Hard Chinese pronunciations]] <span id="prState"></span></h3>
+<p>[[@长 in 路还长着呢, 得 in 你得去: which reading a character has depends on the sentence. tgarr decides the common cases by rules of its own. A second model that reads the whole sentence gets more of them right.]]
+{_t("It is large - {mb}, from Hugging Face (the g2pW project) - and needs about a gigabyte of memory while reading.", mb=mb(tts.SIZES["pronunciation"]))}</p>
 <div class="vo-row" id="voPron"></div></div>
-<div class="vo-box"><h3>Try it</h3>
+<div class="vo-box"><h3>[[@Try it]]</h3>
 <div class="vo-row"><input class="vo-in" id="voText" value="路还长着呢，孩子，不着急，慢慢走。 It was nearly midnight on platform 9." />
-<button class="btn" onclick="voTry()">Say it</button><span id="voMsg" style="color:var(--muted);font-size:13px"></span></div></div>
+<button class="btn" onclick="voTry()">[[@Say it]]</button><span id="voMsg" style="color:var(--muted);font-size:13px"></span></div></div>
 <script>
 const SZ = {{voice: {tts.SIZES["voice"]}, pronunciation: {tts.SIZES["pronunciation"]}}};
 const post = (path, body) => fetch(path, {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify(body)}}).then(r => r.json());
 const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
 const esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
+const fmt = (s, ...a) => s.replace(/%([1-9])/g, (m, i) => a[i - 1]);
 function part(el, what, st, extra){{
   if (st.installing) {{
     const pc = Math.min(100, Math.round(st.done * 100 / SZ[what]));
-    el.innerHTML = '<div class="vo-bar"><i style="width:' + pc + '%"></i></div><span>fetching, ' + pc + '%</span>';
+    el.innerHTML = '<div class="vo-bar"><i style="width:' + pc + '%"></i></div><span>' + fmt("[[@js:fetching, %1%]]", pc) + '</span>';
   }} else if (st.installed) {{
-    el.innerHTML = (extra || "") + '<button class="btn ghost" data-w="' + what + '" onclick="voRemove(this.dataset.w)">Remove</button>';
+    el.innerHTML = (extra || "") + '<button class="btn ghost" data-w="' + what + '" onclick="voRemove(this.dataset.w)">' + "[[@js:Remove]]" + '</button>';
   }} else {{
-    el.innerHTML = '<button class="btn" data-w="' + what + '" onclick="voInstall(this.dataset.w)">Install (' + Math.round(SZ[what] / 1e6) + ' MB)</button>'
+    el.innerHTML = '<button class="btn" data-w="' + what + '" onclick="voInstall(this.dataset.w)">' + fmt("[[@js:Install (%1 MB)]]", Math.round(SZ[what] / 1e6)) + '</button>'
       + (st.error ? '<span style="color:#b45309">' + esc(st.error) + '</span>' : "");
   }}
 }}
 function show(j){{
-  document.getElementById("voState").innerHTML = j.voice.installed ? (j.available ? pill("ok", "installed") : pill("bad", "installed, but this build cannot run it")) : pill("muted", "not installed");
-  document.getElementById("prState").innerHTML = j.pronunciation.installed ? pill(j.pronunciation.on ? "ok" : "muted", j.pronunciation.on ? "in use" : "installed, switched off") : pill("muted", "not installed");
+  document.getElementById("voState").innerHTML = j.voice.installed ? (j.available ? pill("ok", "[[@js:installed]]") : pill("bad", "[[@js:installed, but this build cannot run it]]")) : pill("muted", "[[@js:not installed]]");
+  document.getElementById("prState").innerHTML = j.pronunciation.installed ? pill(j.pronunciation.on ? "ok" : "muted", j.pronunciation.on ? "[[@js:in use]]" : "[[@js:installed, switched off]]") : pill("muted", "[[@js:not installed]]");
   part(document.getElementById("voVoice"), "voice", j.voice,
-    '<span style="color:var(--muted)">' + (j.loaded ? "in memory now" : "not in memory") + ' · ' + j.cache.clips.toLocaleString() + ' clips kept, ' + (j.cache.bytes / 1e6).toFixed(0) + ' MB</span>');
+    '<span style="color:var(--muted)">' + (j.loaded ? "[[@js:in memory now]]" : "[[@js:not in memory]]") + ' · ' + fmt("[[@js:%1 clips kept, %2 MB]]", j.cache.clips.toLocaleString(), (j.cache.bytes / 1e6).toFixed(0)) + '</span>');
   const pr = document.getElementById("voPron");
-  if (!j.voice.installed && !j.pronunciation.installing) {{ pr.innerHTML = '<span style="color:var(--muted)">Install the voice first.</span>'; }}
+  if (!j.voice.installed && !j.pronunciation.installing) {{ pr.innerHTML = '<span style="color:var(--muted)">' + "[[@js:Install the voice first.]]" + '</span>'; }}
   else part(pr, "pronunciation", j.pronunciation,
-    '<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" ' + (j.pronunciation.on ? "checked" : "") + ' onchange="voPron(this.checked)"/> use it</label>');
+    '<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" ' + (j.pronunciation.on ? "checked" : "") + ' onchange="voPron(this.checked)"/> ' + "[[@js:use it]]" + '</label>');
   return j.voice.installing || j.pronunciation.installing;
 }}
 let timer = null;
 function poll(){{ fetch("/api/tts/status").then(r => r.json()).then(j => {{ clearTimeout(timer); timer = setTimeout(poll, show(j) ? 1500 : 15000); }}).catch(() => {{ timer = setTimeout(poll, 5000); }}); }}
-function voInstall(what){{ post("/api/tts/install", {{what: what}}).then(j => {{ if (j.status !== "ok") alert(j.message || "could not start"); poll(); }}); }}
+function voInstall(what){{ post("/api/tts/install", {{what: what}}).then(j => {{ if (j.status !== "ok") alert(j.message || "[[@js:could not start]]"); poll(); }}); }}
 function voRemove(what){{
-  if (!confirm(what === "voice" ? "Remove the voice (and the pronunciation model with it)? The browser's own voice will read again." : "Remove the pronunciation model?")) return;
+  if (!confirm(what === "voice" ? "[[@js:Remove the voice (and the pronunciation model with it)? The browser's own voice will read again.]]" : "[[@js:Remove the pronunciation model?]]")) return;
   post("/api/tts/remove", {{what: what}}).then(poll);
 }}
 function voPron(on){{ post("/api/tts/pronunciation", {{on: on}}).then(poll); }}
 function voTry(){{
-  const m = document.getElementById("voMsg"), t0 = Date.now(); m.textContent = "making it…";
+  const m = document.getElementById("voMsg"), t0 = Date.now(); m.textContent = "[[@js:making it…]]";
   fetch("/api/tts/say", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{text: document.getElementById("voText").value}})}})
-    .then(r => r.ok ? r.blob() : r.json().then(j => {{ throw new Error(j.message || "could not"); }}))
-    .then(b => {{ m.textContent = "made in " + ((Date.now() - t0) / 1000).toFixed(1) + " s"; new Audio(URL.createObjectURL(b)).play(); poll(); }})
+    .then(r => r.ok ? r.blob() : r.json().then(j => {{ throw new Error(j.message || "[[@js:could not]]"); }}))
+    .then(b => {{ m.textContent = fmt("[[@js:made in %1 s]]", ((Date.now() - t0) / 1000).toFixed(1)); new Audio(URL.createObjectURL(b)).play(); poll(); }})
     .catch(e => {{ m.textContent = e.message; }});
 }}
 poll();
 </script>"""
-    return HTMLResponse(_layout("Voice", "/settings", body, page_title="Reading aloud", top_actions_html=""))
+    return HTMLResponse(_layout("Voice", "/settings", _fill(body), page_title="Reading aloud", top_actions_html=""))
 
 
 @app.get("/settings/usenet", response_class=HTMLResponse)
@@ -15670,17 +15668,17 @@ async def page_settings(request: Request):
     # which part of this machine makes the picture when a film is converted while it is watched
     _hw = await api_transcode_hw()
     if _hw["setting"] == "off":
-        _hw_meta = "In software, because it was switched to that here." + (" A graphics card that can do it was found." if _hw["found"] else "")
-        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="auto"/><button class="btn" type="submit">Use the graphics card</button></form>'
+        _hw_meta = _t("In software, because it was switched to that here.") + (" " + _t("A graphics card that can do it was found.") if _hw["found"] else "")
+        _hw_btn = f'<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="auto"/><button class="btn" type="submit">{_t("Use the graphics card")}</button></form>'
     elif _hw["kind"]:
-        _hw_meta = (f"On {html.escape(_hw['name'])}{' at ' + html.escape(_hw['device']) if _hw['device'] else ''}: a film takes a fraction of the processor it takes in software. "
-                    "If a film will not play, or looks wrong, switch to software.")
-        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="off"/><button class="btn ghost" type="submit">Use software</button></form>'
+        _hw_meta = ((_t("On {name} at {device}: a film takes a fraction of the processor it takes in software.", name=_hw["name"], device=_hw["device"])
+                     if _hw["device"] else _t("On {name}: a film takes a fraction of the processor it takes in software.", name=_hw["name"]))
+                    + " " + _t("If a film will not play, or looks wrong, switch to software."))
+        _hw_btn = f'<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="off"/><button class="btn ghost" type="submit">{_t("Use software")}</button></form>'
     else:
-        _hw_meta = ("In software: this tgarr was not given a graphics card that can encode. On Linux, running the installer again hands it "
-                    "the card if there is one; the guide says how to do it by hand.")
-        _hw_btn = '<a class="btn ghost" href="https://github.com/tgarrpro/tgarr/blob/main/docs/install/gpu.md" target="_blank" rel="noopener">How</a>'
-    hw_row = ('<div class="dl-item"><div class="icon">🎞</div><div class="info"><div class="name">Converting films</div>'
+        _hw_meta = _t("In software: this tgarr was not given a graphics card that can encode. On Linux, running the installer again hands it the card if there is one; the guide says how to do it by hand.")
+        _hw_btn = f'<a class="btn ghost" href="https://github.com/tgarrpro/tgarr/blob/main/docs/install/gpu.md" target="_blank" rel="noopener">{_t("How")}</a>'
+    hw_row = (f'<div class="dl-item"><div class="icon">🎞</div><div class="info"><div class="name">{_t("Converting films")}</div>'
               f'<div class="meta">{_hw_meta}</div></div><div class="right">{_hw_btn}</div></div>')
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
@@ -15704,14 +15702,19 @@ async def page_settings(request: Request):
     my_dc_disp = (await _get_my_dc()) or "?"
     cache_ttl, cache_gb = await _cache_settings()
     _usage = await _cache_usage()
-    _kind = {"video": "videos", "audio": "songs", "library": "books"}
+    _kind = {"video": "{n} videos ({size})", "audio": "{n} songs ({size})", "library": "{n} books ({size})"}
     cache_total = _fmt_size(sum(r["bytes"] for r in _usage)) or "0 MB"
+    # (unescaped here: the sentence it is put into is escaped as a whole)
     cache_detail = " · ".join(
-        f'{r["n"]:,} {_kind.get(r["kind"], r["kind"])} ({_fmt_size(r["bytes"]) or "0"})'
-        for r in _usage) or "nothing downloaded yet"
+        html.unescape(_t(_kind[r["kind"]], n=f'{r["n"]:,}', size=_fmt_size(r["bytes"]) or "0")) if r["kind"] in _kind
+        else f'{r["n"]:,} {r["kind"]} ({_fmt_size(r["bytes"]) or "0"})'
+        for r in _usage)
+    cache_now = _t("Now on disk: {what}.", what=cache_detail) if cache_detail else _t("Now on disk: nothing downloaded yet.")
     _full = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
     _uname = user.get("username")
-    _shown = _full or (("@" + _uname) if _uname else "Telegram account")
+    _shown = _full or (("@" + _uname) if _uname else html.unescape(_t("Telegram account")))
+    _out_ask = html.escape(_tj("Sign out of Telegram on this tgarr?") + "\\n\\n" + _tj(
+        "Your private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay."), quote=True)
     try:                                   # the account's own picture, when it has one
         _av = (f'<img class="acct-av" src="/api/me/avatar?v={int(os.path.getmtime(login.AVATAR_FILE))}" alt="">')
     except OSError:
@@ -15722,12 +15725,11 @@ async def page_settings(request: Request):
         f'<div class="acct-name">{html.escape(_shown)}</div>'
         f'<div class="acct-sub">'
         + (f'@{html.escape(_uname)} · ' if _uname and _full else '')
-        + f'Telegram data center {my_dc_disp} <span class="pill ok">signed in</span></div>'
+        + f'{_t("Telegram data center {dc}", dc=my_dc_disp)} <span class="pill ok">{_t("signed in")}</span></div>'
         f'<div class="acct-meta">API ID <code>{html.escape(str(login.API_ID or "-"))}</code> · '
-        f'session at <code>_data/session/tgarr.session</code></div></div>'
-        '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'Sign out of Telegram on this tgarr?'
-        '\\n\\nYour private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay.\'))'
-        'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">Sign out</button></div></div>')
+        + _t("session at %1").replace("%1", '<code>_data/session/tgarr.session</code>') + '</div></div>'
+        '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'' + _out_ask + '\'))'
+        'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">' + _t("Sign out") + '</button></div></div>')
 
     # ── this machine ──
     host = await asyncio.to_thread(_host_info)
@@ -15747,42 +15749,44 @@ async def page_settings(request: Request):
     tiles, alerts = [], []
     for d in host["disks"]:
         used_share = d["used"] / d["total"] if d["total"] else 0
+        # "Downloads folder", "tgarr data", or both joined with " + " when they share a disk
+        label = " + ".join(html.unescape(_t(x)) for x in d["label"].split(" + "))
         tiles.append(
-            f'<div class="sys-t {d["level"]}"><div class="sys-l">💽 {html.escape(d["label"])}</div>'
-            f'<div class="sys-n">{_gb(d["free"])} <small>free</small></div>'
+            f'<div class="sys-t {d["level"]}"><div class="sys-l">💽 {html.escape(label)}</div>'
+            f'<div class="sys-n">{_gb(d["free"])} <small>{_t("free")}</small></div>'
             f'{_bar(used_share, d["level"])}'
-            f'<div class="sys-s">{_gb(d["used"])} used of {_gb(d["total"])} · {used_share * 100:.0f}% full</div></div>')
+            f'<div class="sys-s">{_t("{used} used of {total} · {pct}% full", used=_gb(d["used"]), total=_gb(d["total"]), pct=format(used_share * 100, ".0f"))}</div></div>')
         if d["level"] in ("warn", "bad"):
             alerts.append((d["level"],
-                           f'<b>{html.escape(d["label"])}: {_gb(d["free"])} free.</b> '
-                           + ("New downloads and plays will start failing. " if d["level"] == "bad" else
-                              "Space is getting short. ")
-                           + 'Free some under <a href="#files">Downloaded files</a> below, or set an automatic clean-up there.'))
+                           f'<b>{_t("{label}: {free} free.", label=label, free=_gb(d["free"]))}</b> '
+                           + (_t("New downloads and plays will start failing.") if d["level"] == "bad" else
+                              _t("Space is getting short.")) + " "
+                           + _t("Free some under %1Downloaded files%2 below, or set an automatic clean-up there.").replace("%1", '<a href="#files">').replace("%2", "</a>")))
     if host["mem"]:
         m = host["mem"]
         tiles.append(
-            f'<div class="sys-t {m["level"]}"><div class="sys-l">🧠 Memory</div>'
-            f'<div class="sys-n">{_gb(m["avail"])} <small>available</small></div>'
+            f'<div class="sys-t {m["level"]}"><div class="sys-l">🧠 {_t("Memory")}</div>'
+            f'<div class="sys-n">{_gb(m["avail"])} <small>{_t("available")}</small></div>'
             f'{_bar(1 - m["avail"] / m["total"], m["level"])}'
-            f'<div class="sys-s">of {_gb(m["total"])} in this machine</div></div>')
+            f'<div class="sys-s">{_t("of {total} in this machine", total=_gb(m["total"]))}</div></div>')
         if m["level"] == "bad":
-            alerts.append(("bad", f'<b>Memory: only {_gb(m["avail"])} available.</b> '
-                                  'Making a scanned book into pages and playing several files at once may fail.'))
+            alerts.append(("bad", f'<b>{_t("Memory: only {avail} available.", avail=_gb(m["avail"]))}</b> '
+                                  + _t("Making a scanned book into pages and playing several files at once may fail.")))
     if host["load"]:
         ld = host["load"]
         tiles.append(
-            f'<div class="sys-t {ld["level"]}"><div class="sys-l">⚙ Processor</div>'
-            f'<div class="sys-n">{host["cores"]} <small>cores</small></div>'
-            f'<div class="sys-s">load {ld["l1"]:.2f} · {ld["l5"]:.2f} · {ld["l15"]:.2f}'
-            f'<br>(1, 5 and 15 minutes)</div></div>')
+            f'<div class="sys-t {ld["level"]}"><div class="sys-l">⚙ {_t("Processor")}</div>'
+            f'<div class="sys-n">{host["cores"]} <small>{_t("cores")}</small></div>'
+            f'<div class="sys-s">{_t("load {a} · {b} · {c}", a=format(ld["l1"], ".2f"), b=format(ld["l5"], ".2f"), c=format(ld["l15"], ".2f"))}'
+            f'<br>{_t("(1, 5 and 15 minutes)")}</div></div>')
     tiles.append(
-        f'<div class="sys-t"><div class="sys-l">🗂 Index</div>'
+        f'<div class="sys-t"><div class="sys-l">🗂 {_t("Index")}</div>'
         f'<div class="sys-n">{_fmt_size(db_bytes) or "0"}</div>'
-        f'<div class="sys-s">{idx_counts["ch"]:,} channels · {_fmt_count(idx_counts["msgs"])} posts<br>'
-        f'downloaded files: {html.escape(cache_total)}</div></div>')
+        f'<div class="sys-s">{_t("{ch} channels · {msgs} posts", ch=format(idx_counts["ch"], ","), msgs=_fmt_count(idx_counts["msgs"]))}<br>'
+        f'{_t("downloaded files: {size}", size=cache_total)}</div></div>')
     tiles.append(
-        f'<div class="sys-t"><div class="sys-l">🖥 System</div>'
-        f'<div class="sys-n">{_fmt_uptime(host["uptime_s"])} <small>up</small></div>'
+        f'<div class="sys-t"><div class="sys-l">🖥 {_t("System")}</div>'
+        f'<div class="sys-n">{_fmt_uptime(host["uptime_s"])} <small>{_t("up")}</small></div>'
         f'<div class="sys-s">Linux {html.escape(host["kernel"])}<br>{html.escape(host["arch"])} · '
         f'tgarr {TGARR_VERSION}</div></div>')
     alerts.sort(key=lambda a: a[0] != "bad")
@@ -15836,37 +15840,34 @@ async def page_settings(request: Request):
 .settings details.adv summary {{ cursor:pointer; font-size:13px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.07em; }}
 .settings details.adv summary:hover {{ color:var(--accent); }}
 </style>
-<script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
+<script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="{_tj("Copied")}";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
 <div class="settings">
 {account_html}
 
-<h2 class="section">This machine</h2>
+<h2 class="section">{_t("This machine")}</h2>
 {machine_html}
 
-<h2 class="section">Library</h2>
+<h2 class="section">{_t("Content")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🎯</div>
     <div class="info">
-      <div class="name">When a title has several versions, show first — <span class="pill ok">{'my data center' if version_pref == 'dc' else 'best quality'}</span></div>
+      <div class="name">{_t("When a title has several versions, show first")} — <span class="pill ok">{_t("my data center") if version_pref == 'dc' else _t("best quality")}</span></div>
       <div class="meta">
-        The same film is often posted more than once: different resolutions, or
-        the same file uploaded to different Telegram data centers. tgarr shows
-        one card per title and keeps every version one click away.
-        Your account is on <strong>DC {my_dc_disp}</strong>; a copy on that data
-        center is your fastest path.
+        {_t("The same film is often posted more than once: different resolutions, or the same file uploaded to different Telegram data centers. tgarr shows one card per title and keeps every version one click away.")}
+        {_t("Your account is on %1; a copy on that data center is your fastest path.").replace("%1", f"<strong>DC {my_dc_disp}</strong>")}
       </div>
       <form method="POST" action="/api/settings/version_preference" style="margin-top:12px;font-size:14px;line-height:1.7">
         <label style="display:block;cursor:pointer">
           <input type="radio" name="value" value="quality" {'checked' if version_pref != 'dc' else ''} onchange="this.form.submit()" />
-          <strong>Best quality first</strong> — higher resolution wins; between equal resolutions, the copy on my data center wins.
+          <strong>{_t("Best quality first")}</strong> — {_t("higher resolution wins; between equal resolutions, the copy on my data center wins.")}
         </label>
         <label style="display:block;cursor:pointer">
           <input type="radio" name="value" value="dc" {'checked' if version_pref == 'dc' else ''} onchange="this.form.submit()" />
-          <strong>My data center first</strong> — a copy on my data center wins, then resolution.
+          <strong>{_t("My data center first")}</strong> — {_t("a copy on my data center wins, then resolution.")}
         </label>
         <div style="color:var(--muted);font-size:12px;margin-top:6px">
-          While Telegram is rate-limiting cross-data-center access, tgarr leads with your data center regardless of this choice.
+          {_t("While Telegram is rate-limiting cross-data-center access, tgarr leads with your data center regardless of this choice.")}
         </div>
       </form>
     </div>
@@ -15874,211 +15875,193 @@ async def page_settings(request: Request):
   <div class="dl-item" id="cache">
     <div class="icon" id="files">💾</div>
     <div class="info">
-      <div class="name">Downloaded files — <span class="pill ok">{cache_total}</span></div>
+      <div class="name">{_t("Downloaded files")} — <span class="pill ok">{cache_total}</span></div>
       <div class="meta">
-        Opening a film, a song or a book downloads it here so it plays, and
-        opens instantly next time. Saved items carry a
-        <span class="pill ok" style="font-size:11px">● saved</span> mark in the lists.
-        Now on disk: {cache_detail}.<br/>
-        tgarr tidies up by itself: a file nobody opened for a while is removed
-        (it stays in the index; opening it again fetches it again). Files
-        grabbed through Sonarr/Radarr are never touched.<br/>
-        What you fetched from <a href="/usenet?kind=have">Usenet</a> is not part of this: you asked for
-        each of those files by hand, and they stay until you delete them there. A favourite is never
-        removed by these rules.
+        {_t("Opening a film, a song or a book downloads it here so it plays, and opens instantly next time.")}
+        {_t("Saved items carry a %1 mark in the lists.").replace("%1", f'<span class="pill ok" style="font-size:11px">● {_t("saved")}</span>')}
+        {cache_now}<br/>
+        {_t("tgarr tidies up by itself: a file nobody opened for a while is removed (it stays in the index; opening it again fetches it again). Files grabbed through Sonarr/Radarr are never touched.")}<br/>
+        {_t("What you fetched from %1Usenet%2 is not part of this: you asked for each of those files by hand, and they stay until you delete them there. A favourite is never removed by these rules.").replace("%1", '<a href="/usenet?kind=have">').replace("%2", "</a>")}
       </div>
       <form method="POST" action="/api/settings/cache" style="margin-top:12px;font-size:14px;line-height:2.2">
-        Remove a file not opened for
-        <input type="number" name="ttl_days" value="{cache_ttl}" min="0" style="width:70px" /> days,
-        and keep the total under
-        <input type="number" name="max_gb" value="{cache_gb}" min="0" style="width:70px" /> GB
-        <span style="color:var(--muted);font-size:12px">(0 = no limit)</span>
-        <button class="btn" type="submit" style="margin-left:8px">Save</button>
+        {_t("Remove a file not opened for %1 days, and keep the total under %2 GB").replace("%1", f'<input type="number" name="ttl_days" value="{cache_ttl}" min="0" style="width:70px" />').replace("%2", f'<input type="number" name="max_gb" value="{cache_gb}" min="0" style="width:70px" />')}
+        <span style="color:var(--muted);font-size:12px">{_t("(0 = no limit)")}</span>
+        <button class="btn" type="submit" style="margin-left:8px">{_t("Save")}</button>
       </form>
       <form method="POST" action="/api/settings/cache_clear" style="margin-top:6px"
-            onsubmit="return confirm('Remove every film, song and book downloaded from Telegram from this server? They stay in the index and can be fetched again. What was fetched from Usenet is not touched - it is removed on the Usenet page.')">
-        <button class="ghost" type="submit">Remove all downloaded files now</button>
+            onsubmit="return confirm('{html.escape(_tj("Remove every film, song and book downloaded from Telegram from this server? They stay in the index and can be fetched again. What was fetched from Usenet is not touched - it is removed on the Usenet page."), quote=True)}')">
+        <button class="ghost" type="submit">{_t("Remove all downloaded files now")}</button>
       </form>
     </div>
   </div>
   <div class="dl-item">
     <div class="icon">🔞</div>
     <div class="info">
-      <div class="name">Adult content (NSFW) — <span class="pill {'ok' if nsfw_on else 'muted'}">{'enabled' if nsfw_on else 'hidden (default)'}</span></div>
+      <div class="name">{_t("Adult content (NSFW)")} — <span class="pill {'ok' if nsfw_on else 'muted'}">{_t("enabled") if nsfw_on else _t("hidden (default)")}</span></div>
       <div class="meta">
-        By default, channels flagged adult are hidden everywhere in tgarr.
-        You can opt in below — only enable if you are <strong>18+</strong> and
-        understand you are responsible for compliance with your local laws.
-        tgarr is content-neutral self-hosted software; <strong>we are not
-        responsible for materials shared by others on Telegram</strong>.
+        {_t("By default, channels flagged adult are hidden everywhere in tgarr.")}
+        {_t("You can opt in below — only enable if you are %1 and understand you are responsible for compliance with your local laws.").replace("%1", "<strong>18+</strong>")}
+        {_t("tgarr is content-neutral self-hosted software; %1we are not responsible for materials shared by others on Telegram%2.").replace("%1", "<strong>").replace("%2", "</strong>")}
       </div>
       <form method="POST" action="/api/settings/nsfw_enabled" style="margin-top:12px">
         <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:14px;line-height:1.55">
           <input type="checkbox" name="value" value="true" {'checked' if nsfw_on else ''} onchange="this.form.submit()" style="margin-top:4px" />
-          <span>I am 18+ and want to view channels tgarr has classified as adult.
-            I understand tgarr is a viewer/indexer of Telegram content I have already joined,
-            not the publisher.</span>
+          <span>{_t("I am 18+ and want to view channels tgarr has classified as adult. I understand tgarr is a viewer/indexer of Telegram content I have already joined, not the publisher.")}</span>
         </label>
       </form>
       {('<form method="POST" action="/api/settings/adult_default" style="margin-top:10px;font-size:14px">'
-        'What the lists show first: <select name="value" onchange="this.form.submit()" style="padding:5px 8px;border-radius:6px">'
-        + "".join(f'<option value="{k}"{" selected" if aud_default == k else ""}>{label}</option>' for k, label in
+        + _t("What the lists show first:") + ' <select name="value" onchange="this.form.submit()" style="padding:5px 8px;border-radius:6px">'
+        + "".join(f'<option value="{k}"{" selected" if aud_default == k else ""}>{_t(label)}</option>' for k, label in
                   (("sfw", "All-ages only (default)"), ("any", "Everything"), ("nsfw", "18+ only")))
-        + '</select><div class="meta" style="margin-top:4px">Videos, Releases and the Gallery open this way and let you switch on the page; '
-          'the Usenet page, search and the home page follow it.</div></form>') if nsfw_on else ""}
+        + '</select><div class="meta" style="margin-top:4px">'
+        + _t("Videos, Releases and the Gallery open this way and let you switch on the page; the Usenet page, search and the home page follow it.")
+        + '</div></form>') if nsfw_on else ""}
     </div>
   </div>
   <div class="dl-item">
     <div class="icon">🛑</div>
     <div class="info">
-      <div class="name">CSAM hard block — <span class="pill bad">always on, cannot be disabled</span></div>
+      <div class="name">{_t("CSAM hard block")} — <span class="pill bad">{_t("always on, cannot be disabled")}</span></div>
       <div class="meta">
-        Child Sexual Abuse Material. Channels matching a hardcoded keyword
-        blocklist (loli/shota/child-porn/etc. across multiple scripts) are
-        permanently blocked regardless of any setting. They are never displayed
-        in tgarr, never federated to <code>registry.tgarr.me</code>, and never
-        downloaded. Matches are logged at <code>/tmp/tgarr-csam-flags.log</code>
-        for review. If you encounter CSAM, report to
-        <a href="https://report.cybertip.org" target="_blank">NCMEC CyberTipline</a>
-        or your jurisdiction's hotline via
-        <a href="https://www.inhope.org" target="_blank">INHOPE</a>.
+        {_t("Child Sexual Abuse Material. Channels matching a hardcoded keyword blocklist (loli/shota/child-porn/etc. across multiple scripts) are permanently blocked regardless of any setting.")}
+        {_t("They are never displayed in tgarr, never federated to %1, and never downloaded. Matches are logged at %2 for review.").replace("%1", "<code>registry.tgarr.me</code>").replace("%2", "<code>/tmp/tgarr-csam-flags.log</code>")}
+        {_t("If you encounter CSAM, report to %1 or your jurisdiction's hotline via %2.").replace("%1", '<a href="https://report.cybertip.org" target="_blank">NCMEC CyberTipline</a>').replace("%2", '<a href="https://www.inhope.org" target="_blank">INHOPE</a>')}
       </div>
     </div>
   </div>
 </div>
 
-<h2 class="section">Privacy</h2>
+<h2 class="section">{_t("Privacy")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🔒</div>
     <div class="info">
-      <div class="name">Private chats after signing out</div>
-      <div class="meta">Signing out puts your private chats away on this machine, so that signing in again brings them
-      straight back without fetching them a second time. Another Telegram account signing in here never sees them. Kept for
-      <input id="pkDays" type="number" min="1" max="3650" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg)"/>
-      days without a sign-in, then removed for good. <span id="pkMsg" style="color:var(--muted)"></span></div>
+      <div class="name">{_t("Private chats after signing out")}</div>
+      <div class="meta">{_t("Signing out puts your private chats away on this machine, so that signing in again brings them straight back without fetching them a second time. Another Telegram account signing in here never sees them.")}
+      {_t("Kept for %1 days without a sign-in, then removed for good.").replace("%1", '<input id="pkDays" type="number" min="1" max="3650" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg)"/>')}
+      <span id="pkMsg" style="color:var(--muted)"></span></div>
     </div>
-    <div class="right"><button class="btn" onclick="pkSave()">Save</button></div>
+    <div class="right"><button class="btn" onclick="pkSave()">{_t("Save")}</button></div>
   </div>
 </div>
 <script>
 fetch("/api/settings/private_keep_days").then(r => r.json()).then(j => {{ document.getElementById("pkDays").value = j.days; }});
 function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", headers: {{"Content-Type": "application/json"}},
   body: JSON.stringify({{days: +document.getElementById("pkDays").value}})}}).then(r => r.json())
-  .then(j => {{ document.getElementById("pkMsg").textContent = j.status === "ok" ? "saved" : (j.message || "not saved"); }}); }}
+  .then(j => {{ document.getElementById("pkMsg").textContent = j.status === "ok" ? "{_tj("saved")}" : (j.message || "{_tj("not saved")}"); }}); }}
 </script>
-<h2 class="section">Other sources</h2>
+<h2 class="section">{_t("Other sources")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">📰</div>
     <div class="info">
       <div class="name">Usenet</div>
-      <div class="meta">With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.</div>
+      <div class="meta">{_t("With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.")}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
+    <div class="right"><a class="btn" href="/settings/usenet">{_t("Set up")}</a></div>
   </div>
   {hw_row}
   <div class="dl-item">
     <div class="icon">⬆</div>
     <div class="info">
-      <div class="name">Updating tgarr</div>
-      <div class="meta">Running {TGARR_VERSION}. tgarr updates itself within the hour of a release; here you can have it look now.</div>
+      <div class="name">{_t("Updating tgarr")}</div>
+      <div class="meta">{_t("Running {v}. tgarr updates itself within the hour of a release; here you can have it look now.", v=TGARR_VERSION)}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/update">Update…</a></div>
+    <div class="right"><a class="btn" href="/settings/update">{_t("Update…")}</a></div>
   </div>
   <div class="dl-item">
     <div class="icon">🔊</div>
     <div class="info">
-      <div class="name">Reading aloud</div>
-      <div class="meta">A natural voice of this machine's own for books, in every browser - Chinese and English. Fetched when you ask for it.</div>
+      <div class="name">{_t("Reading aloud")}</div>
+      <div class="meta">{_t("A natural voice of this machine's own for books, in every browser - Chinese and English. Fetched when you ask for it.")}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/voice">Set up</a></div>
+    <div class="right"><a class="btn" href="/settings/voice">{_t("Set up")}</a></div>
   </div>
   <div class="dl-item">
     <div class="icon">🖼</div>
     <div class="info">
-      <div class="name">Looking at pictures</div>
-      <div class="meta">tgarr looks at each picture itself - adult or not, drawn or photographed - instead of going by what its channel is called. Fetched when you ask for it.</div>
+      <div class="name">{_t("Looking at pictures")}</div>
+      <div class="meta">{_t("tgarr looks at each picture itself - adult or not, drawn or photographed - instead of going by what its channel is called. Fetched when you ask for it.")}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/pictures">Set up</a></div>
+    <div class="right"><a class="btn" href="/settings/pictures">{_t("Set up")}</a></div>
   </div>
 </div>
-<h2 class="section">Metadata sources</h2>
+<h2 class="section">{_t("Metadata sources")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🔑</div>
     <div class="info">
-      <div class="name">TMDB API key <span class="pill {('ok' if tmdb_raw else 'muted')}">{('configured' if tmdb_raw else 'not set — using Wikidata only')}</span></div>
-      <div class="meta">Posters &amp; canonical titles from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a> (free, personal use). Without a key, titles are still recognised through Wikidata (free, no key), with fewer posters.</div>
+      <div class="name">{_t("TMDB API key")} <span class="pill {('ok' if tmdb_raw else 'muted')}">{(_t("configured") if tmdb_raw else _t("not set — using Wikidata only"))}</span></div>
+      <div class="meta">{_t("Posters & canonical titles from %1 (free, personal use). Without a key, titles are still recognised through Wikidata (free, no key), with fewer posters.").replace("%1", '<a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a>')}</div>
       <form method="POST" action="/api/settings/tmdb_key" style="margin-top:12px;display:flex;gap:10px;max-width:600px">
-        <input type="text" name="value" placeholder="paste your TMDB API key (or leave blank to clear)" value="{html.escape(tmdb_masked)}" style="flex:1" />
-        <button type="submit">Save</button>
+        <input type="text" name="value" placeholder="{_t("paste your TMDB API key (or leave blank to clear)")}" value="{html.escape(tmdb_masked)}" style="flex:1" />
+        <button type="submit">{_t("Save")}</button>
       </form>
     </div>
   </div>
   <div class="dl-item">
     <div class="icon">📊</div>
     <div class="info">
-      <div class="name">Enrichment progress</div>
+      <div class="name">{_t("Enrichment progress")}</div>
       <div class="meta">
         <span class="pill accent">TMDB {meta_stats['tmdb']:,}</span>
         <span class="pill ok">Wikidata {meta_stats['wiki']:,}</span>
-        <span class="pill warn">Not found {meta_stats['missed']:,}</span>
-        <span class="pill muted">Pending {meta_stats['pending']:,}</span>
-        / total {meta_stats['total']:,}
+        <span class="pill warn">{_t("Not found {n}", n=format(meta_stats['missed'], ","))}</span>
+        <span class="pill muted">{_t("Pending {n}", n=format(meta_stats['pending'], ","))}</span>
+        {_t("/ total {n}", n=format(meta_stats['total'], ","))}
       </div>
     </div>
   </div>
 </div>
 
-<h2 class="section">Connect Sonarr / Radarr</h2>
+<h2 class="section">{_t("Connect Sonarr / Radarr")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🔌</div>
-    <div class="info"><div class="name">Newznab indexer</div>
+    <div class="info"><div class="name">{_t("Newznab indexer")}</div>
       <div class="meta">Settings → Indexers → + → Newznab → URL</div></div>
     <div class="right" style="display:flex;gap:8px;align-items:center"><code>{html.escape(_base_url(request))}/newznab/</code>
-      <button class="ghost" onclick="tgCopy(this)" data-v="{html.escape(_base_url(request))}/newznab/">Copy</button></div>
+      <button class="ghost" onclick="tgCopy(this)" data-v="{html.escape(_base_url(request))}/newznab/">{_t("Copy")}</button></div>
   </div>
   <div class="dl-item">
     <div class="icon">⬇</div>
-    <div class="info"><div class="name">SABnzbd download client</div>
-      <div class="meta">Settings → Download Clients → + → SABnzbd → same host and port, URL Base</div></div>
+    <div class="info"><div class="name">{_t("SABnzbd download client")}</div>
+      <div class="meta">Settings → Download Clients → + → SABnzbd → {_t("same host and port, URL Base")}</div></div>
     <div class="right" style="display:flex;gap:8px;align-items:center"><code>/sabnzbd</code>
-      <button class="ghost" onclick="tgCopy(this)" data-v="/sabnzbd">Copy</button></div>
+      <button class="ghost" onclick="tgCopy(this)" data-v="/sabnzbd">{_t("Copy")}</button></div>
   </div>
 </div>
 
-<details class="adv"><summary>Advanced — values set when the containers were started</summary>
+<details class="adv"><summary>{_t("Advanced — values set when the containers were started")}</summary>
 <div class="dl-list" style="margin-top:12px">
   <div class="dl-item">
     <div class="icon">⚙</div>
-    <div class="info"><div class="name">Parser score threshold</div>
-      <div class="meta">A file whose name scores below this is not treated as a film or an episode · TG_PARSE_SCORE_MIN</div></div>
+    <div class="info"><div class="name">{_t("Parser score threshold")}</div>
+      <div class="meta">{_t("A file whose name scores below this is not treated as a film or an episode")} · TG_PARSE_SCORE_MIN</div></div>
     <div class="right"><code>{os.environ.get("TG_PARSE_SCORE_MIN","0.30")}</code></div>
   </div>
   <div class="dl-item">
     <div class="icon">📁</div>
-    <div class="info"><div class="name">Download root</div>
-      <div class="meta">Where grabbed files are written · TG_DOWNLOAD_ROOT</div></div>
+    <div class="info"><div class="name">{_t("Download root")}</div>
+      <div class="meta">{_t("Where grabbed files are written")} · TG_DOWNLOAD_ROOT</div></div>
     <div class="right"><code>{os.environ.get("TG_DOWNLOAD_ROOT","/downloads/tgarr")}</code></div>
   </div>
   <div class="dl-item">
     <div class="icon">🔢</div>
-    <div class="info"><div class="name">Backfill limit per channel</div>
-      <div class="meta">How far back a channel is read the first time · TG_BACKFILL_LIMIT</div></div>
+    <div class="info"><div class="name">{_t("Backfill limit per channel")}</div>
+      <div class="meta">{_t("How far back a channel is read the first time")} · TG_BACKFILL_LIMIT</div></div>
     <div class="right"><code>{os.environ.get("TG_BACKFILL_LIMIT","5000")}</code></div>
   </div>
 </div>
-<div style="font-size:12.5px;color:var(--muted);margin:10px 4px">Change them in <code>docker-compose.yml</code> / <code>.env</code> and restart. Background jobs and their state: <a href="/system">System</a>.</div>
+<div style="font-size:12.5px;color:var(--muted);margin:10px 4px">{_t("Change them in %1 / %2 and restart.").replace("%1", "<code>docker-compose.yml</code>").replace("%2", "<code>.env</code>")} {_t("Background jobs and their state: %1.").replace("%1", f'<a href="/system">{_t("System")}</a>')}</div>
 </details>
 
-<h2 class="section">About</h2>
+<h2 class="section">{_t("About")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">ℹ</div>
     <div class="info"><div class="name">tgarr v{TGARR_VERSION}</div>
-      <div class="meta">Self-hosted Telegram-as-source bridge · MIT license</div></div>
+      <div class="meta">{_t("Self-hosted Telegram-as-source bridge · MIT license")}</div></div>
     <div class="right"><a class="btn ghost" href="https://tgarr.me" target="_blank">tgarr.me ↗</a></div>
   </div>
 </div>
