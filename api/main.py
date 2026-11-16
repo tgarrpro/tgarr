@@ -14902,25 +14902,25 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     list_active = "active" if view == "list" else ""
     toolbar = (
         f'<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
-        f'{_chip("","all")}{_chip("movie","🎬 films")}{_chip("tv","📺 episodes")}'
+        f'{_chip("", _t("all"))}{_chip("movie", "🎬 " + _t("films"))}{_chip("tv", "📺 " + _t("episodes"))}'
         + (f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
-           f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","18+")}{_aud_chip("any","both")}'
+           f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","18+")}{_aud_chip("any", _t("both"))}'
            if _nsfw_on else '')
         + f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
-        f'<span style="font-size:12px;color:var(--muted)">Sort:</span>'
-        + "".join(_chip_link(lbl, "/releases" + _qs(sort=None if k == "best" else k, offset=None), sort == k, tip)
-                  for k, lbl, tip in (("best", "best", "known titles and good copies first"),
-                                      ("new", "newest", "most recently posted"),
-                                      ("size", "largest", ""), ("name", "name", "")))
+        f'<span style="font-size:12px;color:var(--muted)">{_t("Sort:")}</span>'
+        + "".join(_chip_link(lbl, "/releases" + _qs(sort=None if k == "best" else k, offset=None), sort == k, html.unescape(tip))   # (the chip escapes it)
+                  for k, lbl, tip in (("best", _t("best"), _t("known titles and good copies first")),
+                                      ("new", _t("newest"), _t("most recently posted")),
+                                      ("size", _t("largest"), ""), ("name", _t("name"), "")))
         + f'<div style="margin-left:auto" class="view-toggle">'
-        f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ Grid</a>'
-        f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ List</a>'
+        f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ {_t("Grid")}</a>'
+        f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ {_t("List")}</a>'
         f'</div></div>'
     )
 
     if not rows:
         body_html = ('<div class="empty-state"><div class="icon">🎬</div>'
-                    '<div>No releases match this filter.</div></div>')
+                    f'<div>{_t("No releases match this filter.")}</div></div>')
     elif view == "list":
         def _row_thumb(url, pmid=None):
             if not url and pmid:
@@ -14940,7 +14940,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
             f'{(html.escape(r["canonical_title"]) + "<br>") if r["canonical_title"] and r["canonical_title"] != r["name"] else ""}'
             f'<span style="color:var(--muted);font-weight:400;font-size:13px">{html.escape(r["name"])}</span>'
             f'</td>'
-            f'<td><span class="pill {"accent" if r["category"]=="movie" else "ok" if r["category"]=="tv" else "muted"}">{r["category"]}</span></td>'
+            f'<td><span class="pill {"accent" if r["category"]=="movie" else "ok" if r["category"]=="tv" else "muted"}">{_t(str(r["category"]))}</span></td>'
             f'<td>{("S%02dE%02d" % (r["season"], r["episode"])) if r["season"] and r["episode"] else ""}</td>'
             f'<td>{r["quality"] or ""}</td>'
             f'<td class="num">{_fmt_size(r["size_bytes"])}</td>'
@@ -14949,8 +14949,8 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
             for r in rows
         )
         body_html = (f'<table><thead><tr>'
-                    f'<th></th><th>name</th><th>cat</th><th>S/E</th><th>quality</th>'
-                    f'<th>size</th><th>posted</th>'
+                    f'<th></th><th>{_t("name")}</th><th>{_t("cat")}</th><th>S/E</th><th>{_t("quality")}</th>'
+                    f'<th>{_t("size")}</th><th>{_t("posted")}</th>'
                     f'</tr></thead><tbody>{body_rows}</tbody></table>')
     else:
         body_html = (f'<div class="poster-grid">'
@@ -14973,32 +14973,32 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     next_offset = page_offset + page_size
     nav_links = []
     if page_offset > 0:
-        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=prev_offset if prev_offset else None)}">← prev</a>')
+        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=prev_offset if prev_offset else None)}">← {_t("Prev")}</a>')
     if next_offset < (total_matched or 0):
-        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=next_offset)}">next →</a>')
+        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=next_offset)}">{_t("Next")} →</a>')
     pagination_html = (
         f'<div style="display:flex;justify-content:space-between;align-items:center;'
         f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
         f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {start_idx}–{end_idx} of {total_matched:,}</span>'
+        f'{_t("showing {a}–{b} of {total}", a=start_idx, b=end_idx, total=f"{total_matched:,}")}</span>'
         f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div>'
         f'</div>')
-    _what = ("Versions of this title" if work else
-             {"movie": "Films", "tv": "Episodes"}.get(cat or "", "Films and episodes"))
+    _what = (_t("Versions of this title") if work else
+             {"movie": _t("Films"), "tv": _t("Episodes")}.get(cat or "", _t("Films and episodes")))
     _note = []
     if q:
-        _note.append(f'matching “{html.escape(q)}”')
+        _note.append(_t("matching “{q}”", q=q))
     if min_mb > 0 and not work:
-        _note.append(f'{min_mb} MB and larger · <a href="/releases{_qs(min_mb=0, offset=None)}">show smaller too</a>')
+        _note.append(f'{_t("{n} MB and larger", n=min_mb)} · <a href="/releases{_qs(min_mb=0, offset=None)}">{_t("show smaller too")}</a>')
     if work:
-        _note.append('<a href="/releases">← all releases</a>')
+        _note.append(f'<a href="/releases">← {_t("all releases")}</a>')
     body = (f'{_THUMB_RETRY_JS}<h2 class="section">{_what} '
            f'<span class="count">{total_matched:,}</span>'
            f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
            f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
            f'{toolbar}{body_html}{pagination_html}')
     actions = (f'<form action="/releases" method="GET" style="margin-left:auto">'
-              f'<input type="text" name="q" class="search" placeholder="filter…" '
+              f'<input type="text" name="q" class="search" placeholder="{_t("filter…")}" '
               f'value="{html.escape(q) if q else ""}" /></form>')
     return HTMLResponse(_layout("Releases", "/releases", body, top_actions_html=actions))
 
@@ -15504,11 +15504,11 @@ async def page_search(q: Optional[str] = None,
                     f'<div class="ls-row"><div style="width:30px;text-align:center;font-size:20px">'
                     f'{ico.get(r["media_type"], "📄")}</div>'
                     f'<div class="ls-main"><div class="ls-title"><a href="{href}">{html.escape(name)}</a> '
-                    + ('<span class="tag ok">saved</span>' if _is_local(r["local_path"]) else '')
+                    + (f'<span class="tag ok">{_t("saved")}</span>' if _is_local(r["local_path"]) else '')
                     + f'</div><div class="ls-sub"><span>{html.escape(r["ch_title"] or r["ch_user"] or "")}</span>'
                     f'<span>{_fmt_size(r["file_size"])}</span>'
                     f'<span>{_fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""}</span></div></div>'
-                    f'<div class="ls-act"><a class="abtn" href="{href}">Open</a></div></div>')
+                    f'<div class="ls-act"><a class="abtn" href="{href}">{_t("Open")}</a></div></div>')
             results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         elif scope == "channels":
             res = await meili_search("channels", q, limit=80)
@@ -15525,16 +15525,16 @@ async def page_search(q: Optional[str] = None,
             items = []
             for r in rows:
                 title = r["title"] or ("@" + r["username"])
-                tag = ('<span class="tag bad">gone</span>' if r["dead_at"] else
-                       '<span class="tag ok">joined</span>' if r["is_joined"] else
-                       '<span class="tag acc">followed</span>' if r["subscribed"] else '')
+                tag = (f'<span class="tag bad">{_t("gone")}</span>' if r["dead_at"] else
+                       f'<span class="tag ok">{_t("joined")}</span>' if r["is_joined"] else
+                       f'<span class="tag acc">{_t("followed")}</span>' if r["subscribed"] else '')
                 items.append(
                     f'<div class="ls-row">{_avatar(title)}'
                     f'<div class="ls-main"><div class="ls-title">{html.escape(title)} {tag}</div>'
                     f'<div class="ls-sub"><a href="https://t.me/{html.escape(r["username"])}" target="_blank" '
                     f'rel="noopener">@{html.escape(r["username"])}</a></div></div>'
-                    f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
-                    f'<div class="ls-act"><a class="abtn" href="/channels?q={_q(r["username"])}">Details</a></div></div>')
+                    f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>{_t("members")}</span></div>'
+                    f'<div class="ls-act"><a class="abtn" href="/channels?q={_q(r["username"])}">{_t("Details")}</a></div></div>')
             results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         else:
             res = await meili_search("releases", q, limit=150)
@@ -15570,14 +15570,12 @@ async def page_search(q: Optional[str] = None,
         elapsed_ms = int((time.time() - t0) * 1000)
         if not results_html:
             results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
-                            f'<div>Nothing found for <strong>{html.escape(q)}</strong></div>'
-                            '<div style="margin-top:8px;font-size:13px">Try fewer words, another spelling, '
-                            'or one of the other tabs.</div></div>')
+                            '<div>' + _t("Nothing found for %1").replace("%1", f'<strong>{html.escape(q)}</strong>') + '</div>'
+                            f'<div style="margin-top:8px;font-size:13px">{_t("Try fewer words, another spelling, or one of the other tabs.")}</div></div>')
     else:
         results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
-                        '<div>Search everything tgarr has indexed.</div>'
-                        '<div style="margin-top:8px;font-size:13px">Films and episodes by title · '
-                        'any file by its name · channels by name or @username.</div></div>')
+                        f'<div>{_t("Search everything tgarr has indexed.")}</div>'
+                        f'<div style="margin-top:8px;font-size:13px">{_t("Films and episodes by title · any file by its name · channels by name or @username.")}</div></div>')
 
     def tab(name, label):
         on = scope == name
@@ -15590,12 +15588,12 @@ async def page_search(q: Optional[str] = None,
         f'{_LIST_CSS}{_THUMB_RETRY_JS}'
         '<form action="/search" method="GET" style="margin-bottom:16px;display:flex;gap:10px">'
         f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-        'placeholder="a film, a file name, a channel…" '
+        f'placeholder="{_t("a film, a file name, a channel…")}" '
         'style="flex:1;font-size:16px;padding:12px 16px" autofocus />'
         f'<input type="hidden" name="scope" value="{scope}">'
-        '<button type="submit" style="padding:0 22px">Search</button></form>'
+        f'<button type="submit" style="padding:0 22px">{_t("Search")}</button></form>'
         '<div style="display:flex;align-items:flex-end;border-bottom:1px solid var(--border);margin-bottom:20px">'
-        + tab("releases", "Films &amp; episodes") + tab("messages", "All files") + tab("channels", "Channels")
+        + tab("releases", _t("Films & episodes")) + tab("messages", _t("All files")) + tab("channels", _t("Channels"))
         + (f'<span style="margin-left:auto;font-size:11px;color:var(--muted);padding-bottom:10px">'
            f'{elapsed_ms} ms</span>' if q else '')
         + f'</div>{results_html}')
