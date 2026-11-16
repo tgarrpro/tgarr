@@ -7442,11 +7442,19 @@ div.ub { cursor:default; }
                 border:1px solid var(--border); border-radius:8px; }
 .user .ub-menu a { color:var(--fg); font-weight:400; }
 .user a.ub-in { color:#fff; }
-/* the language of this screen, chosen at the foot of the side menu */
-.lang-sel { display:block; width:calc(100% - 20px); margin:8px 10px 6px; padding:7px 10px; border-radius:8px; font:inherit; font-size:13px;
-  color:var(--fg); background:var(--surface); border:1px solid var(--border); cursor:pointer; }
-.lang-sel:hover, .lang-sel:focus { border-color:var(--accent); outline:none; }
-
+/* the language, a line of the account menu that opens the list of languages inside it */
+.ub-menu button.ub-lgo, .ub-menu button.ub-lg { color:var(--fg); border-top:0; margin-top:0; border-radius:0; text-align:left; }
+.ub-menu button.ub-lgo { display:flex; justify-content:space-between; gap:10px; }
+.ub-menu button.ub-lgo span { color:var(--muted); white-space:nowrap; }
+.ub-lgl { max-height:min(46vh,320px); overflow:auto; border-top:1px solid var(--border); border-bottom:1px solid var(--border); }
+.ub-menu button.ub-lg { padding:7px 12px 7px 26px; font-size:13px; }
+.ub-menu button.ub-lg.on { font-weight:700; color:var(--accent); padding-left:12px; }
+.ub-lgw { margin:6px 10px 0; }
+.ub-lgw .ub-menu { left:0; right:0; }
+.ub-lgw .ub-lgl { border:0; }
+.ub-lgb { display:block; width:100%; padding:7px 10px; border-radius:8px; font:inherit; font-size:13px; text-align:left; cursor:pointer;
+  color:var(--muted); background:transparent; border:1px solid var(--border); }
+.ub-lgb:hover { color:var(--fg); border-color:var(--accent); }
 .ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
          color:#fff; text-align:center; text-decoration:none; font-weight:600; font-size:13px; }
 .user a { color:var(--accent); text-decoration:none; font-size:14px; font-weight:600; }
@@ -7837,6 +7845,39 @@ def _color_for(s: str) -> str:
     return palette[sum(ord(c) for c in (s or "?")) % len(palette)]
 
 
+_LANG_JS = ('<script>'
+            'function tgLang(c){document.cookie="tgarr_lang="+c+"; path=/; max-age=31536000; SameSite=Lax";location.reload()}'
+            'function tgLangOpen(e){e.stopPropagation();var l=document.getElementById("tgLangList");if(l)l.hidden=!l.hidden}'
+            '</script>')
+
+
+def _lang_rows() -> str:
+    """One row for each language, the one in use marked."""
+    lang = _LANG.get()
+    return "".join(f'<button type="button" class="ub-lg{" on" if code == lang else ""}" lang="{code}" onclick="tgLang(\'{code}\')">'
+                   f'{"✓ " if code == lang else ""}{html.escape(name)}</button>' for code, name in i18n.LANGS)
+
+
+def _lang_item() -> str:
+    """The language as a line of the account menu: it opens the list inside the menu."""
+    lang = _LANG.get()
+    return (f'<button type="button" class="ub-lgo" onclick="tgLangOpen(event)">🌐 {html.escape(i18n.t(lang, "Language"))}'
+            f'<span>{html.escape(dict(i18n.LANGS)[lang])} ▾</span></button>'
+            f'<div class="ub-lgl" id="tgLangList" hidden>{_lang_rows()}</div>')
+
+
+def _lang_only() -> str:
+    """Where there is no account menu (nobody signed in, a locked browser): a small menu of
+    its own, in the same place and of the same kind, with the language alone in it."""
+    lang = _LANG.get()
+    return ('<div class="ub-wrap ub-lgw"><div class="ub-menu" id="tgLangMenu" hidden>'
+            f'<div class="ub-lgl">{_lang_rows()}</div></div>'
+            '<button type="button" class="ub-lgb" onclick="event.stopPropagation();var m=document.getElementById(\'tgLangMenu\');m.hidden=!m.hidden" '
+            f'title="{html.escape(i18n.t(lang, "Language"), quote=True)}">🌐 {html.escape(dict(i18n.LANGS)[lang])} ▴</button></div>'
+            '<script>document.addEventListener("click",function(){var m=document.getElementById("tgLangMenu");if(m)m.hidden=true});</script>'
+            + _LANG_JS)
+
+
 def _user_block() -> str:
     """The account at the foot of the side menu: picture, name, a small menu."""
     lang = _LANG.get()
@@ -7844,7 +7885,7 @@ def _user_block() -> str:
     def tr(text: str) -> str:
         return html.escape(i18n.t(lang, text), quote=True)
     if not _signed_in():
-        return ('<div class="ub"><div class="ub-av none">?</div>'
+        return (_lang_only() + '<div class="ub"><div class="ub-av none">?</div>'
                 f'<div class="ub-txt"><b>{tr("Not signed in")}</b><small>{tr("browsing what is already indexed")}</small></div></div>'
                 f'<a class="ub-in" href="/login">{tr("Sign in to Telegram")}</a>'
                 + (f'<a class="ub-lk" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else ''))
@@ -7863,6 +7904,7 @@ def _user_block() -> str:
         f'<a href="/settings">{tr("Settings")}</a>'
         f'<a href="/system">{tr("System status")}</a>'
         f'<a href="/mediacenter/manage">{tr("Media Center & PIN")}</a>'
+        + _lang_item()
         + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">{tr("My Telegram profile")} ↗</a>'
            if uname else '')
         + (f'<a href="/lock">🔒 {tr("Lock (back to the Media Center)")}</a>' if _ACCESS["pin"] else '')
@@ -7871,6 +7913,7 @@ def _user_block() -> str:
         f'{av}<span class="ub-txt"><b>{html.escape(name)}</b>'
         f'<small>{("@" + html.escape(uname)) if uname else tr("signed in")}</small></span>'
         '<span class="ub-ch">⋯</span></button></div>'
+        + _LANG_JS +
         '<script>'
         'function tgUserMenu(e){e.stopPropagation();var m=document.getElementById("tgUserMenu");m.hidden=!m.hidden}'
         'document.addEventListener("click",function(){var m=document.getElementById("tgUserMenu");if(m)m.hidden=true});'
@@ -7908,7 +7951,9 @@ MOBILE_CSS = """
   aside.nav .user .ub-menu { top:calc(100% + 8px); bottom:auto; left:auto; right:0; width:220px; }
   aside.nav .user .ub-in { margin:0; padding:7px 10px; font-size:12px; white-space:nowrap; }
   aside.nav .user { display:flex; align-items:center; gap:6px; }
-  aside.nav .user .lang-sel { width:auto; max-width:120px; margin:0; padding:6px 8px; font-size:12px; }
+  aside.nav .user .ub-lgw { margin:0; position:relative; }
+  aside.nav .user .ub-lgb { width:auto; padding:6px 8px; font-size:12px; white-space:nowrap; }
+  aside.nav .user .ub-lgw .ub-menu { top:calc(100% + 8px); bottom:auto; left:auto; right:0; width:200px; }
   main.main { min-height:0; }
   .topbar { height:auto; padding:10px 14px; gap:10px; flex-wrap:wrap; }
   .topbar h1 { font-size:20px; }
@@ -7953,10 +7998,6 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
             f'<input type="text" name="q" class="search" placeholder="{tr(placeholder)}" />'
             f'</form>'
         )
-    # the language of this screen, changed in the side menu (kept in a cookie, so every page comes in it)
-    chooser = ('<select class="lang-sel" aria-label="Language" onchange="document.cookie=\'tgarr_lang=\'+this.value+\'; path=/; max-age=31536000; SameSite=Lax\';location.reload()">'
-               + "".join(f'<option value="{code}"{" selected" if code == lang else ""}>{"🌐 " if code == lang else ""}{html.escape(name)}</option>' for code, name in i18n.LANGS)
-               + "</select>")
     return f"""<!DOCTYPE html>
 <html lang="{lang}"><head>
 <meta charset="utf-8">
@@ -7975,7 +8016,7 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
     <a class="ver" href="/settings/update" title="this version; updating" style="text-decoration:none;display:block">v{TGARR_VERSION}</a>
   </div>
   <div class="navlinks">{nav}</div>
-  <div class="user">{chooser}{f'<a class="ub-in" href="/unlock">🔒 {tr("Enter PIN")}</a>' if locked else _user_block()}</div>
+  <div class="user">{(_lang_only() + f'<a class="ub-in" href="/unlock">🔒 {tr("Enter PIN")}</a>') if locked else _user_block()}</div>
 </aside>
 <main class="main">
   <header class="topbar">
