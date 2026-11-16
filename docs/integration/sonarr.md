@@ -1,11 +1,13 @@
-# Sonarr / Radarr / Lidarr integration
+# Sonarr / Radarr integration
 
-tgarr appears to your *arr stack as:
+tgarr appears to Sonarr and Radarr as:
 
-1. **A Newznab indexer** — Sonarr does not need to know that the underlying source is Telegram rather than Usenet.
-2. **A SABnzbd download client** — tgarr emulates SAB so Sonarr can manage queue, history, and completed-download handling exactly as it would for a real Usenet downloader.
+1. **A Newznab indexer** - Sonarr searches it like any other indexer.
+2. **A SABnzbd download client** - tgarr emulates SABnzbd so Sonarr can manage queue, history, and completed-download handling as it would for a real downloader.
 
-You configure both in the same Sonarr instance. No Sonarr modifications, plugins, or restarts required.
+You configure both in the same Sonarr instance. The addresses below are also shown on tgarr's Dashboard, under "Connect Sonarr / Radarr". `<your-host>` is the machine tgarr runs on; `8765` is the default port (`TGARR_PORT` in `.env`).
+
+tgarr serves films and series, to Sonarr and Radarr only: its Newznab capabilities offer general, TV and movie search, and no audio or book search.
 
 ---
 
@@ -16,17 +18,16 @@ Sonarr **→ Settings → Indexers → ➕ Add → Newznab → Custom**
 | Field | Value |
 |---|---|
 | Name | `tgarr` |
-| Enable RSS | ✅ |
-| Enable Automatic Search | ✅ |
-| Enable Interactive Search | ✅ |
-| URL | `https://tgarr.me/newznab/` (or your self-hosted origin URL) |
+| URL | `http://<your-host>:8765/newznab/` |
 | API Path | `/api` (the default) |
-| API Key | any string — tgarr does not enforce per-key auth in v0 |
-| Categories | `5030, 5040, 5045` (TV) — Sonarr fills these automatically after Test |
+| API Key | see below |
+| Categories | `5030, 5040, 5045` (TV) |
 
-Click **Test** — should return ✓.
+Click **Test** - should return ✓.
 
 Radarr uses categories `2030, 2040, 2045` (Movies). Same URL otherwise.
+
+**API key.** If `TGARR_API_KEY` is set in `.env`, enter that key: `/newznab`, `/sabnzbd` and `/api` refuse requests without it. If it is not set, any text is accepted.
 
 ## 2. Add tgarr as a SABnzbd download client
 
@@ -35,54 +36,39 @@ Sonarr **→ Settings → Download Clients → ➕ Add → SABnzbd**
 | Field | Value |
 |---|---|
 | Name | `tgarr` |
-| Enable | ✅ |
-| Host | `tgarr.me` (or your origin host) |
-| Port | `443` |
+| Host | `<your-host>` |
+| Port | `8765` |
 | URL Base | `/sabnzbd` |
-| Use SSL | ✅ |
-| API Key | any string (same caveat as above) |
+| API Key | the same as for the indexer |
 | Username / Password | (leave blank) |
 | Category | `tv` for Sonarr, `movies` for Radarr |
-| Recent Priority | Default |
-| Older Priority | Default |
-| Use SSL | ✅ if behind https |
 
-Click **Test** — should return ✓.
+Click **Test** - should return ✓.
 
-## 3. Tell Sonarr where the completed file lives
+## 3. Usenet: a second indexer
 
-When tgarr finishes a download, the file lands on the tgarr host at:
+If you gave tgarr a Usenet account (Settings → Usenet), add a second Newznab indexer beside the "tgarr" one:
 
-    /downloads/tgarr/<release-name>/<original-file-name>.<ext>
+| Field | Value |
+|---|---|
+| URL | `http://<your-host>:8765/newznab/usenet` |
+| API Path | `/api` |
+| API Key | the same as for "tgarr" |
+| Download client | your own SABnzbd or NZBGet - not "tgarr" |
 
-Sonarr needs to be able to read that path. Choose one:
+A Usenet grab is an NZB. tgarr does not download films and series from Usenet itself: Sonarr hands the NZB to your Usenet downloader. An indexer goes to one download client, which is why Usenet needs its own entry. The indexer returns nothing while Usenet is switched off in tgarr.
 
-### Option A — share via NFS (recommended for separate hosts)
+## 4. Tell Sonarr where the completed file lives
 
-On the tgarr host (`tgarr.me`):
+When tgarr finishes a download, the file is inside tgarr's containers at:
 
-```bash
-apt install -y nfs-kernel-server
-echo "/var/www/tgarr.me/app/_data/downloads  192.168.0.0/16(ro,sync,no_subtree_check)" >> /etc/exports
-exportfs -ra
-```
+    /downloads/tgarr/<release-name>/
 
-On your Sonarr host:
+On the host, `/downloads` is the folder set as `TGARR_DOWNLOADS` in `.env` (default `./_data/downloads`, next to `docker-compose.yml`). Sonarr needs to be able to read it.
 
-```bash
-apt install -y nfs-common
-mount -t nfs tgarr.me:/var/www/tgarr.me/app/_data/downloads /mnt/tgarr
-```
+### Same host
 
-Then in Sonarr **→ Settings → Download Clients → tgarr → Remote Path Mapping**:
-
-| Host | Remote Path | Local Path |
-|---|---|---|
-| `tgarr.me` | `/downloads` | `/mnt/tgarr` |
-
-### Option B — co-locate (single host)
-
-If Sonarr and tgarr run on the same host (e.g., the same CasaOS / Synology), just mount the volume into Sonarr's container:
+Mount the same folder into Sonarr's container as `/downloads`:
 
 ```yaml
 sonarr:
@@ -92,26 +78,27 @@ sonarr:
 
 No remote path mapping needed.
 
-### Option C — push to Sonarr's import folder via rsync (no shared mount)
+### Separate hosts
 
-Add a hook script to tgarr's worker that runs after each completed download. Out of scope for v0.1.
+Share the downloads folder with the Sonarr host (NFS, SMB) and mount it there, for example at `/mnt/tgarr`. Then in Sonarr **→ Settings → Download Clients → Remote Path Mappings**:
 
-## 4. Test end-to-end
+| Host | Remote Path | Local Path |
+|---|---|---|
+| `<your-host>` | `/downloads` | `/mnt/tgarr` |
+
+## 5. Test end-to-end
 
 1. Sonarr **→ Series → ➕ Add → search for a show**.
 2. Click the **interactive search** icon (magnifying glass on the episode row).
 3. tgarr-indexed releases should appear.
 4. Click ⬇ on one to grab it.
-5. Watch **Activity → Queue** — should show the download with `tgarr` as client.
-6. After the file lands on disk, Sonarr's CDH imports it into your library automatically.
+5. Watch **Activity → Queue** - should show the download with `tgarr` as client.
+6. After the file lands on disk, Sonarr imports it into your library.
 
 ## Troubleshooting
 
-- **Sonarr "Test" on indexer fails with timeout** — your origin URL is wrong, or Cloudflare is blocking the path. Try `https://tgarr.me/newznab/api?t=caps` in a browser; should return XML.
-- **Searches return 0 results** — check `tgarr` has crawled and indexed the channels you care about. Visit `https://tgarr.me/` for live stats; visit `https://tgarr.me/api/admin/releases` to browse indexed releases.
-- **Download stays "downloading" forever** — `docker compose logs crawler` to see worker progress. Telegram throttles uploads on large files (Kurigram FloodWait is normal); expect ~5–20 MB/s for video.
-- **File downloaded but Sonarr does not import** — Sonarr cannot read the path. Check Remote Path Mapping in §3.
-
-## Lidarr / Readarr
-
-Same pattern. Use categories `3000-3999` for music (Lidarr), `7000-8050` for books (Readarr). tgarr's filename parser does not (yet) recognize music or book release patterns deeply; expect mixed results until v0.3.
+- **Sonarr "Test" on indexer fails** - the URL is wrong or tgarr is not reachable from Sonarr. From the Sonarr machine, `curl "http://<your-host>:8765/newznab/api?t=caps"` should return XML.
+- **Test fails with 401** - `TGARR_API_KEY` is set in `.env` and the API Key in Sonarr is not the same.
+- **Searches return 0 results** - open `http://<your-host>:8765/releases` to see what tgarr has indexed.
+- **Download stays "downloading"** - `docker compose logs crawler`, in the folder that holds your `docker-compose.yml`, shows the worker's progress. A `FloodWait` line is Telegram's rate limit; tgarr waits it out.
+- **File downloaded but Sonarr does not import** - Sonarr cannot read the path. Check §4.
