@@ -54,7 +54,13 @@ def file_name(subject: str) -> str:
     m = re.search(r'"([^"]{1,240})"', subject or "")
     if m:
         return m.group(1).strip()
-    m = re.search(r"(\S+\.[A-Za-z0-9]{2,5})\s+(?:yEnc|\(\d+/\d+\))", subject or "")
+    # (a quote may be left hanging after the name - `…Breakdown.mp3" yEnc (1/14)`, its partner lost
+    #  by the poster's program: the name is still the word before it)
+    if (subject or "").count('"') == 1:
+        head = re.sub(r"^\s*[\[(]\d+\s*(?:/|of)\s*\d+[\])]\s*-?\s*", "", subject.split('"')[0]).strip()
+        if 4 < len(head) <= 240 and re.search(r"\.[A-Za-z0-9]{2,5}$", head):
+            return head
+    m = re.search(r"([^\s\"']+\.[A-Za-z0-9]{2,5})[\"']?\s+(?:yEnc|\(\d+/\d+\))", subject or "")
     return m.group(1) if m else ""
 
 

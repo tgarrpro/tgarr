@@ -93,7 +93,7 @@ services:
     labels:
       com.centurylinklabs.watchtower.enable: "true"
       com.centurylinklabs.watchtower.scope: tgarr
-    # an init process reaps what a stopped e-book conversion leaves behind
+    # an init process reaps what a stopped conversion (a film, a scanned book) leaves behind
     init: true
     # Sonarr / Radarr published on this same host are reachable as
     # host.docker.internal whatever the host's address is.

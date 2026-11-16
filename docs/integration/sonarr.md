@@ -109,7 +109,7 @@ Add a hook script to tgarr's worker that runs after each completed download. Out
 
 - **Sonarr "Test" on indexer fails with timeout** — your origin URL is wrong, or Cloudflare is blocking the path. Try `https://tgarr.me/newznab/api?t=caps` in a browser; should return XML.
 - **Searches return 0 results** — check `tgarr` has crawled and indexed the channels you care about. Visit `https://tgarr.me/` for live stats; visit `https://tgarr.me/api/admin/releases` to browse indexed releases.
-- **Download stays "downloading" forever** — `docker compose logs crawler` to see worker progress. Telegram throttles uploads on large files (Pyrogram FloodWait is normal); expect ~5–20 MB/s for video.
+- **Download stays "downloading" forever** — `docker compose logs crawler` to see worker progress. Telegram throttles uploads on large files (Kurigram FloodWait is normal); expect ~5–20 MB/s for video.
 - **File downloaded but Sonarr does not import** — Sonarr cannot read the path. Check Remote Path Mapping in §3.
 
 ## Lidarr / Readarr
