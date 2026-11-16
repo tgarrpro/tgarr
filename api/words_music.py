@@ -4,26 +4,13 @@ shelf, the player at the bottom and the now-playing panel. The same shape as T i
 # English: (zh-Hans, zh-Hant, es, fr, de, pt, ru, ja, ko, he, ar)
 T = {
     # ── the shelf and its chips ──
-    "Audiobooks": ("有声书", "有聲書", "Audiolibros", "Livres audio", "Hörbücher", "Audiolivros", "Аудиокниги", "オーディオブック", "오디오북", "ספרי שמע", "الكتب الصوتية"),
-    "all": ("全部", "全部", "todo", "tout", "alle", "tudo", "все", "すべて", "전체", "הכול", "الكل"),
-    "Sort:": ("排序：", "排序：", "Ordenar:", "Trier :", "Sortieren:", "Ordenar:", "Сортировка:", "並べ替え：", "정렬:", "מיון:", "الترتيب:"),
     "In order": ("按顺序", "按順序", "En orden", "Dans l'ordre", "Der Reihe nach", "Em ordem", "По порядку", "順番どおり", "순서대로", "לפי הסדר", "بالترتيب"),
-    "Best": ("最佳", "最佳", "Mejores", "Meilleurs", "Beste", "Melhores", "Лучшие", "おすすめ", "추천순", "הטובים ביותר", "الأفضل"),
-    "Recent": ("最新", "最新", "Recientes", "Récents", "Neueste", "Recentes", "Недавние", "新着", "최신", "אחרונים", "الأحدث"),
     "Longest": ("最长", "最長", "Más largos", "Les plus longs", "Längste", "Mais longos", "Самые длинные", "長い順", "긴 순", "הארוכים ביותר", "الأطول"),
-    "Largest": ("最大", "最大", "Más grandes", "Les plus gros", "Größte", "Maiores", "Самые большие", "大きい順", "큰 순", "הגדולים ביותר", "الأكبر"),
-    "favourites": ("收藏", "收藏", "favoritos", "favoris", "Favoriten", "favoritos", "избранное", "お気に入り", "즐겨찾기", "מועדפים", "المفضلة"),
-    "only my favourites": ("只看我的收藏", "只看我的收藏", "solo mis favoritos", "seulement mes favoris", "nur meine Favoriten", "só os meus favoritos", "только избранное", "お気に入りだけ", "즐겨찾기만", "רק המועדפים שלי", "مفضلتي فقط"),
     "back to the songs": ("回到歌曲", "回到歌曲", "volver a las canciones", "retour aux chansons", "zurück zu den Liedern", "voltar às músicas", "назад к песням", "曲に戻る", "노래로 돌아가기", "חזרה לשירים", "العودة إلى الأغاني"),
-    "books that are listened to": ("用来听的书", "用來聽的書", "libros para escuchar", "des livres à écouter", "Bücher zum Anhören", "livros para ouvir", "книги, которые слушают", "聴く本", "듣는 책", "ספרים להאזנה", "كتب تُسمع"),
     # ── the list ──
-    "{n} of {total}": ("{n} / {total}", "{n} / {total}", "{n} de {total}", "{n} sur {total}", "{n} von {total}", "{n} de {total}", "{n} из {total}", "{total} 件中 {n} 件", "{total}개 중 {n}개", "{n} מתוך {total}", "{n} من {total}"),
-    "{n} indexed (click to fetch)": ("已索引 {n} 个（点击即可取回）", "已索引 {n} 個（點一下即可取回）", "{n} indexados (clic para traerlos)", "{n} indexés (cliquer pour récupérer)", "{n} erfasst (zum Holen anklicken)", "{n} indexados (clique para trazer)", "в индексе: {n} (нажмите, чтобы получить)", "索引済み {n} 件（クリックで取得）", "색인됨 {n}개 (누르면 가져옵니다)", "{n} באינדקס (לחיצה מביאה אותם)", "المفهرس: {n} (انقر للجلب)"),
     "title": ("标题", "標題", "título", "titre", "Titel", "título", "название", "タイトル", "제목", "כותרת", "العنوان"),
     "duration": ("时长", "時長", "duración", "durée", "Dauer", "duração", "длительность", "長さ", "길이", "משך", "المدة"),
-    "size": ("大小", "大小", "tamaño", "taille", "Größe", "tamanho", "размер", "サイズ", "크기", "גודל", "الحجم"),
     "posted": ("发布日期", "發布日期", "publicado", "publié", "gepostet", "publicado", "опубликовано", "投稿日", "게시일", "פורסם", "تاريخ النشر"),
-    "(untitled)": ("（无标题）", "（無標題）", "(sin título)", "(sans titre)", "(ohne Titel)", "(sem título)", "(без названия)", "（無題）", "(제목 없음)", "(ללא כותרת)", "(بلا عنوان)"),
     "favourite": ("收藏", "收藏", "favorito", "favori", "Favorit", "favorito", "в избранное", "お気に入り", "즐겨찾기", "מועדף", "مفضلة"),
     "download this file": ("下载此文件", "下載此檔案", "descargar este archivo", "télécharger ce fichier", "diese Datei herunterladen", "baixar este arquivo", "скачать этот файл", "このファイルをダウンロード", "이 파일 다운로드", "הורדת הקובץ הזה", "تنزيل هذا الملف"),
     # ── nothing to show ──

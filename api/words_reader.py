@@ -33,7 +33,6 @@ T = {
     "Fit width": ("适合宽度", "符合寬度", "Ajustar ancho", "Pleine largeur", "Seitenbreite", "Ajustar à largura", "По ширине", "幅に合わせる", "너비 맞춤", "התאמה לרוחב", "ملاءمة العرض"),
     "Fit height": ("适合高度", "符合高度", "Ajustar alto", "Pleine hauteur", "Seitenhöhe", "Ajustar à altura", "По высоте", "高さに合わせる", "높이 맞춤", "התאמה לגובה", "ملاءمة الارتفاع"),
     "how a page fills the window: the whole page, its width, or its height": ("页面如何填满窗口：整页、按宽度或按高度", "頁面如何填滿視窗：整頁、依寬度或依高度", "cómo llena la página la ventana: la página entera, su ancho o su alto", "comment la page remplit la fenêtre : la page entière, sa largeur ou sa hauteur", "wie eine Seite das Fenster füllt: die ganze Seite, ihre Breite oder ihre Höhe", "como a página preenche a janela: a página inteira, a largura ou a altura", "как страница заполняет окно: целиком, по ширине или по высоте", "ページをウィンドウにどう収めるか：ページ全体・幅・高さ", "페이지를 창에 맞추는 방법: 전체, 너비 또는 높이", "איך העמוד ממלא את החלון: העמוד כולו, רוחבו או גובהו", "كيف تملأ الصفحة النافذة: الصفحة كاملة، أو عرضها، أو ارتفاعها"),
-    "full screen (F)": ("全屏 (F)", "全螢幕 (F)", "pantalla completa (F)", "plein écran (F)", "Vollbild (F)", "tela cheia (F)", "во весь экран (F)", "全画面 (F)", "전체 화면 (F)", "מסך מלא (F)", "ملء الشاشة (F)"),
     "Original": ("原文件", "原始檔", "Original", "Original", "Original", "Original", "Оригинал", "原本", "원본", "מקור", "الأصل"),
     "the untouched file in the browser's own viewer: select text, search, print": ("用浏览器自带的阅读器打开原文件：可选择文字、搜索、打印", "用瀏覽器內建的檢視器開啟原始檔：可選取文字、搜尋、列印", "el archivo intacto en el visor del navegador: seleccionar texto, buscar, imprimir", "le fichier intact dans la visionneuse du navigateur : sélectionner du texte, chercher, imprimer", "die unveränderte Datei im Betrachter des Browsers: Text markieren, suchen, drucken", "o arquivo intacto no visualizador do navegador: selecionar texto, buscar, imprimir", "исходный файл в просмотрщике самого браузера: выделение текста, поиск, печать", "元のファイルをブラウザーのビューアで開きます：文字の選択・検索・印刷", "원본 파일을 브라우저 자체 뷰어로 열기: 글자 선택, 검색, 인쇄", "הקובץ המקורי במציג של הדפדפן: סימון טקסט, חיפוש, הדפסה", "الملف الأصلي في عارض المتصفح نفسه: تحديد النص، البحث، الطباعة"),
     # ── the page itself ──
@@ -88,8 +87,6 @@ T = {
     "Open it": ("打开", "開啟", "Abrirlo", "L'ouvrir", "Öffnen", "Abrir", "Открыть", "開く", "열기", "לפתוח", "فتحه"),
     "Download it": ("下载", "下載", "Descargarlo", "Le télécharger", "Herunterladen", "Baixar", "Скачать", "ダウンロード", "내려받기", "להוריד", "تنزيله"),
     # ── the comic reader ──
-    "back": ("返回", "返回", "atrás", "retour", "zurück", "voltar", "назад", "戻る", "뒤로", "חזרה", "رجوع"),
     "wider": ("加宽", "加寬", "más ancho", "plus large", "breiter", "mais largo", "шире", "幅を広げる", "넓게", "רחב יותר", "أعرض"),
     "fit the width of the window": ("适合窗口宽度", "符合視窗寬度", "ajustar al ancho de la ventana", "ajuster à la largeur de la fenêtre", "an die Fensterbreite anpassen", "ajustar à largura da janela", "по ширине окна", "ウィンドウの幅に合わせる", "창 너비에 맞추기", "התאמה לרוחב החלון", "ملاءمة عرض النافذة"),
-    "download": ("下载", "下載", "descargar", "télécharger", "herunterladen", "baixar", "скачать", "ダウンロード", "내려받기", "הורדה", "تنزيل"),
 }

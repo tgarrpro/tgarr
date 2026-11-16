@@ -6508,20 +6508,20 @@ _EXPORT_JS = (
     'function ask(b){return fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},'
     'body:JSON.stringify(b)}).then(function(r){return r.json()})}'
     'ask(Object.assign({check:true},o)).then(function(j){'
-    'if(j.status!=="ok"){alert(j.message||"That cannot be downloaded.");return}'
-    'if(!j.files){alert("There is nothing to download here.");return}'
-    'var m=j.files+" files"+(j.size?" ("+j.size+")":"")+" as one zip.";'
-    'if(j.to_fetch){m+=" "+j.to_fetch+" of them are not on this machine yet"+(j.fetch_size?" ("+j.fetch_size+")":"")+'
-    '": they are fetched from Telegram first, which takes a while."}'
-    'if(!confirm(m+" Go on?"))return;'
-    'ask(o).then(function(k){if(k.status==="ok"){location.href=k.ready?"/export/"+k.id+"/download":"/exports"}else{alert(k.message||"That did not work.")}})'
+    'if(j.status!=="ok"){alert(j.message||"[[@js:That cannot be downloaded.]]");return}'
+    'if(!j.files){alert("[[@js:There is nothing to download here.]]");return}'
+    'var m="[[@js:%1 files as one zip.]]".replace("%1",j.files+(j.size?" ("+j.size+")":""));'
+    'if(j.to_fetch){m+=" "+"[[@js:%1 of them are not on this machine yet: they are fetched from Telegram first, which takes a while.]]"'
+    '.replace("%1",j.to_fetch+(j.fetch_size?" ("+j.fetch_size+")":""))}'
+    'if(!confirm(m+" "+"[[@js:Go on?]]"))return;'
+    'ask(o).then(function(k){if(k.status==="ok"){location.href=k.ready?"/export/"+k.id+"/download":"/exports"}else{alert(k.message||"[[@js:That did not work.]]")}})'
     '})}}</script>')
 
 
 def _export_btn(what: dict, label: str) -> str:
     return ('<button type="button" class="btn ghost" style="padding:5px 12px;font-size:12px" '
             f'data-exp="{html.escape(_json.dumps(what), quote=True)}" '
-            'onclick="tgExport(JSON.parse(this.dataset.exp))">' + label + '</button>' + _EXPORT_JS)
+            'onclick="tgExport(JSON.parse(this.dataset.exp))">' + label + '</button>' + _fill(_EXPORT_JS))
 
 
 async def _export_pick(scope: str, ch, kind: str) -> list:
@@ -6754,7 +6754,7 @@ async def page_exports():
         + f'<h2 class="section">{_t("Downloads prepared")} <span class="count">' + str(len(jobs)) + '</span></h2>'
         + ('<div class="dl-list">' + "".join(items) + '</div>' if items else
            f'<div class="empty-state"><div class="icon">🗜</div><div>{_t("Nothing prepared yet.")}</div></div>')
-        + _EXPORT_JS
+        + _fill(_EXPORT_JS)
         + '<script>function exGo(){var c=document.getElementById("exChat").value,k=document.getElementById("exKind").value;'
           'tgExport(c==="saved"||c==="private"?{scope:c,kind:k}:{scope:"chat",ch:c,kind:k})}'
           'function exDel(i){fetch("/api/export/"+i+"/delete",{method:"POST"}).then(function(){location.reload()})}'
@@ -7753,13 +7753,13 @@ def _ago(dt) -> str:
     if sec < 0:
         return dt.strftime("%Y-%m-%d")
     if sec < 90:
-        return "just now"
+        return _t("just now")
     if sec < 3600:
-        return f"{int(sec // 60)} min ago"
+        return _t("{n} min ago", n=int(sec // 60))
     if sec < 86400:
-        return f"{int(sec // 3600)} h ago"
+        return _t("{n} h ago", n=int(sec // 3600))
     if sec < 86400 * 30:
-        return f"{int(sec // 86400)} d ago"
+        return _t("{n} d ago", n=int(sec // 86400))
     return dt.strftime("%Y-%m-%d")
 
 
@@ -14298,7 +14298,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
                 "CSV": "📈", "TSV": "📈", "IPYNB": "📓",
                 "PPTX": "📊", "PPSX": "📊", "XLSX": "📈", "XLSM": "📈"}.get(ext, "📄")
 
-    if not rows:
+    if not rows and not (q or lang or fmt or local or src or offset):
         body = (
             f'<h2 class="section">{_t("Library")} <span class="count">{_t("{n} cached", n=0)}</span></h2>'
             '<div class="empty-state">'

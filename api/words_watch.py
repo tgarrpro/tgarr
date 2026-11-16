@@ -10,12 +10,8 @@ of the keyboard and stay as they are.
 
 T = {
     # ── the top bar ──
-    "back": ("返回", "返回", "volver", "retour", "zurück", "voltar", "назад", "戻る", "뒤로", "חזרה", "رجوع"),
-    "download": ("下载", "下載", "descargar", "télécharger", "herunterladen", "baixar", "скачать", "ダウンロード", "다운로드", "הורדה", "تنزيل"),
     "download raw": ("下载原文件", "下載原始檔", "descargar el archivo original", "télécharger le fichier d'origine", "Originaldatei herunterladen", "baixar o arquivo original", "скачать исходный файл", "元のファイルをダウンロード", "원본 파일 다운로드", "הורדת הקובץ המקורי", "تنزيل الملف الأصلي"),
     "Favourite": ("收藏", "收藏", "Favorito", "Favori", "Favorit", "Favorito", "Избранное", "お気に入り", "즐겨찾기", "מועדף", "المفضلة"),
-    "in your favourites": ("已收藏", "已收藏", "en tus favoritos", "dans vos favoris", "in deinen Favoriten", "nos seus favoritos", "в избранном", "お気に入りに登録済み", "즐겨찾기에 있음", "במועדפים שלך", "في مفضلتك"),
-    "add to favourites": ("加入收藏", "加入收藏", "añadir a favoritos", "ajouter aux favoris", "zu den Favoriten hinzufügen", "adicionar aos favoritos", "добавить в избранное", "お気に入りに追加", "즐겨찾기에 추가", "הוספה למועדפים", "إضافة إلى المفضلة"),
     "play converted": ("转码播放", "轉碼播放", "reproducir convertido", "lire en version convertie", "konvertiert abspielen", "reproduzir convertido", "воспроизвести с конвертацией", "変換して再生", "변환해서 재생", "ניגון בהמרה", "تشغيل بعد التحويل"),
     "no picture or no sound? this plays it converted for this device": ("没有画面或没有声音？点这里按本设备转码播放", "沒有畫面或沒有聲音？點這裡依本裝置轉碼播放", "¿sin imagen o sin sonido? esto lo reproduce convertido para este dispositivo", "pas d'image ou pas de son ? ceci le lit converti pour cet appareil", "kein Bild oder kein Ton? Hiermit wird es für dieses Gerät konvertiert abgespielt", "sem imagem ou sem som? isto reproduz convertido para este aparelho", "нет изображения или звука? так видео конвертируется под это устройство", "映像や音が出ませんか？この端末向けに変換して再生します", "화면이나 소리가 안 나오나요? 이 기기에 맞게 변환해서 재생합니다", "אין תמונה או אין קול? כאן הקובץ מנוגן בהמרה למכשיר הזה", "لا صورة أو لا صوت؟ هذا يشغّله محوَّلًا لهذا الجهاز"),
     "message not indexed": ("此消息不在索引中", "此訊息不在索引中", "mensaje no indexado", "message non indexé", "Nachricht nicht erfasst", "mensagem não indexada", "сообщение не проиндексировано", "このメッセージは索引にありません", "색인되지 않은 메시지", "ההודעה אינה באינדקס", "الرسالة غير مفهرسة"),
@@ -64,7 +60,6 @@ T = {
     "keep playing in a small floating window": ("在悬浮小窗中继续播放", "在懸浮小視窗中繼續播放", "seguir reproduciendo en una ventanita flotante", "continuer la lecture dans une petite fenêtre flottante", "in einem kleinen schwebenden Fenster weiterspielen", "continuar reproduzindo numa janelinha flutuante", "продолжить в маленьком плавающем окне", "小さなフローティングウィンドウで再生を続ける", "작은 떠 있는 창에서 계속 재생", "להמשיך לנגן בחלון צף קטן", "متابعة التشغيل في نافذة عائمة صغيرة"),
     "Picture-in-picture": ("画中画", "子母畫面", "Imagen en imagen", "Image dans l'image", "Bild-in-Bild", "Picture-in-picture", "Картинка в картинке", "ピクチャーインピクチャー", "PIP 모드", "תמונה בתוך תמונה", "صورة داخل صورة"),
     "full screen (f)": ("全屏 (f)", "全螢幕 (f)", "pantalla completa (f)", "plein écran (f)", "Vollbild (f)", "tela cheia (f)", "во весь экран (f)", "全画面 (f)", "전체 화면 (f)", "מסך מלא (f)", "ملء الشاشة (f)"),
-    "full screen (F)": ("全屏 (F)", "全螢幕 (F)", "pantalla completa (F)", "plein écran (F)", "Vollbild (F)", "tela cheia (F)", "во весь экран (F)", "全画面 (F)", "전체 화면 (F)", "מסך מלא (F)", "ملء الشاشة (F)"),
     "Full screen": ("全屏", "全螢幕", "Pantalla completa", "Plein écran", "Vollbild", "Tela cheia", "Во весь экран", "全画面", "전체 화면", "מסך מלא", "ملء الشاشة"),
     "continued from %1": ("已从 %1 继续播放", "已從 %1 繼續播放", "continúa desde %1", "reprise à %1", "weiter ab %1", "continuando de %1", "продолжено с %1", "%1 から再開しました", "%1부터 이어서 재생", "ממשיך מ-%1", "متابعة من %1"),
     "start over": ("从头播放", "從頭播放", "empezar de nuevo", "revoir depuis le début", "von vorn", "começar do início", "с начала", "最初から再生", "처음부터", "מההתחלה", "من البداية"),
