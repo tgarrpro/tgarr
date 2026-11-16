@@ -6,6 +6,7 @@
     .rtf                 text and paragraphs (type faces, pictures and tables are let go)
     .html  .htm          a saved page: its text and structure (pictures kept beside it are not in the file)
     .mobi  .azw  .prc    Mobipocket, the old Kindle format, when it is not protected
+    .azw3                KF8, the newer one: its pages of XHTML, its pictures (its style sheets are let go)
 
 Each becomes the same thing: a title, chapter titles, chapters as HTML, pictures by name. The
 e-book reader shows that as it shows an EPUB - type you can size, pages that fit the screen,
@@ -30,7 +31,7 @@ from xml.etree import ElementTree as ET
 
 import textbook
 
-KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "prc", "html", "htm", "xhtml")
+KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml")
 XML_MOST = 80 * 1024 * 1024         # one XML part, unpacked
 TEXT_MOST = 120 * 1024 * 1024       # the text of one book
 _CACHE: dict = {}                   # path -> (mtime, Book)
@@ -901,6 +902,7 @@ def _mobi(path: str) -> Book:
         if comp not in (1, 2):
             raise NotReadable("this book is packed in a way not known here")
         codec, flags, first_img, title, cover, version = "cp1252", 0, None, None, None, 0
+        kf8, fdst, flow_end = False, None, None
         if head[60:68] == b"BOOKMOBI" and r0[16:20] == b"MOBI" and len(r0) >= 0x74:
             mlen = struct.unpack(">L", r0[20:24])[0]
             if struct.unpack(">L", r0[28:32])[0] == 65001:
@@ -912,8 +914,9 @@ def _mobi(path: str) -> Book:
                 title = r0[name_off:name_off + name_len].decode(codec, "replace").strip() or None
             if mlen >= 0xe4 and version >= 5 and len(r0) >= 0xf4:
                 flags = struct.unpack(">H", r0[0xf2:0xf4])[0]
-            if version >= 8:
-                raise NotReadable("this is a Kindle book of the newer kind (KF8), not read here yet")
+            kf8 = version >= 8
+            if kf8 and len(r0) >= 0xc4:
+                fdst = struct.unpack(">L", r0[0xc0:0xc4])[0]
             exth_at = 16 + mlen
             if len(r0) >= 0x84 and struct.unpack(">L", r0[0x80:0x84])[0] & 0x40 and r0[exth_at:exth_at + 4] == b"EXTH":
                 n = struct.unpack(">L", r0[exth_at + 8:exth_at + 12])[0]
@@ -943,6 +946,14 @@ def _mobi(path: str) -> Book:
             if got > TEXT_MOST:
                 raise NotReadable("this book is too large to open here")
         raw = b"".join(parts)[:text_len] if text_len else b"".join(parts)
+        if kf8 and fdst is not None and n_text < fdst < count:
+            # a KF8 book holds several "flows" one after the other: the pages first, then
+            # style sheets and drawings. This record says where the first one ends.
+            fd = rec(fdst)
+            if fd[:4] == b"FDST" and len(fd) >= 20 and struct.unpack(">L", fd[8:12])[0] >= 1:
+                a, b = struct.unpack(">LL", fd[12:20])
+                if a == 0 and 0 < b <= len(raw):
+                    flow_end = b
         # the pictures: every record after the text that begins like one
         assets = {}
         if first_img and n_text < first_img < count:
@@ -951,7 +962,12 @@ def _mobi(path: str) -> Book:
                 if picture_type(f.read(32) + b"\0" * 26):
                     assets[f"i{i - first_img + 1}"] = ("file", path, offs[i], offs[i + 1] - offs[i])
     # where the pages break; a book without breaks, and a piece too long, is cut at headings
-    starts = [0] + [m.end() for m in _MOBI_BREAK.finditer(raw)]
+    if kf8:
+        # each page of the book is a file of XHTML: an empty shell, then what belongs in it
+        raw = raw[:flow_end] if flow_end else raw
+        starts = sorted({0} | {m.start() for m in re.finditer(rb"<html[\s>]", raw, re.I)})
+    else:
+        starts = [0] + [m.end() for m in _MOBI_BREAK.finditer(raw)]
     cuts = []
     for k, s in enumerate(starts):
         e = starts[k + 1] if k + 1 < len(starts) else len(raw)
@@ -987,6 +1003,9 @@ def _mobi(path: str) -> Book:
         v = a.get("recindex") or ""
         if v.isdigit() and f"i{int(v)}" in assets:
             return f"../asset/i{int(v)}"
+        m = re.match(r"kindle:embed:([0-9A-Va-v]{1,6})", a.get("src") or "")       # KF8: the number in base 32
+        if m and f"i{int(m.group(1), 32)}" in assets:
+            return f"../asset/i{int(m.group(1), 32)}"
         return None
 
     titles, chapters, sample = [], [], []
@@ -1058,7 +1077,7 @@ def build(path: str, kind: str) -> Book:
     if kind == "txt":
         b = textbook.load(path)
         return Book(None, b["titles"], b["chapters"], b["latin"])
-    if kind in ("mobi", "azw", "prc"):
+    if kind in ("mobi", "azw", "azw3", "prc"):
         return _mobi(path)
     if kind == "docx":
         return _docx(path)
