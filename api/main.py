@@ -13212,7 +13212,7 @@ a{color:inherit;text-decoration:none}
 html[dir=rtl] .hero::after{transform:scaleX(-1)}
 @media (max-width:560px){.hero .po{display:none}.hero{min-height:180px}}
 .find{padding:16px clamp(16px,4vw,44px) 0;display:flex;gap:10px}
-.find input{flex:1;max-width:440px;font:inherit;font-size:16.500px;padding:12px 18px;border-radius:12px;
+.find input{flex:1;min-width:0;max-width:440px;font:inherit;font-size:16.500px;padding:12px 18px;border-radius:12px;
   border:1.500px solid var(--line);background:var(--card);color:var(--ink);outline:none}
 .find input:focus{border-color:var(--accent)}
 .find button{font:inherit;font-size:16px;font-weight:700;padding:0 22px;border-radius:12px;border:0;
@@ -13309,7 +13309,7 @@ html[data-th=playroom]{--bg:#e8f6ff;--card:#ffffff;--ink:#27314d;--soft:#62739a;
   --shadow:0 8px 0 rgba(39,49,77,.10);--r:30px;color-scheme:light}
 html[data-th=playroom] body{background:linear-gradient(180deg,#bfe6ff 0%,#e8f6ff 34%,#fff4d6 100%);background-attachment:fixed;
   font-family:"Baloo 2","Comic Neue",ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
-html[data-th=playroom] .cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);padding-top:14px;overflow:visible}
+html[data-th=playroom] .cats{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:clamp(6px,2vw,20px);padding-top:14px;overflow:visible}
 html[data-th=playroom] .cat{display:block;text-align:center;padding:clamp(14px,2.4vw,24px) 10px;border:4px solid var(--c);background:var(--card);
   border-radius:var(--r);box-shadow:var(--shadow);color:var(--ink);white-space:normal}
 html[data-th=playroom] .cat b{display:block;margin-top:10px;font-size:clamp(15px,2.2vw,21px)}
@@ -13317,6 +13317,8 @@ html[data-th=playroom] .cat .ic{width:clamp(56px,7.6vw,84px);height:clamp(56px,7
 html[data-th=playroom] .cat.on .ic{background:#fff;color:var(--c);box-shadow:none}
 html[data-th=playroom] .cat.on{background:var(--c);color:#fff}
 html[data-th=playroom] .cat.on small{color:#fff}
+@media (min-width:1200px){html[data-th=playroom] .cat{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;column-gap:clamp(10px,1.2vw,22px);text-align:left;padding:clamp(12px,1.5vw,22px) clamp(12px,1.5vw,26px)}html[data-th=playroom] .cat .ic{grid-row:1 / span 2;margin:0;width:clamp(52px,4.8vw,92px);height:clamp(52px,4.8vw,92px)}html[data-th=playroom] .cat b{margin-top:0;align-self:end;font-size:clamp(17px,1.5vw,27px);line-height:1.15;overflow:hidden;text-overflow:ellipsis}html[data-th=playroom] .cat small{align-self:start;font-size:clamp(13px,1vw,16px);margin-top:3px}}
+@media (max-width:560px){html[data-th=playroom] .cats{gap:6px}html[data-th=playroom] .cat{padding:10px 1px 9px;border-width:3px;border-radius:18px}html[data-th=playroom] .cat .ic{width:36px;height:36px}html[data-th=playroom] .cat .ic svg{width:20px;height:20px}html[data-th=playroom] .cat b{font-size:12px;margin-top:6px;overflow:hidden;text-overflow:ellipsis}html[data-th=playroom] .cat small{font-size:10px}}
 html[data-th=playroom] .card{border:4px solid #fff}
 html[data-th=playroom] .card:hover{transform:translateY(-6px) rotate(-1deg) scale(1.03)}
 html[data-th=playroom] .pill,html[data-th=playroom] .find input{border-width:3px;font-weight:700}
