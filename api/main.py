@@ -1417,7 +1417,7 @@ _PWA_HEAD = ('<link rel="manifest" href="__MANIFEST__" />'
 
 def _pwa_head(kids: bool = False) -> str:
     return (_PWA_HEAD.replace("__MANIFEST__", "/mediacenter/manifest.webmanifest" if kids else "/manifest.webmanifest")
-            .replace("__THEME__", "#fff8ef" if kids else "#229ED9").replace("__TITLE__", "Media Center" if kids else "tgarr"))
+            .replace("__THEME__", "#0b0d12" if kids else "#229ED9").replace("__TITLE__", "Media Center" if kids else "tgarr"))
 
 
 def _pwa_manifest(kids: bool) -> dict:
@@ -1426,7 +1426,7 @@ def _pwa_manifest(kids: bool) -> dict:
              {"src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}]
     if kids:
         return {"name": "tgarr Media Center", "short_name": "Media Center", "id": "/mediacenter", "start_url": "/mediacenter",
-                "scope": "/", "display": "standalone", "background_color": "#fff8ef", "theme_color": "#fff8ef", "icons": icons}
+                "scope": "/", "display": "standalone", "background_color": "#0b0d12", "theme_color": "#0b0d12", "icons": icons}
     return {"name": "tgarr", "short_name": "tgarr", "id": "/", "start_url": "/", "scope": "/", "display": "standalone",
             "background_color": "#0e1621", "theme_color": "#229ED9", "icons": icons}
 
@@ -8855,7 +8855,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
            + '</p>' if (revoked or browsable) else
            f'<h2 style="margin:0 0 6px;font-size:19px">{_t("Welcome to tgarr")}</h2>'
            '<p style="margin:0 0 12px;color:var(--muted)">'
-           + _t("Nothing is indexed yet. There are three ways to fill this library - start with any of them, the others can follow later:")
+           + _t("Nothing is indexed yet. There are several ways to fill this library - start with any of them, the others can follow later:")
            + '</p>')
         + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">'
         + "".join(
@@ -12001,6 +12001,8 @@ label{display:flex;gap:8px;align-items:center;justify-content:center;font-size:1
 button{margin-top:12px;width:100%;padding:12px;font:inherit;font-size:15px;font-weight:600;color:#fff;background:#0ea5e9;
   border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.6}
 #err{color:#b91c1c;font-size:14px;min-height:20px;margin-top:10px}a{color:#0284c7;font-size:13px}
+@media (prefers-color-scheme:dark){body{background:#0b0d12;color:#f2f3f6}.card{background:#161922;border-color:#252a37;box-shadow:0 10px 28px rgba(0,0,0,.55)}
+  p,label{color:#99a0b0}input[type=password]{background:#0b0d12;color:#f2f3f6;border-color:#252a37}#err{color:#f87171}a{color:#38bdf8}}
 </style></head><body><div class="card">
 <h1>[[@Enter the PIN]]</h1><p>[[@Enter the PIN to open all of tgarr.]]</p>
 <form id="f" autocomplete="off">
@@ -12137,9 +12139,9 @@ _MC_REST_HTML = """<!DOCTYPE html><html lang="__LANG__" dir="__DIR__"><head><met
 <meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr · [[@Media Center]]</title>
 <style>
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;
-  background:#fff8ef;color:#2b2140;font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC",system-ui,sans-serif;text-align:center}
-@media (prefers-color-scheme:dark){body{background:#191624;color:#f3eefc}}
-.big{font-size:96px;line-height:1}h1{font-size:34px;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
+  background:#f4f5f8;color:#12141a;font-family:"Inter","SF Pro Display","Segoe UI","Helvetica Neue","PingFang SC","Microsoft YaHei",system-ui,sans-serif;text-align:center}
+@media (prefers-color-scheme:dark){body{background:#0b0d12;color:#f2f3f6}}
+.big{font-size:96px;line-height:1}h1{font-size:34px;font-weight:800;letter-spacing:-.02em;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
 a{display:inline-block;margin-top:34px;font-size:13px;color:inherit;opacity:.55}
 </style></head><body><div><div class="big">__ICON__</div><h1>__TITLE__</h1><p>__TEXT__</p>
 <a href="/unlock">🔒 [[@Enter PIN]]</a></div>
@@ -12483,7 +12485,10 @@ a{color:inherit;text-decoration:none}
 /* the first thing, wide: its own picture, blurred, behind its name */
 .hero{position:relative;margin:16px clamp(16px,4vw,44px) 0;border-radius:calc(var(--r) + 8px);overflow:hidden;isolation:isolate;
   min-height:clamp(210px,34vh,400px);display:flex;align-items:flex-end;gap:clamp(16px,2.6vw,34px);padding:clamp(18px,3vw,40px);
-  background:linear-gradient(120deg, color-mix(in srgb, var(--c) 55%, #0b0d12), #0b0d12);color:#fff;box-shadow:var(--shadow)}
+  background:linear-gradient(120deg, color-mix(in srgb, var(--c) 30%, #0b0d12), color-mix(in srgb, var(--c) 62%, #0b0d12));color:#fff;box-shadow:var(--shadow)}
+/* its kind, drawn large and faint at the far side: what is seen where there is no picture */
+.hero .hi{position:absolute;z-index:-1;inset-inline-end:clamp(10px,5vw,70px);top:50%;transform:translateY(-50%);height:74%;aspect-ratio:1;color:#fff;opacity:.13}
+.hero .hi svg{width:100%;height:100%;display:block}
 .hero .bk{position:absolute;inset:-40px;z-index:-2;background:var(--img) center/cover no-repeat;filter:blur(34px) saturate(1.25);transform:scale(1.15)}
 .hero::after{content:"";position:absolute;inset:0;z-index:-1;
   background:linear-gradient(90deg, rgba(8,10,16,.86) 0%, rgba(8,10,16,.55) 48%, rgba(8,10,16,.12) 100%),linear-gradient(0deg, rgba(8,10,16,.55), rgba(8,10,16,0) 55%)}
@@ -12902,7 +12907,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
         if not hero and kind != "photo" and not q and not offset:
             # the first thing gets the wide banner: its picture behind its name, and one button
             shown = (f'<img class="po" src="{pic}" alt="" onerror="this.remove()"/>' if pic else "")
-            hero = (f'<section class="hero" style="--c:{colour};--img:url({pic or "data:,"})"><div class="bk"></div>{shown}'
+            hero = (f'<section class="hero" style="--c:{colour};--img:url({pic or "data:,"})"><div class="bk"></div><span class="hi">{_MC_ICONS[kind]}</span>{shown}'
                     f'<div class="tx"><span class="ey"><span class="hic">{_MC_ICONS[kind]}</span>{tr(label)}</span>'
                     f'<h1>{html.escape(name)}</h1>'
                     f'<a class="hbtn" href="{href}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.500v13l11-6.500z"/></svg>'
