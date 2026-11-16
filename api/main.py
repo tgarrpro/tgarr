@@ -3690,10 +3690,11 @@ async def comic_page(msg_id: int, n: int):
 async def comic_render(msg_id: int):
     c = await _comic_of(msg_id)
     if not c:
-        return HTMLResponse(f'<p>This comic cannot be shown as it is. <a href="/watch/{int(msg_id)}">Open it</a>.</p>', status_code=404)
+        return HTMLResponse(f'<p>{_t("This comic cannot be shown as it is.")} <a href="/watch/{int(msg_id)}">{_t("Open it")}</a></p>', status_code=404)
     n = len(c[2])
     mid = int(msg_id)
-    pages = "".join(f'<img id="p{i}" data-n="{i}" loading="lazy" decoding="async" src="/comic/{mid}/page/{i}" alt="page {i + 1}"/>'
+    page_n = _t("page %1")
+    pages = "".join(f'<img id="p{i}" data-n="{i}" loading="lazy" decoding="async" src="/comic/{mid}/page/{i}" alt="{page_n.replace("%1", str(i + 1))}"/>'
                     for i in range(n))
     return HTMLResponse(
         '<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>'
@@ -3705,10 +3706,10 @@ async def comic_render(msg_id: int):
         'main{display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 0 40px}'
         'main img{display:block;max-width:100%;min-height:70vh;background:#1b1b1b}main img.ok{min-height:0}'
         'main.fit img{max-width:min(100%,1100px)}main.wide img{width:100%;max-width:none}'
-        '</style></head><body><div class="bar"><a href="#" id="back">&larr; back</a>'
+        '</style></head><body><div class="bar"><a href="#" id="back">&larr; ' + _t("back") + '</a>'
         f'<div class="t">{html.escape(c[1])}</div><span id="at">1 / {n}</span>'
-        '<button id="w" title="fit the width of the window">wider</button>'
-        f'<a href="/media/{mid}" download>&#11015; download</a></div><main id="m" class="fit">{pages}</main><script>'
+        '<button id="w" title="' + _t("fit the width of the window") + '">' + _t("wider") + '</button>'
+        f'<a href="/media/{mid}" download>&#11015; {_t("download")}</a></div><main id="m" class="fit">{pages}</main><script>'
         f'const ID={mid},N={n},KEY="comic-"+ID;'
         'const m=document.getElementById("m"),at=document.getElementById("at");'
         'document.getElementById("back").onclick=e=>{e.preventDefault();if(history.length>1)history.back();else location.href="/library";};'
@@ -3732,7 +3733,8 @@ async def epub_toc(msg_id: int):
     if not epub_path:
         return JSONResponse({"error": "not cached"}, status_code=404)
     if _arriving(row, epub_path):
-        return JSONResponse({"error": "this book is still arriving - a moment", "arriving": True}, status_code=409)
+        lang = _LANG.get()
+        return JSONResponse({"error": i18n.t(lang, "this book is still arriving - a moment"), "arriving": True}, status_code=409)
     kind = _own_kind(row)
     if kind:
         book, why = await _own_book(epub_path, kind)
@@ -3743,7 +3745,8 @@ async def epub_toc(msg_id: int):
     try:
         idx = await asyncio.to_thread(_epub_index, epub_path)
     except Exception as e:
-        return JSONResponse({"error": f"cannot read this book: {e}"}, status_code=422)
+        lang = _LANG.get()
+        return JSONResponse({"error": i18n.t(lang, "cannot read this book: {e}", e=str(e))}, status_code=422)
     return JSONResponse({"title": idx["title"] or row["file_name"] or f"book-{msg_id}",
                          "chapters": idx["titles"]})
 
@@ -3782,7 +3785,7 @@ async def epub_chapter(msg_id: int, n: int):
                 return _epub_chapter_body(zf, msg_id, idx["chapters"][n])
         body = await asyncio.to_thread(_read)
     except Exception as e:
-        return HTMLResponse(f"<p>cannot show this chapter: {html.escape(str(e))}</p>",
+        return HTMLResponse("<p>" + _t("cannot show this chapter: {e}", e=str(e)) + "</p>",
                             status_code=500, headers={"Content-Security-Policy": _EPUB_CSP})
     await _touch_local(msg_id)
     return HTMLResponse(
@@ -3897,7 +3900,7 @@ function voiceMenu(){
   const btn = document.getElementById("readBtn");
   if (!btn || !synth || document.getElementById("voiceBtn")) return;
   const b = document.createElement("button");
-  b.id = "voiceBtn"; b.title = "voice and speed"; b.innerHTML = "&#9881;";
+  b.id = "voiceBtn"; b.title = "[[@js:voice and speed]]"; b.innerHTML = "&#9881;";
   btn.insertAdjacentElement("afterend", b);
   const box = document.createElement("div");
   box.id = "voiceBox";
@@ -3913,25 +3916,25 @@ function voiceMenu(){
       const zh = /[一-鿿]/.test(text), list = TG_VOICES[zh ? "zh" : "en"], k = PREF[zh ? "zh" : "en"];
       let name = (list.find(o => o[0] === k) || list[0])[1];
       if (!zh && (list.find(o => o[0] === k) || list[0])[0] === "same") name = (TG_VOICES.zh.find(o => o[0] === PREF.zh) || TG_VOICES.zh[0])[1];
-      return "this machine, " + name;
+      return "[[@js:this machine, %1]]".replace("%1", () => name);
     }
     const v = bsynth ? voiceFor(text).voice : null;
-    return v ? v.name : (bsynth ? "the browser's voice" : "nobody: no voice here");
+    return v ? v.name : (bsynth ? "[[@js:the browser's voice]]" : "[[@js:nobody: no voice here]]");
   };
   const draw = () => {
-    let h = sel("mode", "Read with", [["", "Automatic: the better of the two"]].concat(bsynth ? [["browser", "This browser's voices"]] : [],
-      TG_VOICE ? [["own", "This machine's voice"]] : []), PREF.mode);
+    let h = sel("mode", "[[@js:Read with]]", [["", "[[@js:Automatic: the better of the two]]"]].concat(bsynth ? [["browser", "[[@js:This browser's voices]]"]] : [],
+      TG_VOICE ? [["own", "[[@js:This machine's voice]]"]] : []), PREF.mode);
     if (TG_VOICE && PREF.mode !== "browser") {
-      h += sel("zh", "This machine, Chinese", TG_VOICES.zh, PREF.zh || TG_VOICES.zh[0][0]) + sel("en", "This machine, English", TG_VOICES.en, PREF.en || TG_VOICES.en[0][0]);
+      h += sel("zh", "[[@js:This machine, Chinese]]", TG_VOICES.zh, PREF.zh || TG_VOICES.zh[0][0]) + sel("en", "[[@js:This machine, English]]", TG_VOICES.en, PREF.en || TG_VOICES.en[0][0]);
     }
     if (bsynth && PREF.mode !== "own") {
       const z = ofLang("zh"), e = ofLang("en");
-      if (z.length > 1) h += sel("bzh", "Browser, Chinese", [["", "Automatic"]].concat(z.map(v => [v.name, v.name])), PREF.bzh);
-      if (e.length > 1) h += sel("ben", "Browser, English", [["", "Automatic"]].concat(e.map(v => [v.name, v.name])), PREF.ben);
+      if (z.length > 1) h += sel("bzh", "[[@js:Browser, Chinese]]", [["", "[[@js:Automatic]]"]].concat(z.map(v => [v.name, v.name])), PREF.bzh);
+      if (e.length > 1) h += sel("ben", "[[@js:Browser, English]]", [["", "[[@js:Automatic]]"]].concat(e.map(v => [v.name, v.name])), PREF.ben);
     }
-    h += sel("rate", "Speed", [["0.75", "0.75 x"], ["1", "1 x"], ["1.25", "1.25 x"], ["1.5", "1.5 x"], ["1.75", "1.75 x"], ["2", "2 x"]], String(rateNow()));
-    h += '<div style="color:#cbd5e1;font-size:12px">Chinese is read by ' + esc(who("中文中文中文")) + '.<br>English by ' + esc(who("English text")) + '.'
-      + (TG_VOICE ? "" : '<br>A voice of this machine\'s own can be installed in Settings.') + '</div>';
+    h += sel("rate", "[[@js:Speed]]", [["0.75", "0.75 x"], ["1", "1 x"], ["1.25", "1.25 x"], ["1.5", "1.5 x"], ["1.75", "1.75 x"], ["2", "2 x"]], String(rateNow()));
+    h += '<div style="color:#cbd5e1;font-size:12px">' + "[[@js:Chinese is read by %1.]]".replace("%1", () => esc(who("中文中文中文"))) + '<br>' + "[[@js:English by %1.]]".replace("%1", () => esc(who("English text")))
+      + (TG_VOICE ? "" : '<br>' + "[[@js:A voice of this machine's own can be installed in Settings.]]") + '</div>';
     box.innerHTML = h;
     box.querySelectorAll("select").forEach(s => { s.onchange = () => {
       const k = s.dataset.k;
@@ -3972,7 +3975,7 @@ def _speech_js() -> str:
     except Exception:
         on = False
     voices = {lang: [[k, label] for k, label, _sid in vs] for lang, vs in tts.VOICES.items()}
-    return _SPEECH_JS.replace("__TG_VOICE__", "true" if on else "false").replace("__TG_VOICES__", _json.dumps(voices))
+    return _fill(_SPEECH_JS).replace("__TG_VOICE__", "true" if on else "false").replace("__TG_VOICES__", _json.dumps(voices))
 
 
 _EPUB_READER_HTML = r"""<!DOCTYPE html>
@@ -4033,37 +4036,37 @@ button.on{background:var(--acc,#2563eb);color:#fff;border-color:var(--acc,#2563e
 </style></head>
 <body data-theme="light" data-mode="paged">
 <div class="bar">
-  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
-  <button id="tocBtn" title="table of contents">&#9776;<span class="hide-s"> Contents</span></button>
+  <a class="btn" id="back" href="/library" title="[[@back to the library]]">&larr;<span class="hide-s"> [[@Library]]</span></a>
+  <button id="tocBtn" title="[[@table of contents]]">&#9776;<span class="hide-s"> [[@Contents]]</span></button>
   <div class="ttl" id="ttl">__TITLE__</div>
-  <button id="readBtn" title="read aloud from here; the page follows the voice (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
-  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
-  <button id="fsDown" title="smaller text">A&minus;</button>
-  <button id="fsUp" title="larger text">A+</button>
-  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
-  <button id="modeBtn" title="turn pages or scroll"><span id="modeLbl">Scroll</span></button>
-  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+  <button id="readBtn" title="[[@read aloud from here; the page follows the voice (R)]]">&#128266;<span class="hide-s"> [[@Read aloud]]</span></button>
+  <button id="twoBtn" class="hide-s" title="[[@two pages side by side, like an open book (2)]]">[[@2 pages]]</button>
+  <button id="fsDown" title="[[@smaller text]]">A&minus;</button>
+  <button id="fsUp" title="[[@larger text]]">A+</button>
+  <button id="themeBtn" title="[[@light / sepia / dark]]">&#9680;<span class="hide-s"> [[@Theme]]</span></button>
+  <button id="modeBtn" title="[[@turn pages or scroll]]"><span id="modeLbl">[[@Scroll]]</span></button>
+  <a class="btn hide-s" href="/media/__ID__" download title="[[@download the file]]">&#11015;</a>
 </div>
 <div class="stage" id="stage">
-  <div class="msg" id="msg">opening the book…</div>
-  <iframe id="bk" sandbox="allow-same-origin" title="book"></iframe>
-  <div class="zone l" id="zl" title="previous page">&lsaquo;</div>
-  <div class="zone r" id="zr" title="next page">&rsaquo;</div>
+  <div class="msg" id="msg">[[@opening the book…]]</div>
+  <iframe id="bk" sandbox="allow-same-origin" title="[[@book]]"></iframe>
+  <div class="zone l" id="zl" title="[[@previous page]]">&lsaquo;</div>
+  <div class="zone r" id="zr" title="[[@next page]]">&rsaquo;</div>
   <div class="shade" id="shade"></div>
   <div class="drawer" id="drawer">
-    <h3><span>Contents</span><button id="tocClose">&times;</button></h3>
+    <h3><span>[[@Contents]]</span><button id="tocClose">&times;</button></h3>
     <div class="list" id="tocList"></div>
   </div>
-  <div class="tip" id="tip">&larr; &rarr; or Space to turn pages &middot; click the edges &middot; swipe on a phone</div>
+  <div class="tip" id="tip">[[@← → or Space to turn pages · click the edges · swipe on a phone]]</div>
 </div>
 <div class="bar bottom">
-  <button class="big" id="prev">&lsaquo; Prev</button>
+  <button class="big" id="prev">&lsaquo; [[@Prev]]</button>
   <div class="pos">
     <span class="chn" id="chn"></span>
     <span id="pg"></span>
-    <input type="range" id="slider" min="0" max="0" value="0" title="jump to a chapter">
+    <input type="range" id="slider" min="0" max="0" value="0" title="[[@jump to a chapter]]">
   </div>
-  <button class="big" id="next">Next &rsaquo;</button>
+  <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
 <script>
 (function(){
@@ -4118,7 +4121,7 @@ function layout(keep){
   if (!el) { el = doc.createElement("style"); el.id = "tg-reader"; doc.head.appendChild(el); }
   el.textContent = css();
   document.body.dataset.theme = theme; document.body.dataset.mode = mode;
-  $("modeLbl").textContent = mode === "paged" ? "Scroll" : "Pages";
+  $("modeLbl").textContent = mode === "paged" ? "[[@js:Scroll]]" : "[[@js:Pages]]";
   $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
   if (mode === "paged") {
     pages = Math.max(1, Math.round(doc.body.scrollWidth / W));
@@ -4132,11 +4135,11 @@ function layout(keep){
 }
 function ui(){
   const n = titles.length || 1;
-  $("chn").textContent = titles[ch] || ("Section " + (ch + 1));
+  $("chn").textContent = titles[ch] || "[[@js:Section %1]]".replace("%1", ch + 1);
   let within = frac();
-  if (mode === "paged") $("pg").innerHTML = "page <b>" + (page + 1) + "</b> of " + pages + " &middot; chapter " + (ch + 1) + " of " + n +
+  if (mode === "paged") $("pg").innerHTML = "[[@js:page %1 of %2]]".replace("%1", "<b>" + (page + 1) + "</b>").replace("%2", pages) + " &middot; " + "[[@js:chapter %1 of %2]]".replace("%1", ch + 1).replace("%2", n) +
       " &middot; <b>" + Math.round((ch + (pages > 1 ? page / pages : 0)) / n * 100) + "%</b>";
-  else $("pg").innerHTML = "chapter " + (ch + 1) + " of " + n + " &middot; <b>" + Math.round((ch + within) / n * 100) + "%</b>";
+  else $("pg").innerHTML = "[[@js:chapter %1 of %2]]".replace("%1", ch + 1).replace("%2", n) + " &middot; <b>" + Math.round((ch + within) / n * 100) + "%</b>";
   $("slider").max = n - 1; $("slider").value = ch;
   const first = ch === 0 && (mode === "paged" ? page === 0 : within <= 0.001);
   const last = ch >= n - 1 && (mode === "paged" ? page >= pages - 1 : within >= 0.999);
@@ -4147,7 +4150,7 @@ function ui(){
 function load(n, f){
   n = Math.max(0, Math.min((titles.length || 1) - 1, n));
   ch = n; pendingFrac = f || 0; busy = true;
-  $("msg").style.display = "flex"; $("msg").textContent = "loading…";
+  $("msg").style.display = "flex"; $("msg").textContent = "[[@js:loading…]]";
   // replace, not assign: setting src made every chapter a step in the tab's
   // history, so "Library" (one step back) only went back one chapter
   const url = "/epub/" + ID + "/ch/" + n;
@@ -4267,7 +4270,7 @@ function readBlock(i){
   if (!reading) return;
   const run = ++readRun; synth.cancel(); unmark();
   if (i >= blocks.length) {
-    if (ch >= titles.length - 1) { stopRead("the end of the book"); return; }
+    if (ch >= titles.length - 1) { stopRead("[[@js:the end of the book]]"); return; }
     readerLoad = true; load(ch + 1, 0); return;          // goes on when the chapter has arrived
   }
   const el = blocks[i], text = (el.textContent || "").replace(/\s+/g, " ").trim();
@@ -4289,14 +4292,14 @@ function readBlock(i){
       if (want > page) turnTo(want);
     };
     if (k === parts.length - 1) u.onend = () => { if (reading && run === readRun) readBlock(i + 1); };
-    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("[[@js:the browser could not read this aloud]]"); };
     synth.speak(u);
   });
 }
 function readFromView(){
   if (!reading || busy || !doc) return;        // a chapter on its way: its arrival starts the reading
   blocks = collect();
-  if (!blocks.length) { if (ch < titles.length - 1) { readerLoad = true; load(ch + 1, 0); } else stopRead("nothing to read here"); return; }
+  if (!blocks.length) { if (ch < titles.length - 1) { readerLoad = true; load(ch + 1, 0); } else stopRead("[[@js:nothing to read here]]"); return; }
   // nothing readable on this page or after it (a picture, a blank end): readBlock
   // then goes on to the next chapter - never back to an earlier paragraph
   readBlock(firstInView());
@@ -4305,7 +4308,7 @@ function readFromView(){
 function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 450); }
 document.addEventListener("tgvoice", userMoved);          // another voice was chosen: this paragraph again, in it
 $("readBtn").onclick = () => {
-  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (!synth) { toast("[[@js:this browser cannot read aloud]]"); return; }
   if (reading) { stopRead(); return; }
   reading = true; $("readBtn").classList.add("on"); readFromView();
 };
@@ -4347,7 +4350,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
   titles.forEach((t, i) => { if (!t) return; listed++;
     const a = document.createElement("a"); a.textContent = t; a.dataset.i = i;
     a.onclick = () => { toc(false); userMoved(); load(i, 0); }; fragm.appendChild(a); });
-  if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "Section " + (i + 1);
+  if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "[[@js:Section %1]]".replace("%1", i + 1);
     a.dataset.i = i; a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
   list.appendChild(fragm);
   let pos = {}; try { pos = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
@@ -4355,7 +4358,7 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
   const h = /[?&]was=pdf/.test(location.search) ? 0 : parseInt((location.hash || "").slice(1), 10);
   if (h >= 1 && h <= titles.length) pos = {ch: h - 1, frac: 0};
   load(pos.ch || 0, pos.frac || 0);
-}).catch(() => { $("msg").textContent = "✗ could not open this book"; });
+}).catch(() => { $("msg").textContent = "✗ [[@js:could not open this book]]"; });
 })();
 </script>
 <script src="/mc/ping.js" defer></script>
@@ -4370,7 +4373,7 @@ async def epub_render(msg_id: int):
     path = _epub_locate(msg_id, row)
     if not path:
         return HTMLResponse(
-            f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            f'<p>{_t("This book is not downloaded yet.")} <a href="/watch/{msg_id}">{_t("Open it")}</a></p>',
             status_code=404)
     if _arriving(row, path):
         return RedirectResponse(f"/watch/{int(msg_id)}", status_code=307)      # that page waits for it
@@ -4381,12 +4384,13 @@ async def epub_render(msg_id: int):
             # one this reader cannot open after all (protected, packed in a way not read here)
             return HTMLResponse(
                 '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-                '<title>cannot be shown</title></head><body style="font-family:system-ui,sans-serif;max-width:560px;margin:15vh auto;padding:0 20px;line-height:1.6">'
+                '<title>' + _t("cannot be shown") + '</title></head><body style="font-family:system-ui,sans-serif;max-width:560px;margin:15vh auto;padding:0 20px;line-height:1.6">'
                 f'<p>{html.escape(why[:1].upper() + why[1:])}.</p>'
-                f'<p>It is kept as it is: <a href="/media/{int(msg_id)}" download>download it</a> to read it with another program.</p>'
-                '<p><a href="/library">&larr; Library</a></p></body></html>', status_code=422)
+                '<p>' + _t("It is kept as it is: %1download it%2 to read it with another program.")
+                .replace("%1", f'<a href="/media/{int(msg_id)}" download>').replace("%2", "</a>") + '</p>'
+                '<p><a href="/library">&larr; ' + _t("Library") + '</a></p></body></html>', status_code=422)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"book-{msg_id}")
-    return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    return HTMLResponse(_fill(_EPUB_READER_HTML).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -4649,28 +4653,28 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
 </style></head>
 <body data-theme="light">
 <div class="bar">
-  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
+  <a class="btn" id="back" href="/library" title="[[@back to the library]]">&larr;<span class="hide-s"> [[@Library]]</span></a>
   <div class="ttl">__TITLE__</div>
-  <button id="wmBtn" title="on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.">Hide watermark</button>
-  <button id="readBtn" title="read this book aloud from the current page, turning pages as it goes (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
-  <button id="modeBtn" title="one page at a time (pages slide sideways), or one long scroll">Pages</button>
-  <button id="fitBtn" title="how a page fills the window: the whole page, its width, or its height">Fit page</button>
-  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
-  <button id="fsBtn" class="hide-s" title="full screen (F)">&#9974;</button>
-  <button id="zOut" title="smaller (-)">A&minus;</button>
-  <button id="zIn" title="larger (+)">A+</button>
-  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
-  <a class="btn hide-s" href="/media/__ID__" target="_blank" title="the untouched file in the browser's own viewer: select text, search, print">Original</a>
-  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+  <button id="wmBtn" title="[[@on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.]]">[[@Hide watermark]]</button>
+  <button id="readBtn" title="[[@read this book aloud from the current page, turning pages as it goes (R)]]">&#128266;<span class="hide-s"> [[@Read aloud]]</span></button>
+  <button id="modeBtn" title="[[@one page at a time (pages slide sideways), or one long scroll]]">[[@Pages]]</button>
+  <button id="fitBtn" title="[[@how a page fills the window: the whole page, its width, or its height]]">[[@Fit page]]</button>
+  <button id="twoBtn" class="hide-s" title="[[@two pages side by side, like an open book (2)]]">[[@2 pages]]</button>
+  <button id="fsBtn" class="hide-s" title="[[@full screen (F)]]">&#9974;</button>
+  <button id="zOut" title="[[@smaller (-)]]">A&minus;</button>
+  <button id="zIn" title="[[@larger (+)]]">A+</button>
+  <button id="themeBtn" title="[[@light / sepia / dark]]">&#9680;<span class="hide-s"> [[@Theme]]</span></button>
+  <a class="btn hide-s" href="/media/__ID__" target="_blank" title="[[@the untouched file in the browser's own viewer: select text, search, print]]">[[@Original]]</a>
+  <a class="btn hide-s" href="/media/__ID__" download title="[[@download the file]]">&#11015;</a>
 </div>
-<div class="stage" id="stage"><div class="msg" id="msg">opening…</div></div>
+<div class="stage" id="stage"><div class="msg" id="msg">[[@opening…]]</div></div>
 <div class="bar bottom">
-  <button class="big" id="prev">&lsaquo; Prev</button>
+  <button class="big" id="prev">&lsaquo; [[@Prev]]</button>
   <div class="pos">
-    page <input type="number" id="pno" min="1" value="1"> of <b id="ptotal">…</b>
+    __PAGE_OF__
     <input type="range" id="slider" min="1" max="1" value="1">
   </div>
-  <button class="big" id="next">Next &rsaquo;</button>
+  <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
 <script>
 (function(){
@@ -4706,7 +4710,7 @@ function build(){
   const f = document.createDocumentFragment();
   for (let n = 1; n <= pages; n++) {
     const el = document.createElement("div"); el.className = "pg"; el.dataset.n = n;
-    const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+    const img = document.createElement("img"); img.alt = "[[@js:page %1]]".replace("%1", n); img.decoding = "async";
     img.onload = () => { if (img.naturalWidth) { const r = img.naturalHeight / img.naturalWidth;
       if (Math.abs(r - (el._ratio || ratio)) > 0.01) { el._ratio = r; el.style.height = Math.round(pageW() * r) + "px"; } } };
     const no = document.createElement("span"); no.className = "no"; no.textContent = n;
@@ -4743,7 +4747,7 @@ function mkPage(n){
   const el = document.createElement("div"); el.className = "pg";
   const fit = r => { const w = fitW(r); el.style.width = w + "px"; el.style.height = Math.round(w * r) + "px"; return w; };
   const r0 = ratios[n] || ratio, w = fit(r0);
-  const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+  const img = document.createElement("img"); img.alt = "[[@js:page %1]]".replace("%1", n); img.decoding = "async";
   img.onload = () => { if (!img.naturalWidth) return; const r = img.naturalHeight / img.naturalWidth;
     if (Math.abs(r - r0) > 0.01) { ratios[n] = r; fit(r); } };
   img.src = pageSrc(n, w);
@@ -4796,11 +4800,11 @@ function track(){
 function ui(){
   if (document.activeElement !== $("pno")) $("pno").value = cur;
   $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur + step() > pages;
-  $("fitBtn").textContent = "Fit " + fit; $("fitBtn").disabled = mode !== "paged";
+  $("fitBtn").textContent = ({page: "[[@js:Fit page]]", width: "[[@js:Fit width]]", height: "[[@js:Fit height]]"})[fit]; $("fitBtn").disabled = mode !== "paged";
   $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
   $("readBtn").classList.toggle("on", reading);
   $("wmBtn").classList.toggle("on", clean); document.body.dataset.theme = theme;
-  $("modeBtn").textContent = mode === "paged" ? "Pages" : "Scroll";
+  $("modeBtn").textContent = mode === "paged" ? "[[@js:Pages]]" : "[[@js:Scroll]]";
 }
 let tt = null; stage.addEventListener("scroll", () => { clearTimeout(tt); tt = setTimeout(track, 60); }, {passive: true});
 $("prev").onclick = () => go(cur - step(), true); $("next").onclick = () => go(cur + step(), true);
@@ -4827,11 +4831,11 @@ async function readFrom(n){
   const text = (j.text || "").trim();
   const nextPage = () => {
     if (!reading || run !== readRun) return;
-    if (n >= pages) { stopRead("the end of the book"); return; }
+    if (n >= pages) { stopRead("[[@js:the end of the book]]"); return; }
     byReader = true; go(n + 1, true); byReader = false; readFrom(n + 1);
   };
   if (!text) {
-    if (++blanks >= 3) { stopRead("no words to read on these pages - a scanned book holds pictures of text"); return; }
+    if (++blanks >= 3) { stopRead("[[@js:no words to read on these pages - a scanned book holds pictures of text]]"); return; }
     nextPage(); return;
   }
   blanks = 0;
@@ -4840,7 +4844,7 @@ async function readFrom(n){
     const u = mkUtter(part);
     if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
     if (i === parts.length - 1) u.onend = nextPage;
-    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("[[@js:the browser could not read this aloud]]"); };
     synth.speak(u);
   });
 }
@@ -4850,7 +4854,7 @@ function turned(){
 }
 document.addEventListener("tgvoice", () => { if (reading) readFrom(cur); });      // another voice was chosen: this page again, in it
 $("readBtn").onclick = () => {
-  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (!synth) { toast("[[@js:this browser cannot read aloud]]"); return; }
   if (reading) { stopRead(); return; }
   reading = true; blanks = 0; ui(); readFrom(cur);
 };
@@ -4907,7 +4911,7 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
   const h = parseInt((location.hash || "").slice(1), 10);
   cur = (h >= 1 && h <= pages) ? h : Math.min(pages, book.page || 1);
   setMode(mode);
-}).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
+}).catch(() => { $("msg").textContent = "✗ [[@js:could not open this PDF]]"; });
 })();
 </script>
 <script src="/mc/ping.js" defer></script>
@@ -4937,10 +4941,11 @@ async def pdf_reader(msg_id: int, conv: int = 0):
             await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not _pdf_source(row):
         return HTMLResponse(
-            f'<p>This file cannot be shown here. <a href="/media/{msg_id}">Download it</a>.</p>',
+            f'<p>{_t("This file cannot be shown here.")} <a href="/media/{msg_id}">{_t("Download it")}</a></p>',
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
-    return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    page_of = _t("page %1 of %2").replace("%1", '<input type="number" id="pno" min="1" value="1">').replace("%2", '<b id="ptotal">…</b>')
+    return HTMLResponse(_fill(_PDF_READER_HTML).replace("__PAGE_OF__", page_of).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
