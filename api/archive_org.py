@@ -40,7 +40,7 @@ _VIDEO_WEB = ("mp4", "m4v", "webm")                         # a browser plays th
 _VIDEO_OTHER = ("mkv", "avi", "mpg", "mpeg", "mov", "ogv", "wmv", "flv")
 _AUDIO = ("mp3", "flac", "m4a", "ogg", "opus", "wav", "m4b")
 _TEXT = ("epub", "pdf", "cbz", "cbr", "mobi", "azw3", "djvu", "txt")
-_IMAGE = ("jpg", "jpeg", "png", "gif", "webp")
+_IMAGE = ("jpg", "jpeg", "png", "gif", "webp", "avif")
 _PROGRAM = frozenset("exe scr msi bat com cmd pif vbs vbe js jse jar apk dll lnk ps1 sh dmg pkg deb rpm appx hta cpl iso".split())
 _NOT_THE_THING = re.compile(r"(^__ia|_thumb\.|\.thumbs/|_spectrogram\.png$|_meta\.|_files\.xml$)", re.I)
 _SMALL_COPY = re.compile(r"(_64kb|_vbr|_512kb|_small|\.ia)\.(mp3|mp4)$", re.I)
@@ -187,7 +187,7 @@ def plan(meta: dict) -> dict:
     elif out["shelf"] == "book":
         # (plain text last, and only the uploader's own: the Archive's own .txt of a scan is what a
         # machine read off the pages, misprints and all)
-        take = (_first_kind(files, ("epub", "pdf", "cbz", "cbr", "mobi", "azw3"))
+        take = (_first_kind(files, ("epub", "pdf", "cbz", "cbr", "mobi", "azw3", "djvu", "fb2", "azw", "prc", "chm", "docx", "rtf"))
                 or [f for f in files if f["ext"] == "txt" and f["original"]][:1])
         if take and take[0]["ext"] == "epub":
             take = take[:1]                                  # one book: the Archive makes several of the same

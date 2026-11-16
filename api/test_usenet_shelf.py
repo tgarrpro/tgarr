@@ -9,9 +9,10 @@ import zipfile
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read()
 tree = ast.parse(src)
 want = {"_UN_SHELVES", "_UN_AUDIOBOOK_GRP", "_UN_COMIC_GRP", "_UN_SHELF_SQL", "_UN_FOLDER", "_un_shelf", "_un_single_name",
-        "_AUDIOBOOK_WORDS", "_AUDIOBOOK_PATH", "_AUDIOBOOK_SQL", "_is_audiobook", "_un_caption", "_COMIC_PAGE_RX", "_COMIC_PAGE_MOST", "_COMIC_CACHE", "_comic_pages"}
+        "_AUDIOBOOK_WORDS", "_AUDIOBOOK_PATH", "_AUDIOBOOK_SQL", "_is_audiobook", "_un_caption", "_COMIC_PAGE_RX", "_COMIC_PAGE_MOST", "_COMIC_CACHE", "_comic_pages", "_comic_is_rar"}
 import time  # noqa: E402
-ns = {"re": re, "os": os, "_zipfile": zipfile, "time": time}
+import unpack  # noqa: E402
+ns = {"re": re, "os": os, "_zipfile": zipfile, "time": time, "unpack": unpack}
 for node in tree.body:
     names = []
     if isinstance(node, ast.FunctionDef):
@@ -83,7 +84,7 @@ bad = os.path.join(tmp, "r.cbr")
 open(bad, "wb").write(b"Rar!\x1a\x07\x00 not a zip")
 try:
     ns["_comic_pages"](bad)
-    raise AssertionError("a RAR was read as a zip")
-except zipfile.BadZipFile:
+    raise AssertionError("a broken RAR was read as a comic")
+except (zipfile.BadZipFile, OSError):      # no bsdtar here, or bsdtar says it is broken
     n += 1
 print(f"test_usenet_shelf: {n} checks passed")

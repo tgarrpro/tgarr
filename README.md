@@ -12,6 +12,20 @@
 
 ## Three sources, and a household
 
+**New in 0.5.13: books open as they are.** A book, a document, a slide deck or a sheet opens in tgarr's own reader the moment it is here - type you can size, pages that fit a phone, Read aloud - with nothing to convert first and no converter to download (calibre, and the gigabyte it brought, are gone).
+
+| Opens in the reader | |
+|---|---|
+| Books | `.epub` `.mobi` `.azw` `.azw3` `.prc` `.fb2` `.txt` `.chm` |
+| Documents | `.pdf` `.docx` `.odt` `.rtf` `.html` `.md` (Markdown, laid out: headings, lists, code, tables) |
+| Slides and sheets | `.pptx` `.xlsx` `.csv` (text, pictures and tables - not the layout, not charts) |
+| Notebooks and data | `.ipynb` (notes, code, and what the code printed or drew) `.json` `.yaml` `.toml` |
+| Pictures | JPEG, PNG, GIF, WebP, AVIF as they are; a phone's HEIC and JPEG XL shown as a JPEG made of them |
+| Scanned books | `.djvu` (made into pages the first time it is opened) |
+| Comics | `.cbz` `.cbr` (page by page, a real RAR too) |
+
+Not shown, only kept for download: `.lit` `.lrf` `.pdb`, old `.doc` `.xls` `.ppt`, and Kindle books that are copy-protected.
+
 **New in 0.5.9: it works before you give it any account.** The Internet Archive is a third source - old films, radio plays, audiobooks, books and magazines that anybody may download: search it on the Archive page, press Get, and Radarr can ask for its films through tgarr with nothing configured but tgarr itself. Public Telegram channels can be followed and browsed without signing in; the Telegram app id is asked for when you first want to play a file, not before. Small things posted whole on Usenet - a book, an album, a set of pictures - are fetched by tgarr itself. And what a browser cannot play (a DVD or Blu-ray image, an avi, an mkv with sound it has no decoder for) is converted while it is watched, so a phone or a tablet can play it.
 
 **Telegram and Usenet, one indexer.** Since 0.5.8 tgarr reads Usenet as well: give it a Usenet account (Settings → Usenet) and it reads newsgroup *headers*, keeps a card for every named film, episode, album and book, and makes the NZB itself when Sonarr or Radarr wants one - no outside NZB indexer, no invite. Your downloader (SABnzbd, NZBGet) does the downloading of films and series; tgarr itself fetches only small things that were posted whole - a book, a song, a picture - straight into its Library, Music and Gallery, and never video. Like the Telegram index, the reading is shared: every install reads a different stretch and all of them can search what any of them found - names and pointers, never files. [Choosing a Usenet provider](https://tgarr.me/usenet/).
@@ -66,9 +80,9 @@ Public-tracker users have their IP logged by tens of thousands of peers. US ISPs
                       ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  tgarr-api       (FastAPI, Newznab XML)                          │
-│    GET /api?t=tvsearch&q=...   → Newznab XML                     │
-│    GET /api?t=movie&imdbid=... → Newznab XML                     │
-│    GET /api?t=get&id=GUID      → triggers download               │
+│    GET /newznab/api?t=tvsearch&q=...   → Newznab XML             │
+│    GET /newznab/api?t=movie&imdbid=... → Newznab XML             │
+│    GET /newznab/api?t=get&id=GUID      → triggers download       │
 └─────────────────────┬────────────────────────────────────────────┘
                       ▼
 ┌──────────────────────────────────────────────────────────────────┐
@@ -149,7 +163,6 @@ Once running:
 | TrueNAS Scale | ✅ TrueCharts catalog coming | [docs/install/truenas.md](docs/install/truenas.md) |
 | QNAP (Container Station) | ✅ docker-compose | [docs/install/qnap.md](docs/install/qnap.md) |
 | Portainer | ✅ stack template | [docs/install/portainer.md](docs/install/portainer.md) |
-| Kubernetes / k3s | 🛠 Helm chart v0.2 | [docs/install/kubernetes.md](docs/install/kubernetes.md) |
 
 Container images are multi-arch (`linux/amd64`, `linux/arm64`) — every modern NAS, Raspberry Pi 4/5, M-series Mac, and cloud ARM host runs them.
 
@@ -157,10 +170,10 @@ Container images are multi-arch (`linux/amd64`, `linux/arm64`) — every modern 
 
 | Component | Purpose | Stack |
 |---|---|---|
-| `crawler/` | MTProto channel listener — ingests messages to Postgres | Python · Kurigram · asyncpg |
-| `api/` | Newznab-compatible HTTP API — Sonarr/Radarr query target | Python · FastAPI |
-| `worker/` | Download executor — pulls files from Telegram, delivers to *arr | Python · Kurigram |
-| `ui/` | Web admin — channel management, stats, manual search | React · Vite |
+| `crawler/` | Talks to Telegram: indexes channels into Postgres, fetches a file when somebody opens it | Python · Kurigram · asyncpg |
+| `api/` | Every page, reader and player; Usenet and the Internet Archive; the Newznab and SABnzbd endpoints for Sonarr/Radarr | Python · FastAPI |
+| `install/` | Installers for Linux, Windows (WSL2) and macOS (Colima) | sh · PowerShell |
+| `tv/` | The Android TV app: the Media Center on a television | Java |
 | `api/schema.sql` | PostgreSQL base schema (applied by the api on start) | SQL |
 
 ## FAQ
@@ -196,7 +209,7 @@ If you are a rights-holder and believe a Telegram channel is being indexed in a 
 
 ## Status
 
-Active development. Public alpha targeted end of week — see [Issues](https://github.com/tgarrpro/tgarr/issues) for the live roadmap.
+Active development, released as it goes - see [Releases](https://github.com/tgarrpro/tgarr/releases) for what each version brought and [Issues](https://github.com/tgarrpro/tgarr/issues) for what is being worked on.
 
 ## License
 

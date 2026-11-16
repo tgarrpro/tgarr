@@ -18,9 +18,9 @@ import re
 import zlib
 import xml.etree.ElementTree as ET
 
-TAKEN = {"ebook": "epub mobi azw azw3 pdf djvu fb2 cbz cbr".split(),
+TAKEN = {"ebook": "epub mobi azw azw3 prc pdf djvu fb2 cbz cbr chm docx rtf".split(),
          "audio": "mp3 flac m4a m4b ogg opus aac wav ape wv".split(),
-         "photo": "jpg jpeg png gif webp".split()}
+         "photo": "jpg jpeg png gif webp avif".split()}
 _KIND = {e: k for k, v in TAKEN.items() for e in v}
 MB = 1024 * 1024
 MOST = {"ebook": 400 * MB, "audio": 600 * MB, "photo": 60 * MB}      # one file
@@ -54,7 +54,13 @@ def file_name(subject: str) -> str:
     m = re.search(r'"([^"]{1,240})"', subject or "")
     if m:
         return m.group(1).strip()
-    m = re.search(r"(\S+\.[A-Za-z0-9]{2,5})\s+(?:yEnc|\(\d+/\d+\))", subject or "")
+    # (a quote may be left hanging after the name - `…Breakdown.mp3" yEnc (1/14)`, its partner lost
+    #  by the poster's program: the name is still the word before it)
+    if (subject or "").count('"') == 1:
+        head = re.sub(r"^\s*[\[(]\d+\s*(?:/|of)\s*\d+[\])]\s*-?\s*", "", subject.split('"')[0]).strip()
+        if 4 < len(head) <= 240 and re.search(r"\.[A-Za-z0-9]{2,5}$", head):
+            return head
+    m = re.search(r"([^\s\"']+\.[A-Za-z0-9]{2,5})[\"']?\s+(?:yEnc|\(\d+/\d+\))", subject or "")
     return m.group(1) if m else ""
 
 

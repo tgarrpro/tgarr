@@ -32,6 +32,18 @@ import access  # local module
 import screentime  # local module
 import export  # local module
 import localfiles  # local module
+import ownbooks  # local module: books read here without converting (.txt .fb2 .docx .odt .rtf .mobi .html)
+import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
+import i18n  # local module: the words on the pages, in the languages of those who read them
+
+# What counts as a book on every shelf, count and export: everything a reader here opens.
+# (This list used to be written out in seven places, each a little different.)
+BOOK_KINDS = tuple(dict.fromkeys(("pdf", "epub", "djvu", "djv", "cbz", "cbr") + tuple(k for k in ownbooks.KINDS if k not in ownbooks.DATA_KINDS)))
+_BOOK_RX = "\\.(" + "|".join(BOOK_KINDS) + ")$"          # for PostgreSQL's ~*
+
+
+def _book_sql(col: str = "file_name") -> str:
+    return f"{col} ~* '{_BOOK_RX}'"
 import contextvars
 
 
@@ -102,7 +114,7 @@ def _cross_site(request) -> bool:
 #   * anything that acts through the account: follow, unfollow, grab, fetch,
 #     settings. The pages hide those buttons; this refuses the requests.
 _PRIVATE_ID_RX = re.compile(
-    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/lyrics|api/fav|"
+    r"^/(?:media|watch|api/thumb|api/photo-preview|api/media-status|api/ebook-status|api/lyrics|api/fav|"
     r"ebook-pdf|ebook-cover|epub|comic|pdf|play|transcode)/(\d+)(?:/|$)")
 _PUBLIC_MSG: dict = {}
 
@@ -162,6 +174,7 @@ def _pub_m(alias: str = "m") -> str:
 # else. This is decided here, for every request, not by hiding links.
 # ════════════════════════════════════════════════════════════════════
 _LOCKED = contextvars.ContextVar("tgarr_locked", default=False)
+_LANG = contextvars.ContextVar("tgarr_lang", default="en")      # the language this request is answered in
 _ACCESS = {"at": 0.0, "pin": None, "secret": None}
 _GUESSES = access.Guesses()
 _KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
@@ -384,6 +397,7 @@ def _ct_equal(a: str, b: str) -> bool:
 
 async def _request_guard(request: Request, call_next):
     path = request.url.path
+    _LANG.set(await _lang(request))
     # a different account than a moment ago: put the other one's private
     # chats into keeping (and take this one's out) before anything is shown
     if db_pool is not None and _me_id() != _PRIVATE_FOR[0]:
@@ -468,7 +482,7 @@ import usenet_client  # local module
 import usenet_rules  # local module
 import archive_org  # local module
 import updater
-import packs  # what is fetched when first wanted (calibre; the models' runtime)
+import packs  # what is fetched when first wanted (the models' runtime)
 import transcode  # local module
 import usenet_fetch  # local module
 import usenet_judge  # local module
@@ -478,7 +492,7 @@ import vision  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.12"
+TGARR_VERSION = "0.5.13"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -1213,7 +1227,7 @@ async def _stats_snapshot_worker():
         "photos":    "SELECT count(*) FROM messages WHERE media_type='photo'",
         "audio":     "SELECT count(*) FROM messages WHERE media_type='audio'",
         "books":     ("SELECT count(*) FROM messages WHERE media_type='document'"
-                      " AND file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"),
+                      " AND " + _book_sql()),
         "completed": "SELECT count(*) FROM downloads WHERE status='completed'",
     }
     await asyncio.sleep(60)  # let startup settle
@@ -1403,7 +1417,7 @@ _PWA_HEAD = ('<link rel="manifest" href="__MANIFEST__" />'
 
 def _pwa_head(kids: bool = False) -> str:
     return (_PWA_HEAD.replace("__MANIFEST__", "/mediacenter/manifest.webmanifest" if kids else "/manifest.webmanifest")
-            .replace("__THEME__", "#fff8ef" if kids else "#229ED9").replace("__TITLE__", "Media Center" if kids else "tgarr"))
+            .replace("__THEME__", "#0b0d12" if kids else "#229ED9").replace("__TITLE__", "Media Center" if kids else "tgarr"))
 
 
 def _pwa_manifest(kids: bool) -> dict:
@@ -1412,7 +1426,7 @@ def _pwa_manifest(kids: bool) -> dict:
              {"src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}]
     if kids:
         return {"name": "tgarr Media Center", "short_name": "Media Center", "id": "/mediacenter", "start_url": "/mediacenter",
-                "scope": "/", "display": "standalone", "background_color": "#fff8ef", "theme_color": "#fff8ef", "icons": icons}
+                "scope": "/", "display": "standalone", "background_color": "#0b0d12", "theme_color": "#0b0d12", "icons": icons}
     return {"name": "tgarr", "short_name": "tgarr", "id": "/", "start_url": "/", "scope": "/", "display": "standalone",
             "background_color": "#0e1621", "theme_color": "#229ED9", "icons": icons}
 
@@ -1487,6 +1501,9 @@ PREVIEWS_DIR = "/downloads/previews"
 _THUMB_SAFE = _re.compile(r"^[A-Za-z0-9_\-]+\.jpg$")
 
 
+_PUBLIC_THUMB: dict = {}          # thumbnail file -> may it be shown to a browser that is not signed in
+
+
 @app.get("/thumbs/{fname}")
 async def serve_thumb(fname: str):
     if not _THUMB_SAFE.match(fname):
@@ -1494,6 +1511,22 @@ async def serve_thumb(fname: str):
     path = os.path.join(THUMBS_DIR, fname)
     if not os.path.exists(path):
         return Response("not found", status_code=404)
+    if not _signed_in() and db_pool is not None:
+        # signed out, a private chat's pictures are not shown - and a thumbnail's address can
+        # be kept from when they were. Only one that belongs to a public channel or to this
+        # machine's own files is given out.
+        ok = _PUBLIC_THUMB.get(fname)
+        if ok is None:
+            async with db_pool.acquire() as conn:
+                ok = bool(await conn.fetchval(
+                    """SELECT 1 FROM messages m JOIN channels c ON c.id = m.channel_id
+                        WHERE (m.thumb_path = $1 OR m.preview_path = $1)
+                          AND (c.username IS NOT NULL OR c.local_root IS NOT NULL) LIMIT 1""", fname))
+            if len(_PUBLIC_THUMB) > 20000:
+                _PUBLIC_THUMB.clear()
+            _PUBLIC_THUMB[fname] = ok
+        if not ok:
+            return Response("not found", status_code=404)
     return FileResponse(path, media_type="image/jpeg",
                        headers={"Cache-Control": "public, max-age=604800"})
 
@@ -1650,7 +1683,18 @@ async def lazy_preview(msg_id: int):
                    media_type="image/gif")
 
 
+_ACTIVE_TYPES = ("text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml", "text/javascript",
+                 "application/javascript", "application/x-javascript", "text/css", "application/x-shockwave-flash",
+                 "multipart/related", "message/rfc822", "application/x-mimearchive")
+
+
 def _mime_for(media_type, mime):
+    """The type a file is served as. What Telegram says a file is, is what its sender said:
+    a file that calls itself a web page (or a drawing with script in it) would run in this
+    site's name if it were handed to the browser as one. Those are served as plain bytes."""
+    mime = (mime or "").split(";")[0].strip().lower()
+    if mime in _ACTIVE_TYPES or mime.endswith("+xml"):
+        return "application/octet-stream"
     if mime:
         return mime
     return ("audio/mpeg" if media_type == "audio"
@@ -1732,16 +1776,27 @@ async def serve_media(msg_id: int, request: Request):
         # Partial file or unknown size: fall through to progressive streamer
         start, end = 0, (total_size - 1) if total_size else None
     else:
-        m = _re.match(r"bytes=(\d+)-(\d*)", range_header)
-        if not m:
+        m = _re.match(r"bytes=(\d{1,15})-(\d{0,15})\s*$", range_header)
+        last = _re.match(r"bytes=-(\d{1,15})\s*$", range_header)
+        if last and total_size and int(last.group(1)) > 0:
+            start, end = max(0, total_size - int(last.group(1))), total_size - 1       # "the last N bytes"
+        elif not m:
             return Response("bad range", status_code=416)
-        start = int(m.group(1))
-        end = int(m.group(2)) if m.group(2) else (
-            total_size - 1 if total_size else None)
+        else:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else (
+                total_size - 1 if total_size else None)
+        if total_size:
+            if start >= total_size:
+                return Response("no such bytes", status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
+            if end is not None:
+                end = min(end, total_size - 1)      # asked for more than there is: what there is
 
     if end is None:
         # Without TG size, just serve whatever\'s in the file now
         end = os.path.getsize(path) - 1
+    if end < start:
+        return Response("no such bytes", status_code=416)
 
     def _tail_read(pos: int, n: int) -> bytes:
         """Bytes at `pos` from the "<file>.tail" sidecar: the end of a file
@@ -1783,8 +1838,10 @@ async def serve_media(msg_id: int, request: Request):
                     # Partial file caught up — wait for crawler to write more.
                     # Abort if download appears stalled.
                     stuck_iters += 1
-                    if stuck_iters == 60 and not revived:
+                    if stuck_iters == 60 and not revived and not (total_size and current >= total_size):
                         # 30 s without a new byte: the fetch is not running
+                        # (never for a file that is here in full: asking for it again would
+                        #  take its place away from it - and an uploaded file has no other)
                         revived = True
                         await _revive_fetch(msg_id, _lp)
                     if stuck_iters > 600:  # 5 min no progress = give up
@@ -1858,7 +1915,7 @@ def _local_pill(lp) -> str:
     if not _is_local(lp):
         return ""
     return ('<span class="pill ok" style="font-size:11px" '
-            'title="already downloaded: opens instantly">● saved</span>')
+            f'title="{_t("already downloaded: opens instantly")}">● {_t("saved")}</span>')
 
 
 async def _touch_local(msg_id: int) -> None:
@@ -2232,23 +2289,23 @@ async def _update_banner() -> str:
     st = _update_state(rows, time.time())
     if st["kind"] in ("current", "dismissed", "pending"):
         return ""
-    latest = html.escape(st["latest"])
     hide = ('<form method="POST" action="/api/update/dismiss" style="margin:0">'
-            '<button class="abtn" type="submit" title="hide until the next version">Hide</button></form>')
+            f'<button class="abtn" type="submit" title="{_t("hide until the next version")}">{_t("Hide")}</button></form>')
     box = ('<div style="background:{bg};border:1px solid {bd};border-radius:12px;padding:14px 18px;'
            'margin-bottom:16px;line-height:1.6;display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">'
            '<div style="flex:1;min-width:240px">{body}</div>{hide}</div>')
     if st["kind"] == "pinned":
-        body = (f'<b>tgarr {latest} is available.</b> This install stays on {html.escape(TGARR_VERSION)} '
-                f'because <code>TGARR_TAG={html.escape(st["tag"])}</code> is set in <code>.env</code>. '
-                f'Remove that line and run <code>docker compose up -d</code> to follow new versions.')
+        body = (f'<b>{_t("tgarr {latest} is available.", latest=st["latest"])}</b> '
+                + _t("This install stays on {cur} because %1 is set in %2. Remove that line and run %3 to follow new versions.", cur=TGARR_VERSION)
+                .replace("%1", f'<code>TGARR_TAG={html.escape(st["tag"])}</code>')
+                .replace("%2", '<code>.env</code>').replace("%3", '<code>docker compose up -d</code>'))
         return box.format(bg="#eff6ff", bd="#bfdbfe", body=body, hide=hide)
-    body = (f'<b>tgarr {latest} is available, and this install is still on {html.escape(TGARR_VERSION)}.</b> '
-            f'It has not updated itself in {st["hours"]} hours, so its updater is probably missing or not running. '
-            f'To update now, in the folder that holds <code>docker-compose.yml</code>:'
-            f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
-            f'<a class="btn" href="/settings/update" style="margin-right:10px">Update now</a>'
-            f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">How to make updates automatic again</a>')
+    body = (f'<b>{_t("tgarr {latest} is available, and this install is still on {cur}.", latest=st["latest"], cur=TGARR_VERSION)}</b> '
+            + _t("It has not updated itself in {h} hours, so its updater is probably missing or not running.", h=st["hours"]) + ' '
+            + _t("To update now, in the folder that holds %1:").replace("%1", '<code>docker-compose.yml</code>')
+            + f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
+            f'<a class="btn" href="/settings/update" style="margin-right:10px">{_t("Update now")}</a>'
+            f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">{_t("How to make updates automatic again")}</a>')
     return box.format(bg="#fffbeb", bd="#fde68a", body=body, hide=hide)
 
 
@@ -2315,27 +2372,27 @@ async def page_settings_update():
 .up-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .up-msg{margin-top:12px;line-height:1.6}.up-msg code{background:rgba(127,127,127,.14);padding:2px 6px;border-radius:5px}
 </style>
-<div class="up-box"><h3>This install <span id="upPill"></span></h3>
+<div class="up-box"><h3>[[@This install]] <span id="upPill"></span></h3>
 <p id="upLine">…</p>
-<div class="up-row"><button class="btn" id="upNow" onclick="upNow()">Update now</button>
-<button class="btn ghost" id="upChk" onclick="upCheck()">Check for a new version</button></div>
+<div class="up-row"><button class="btn" id="upNow" onclick="upNow()">[[@Update now]]</button>
+<button class="btn ghost" id="upChk" onclick="upCheck()">[[@Check for a new version]]</button></div>
 <div class="up-msg" id="upMsg"></div></div>
-<div class="up-box"><h3>How tgarr is kept current</h3>
-<p>A small updater runs beside tgarr and looks every half hour whether a newer version was released; when there is one it fetches it and
-restarts tgarr - your data is not touched. <b>Update now</b> has it look at once. If the updater is not running, or this install was set up
-from an older docker-compose.yml, the message above says what to type instead.</p></div>
+<div class="up-box"><h3>[[@How tgarr is kept current]]</h3>
+<p>[[@A small updater runs beside tgarr and looks every half hour whether a newer version was released; when there is one it fetches it and restarts tgarr - your data is not touched.]]
+__UPNOW__ [[@If the updater is not running, or this install was set up from an older docker-compose.yml, the message above says what to type instead.]]</p></div>
 <script>
 const esc = t => String(t).replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
 const code = t => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>");
 const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
+const fmt = (s, ...a) => s.replace(/%([1-9])/g, (m, i) => a[i - 1]);
 let was = null, waiting = false;
 function show(j){
   if (was === null) was = j.running;
   const newer = j.kind && j.kind !== "current";
-  document.getElementById("upPill").innerHTML = newer ? pill("bad", esc(j.latest) + " is out") : pill("ok", "current");
-  document.getElementById("upLine").innerHTML = "Running <b>" + esc(j.running) + "</b>" + (newer ? " - <b>" + esc(j.latest) + "</b> was released." : ".")
-    + (j.checked_at ? " tgarr.me was last asked " + new Date(j.checked_at * 1000).toLocaleString() + "." : "")
-    + (j.kind === "pinned" ? " Held at <code>" + esc(j.tag) + "</code> by TGARR_TAG in .env." : "");
+  document.getElementById("upPill").innerHTML = newer ? pill("bad", fmt("[[@js:%1 is out]]", esc(j.latest))) : pill("ok", "[[@js:current]]");
+  document.getElementById("upLine").innerHTML = (newer ? fmt("[[@js:Running %1 - %2 was released.]]", "<b>" + esc(j.running) + "</b>", "<b>" + esc(j.latest) + "</b>") : fmt("[[@js:Running %1.]]", "<b>" + esc(j.running) + "</b>"))
+    + (j.checked_at ? " " + fmt("[[@js:tgarr.me was last asked %1.]]", new Date(j.checked_at * 1000).toLocaleString()) : "")
+    + (j.kind === "pinned" ? " " + fmt("[[@js:Held at %1 by TGARR_TAG in .env.]]", "<code>" + esc(j.tag) + "</code>") : "");
   if (waiting && j.running !== was) location.reload();
 }
 function poll(){ fetch("/api/update").then(r => r.json()).then(show).catch(() => {}).finally(() => setTimeout(poll, waiting ? 3000 : 30000)); }
@@ -2343,19 +2400,20 @@ function say(t, bad){ const m = document.getElementById("upMsg"); m.style.color 
 function upCheck(){
   const b = document.getElementById("upChk"); b.disabled = true;
   fetch("/api/update/check", {method: "POST"}).then(r => r.json()).then(j => {
-    say(j.status !== "ok" ? j.message : j.newer ? "tgarr " + j.latest + " is out; this install runs " + j.running + "." : "This is the current version (" + j.running + ").", j.status !== "ok");
+    say(j.status !== "ok" ? j.message : j.newer ? fmt("[[@js:tgarr %1 is out; this install runs %2.]]", j.latest, j.running) : fmt("[[@js:This is the current version (%1).]]", j.running), j.status !== "ok");
     return fetch("/api/update").then(r => r.json()).then(show);
-  }).catch(() => say("this server did not answer", true)).finally(() => { b.disabled = false; });
+  }).catch(() => say("[[@js:this server did not answer]]", true)).finally(() => { b.disabled = false; });
 }
 function upNow(){
-  const b = document.getElementById("upNow"); b.disabled = true; say("Asking the updater…");
+  const b = document.getElementById("upNow"); b.disabled = true; say("[[@js:Asking the updater…]]");
   fetch("/api/update/now", {method: "POST"}).then(r => r.json()).then(j => {
     say(j.message || "", !["asked", "current"].includes(j.state));
     if (j.state === "asked") { waiting = true; poll(); setTimeout(() => { b.disabled = false; }, 240000); } else b.disabled = false;
-  }).catch(() => { say("tgarr is restarting - this page comes back by itself."); waiting = true; poll(); });
+  }).catch(() => { say("[[@js:tgarr is restarting - this page comes back by itself.]]"); waiting = true; poll(); });
 }
 poll();
 </script>"""
+    body = _fill(body).replace("__UPNOW__", _t("%1 has it look at once.").replace("%1", f'<b>{_t("Update now")}</b>'))
     return HTMLResponse(_layout("Update", "/settings", body, page_title="Updating tgarr", top_actions_html=""))
 
 
@@ -2378,14 +2436,14 @@ def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> 
     links = []
     if offset > 0:
         prev = max(0, offset - size)
-        links.append(f'<a class="btn ghost" href="{path}{qs(offset=prev if prev else None)}">← prev</a>')
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=prev if prev else None)}">← {_t("Prev")}</a>')
     if offset + size < total:
-        links.append(f'<a class="btn ghost" href="{path}{qs(offset=offset + size)}">next →</a>')
+        links.append(f'<a class="btn ghost" href="{path}{qs(offset=offset + size)}">{_t("Next")} →</a>')
     return (
         '<div style="display:flex;justify-content:space-between;align-items:center;'
         'margin-top:18px;padding:12px 0 90px;border-top:1px solid var(--border, #e2e8f0)">'
         f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {offset + 1 if shown else 0}–{offset + shown} of {total:,}</span>'
+        f'{_t("showing {a}–{b} of {total}", a=offset + 1 if shown else 0, b=offset + shown, total=f"{total:,}")}</span>'
         f'<div style="display:flex;gap:8px">{"".join(links)}</div></div>')
 
 
@@ -2393,10 +2451,10 @@ def _page_nav(path: str, qs, offset: int, size: int, shown: int, total: int) -> 
 # folders. Videos, Music and the Library can be narrowed to one of them. A source is told by
 # the made-up chat id its folder stands under (localfiles.chat_id), so the condition needs
 # nothing but the message row.
-_SRC_NAMES = (("tg", "✈ Telegram", "from Telegram channels and chats"),
-              ("usenet", "📰 Usenet", "fetched from the newsgroups"),
-              ("archive", "🏛 Internet Archive", "fetched from the Internet Archive"),
-              ("mine", "📁 My files", "uploaded to this server, or found in its folders"))
+_SRC_NAMES = (("tg", "✈", "Telegram", "from Telegram channels and chats"),
+              ("usenet", "📰", "Usenet", "fetched from the newsgroups"),
+              ("archive", "🏛", "Internet Archive", "fetched from the Internet Archive"),
+              ("mine", "📁", "My files", "uploaded to this server, or found in its folders"))
 
 
 def _src_ids() -> tuple:
@@ -2426,13 +2484,14 @@ async def _src_counts(conn, from_sql: str, where: list, params: list) -> dict:
 def _src_chips(path: str, qs, src: str, counts: dict) -> str:
     """The sources as chips - only when there is a choice to make: two sources or more have
     something, or one is chosen already."""
-    if not src and sum(1 for k, _, _ in _SRC_NAMES if counts.get(k)) < 2:
+    if not src and sum(1 for k, *_ in _SRC_NAMES if counts.get(k)) < 2:
         return ""
     on = "background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);"
     out = ""
-    for k, label, tip in _SRC_NAMES:
+    for k, sign, name, tip in _SRC_NAMES:
         if not counts.get(k) and k != src:
             continue
+        label, tip = f"{sign} {_t(name)}", _t(tip)
         out += (f'<a class="btn ghost" href="{path}{qs(src=None if src == k else k, offset=None)}" '
                 f'style="{on if src == k else ""}padding:5px 12px;font-size:12px" title="{tip}">'
                 f'{label} <span style="opacity:.6">{counts.get(k, 0):,}</span></a>')
@@ -2444,11 +2503,11 @@ def _saved_chip(path: str, qs, local: int) -> str:
              if local else "")
     chip = (f'<a class="btn ghost" href="{path}{qs(local=None if local else 1)}" '
             f'style="{style}padding:5px 12px;font-size:12px" '
-            f'title="only what is already downloaded">● saved</a>')
+            f'title="{_t("only what is already downloaded")}">● {_t("saved")}</a>')
     # with "saved" chosen: everything of this kind that is on this machine, as one zip, at once
     kind = {"/music": "audio", "/library": "book", "/videos": "video"}.get(path)
     if local and kind and _signed_in():
-        chip += _export_btn({"scope": "saved", "kind": kind}, "⬇ Download all")
+        chip += _export_btn({"scope": "saved", "kind": kind}, "⬇ " + _t("Download all"))
     return chip
 
 
@@ -2825,7 +2884,7 @@ import re as _re
 
 _EPUB_MIME = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-    "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp",
+    "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp", "avif": "image/avif",
     "css": "text/css", "html": "text/html", "xhtml": "application/xhtml+xml",
     "js": "application/javascript", "ttf": "font/ttf", "otf": "font/otf",
     "woff": "font/woff", "woff2": "font/woff2",
@@ -2854,7 +2913,7 @@ def _ebook_safe_to_convert(src: str, ext: str) -> bool:
     and entry count at 20K. Non-zip formats pass through (calibre has
     its own format-specific limits)."""
     if ext not in ("epub", "cbz", "cbr", "docx", "odt"):
-        return True  # mobi/azw/djvu/etc. not zip-based; trust calibre
+        return True  # djvu and the like are not zips
     import zipfile
     try:
         with zipfile.ZipFile(src) as zf:
@@ -2904,10 +2963,17 @@ def _ebook_lock(msg_id: int):
     return _EBOOK_LOCKS[msg_id]
 
 
-_EBOOK_CONVERTIBLE = ("epub", "mobi", "azw", "azw3", "djvu", "fb2",
-                      "lit", "cbr", "cbz", "rtf", "lrf", "pdb",
-                      # plain documents a household uploads: readable, and read aloud, like a book
-                      "txt", "docx", "odt")
+# What is made into a PDF before it is read: scanned books only. (calibre used to make one of
+# every book that was not an EPUB; the reader opens those by itself now - ownbooks.py.)
+_EBOOK_CONVERTIBLE = ("djvu", "djv")
+_NOT_SHOWN = "this kind of book cannot be shown here - download it to read it with another program"
+
+def _djvu_tool(src: str):
+    """The program that turns a scanned .djvu into a PDF by itself (ddjvu, a few megabytes in
+    the image), so those need no calibre; None for another kind of book or an older image."""
+    import shutil
+    return shutil.which("ddjvu") if src.lower().endswith((".djvu", ".djv")) else None
+
 
 def _ebook_paths(local_path: str):
     """Return (source_abs, pdf_abs, cover_abs) for a cached ebook."""
@@ -2978,19 +3044,20 @@ async def _ebook_watchdog(proc, src: str) -> str:
 
 
 async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
-    """Run calibre ebook-convert src → pdf. Returns True on success.
+    """A scanned .djvu made into a PDF (ddjvu), kept beside it. Returns True on success.
     Idempotent: skip if pdf already exists and is newer than src.
-    Serialized per msg_id so concurrent /ebook-pdf hits don't fork 2 calibres.
-    """
+    Serialized per msg_id so two requests for one book do not convert it twice.
+    Every other kind of book is opened by the reader itself (ownbooks.py); what neither can
+    show - .lit, .lrf, .pdb, a protected Kindle book - is offered as a download."""
     import asyncio
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return True
     import time as _t
-    # calibre is no longer in the image: it is fetched when a book first needs it (packs.py).
-    # Until then nothing is queued - the page that asked says so and offers to fetch it.
-    convert = packs.program("ebook-convert")
-    if not convert:
-        _EBOOK_JOBS[msg_id] = {"state": "needs_converter", "started_at": _t.time()}
+    djvu = _djvu_tool(src)
+    if not djvu:
+        _EBOOK_JOBS[msg_id] = {"state": "failed", "reason": _NOT_SHOWN, "started_at": _t.time()}
+        try: os.unlink(src + ".queue")           # (a marker an older version left for calibre)
+        except OSError: pass
         return False
     # Mark queued + write disk marker for restart persistence
     if msg_id not in _EBOOK_JOBS or _EBOOK_JOBS[msg_id].get("state") == "failed":
@@ -3007,24 +3074,19 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
             except OSError: pass
             return True
         _EBOOK_JOBS[msg_id] = {"state": "converting", "started_at": _t.time()}
-        env = dict(os.environ)
-        env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
-        env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
-        env["QT_QPA_PLATFORM"] = "offscreen"          # there is no screen to draw on
         tmp = pdf + ".inprogress.pdf"
         # preexec_fn: RLIMIT_CPU 240s + RLIMIT_FSIZE 200MB; mem bound via container cgroup
         def _set_limits():
-            # (an address-space limit is no use here: Chromium maps a terabyte
-            # and touches little of it - memory is watched by _ebook_watchdog)
+            # (memory and time are watched by _ebook_watchdog)
             try:
                 os.nice(15)          # never compete with playback or the UI
             except OSError:
                 pass
         proc = await asyncio.create_subprocess_exec(
-            convert, src, tmp,
+            djvu, "-format=pdf", "-quality=85", src, tmp,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            env=env, preexec_fn=_set_limits, start_new_session=True)
+            preexec_fn=_set_limits, start_new_session=True)
         stopped = await _ebook_watchdog(proc, src)
         if stopped:
             for _f in (tmp, src + ".queue"):     # not retried: it would do the same again
@@ -3051,23 +3113,97 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         return False
 
 
+# The kinds of book whose cover can be had at all. (For the others nobody is asked: opening a
+# whole .txt or a spreadsheet to learn that it has no cover is a book parsed for nothing.)
+_COVER_KINDS = ("pdf", "epub", "djvu", "djv") + ownbooks.COVER_KINDS
+_NO_COVER: dict = {}              # file -> its mtime when it was found to have no cover
+
+
+def _cover_bytes(src: str):
+    """The cover of a book as the bytes of a picture, or None: an EPUB's or another book's own
+    (ownbooks.py), the first page of a PDF or of a scanned .djvu."""
+    import subprocess
+    import tempfile
+    low = src.lower()
+    kind = ownbooks.kind_of(src)
+    if kind and kind not in ownbooks.COVER_KINDS:
+        return None
+    if kind:
+        try:
+            book = ownbooks.load(src, kind)
+        except Exception:
+            return None
+        got = book.asset(book.cover) if book.cover else None
+        return got[0] if got else None
+    if low.endswith(".epub"):
+        try:
+            with _zipfile.ZipFile(src) as zf:
+                pics = [i for i in zf.infolist() if re.search(r"\.(jpe?g|png|webp|avif)$", i.filename, re.I) and i.file_size < 30 * 1024 * 1024]
+                named = sorted((i for i in pics if "cover" in i.filename.lower()), key=lambda i: len(i.filename))
+                pick = (named or pics[:1] or [None])[0]
+                return zf.read(pick) if pick else None
+        except Exception:
+            return None
+    tmp = tempfile.mkdtemp(prefix="cover-")
+    try:
+        if low.endswith(".pdf"):
+            subprocess.run(["pdftoppm", "-f", "1", "-l", "1", "-singlefile", "-jpeg", "-scale-to", "900", src, os.path.join(tmp, "c")],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=40)
+            out = os.path.join(tmp, "c.jpg")
+        elif _djvu_tool(src):
+            out = os.path.join(tmp, "c.ppm")
+            subprocess.run([_djvu_tool(src), "-format=ppm", "-page=1", "-size=900x1200", src, out],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=40)
+        else:
+            return None
+        if not os.path.exists(out) or os.path.getsize(out) > 60 * 1024 * 1024:
+            return None
+        with open(out, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def _ebook_cover(src: str, cover: str) -> bool:
-    import asyncio
+    """The cover of a book kept here, written beside it as a JPEG the first time it is asked
+    for. False when the book has none."""
     if os.path.exists(cover):
         return True
-    meta = packs.program("ebook-meta")
-    if not meta:                                    # (no converter fetched yet: no cover from these formats)
-        return False
-    proc = await asyncio.create_subprocess_exec(
-        meta, src, f"--get-cover={cover}",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL)
     try:
-        await asyncio.wait_for(proc.communicate(), timeout=30)
-    except asyncio.TimeoutError:
-        proc.kill()
+        mtime = os.path.getmtime(src)
+    except OSError:
         return False
-    return proc.returncode == 0 and os.path.exists(cover)
+    if _NO_COVER.get(src) == mtime:
+        return False
+
+    def _make() -> bool:
+        data = _cover_bytes(src)
+        if not data:
+            if len(_NO_COVER) > 20000:
+                _NO_COVER.clear()
+            _NO_COVER[src] = mtime
+            return False
+        try:
+            import io
+            from PIL import Image
+            im = Image.open(io.BytesIO(data))
+            im.load()
+            im = im.convert("RGB")
+            im.thumbnail((900, 1200))
+            im.save(cover + ".part", "JPEG", quality=85)
+            os.replace(cover + ".part", cover)
+            return True
+        except Exception:
+            try: os.unlink(cover + ".part")
+            except OSError: pass
+            return False
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_make), timeout=60)
+    except Exception:
+        return False
 
 
 @app.get("/api/ebook-status/{msg_id}")
@@ -3100,14 +3236,9 @@ async def ebook_status(msg_id: int, request: Request):
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
                 "size": os.path.getsize(pdf)}
-    if not packs.program("ebook-convert"):
-        st = packs.status("books")
-        return {"state": "needs_converter", "installing": st["installing"], "done": st["done"], "bytes": st["bytes"],
-                "error": st["error"], "possible": st["possible"]}
+    if not _djvu_tool(src):
+        return {"state": "failed", "reason": _NOT_SHOWN}
     job = _EBOOK_JOBS.get(msg_id)
-    if job and job.get("state") == "needs_converter":      # it has arrived since: start over
-        _EBOOK_JOBS.pop(msg_id, None)
-        job = None
     if job and job.get("state") == "converting":
         import time as _t
         return {"state": "converting",
@@ -3165,40 +3296,66 @@ async def ebook_pdf(msg_id: int):
                             headers={"Content-Disposition": "inline",
                                      "Cache-Control": "private, max-age=3600"})
     if ext not in _EBOOK_CONVERTIBLE:
-        return Response(f"format .{ext} not supported by ebook-convert",
-                        status_code=415)
+        return Response(f"a .{ext} is not shown as pages here", status_code=415)
     if not _ebook_safe_to_convert(src, ext):
         return Response("file rejected: zip-bomb or malformed archive", status_code=422)
     ok = await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not ok:
-        if not packs.program("ebook-convert"):
-            return Response("the book converter is not installed yet: open the book's page to fetch it", status_code=409)
-        return Response("conversion failed", status_code=500)
+        return Response("this book could not be made into pages", status_code=500)
     return FileResponse(pdf, media_type="application/pdf",
                         headers={"Content-Disposition": "inline",
                                  "Cache-Control": "private, max-age=86400"})
 
 
+_WAS_CONVERTED = ("epub", "mobi", "azw", "azw3", "fb2", "lit", "cbr", "cbz", "rtf", "lrf", "pdb", "txt", "docx", "odt")
+
+
+def _calibre_pdfs_sweep(root: str = "/downloads") -> tuple:
+    """Delete `<book>.<ext>.pdf` (and the marks of a conversion) beside a book of a kind calibre
+    used to convert: nothing opens those PDFs any more. Only a PDF whose own book lies next to
+    it goes - never a PDF somebody saved. Returns (how many, bytes)."""
+    n = size = 0
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        have = set(files)
+        for f in files:
+            for tail in (".pdf", ".queue", ".pdf.inprogress.pdf"):
+                if not f.endswith(tail):
+                    continue
+                book = f[:-len(tail)]
+                if book in have and "." in book and book.rsplit(".", 1)[-1].lower() in _WAS_CONVERTED:
+                    full = os.path.join(base, f)
+                    try:
+                        if not os.path.islink(full):
+                            size += os.path.getsize(full)
+                            os.unlink(full)
+                            n += 1
+                    except OSError:
+                        pass
+                break
+    return n, size
+
+
 async def _packs_heal():
     """An install that was using what the image used to carry gets it back without being asked:
-    the models' runtime if a voice or the picture model is installed, the book converter if
-    there are books here it is needed for (looked at once, at the first start of a version
-    that no longer carries it; a new install fetches it when a book first asks)."""
+    the models' runtime if a voice or the picture model is installed. And what calibre left
+    behind is cleared away once: calibre itself, and the PDFs it made of books."""
     await asyncio.sleep(90)
     try:
         if (tts.installed("voice") or vision.installed()) and not packs.installed("runtime"):
             log.info("[packs] a model is installed but what it runs on is no longer in the image: fetching it")
             packs.install("runtime")
-        if not packs.installed("books"):
+        freed = await asyncio.to_thread(packs.forget_books)
+        if freed:
+            log.info("[packs] calibre is not used any more: the %d MB an older version fetched are given back", freed // (1024 * 1024))
+        async with db_pool.acquire() as conn:
+            swept = await conn.fetchval("SELECT value FROM config WHERE key = 'calibre_pdfs_swept'")
+        if not swept:
+            n, size = await asyncio.to_thread(_calibre_pdfs_sweep)
             async with db_pool.acquire() as conn:
-                if not await conn.fetchval("SELECT value FROM config WHERE key = 'packs_seeded'"):
-                    n = await conn.fetchval(
-                        r"""SELECT count(*) FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
-                             AND file_name ~* '\.(mobi|azw3?|fb2|djvu|lit|rtf|lrf|pdb|docx|odt)$'""")
-                    await conn.execute("INSERT INTO config (key, value) VALUES ('packs_seeded', '1') ON CONFLICT (key) DO NOTHING")
-                    if n:
-                        log.info("[packs] %d books here need the converter the image no longer carries: fetching it", n)
-                        packs.install("books")
+                await conn.execute("INSERT INTO config (key, value) VALUES ('calibre_pdfs_swept', '1') ON CONFLICT (key) DO NOTHING")
+            if n:
+                log.info("[packs] %d PDFs calibre once made of books that are now read as they are: deleted, %d MB given back", n, size // (1024 * 1024))
     except Exception as e:
         log.warning("[packs] looking what is needed: %s", e)
 
@@ -3262,6 +3419,18 @@ _EPUB_CSP = ("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline
 _EPUB_INDEX_CACHE: dict = {}      # path -> (mtime, index)
 
 
+_EPUB_PART_MOST = 32 * 1024 * 1024       # one page, list or style sheet of a book, unpacked
+_EPUB_ASSET_MOST = 64 * 1024 * 1024      # one picture or font
+
+
+def _zread(zf, name: str, most: int = _EPUB_PART_MOST) -> bytes:
+    """One member of a zip, if it is not larger unpacked than a part of a book ever is. (A few
+    kilobytes can unpack to gigabytes; the size is written in the zip and is looked at first.)"""
+    if zf.getinfo(name).file_size > most:
+        raise ValueError(f"a part of this book is too large to open ({name[-60:]})")
+    return zf.read(name)
+
+
 def _epub_index(epub_path: str) -> dict:
     """Reading order + chapter titles of a book. Cached per file."""
     mtime = os.path.getmtime(epub_path)
@@ -3270,14 +3439,14 @@ def _epub_index(epub_path: str) -> dict:
         return hit[1]
     from xml.etree import ElementTree as _ET
     with _zipfile.ZipFile(epub_path) as zf:
-        container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+        container = _zread(zf, "META-INF/container.xml").decode("utf-8", "replace")
         ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
         opf_node = _ET.fromstring(container).find(".//c:rootfile", ns_c)
         if opf_node is None:
             raise RuntimeError("OPF not declared in container.xml")
         opf_path = opf_node.attrib["full-path"]
         opf_dir = os.path.dirname(opf_path).replace("\\", "/")
-        opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+        opf_root = _ET.fromstring(_zread(zf, opf_path).decode("utf-8", "replace"))
         ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
 
         def _in_zip(base_dir, href):
@@ -3306,14 +3475,14 @@ def _epub_index(epub_path: str) -> dict:
             try:
                 if "nav" in (it.get("properties") or "").split():
                     nav_path = _in_zip(opf_dir, href)
-                    nav = zf.read(nav_path).decode("utf-8", "replace")
+                    nav = _zread(zf, nav_path).decode("utf-8", "replace")
                     nav_dir = os.path.dirname(nav_path)
                     for m in _re.finditer(r"<a\b[^>]*\bhref=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
                                           nav, _re.DOTALL | _re.IGNORECASE):
                         titles.setdefault(_in_zip(nav_dir, m.group(1)), _clean(m.group(2)))
                 elif it.get("media-type") == "application/x-dtbncx+xml":
                     ncx_path = _in_zip(opf_dir, href)
-                    ncx = zf.read(ncx_path).decode("utf-8", "replace")
+                    ncx = _zread(zf, ncx_path).decode("utf-8", "replace")
                     ncx_dir = os.path.dirname(ncx_path)
                     for m in _re.finditer(
                             r"<navLabel>\s*<text>(.*?)</text>\s*</navLabel>\s*"
@@ -3329,7 +3498,8 @@ def _epub_index(epub_path: str) -> dict:
                 if titles.get(c):
                     continue
                 try:
-                    head = zf.read(c)[:6000].decode("utf-8", "replace")
+                    with zf.open(c) as part:
+                        head = part.read(6000).decode("utf-8", "replace")
                 except KeyError:
                     continue
                 m = (_re.search(r"<h[1-3][^>]*>(.*?)</h[1-3]>", head, _re.DOTALL | _re.IGNORECASE)
@@ -3351,15 +3521,17 @@ def _epub_index(epub_path: str) -> dict:
 def _epub_chapter_body(zf, msg_id: int, chapter_path: str) -> str:
     """The <body> of one chapter, made safe to show: references rewritten to
     /epub/{id}/asset/..., style sheets, scripts and event handlers removed."""
-    raw_html = zf.read(chapter_path).decode("utf-8", errors="replace")
+    raw_html = _zread(zf, chapter_path).decode("utf-8", errors="replace")
     m = _re.search(r"<body[^>]*>(.*?)</body>", raw_html, _re.DOTALL | _re.IGNORECASE)
     body_html = m.group(1) if m else raw_html
     chapter_dir = os.path.dirname(chapter_path).replace("\\", "/")
 
     def fix_ref(match):
         src = _uq(match.group(1))
-        if src.startswith(("http://", "https://", "data:", "/")):
-            return match.group(0)
+        if src.startswith("/"):
+            return match.group(0).replace(match.group(1), "data:,")
+        if src.startswith(("http://", "https://", "data:")):
+            return match.group(0)        # (the chapter's policy lets nothing from outside load)
         abs_in_zip = os.path.normpath(os.path.join(chapter_dir, src)).replace("\\", "/")
         return match.group(0).replace(match.group(1), f"/epub/{msg_id}/asset/{_q(abs_in_zip)}")
 
@@ -3403,29 +3575,63 @@ _EPUB_CHAPTER_CSS = (
 
 
 def _epub_row_sql():
-    return "SELECT local_path, file_name FROM messages WHERE id=$1"
+    return "SELECT local_path, file_name, file_size FROM messages WHERE id=$1"
+
+
+def _arriving(row, path: str) -> bool:
+    """Is this file still on its way from Telegram? (It is written in place, so it exists
+    from the first byte; a reader that opened it now would call a good book damaged.)"""
+    try:
+        return bool(row and row["file_size"]) and os.path.getsize(path) < row["file_size"]
+    except (OSError, KeyError):
+        return False
+
+
+def _own_kind(row) -> str:
+    """'fb2', 'mobi', 'txt' ... for a file the e-book reader opens by itself (ownbooks.py);
+    '' for an EPUB and for everything else."""
+    return ownbooks.kind_of(row["file_name"] or row["local_path"] or "") if row else ""
+
+
+async def _own_book(path: str, kind: str):
+    """The book, or the sentence that says why it cannot be opened here."""
+    try:
+        return await asyncio.to_thread(ownbooks.load, path, kind), ""
+    except ownbooks.NotReadable as e:
+        return None, i18n.t(_LANG.get(), str(e))      # said in the reader's language (words_books.py)
+    except Exception as e:
+        return None, i18n.t(_LANG.get(), "this book could not be opened ({why})", why=type(e).__name__)
 
 
 # ── comics ─────────────────────────────────────────────────────────────────────────────
 # A .cbz (and many a .cbr) is a zip of pictures. Converting one means unpacking every page
 # into memory at once - a 160 MB scan of a newspaper needs gigabytes. Reading one needs a
 # page at a time, so that is what is done: the pages are served as they lie in the zip.
-_COMIC_PAGE_RX = re.compile(r"\.(jpe?g|png|gif|webp)$", re.I)
-_COMIC_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+_COMIC_PAGE_RX = re.compile(r"\.(jpe?g|png|gif|webp|avif)$", re.I)
+_COMIC_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 _COMIC_PAGE_MOST = 80 * 1024 * 1024
 _COMIC_CACHE: dict = {}           # path -> (mtime, [names in reading order])
 
 
+def _comic_is_rar(path: str) -> bool:
+    return unpack.magic(path, 6) == unpack.RAR_MAGIC
+
+
 def _comic_pages(path: str) -> list:
-    """The pictures of a comic in reading order. Raises when the file is not a zip."""
+    """The pictures of a comic in reading order. Raises when the file is neither a zip nor
+    (where the image has bsdtar) a RAR archive."""
     mtime = os.path.getmtime(path)
     hit = _COMIC_CACHE.get(path)
     if hit and hit[0] == mtime:
         return hit[1]
-    with _zipfile.ZipFile(path) as zf:
-        names = [i.filename for i in zf.infolist()
-                 if not i.is_dir() and _COMIC_PAGE_RX.search(i.filename) and i.file_size <= _COMIC_PAGE_MOST
-                 and "__MACOSX" not in i.filename and not os.path.basename(i.filename).startswith(".")]
+    if _comic_is_rar(path):
+        names = [n for n in unpack.rar_names(path)
+                 if _COMIC_PAGE_RX.search(n) and "__MACOSX" not in n and not os.path.basename(n).startswith(".")]
+    else:
+        with _zipfile.ZipFile(path) as zf:
+            names = [i.filename for i in zf.infolist()
+                     if not i.is_dir() and _COMIC_PAGE_RX.search(i.filename) and i.file_size <= _COMIC_PAGE_MOST
+                     and "__MACOSX" not in i.filename and not os.path.basename(i.filename).startswith(".")]
     names.sort(key=lambda s: [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", s)])
     if len(_COMIC_CACHE) > 200:
         _COMIC_CACHE.clear()
@@ -3463,6 +3669,11 @@ async def comic_page(msg_id: int, n: int):
     name = c[2][n]
 
     def _read():
+        if _comic_is_rar(c[0]):
+            data = unpack.rar_read(c[0], name, _COMIC_PAGE_MOST)
+            if not ownbooks.picture_type(data):
+                raise ValueError("not a picture")
+            return data
         with _zipfile.ZipFile(c[0]) as zf:
             return zf.read(name)
     try:
@@ -3481,10 +3692,11 @@ async def comic_page(msg_id: int, n: int):
 async def comic_render(msg_id: int):
     c = await _comic_of(msg_id)
     if not c:
-        return HTMLResponse(f'<p>This comic cannot be shown as it is. <a href="/watch/{int(msg_id)}">Open it</a>.</p>', status_code=404)
+        return HTMLResponse(f'<p>{_t("This comic cannot be shown as it is.")} <a href="/watch/{int(msg_id)}">{_t("Open it")}</a></p>', status_code=404)
     n = len(c[2])
     mid = int(msg_id)
-    pages = "".join(f'<img id="p{i}" data-n="{i}" loading="lazy" decoding="async" src="/comic/{mid}/page/{i}" alt="page {i + 1}"/>'
+    page_n = _t("page %1")
+    pages = "".join(f'<img id="p{i}" data-n="{i}" loading="lazy" decoding="async" src="/comic/{mid}/page/{i}" alt="{page_n.replace("%1", str(i + 1))}"/>'
                     for i in range(n))
     return HTMLResponse(
         '<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>'
@@ -3496,10 +3708,10 @@ async def comic_render(msg_id: int):
         'main{display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 0 40px}'
         'main img{display:block;max-width:100%;min-height:70vh;background:#1b1b1b}main img.ok{min-height:0}'
         'main.fit img{max-width:min(100%,1100px)}main.wide img{width:100%;max-width:none}'
-        '</style></head><body><div class="bar"><a href="#" id="back">&larr; back</a>'
+        '</style></head><body><div class="bar"><a href="#" id="back">&larr; ' + _t("back") + '</a>'
         f'<div class="t">{html.escape(c[1])}</div><span id="at">1 / {n}</span>'
-        '<button id="w" title="fit the width of the window">wider</button>'
-        f'<a href="/media/{mid}" download>&#11015; download</a></div><main id="m" class="fit">{pages}</main><script>'
+        '<button id="w" title="' + _t("fit the width of the window") + '">' + _t("wider") + '</button>'
+        f'<a href="/media/{mid}" download>&#11015; {_t("download")}</a></div><main id="m" class="fit">{pages}</main><script>'
         f'const ID={mid},N={n},KEY="comic-"+ID;'
         'const m=document.getElementById("m"),at=document.getElementById("at");'
         'document.getElementById("back").onclick=e=>{e.preventDefault();if(history.length>1)history.back();else location.href="/library";};'
@@ -3522,10 +3734,21 @@ async def epub_toc(msg_id: int):
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return JSONResponse({"error": "not cached"}, status_code=404)
+    if _arriving(row, epub_path):
+        lang = _LANG.get()
+        return JSONResponse({"error": i18n.t(lang, "this book is still arriving - a moment"), "arriving": True}, status_code=409)
+    kind = _own_kind(row)
+    if kind:
+        book, why = await _own_book(epub_path, kind)
+        if not book:
+            return JSONResponse({"error": why}, status_code=422)
+        return JSONResponse({"title": book.title or _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or "") or f"book-{msg_id}",
+                             "chapters": book.titles})
     try:
         idx = await asyncio.to_thread(_epub_index, epub_path)
     except Exception as e:
-        return JSONResponse({"error": f"cannot read this book: {e}"}, status_code=422)
+        lang = _LANG.get()
+        return JSONResponse({"error": i18n.t(lang, "cannot read this book: {e}", e=str(e))}, status_code=422)
     return JSONResponse({"title": idx["title"] or row["file_name"] or f"book-{msg_id}",
                          "chapters": idx["titles"]})
 
@@ -3537,6 +3760,23 @@ async def epub_chapter(msg_id: int, n: int):
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return HTMLResponse("not cached", status_code=404)
+    kind = _own_kind(row)
+    if kind:
+        book, why = await _own_book(epub_path, kind)
+        if not book:
+            return HTMLResponse(f"<p>{html.escape(why)}</p>",
+                                status_code=422, headers={"Content-Security-Policy": _EPUB_CSP})
+        if not 0 <= n < len(book):
+            return HTMLResponse("no such chapter", status_code=404)
+        body = await asyncio.to_thread(book.chapter, n)
+        await _touch_local(msg_id)
+        return HTMLResponse(
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<style>{_EPUB_CHAPTER_CSS}{ownbooks.CSS}</style></head>"
+            f"<body class='{'tb-latin' if book.latin else 'tb-cjk'}'>{body}</body></html>",
+            headers={"Content-Security-Policy": _EPUB_CSP,
+                     "X-Content-Type-Options": "nosniff",
+                     "Cache-Control": "private, max-age=3600"})
     try:
         idx = await asyncio.to_thread(_epub_index, epub_path)
         if not 0 <= n < len(idx["chapters"]):
@@ -3547,7 +3787,7 @@ async def epub_chapter(msg_id: int, n: int):
                 return _epub_chapter_body(zf, msg_id, idx["chapters"][n])
         body = await asyncio.to_thread(_read)
     except Exception as e:
-        return HTMLResponse(f"<p>cannot show this chapter: {html.escape(str(e))}</p>",
+        return HTMLResponse("<p>" + _t("cannot show this chapter: {e}", e=str(e)) + "</p>",
                             status_code=500, headers={"Content-Security-Policy": _EPUB_CSP})
     await _touch_local(msg_id)
     return HTMLResponse(
@@ -3662,7 +3902,7 @@ function voiceMenu(){
   const btn = document.getElementById("readBtn");
   if (!btn || !synth || document.getElementById("voiceBtn")) return;
   const b = document.createElement("button");
-  b.id = "voiceBtn"; b.title = "voice and speed"; b.innerHTML = "&#9881;";
+  b.id = "voiceBtn"; b.title = "[[@js:voice and speed]]"; b.innerHTML = "&#9881;";
   btn.insertAdjacentElement("afterend", b);
   const box = document.createElement("div");
   box.id = "voiceBox";
@@ -3678,25 +3918,25 @@ function voiceMenu(){
       const zh = /[一-鿿]/.test(text), list = TG_VOICES[zh ? "zh" : "en"], k = PREF[zh ? "zh" : "en"];
       let name = (list.find(o => o[0] === k) || list[0])[1];
       if (!zh && (list.find(o => o[0] === k) || list[0])[0] === "same") name = (TG_VOICES.zh.find(o => o[0] === PREF.zh) || TG_VOICES.zh[0])[1];
-      return "this machine, " + name;
+      return "[[@js:this machine, %1]]".replace("%1", () => name);
     }
     const v = bsynth ? voiceFor(text).voice : null;
-    return v ? v.name : (bsynth ? "the browser's voice" : "nobody: no voice here");
+    return v ? v.name : (bsynth ? "[[@js:the browser's voice]]" : "[[@js:nobody: no voice here]]");
   };
   const draw = () => {
-    let h = sel("mode", "Read with", [["", "Automatic: the better of the two"]].concat(bsynth ? [["browser", "This browser's voices"]] : [],
-      TG_VOICE ? [["own", "This machine's voice"]] : []), PREF.mode);
+    let h = sel("mode", "[[@js:Read with]]", [["", "[[@js:Automatic: the better of the two]]"]].concat(bsynth ? [["browser", "[[@js:This browser's voices]]"]] : [],
+      TG_VOICE ? [["own", "[[@js:This machine's voice]]"]] : []), PREF.mode);
     if (TG_VOICE && PREF.mode !== "browser") {
-      h += sel("zh", "This machine, Chinese", TG_VOICES.zh, PREF.zh || TG_VOICES.zh[0][0]) + sel("en", "This machine, English", TG_VOICES.en, PREF.en || TG_VOICES.en[0][0]);
+      h += sel("zh", "[[@js:This machine, Chinese]]", TG_VOICES.zh, PREF.zh || TG_VOICES.zh[0][0]) + sel("en", "[[@js:This machine, English]]", TG_VOICES.en, PREF.en || TG_VOICES.en[0][0]);
     }
     if (bsynth && PREF.mode !== "own") {
       const z = ofLang("zh"), e = ofLang("en");
-      if (z.length > 1) h += sel("bzh", "Browser, Chinese", [["", "Automatic"]].concat(z.map(v => [v.name, v.name])), PREF.bzh);
-      if (e.length > 1) h += sel("ben", "Browser, English", [["", "Automatic"]].concat(e.map(v => [v.name, v.name])), PREF.ben);
+      if (z.length > 1) h += sel("bzh", "[[@js:Browser, Chinese]]", [["", "[[@js:Automatic]]"]].concat(z.map(v => [v.name, v.name])), PREF.bzh);
+      if (e.length > 1) h += sel("ben", "[[@js:Browser, English]]", [["", "[[@js:Automatic]]"]].concat(e.map(v => [v.name, v.name])), PREF.ben);
     }
-    h += sel("rate", "Speed", [["0.75", "0.75 x"], ["1", "1 x"], ["1.25", "1.25 x"], ["1.5", "1.5 x"], ["1.75", "1.75 x"], ["2", "2 x"]], String(rateNow()));
-    h += '<div style="color:#cbd5e1;font-size:12px">Chinese is read by ' + esc(who("中文中文中文")) + '.<br>English by ' + esc(who("English text")) + '.'
-      + (TG_VOICE ? "" : '<br>A voice of this machine\'s own can be installed in Settings.') + '</div>';
+    h += sel("rate", "[[@js:Speed]]", [["0.75", "0.75 x"], ["1", "1 x"], ["1.25", "1.25 x"], ["1.5", "1.5 x"], ["1.75", "1.75 x"], ["2", "2 x"]], String(rateNow()));
+    h += '<div style="color:#cbd5e1;font-size:12px">' + "[[@js:Chinese is read by %1.]]".replace("%1", () => esc(who("中文中文中文"))) + '<br>' + "[[@js:English by %1.]]".replace("%1", () => esc(who("English text")))
+      + (TG_VOICE ? "" : '<br>' + "[[@js:A voice of this machine's own can be installed in Settings.]]") + '</div>';
     box.innerHTML = h;
     box.querySelectorAll("select").forEach(s => { s.onchange = () => {
       const k = s.dataset.k;
@@ -3737,7 +3977,7 @@ def _speech_js() -> str:
     except Exception:
         on = False
     voices = {lang: [[k, label] for k, label, _sid in vs] for lang, vs in tts.VOICES.items()}
-    return _SPEECH_JS.replace("__TG_VOICE__", "true" if on else "false").replace("__TG_VOICES__", _json.dumps(voices))
+    return _fill(_SPEECH_JS).replace("__TG_VOICE__", "true" if on else "false").replace("__TG_VOICES__", _json.dumps(voices))
 
 
 _EPUB_READER_HTML = r"""<!DOCTYPE html>
@@ -3798,37 +4038,37 @@ button.on{background:var(--acc,#2563eb);color:#fff;border-color:var(--acc,#2563e
 </style></head>
 <body data-theme="light" data-mode="paged">
 <div class="bar">
-  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
-  <button id="tocBtn" title="table of contents">&#9776;<span class="hide-s"> Contents</span></button>
+  <a class="btn" id="back" href="/library" title="[[@back to the library]]">&larr;<span class="hide-s"> [[@Library]]</span></a>
+  <button id="tocBtn" title="[[@table of contents]]">&#9776;<span class="hide-s"> [[@Contents]]</span></button>
   <div class="ttl" id="ttl">__TITLE__</div>
-  <button id="readBtn" title="read aloud from here; the page follows the voice (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
-  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
-  <button id="fsDown" title="smaller text">A&minus;</button>
-  <button id="fsUp" title="larger text">A+</button>
-  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
-  <button id="modeBtn" title="turn pages or scroll"><span id="modeLbl">Scroll</span></button>
-  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+  <button id="readBtn" title="[[@read aloud from here; the page follows the voice (R)]]">&#128266;<span class="hide-s"> [[@Read aloud]]</span></button>
+  <button id="twoBtn" class="hide-s" title="[[@two pages side by side, like an open book (2)]]">[[@2 pages]]</button>
+  <button id="fsDown" title="[[@smaller text]]">A&minus;</button>
+  <button id="fsUp" title="[[@larger text]]">A+</button>
+  <button id="themeBtn" title="[[@light / sepia / dark]]">&#9680;<span class="hide-s"> [[@Theme]]</span></button>
+  <button id="modeBtn" title="[[@turn pages or scroll]]"><span id="modeLbl">[[@Scroll]]</span></button>
+  <a class="btn hide-s" href="/media/__ID__" download title="[[@download the file]]">&#11015;</a>
 </div>
 <div class="stage" id="stage">
-  <div class="msg" id="msg">opening the book…</div>
-  <iframe id="bk" sandbox="allow-same-origin" title="book"></iframe>
-  <div class="zone l" id="zl" title="previous page">&lsaquo;</div>
-  <div class="zone r" id="zr" title="next page">&rsaquo;</div>
+  <div class="msg" id="msg">[[@opening the book…]]</div>
+  <iframe id="bk" sandbox="allow-same-origin" title="[[@book]]"></iframe>
+  <div class="zone l" id="zl" title="[[@previous page]]">&lsaquo;</div>
+  <div class="zone r" id="zr" title="[[@next page]]">&rsaquo;</div>
   <div class="shade" id="shade"></div>
   <div class="drawer" id="drawer">
-    <h3><span>Contents</span><button id="tocClose">&times;</button></h3>
+    <h3><span>[[@Contents]]</span><button id="tocClose">&times;</button></h3>
     <div class="list" id="tocList"></div>
   </div>
-  <div class="tip" id="tip">&larr; &rarr; or Space to turn pages &middot; click the edges &middot; swipe on a phone</div>
+  <div class="tip" id="tip">[[@← → or Space to turn pages · click the edges · swipe on a phone]]</div>
 </div>
 <div class="bar bottom">
-  <button class="big" id="prev">&lsaquo; Prev</button>
+  <button class="big" id="prev">&lsaquo; [[@Prev]]</button>
   <div class="pos">
     <span class="chn" id="chn"></span>
     <span id="pg"></span>
-    <input type="range" id="slider" min="0" max="0" value="0" title="jump to a chapter">
+    <input type="range" id="slider" min="0" max="0" value="0" title="[[@jump to a chapter]]">
   </div>
-  <button class="big" id="next">Next &rsaquo;</button>
+  <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
 <script>
 (function(){
@@ -3883,7 +4123,7 @@ function layout(keep){
   if (!el) { el = doc.createElement("style"); el.id = "tg-reader"; doc.head.appendChild(el); }
   el.textContent = css();
   document.body.dataset.theme = theme; document.body.dataset.mode = mode;
-  $("modeLbl").textContent = mode === "paged" ? "Scroll" : "Pages";
+  $("modeLbl").textContent = mode === "paged" ? "[[@js:Scroll]]" : "[[@js:Pages]]";
   $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
   if (mode === "paged") {
     pages = Math.max(1, Math.round(doc.body.scrollWidth / W));
@@ -3897,11 +4137,11 @@ function layout(keep){
 }
 function ui(){
   const n = titles.length || 1;
-  $("chn").textContent = titles[ch] || ("Section " + (ch + 1));
+  $("chn").textContent = titles[ch] || "[[@js:Section %1]]".replace("%1", ch + 1);
   let within = frac();
-  if (mode === "paged") $("pg").innerHTML = "page <b>" + (page + 1) + "</b> of " + pages + " &middot; chapter " + (ch + 1) + " of " + n +
+  if (mode === "paged") $("pg").innerHTML = "[[@js:page %1 of %2]]".replace("%1", "<b>" + (page + 1) + "</b>").replace("%2", pages) + " &middot; " + "[[@js:chapter %1 of %2]]".replace("%1", ch + 1).replace("%2", n) +
       " &middot; <b>" + Math.round((ch + (pages > 1 ? page / pages : 0)) / n * 100) + "%</b>";
-  else $("pg").innerHTML = "chapter " + (ch + 1) + " of " + n + " &middot; <b>" + Math.round((ch + within) / n * 100) + "%</b>";
+  else $("pg").innerHTML = "[[@js:chapter %1 of %2]]".replace("%1", ch + 1).replace("%2", n) + " &middot; <b>" + Math.round((ch + within) / n * 100) + "%</b>";
   $("slider").max = n - 1; $("slider").value = ch;
   const first = ch === 0 && (mode === "paged" ? page === 0 : within <= 0.001);
   const last = ch >= n - 1 && (mode === "paged" ? page >= pages - 1 : within >= 0.999);
@@ -3912,7 +4152,7 @@ function ui(){
 function load(n, f){
   n = Math.max(0, Math.min((titles.length || 1) - 1, n));
   ch = n; pendingFrac = f || 0; busy = true;
-  $("msg").style.display = "flex"; $("msg").textContent = "loading…";
+  $("msg").style.display = "flex"; $("msg").textContent = "[[@js:loading…]]";
   // replace, not assign: setting src made every chapter a step in the tab's
   // history, so "Library" (one step back) only went back one chapter
   const url = "/epub/" + ID + "/ch/" + n;
@@ -4032,7 +4272,7 @@ function readBlock(i){
   if (!reading) return;
   const run = ++readRun; synth.cancel(); unmark();
   if (i >= blocks.length) {
-    if (ch >= titles.length - 1) { stopRead("the end of the book"); return; }
+    if (ch >= titles.length - 1) { stopRead("[[@js:the end of the book]]"); return; }
     readerLoad = true; load(ch + 1, 0); return;          // goes on when the chapter has arrived
   }
   const el = blocks[i], text = (el.textContent || "").replace(/\s+/g, " ").trim();
@@ -4054,14 +4294,14 @@ function readBlock(i){
       if (want > page) turnTo(want);
     };
     if (k === parts.length - 1) u.onend = () => { if (reading && run === readRun) readBlock(i + 1); };
-    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("[[@js:the browser could not read this aloud]]"); };
     synth.speak(u);
   });
 }
 function readFromView(){
   if (!reading || busy || !doc) return;        // a chapter on its way: its arrival starts the reading
   blocks = collect();
-  if (!blocks.length) { if (ch < titles.length - 1) { readerLoad = true; load(ch + 1, 0); } else stopRead("nothing to read here"); return; }
+  if (!blocks.length) { if (ch < titles.length - 1) { readerLoad = true; load(ch + 1, 0); } else stopRead("[[@js:nothing to read here]]"); return; }
   // nothing readable on this page or after it (a picture, a blank end): readBlock
   // then goes on to the next chapter - never back to an earlier paragraph
   readBlock(firstInView());
@@ -4070,7 +4310,7 @@ function readFromView(){
 function userMoved(){ if (!reading) return; readRun++; synth.cancel(); clearTimeout(moveT); moveT = setTimeout(readFromView, 450); }
 document.addEventListener("tgvoice", userMoved);          // another voice was chosen: this paragraph again, in it
 $("readBtn").onclick = () => {
-  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (!synth) { toast("[[@js:this browser cannot read aloud]]"); return; }
   if (reading) { stopRead(); return; }
   reading = true; $("readBtn").classList.add("on"); readFromView();
 };
@@ -4112,15 +4352,15 @@ fetch("/epub/" + ID + "/toc").then(r => r.json()).then(j => {
   titles.forEach((t, i) => { if (!t) return; listed++;
     const a = document.createElement("a"); a.textContent = t; a.dataset.i = i;
     a.onclick = () => { toc(false); userMoved(); load(i, 0); }; fragm.appendChild(a); });
-  if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "Section " + (i + 1);
+  if (!listed) titles.forEach((t, i) => { const a = document.createElement("a"); a.textContent = "[[@js:Section %1]]".replace("%1", i + 1);
     a.dataset.i = i; a.onclick = () => { toc(false); load(i, 0); }; fragm.appendChild(a); });
   list.appendChild(fragm);
   let pos = {}; try { pos = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
   // /epub/123#40 opens chapter 40
-  const h = parseInt((location.hash || "").slice(1), 10);
+  const h = /[?&]was=pdf/.test(location.search) ? 0 : parseInt((location.hash || "").slice(1), 10);
   if (h >= 1 && h <= titles.length) pos = {ch: h - 1, frac: 0};
   load(pos.ch || 0, pos.frac || 0);
-}).catch(() => { $("msg").textContent = "✗ could not open this book"; });
+}).catch(() => { $("msg").textContent = "✗ [[@js:could not open this book]]"; });
 })();
 </script>
 <script src="/mc/ping.js" defer></script>
@@ -4132,12 +4372,27 @@ async def epub_render(msg_id: int):
     """The e-book reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
-    if not _epub_locate(msg_id, row):
+    path = _epub_locate(msg_id, row)
+    if not path:
         return HTMLResponse(
-            f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
+            f'<p>{_t("This book is not downloaded yet.")} <a href="/watch/{msg_id}">{_t("Open it")}</a></p>',
             status_code=404)
-    title = _re.sub(r"\.epub$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
-    return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    if _arriving(row, path):
+        return RedirectResponse(f"/watch/{int(msg_id)}", status_code=307)      # that page waits for it
+    kind = _own_kind(row)
+    if kind and kind != "txt":
+        why = (await _own_book(path, kind))[1]
+        if why:
+            # one this reader cannot open after all (protected, packed in a way not read here)
+            return HTMLResponse(
+                '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<title>' + _t("cannot be shown") + '</title></head><body style="font-family:system-ui,sans-serif;max-width:560px;margin:15vh auto;padding:0 20px;line-height:1.6">'
+                f'<p>{html.escape(why[:1].upper() + why[1:])}.</p>'
+                '<p>' + _t("It is kept as it is: %1download it%2 to read it with another program.")
+                .replace("%1", f'<a href="/media/{int(msg_id)}" download>').replace("%2", "</a>") + '</p>'
+                '<p><a href="/library">&larr; ' + _t("Library") + '</a></p></body></html>', status_code=422)
+    title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"book-{msg_id}")
+    return HTMLResponse(_fill(_EPUB_READER_HTML).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -4400,28 +4655,28 @@ input[type=range]{width:100%;accent-color:var(--acc);margin:4px 0 0}
 </style></head>
 <body data-theme="light">
 <div class="bar">
-  <a class="btn" id="back" href="/library" title="back to the library">&larr;<span class="hide-s"> Library</span></a>
+  <a class="btn" id="back" href="/library" title="[[@back to the library]]">&larr;<span class="hide-s"> [[@Library]]</span></a>
   <div class="ttl">__TITLE__</div>
-  <button id="wmBtn" title="on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.">Hide watermark</button>
-  <button id="readBtn" title="read this book aloud from the current page, turning pages as it goes (R)">&#128266;<span class="hide-s"> Read aloud</span></button>
-  <button id="modeBtn" title="one page at a time (pages slide sideways), or one long scroll">Pages</button>
-  <button id="fitBtn" title="how a page fills the window: the whole page, its width, or its height">Fit page</button>
-  <button id="twoBtn" class="hide-s" title="two pages side by side, like an open book (2)">2 pages</button>
-  <button id="fsBtn" class="hide-s" title="full screen (F)">&#9974;</button>
-  <button id="zOut" title="smaller (-)">A&minus;</button>
-  <button id="zIn" title="larger (+)">A+</button>
-  <button id="themeBtn" title="light / sepia / dark">&#9680;<span class="hide-s"> Theme</span></button>
-  <a class="btn hide-s" href="/media/__ID__" target="_blank" title="the untouched file in the browser's own viewer: select text, search, print">Original</a>
-  <a class="btn hide-s" href="/media/__ID__" download title="download the file">&#11015;</a>
+  <button id="wmBtn" title="[[@on: pages are redrawn in black and white without pale watermarks. off: the pages as they are, in colour. The file is never changed.]]">[[@Hide watermark]]</button>
+  <button id="readBtn" title="[[@read this book aloud from the current page, turning pages as it goes (R)]]">&#128266;<span class="hide-s"> [[@Read aloud]]</span></button>
+  <button id="modeBtn" title="[[@one page at a time (pages slide sideways), or one long scroll]]">[[@Pages]]</button>
+  <button id="fitBtn" title="[[@how a page fills the window: the whole page, its width, or its height]]">[[@Fit page]]</button>
+  <button id="twoBtn" class="hide-s" title="[[@two pages side by side, like an open book (2)]]">[[@2 pages]]</button>
+  <button id="fsBtn" class="hide-s" title="[[@full screen (F)]]">&#9974;</button>
+  <button id="zOut" title="[[@smaller (-)]]">A&minus;</button>
+  <button id="zIn" title="[[@larger (+)]]">A+</button>
+  <button id="themeBtn" title="[[@light / sepia / dark]]">&#9680;<span class="hide-s"> [[@Theme]]</span></button>
+  <a class="btn hide-s" href="/media/__ID__" target="_blank" title="[[@the untouched file in the browser's own viewer: select text, search, print]]">[[@Original]]</a>
+  <a class="btn hide-s" href="/media/__ID__" download title="[[@download the file]]">&#11015;</a>
 </div>
-<div class="stage" id="stage"><div class="msg" id="msg">opening…</div></div>
+<div class="stage" id="stage"><div class="msg" id="msg">[[@opening…]]</div></div>
 <div class="bar bottom">
-  <button class="big" id="prev">&lsaquo; Prev</button>
+  <button class="big" id="prev">&lsaquo; [[@Prev]]</button>
   <div class="pos">
-    page <input type="number" id="pno" min="1" value="1"> of <b id="ptotal">…</b>
+    __PAGE_OF__
     <input type="range" id="slider" min="1" max="1" value="1">
   </div>
-  <button class="big" id="next">Next &rsaquo;</button>
+  <button class="big" id="next">[[@Next]] &rsaquo;</button>
 </div>
 <script>
 (function(){
@@ -4457,7 +4712,7 @@ function build(){
   const f = document.createDocumentFragment();
   for (let n = 1; n <= pages; n++) {
     const el = document.createElement("div"); el.className = "pg"; el.dataset.n = n;
-    const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+    const img = document.createElement("img"); img.alt = "[[@js:page %1]]".replace("%1", n); img.decoding = "async";
     img.onload = () => { if (img.naturalWidth) { const r = img.naturalHeight / img.naturalWidth;
       if (Math.abs(r - (el._ratio || ratio)) > 0.01) { el._ratio = r; el.style.height = Math.round(pageW() * r) + "px"; } } };
     const no = document.createElement("span"); no.className = "no"; no.textContent = n;
@@ -4494,7 +4749,7 @@ function mkPage(n){
   const el = document.createElement("div"); el.className = "pg";
   const fit = r => { const w = fitW(r); el.style.width = w + "px"; el.style.height = Math.round(w * r) + "px"; return w; };
   const r0 = ratios[n] || ratio, w = fit(r0);
-  const img = document.createElement("img"); img.alt = "page " + n; img.decoding = "async";
+  const img = document.createElement("img"); img.alt = "[[@js:page %1]]".replace("%1", n); img.decoding = "async";
   img.onload = () => { if (!img.naturalWidth) return; const r = img.naturalHeight / img.naturalWidth;
     if (Math.abs(r - r0) > 0.01) { ratios[n] = r; fit(r); } };
   img.src = pageSrc(n, w);
@@ -4547,11 +4802,11 @@ function track(){
 function ui(){
   if (document.activeElement !== $("pno")) $("pno").value = cur;
   $("slider").value = cur; $("prev").disabled = cur <= 1; $("next").disabled = cur + step() > pages;
-  $("fitBtn").textContent = "Fit " + fit; $("fitBtn").disabled = mode !== "paged";
+  $("fitBtn").textContent = ({page: "[[@js:Fit page]]", width: "[[@js:Fit width]]", height: "[[@js:Fit height]]"})[fit]; $("fitBtn").disabled = mode !== "paged";
   $("twoBtn").classList.toggle("on", two); $("twoBtn").disabled = mode !== "paged";
   $("readBtn").classList.toggle("on", reading);
   $("wmBtn").classList.toggle("on", clean); document.body.dataset.theme = theme;
-  $("modeBtn").textContent = mode === "paged" ? "Pages" : "Scroll";
+  $("modeBtn").textContent = mode === "paged" ? "[[@js:Pages]]" : "[[@js:Scroll]]";
 }
 let tt = null; stage.addEventListener("scroll", () => { clearTimeout(tt); tt = setTimeout(track, 60); }, {passive: true});
 $("prev").onclick = () => go(cur - step(), true); $("next").onclick = () => go(cur + step(), true);
@@ -4578,11 +4833,11 @@ async function readFrom(n){
   const text = (j.text || "").trim();
   const nextPage = () => {
     if (!reading || run !== readRun) return;
-    if (n >= pages) { stopRead("the end of the book"); return; }
+    if (n >= pages) { stopRead("[[@js:the end of the book]]"); return; }
     byReader = true; go(n + 1, true); byReader = false; readFrom(n + 1);
   };
   if (!text) {
-    if (++blanks >= 3) { stopRead("no words to read on these pages - a scanned book holds pictures of text"); return; }
+    if (++blanks >= 3) { stopRead("[[@js:no words to read on these pages - a scanned book holds pictures of text]]"); return; }
     nextPage(); return;
   }
   blanks = 0;
@@ -4591,7 +4846,7 @@ async function readFrom(n){
     const u = mkUtter(part);
     if (v.voice) u.voice = v.voice; u.lang = v.voice ? v.voice.lang : v.lang;
     if (i === parts.length - 1) u.onend = nextPage;
-    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("the browser could not read this aloud"); };
+    u.onerror = e => { if (e.error !== "canceled" && e.error !== "interrupted" && run === readRun) stopRead("[[@js:the browser could not read this aloud]]"); };
     synth.speak(u);
   });
 }
@@ -4601,7 +4856,7 @@ function turned(){
 }
 document.addEventListener("tgvoice", () => { if (reading) readFrom(cur); });      // another voice was chosen: this page again, in it
 $("readBtn").onclick = () => {
-  if (!synth) { toast("this browser cannot read aloud"); return; }
+  if (!synth) { toast("[[@js:this browser cannot read aloud]]"); return; }
   if (reading) { stopRead(); return; }
   reading = true; blanks = 0; ui(); readFrom(cur);
 };
@@ -4658,7 +4913,7 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
   const h = parseInt((location.hash || "").slice(1), 10);
   cur = (h >= 1 && h <= pages) ? h : Math.min(pages, book.page || 1);
   setMode(mode);
-}).catch(() => { $("msg").textContent = "✗ could not open this PDF"; });
+}).catch(() => { $("msg").textContent = "✗ [[@js:could not open this PDF]]"; });
 })();
 </script>
 <script src="/mc/ping.js" defer></script>
@@ -4666,10 +4921,19 @@ fetch("/pdf/" + ID + "/info").then(r => r.json()).then(j => {
 
 
 @app.get("/pdf/{msg_id}", response_class=HTMLResponse)
-async def pdf_reader(msg_id: int):
+async def pdf_reader(msg_id: int, conv: int = 0):
     """The PDF reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    kind = _own_kind(row)
+    here = _epub_locate(msg_id, row)
+    if here and _arriving(row, here):
+        return RedirectResponse(f"/watch/{int(msg_id)}", status_code=307)      # that page waits for it
+    if kind and not conv and here and (kind == "txt" or (await _own_book(here, kind))[0]):
+        # read as a book, with type that can be set: not as pictures of pages (links kept
+        # from before these were led to the e-book reader; "was=pdf" tells the reader that a
+        # #40 on such a link meant page 40 of the PDF, not chapter 40)
+        return RedirectResponse(f"/epub/{msg_id}?was=pdf", status_code=307)
     if not _pdf_source(row) and row and _is_local(row["local_path"]):
         # here, but not a PDF yet (a text file, a .docx, a book in another
         # format opened straight from a list): make the PDF now, once
@@ -4679,10 +4943,11 @@ async def pdf_reader(msg_id: int):
             await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not _pdf_source(row):
         return HTMLResponse(
-            f'<p>This file cannot be shown here. <a href="/media/{msg_id}">Download it</a>.</p>',
+            f'<p>{_t("This file cannot be shown here.")} <a href="/media/{msg_id}">{_t("Download it")}</a></p>',
             status_code=404)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"file-{msg_id}")
-    return HTMLResponse(_PDF_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
+    page_of = _t("page %1 of %2").replace("%1", '<input type="number" id="pno" min="1" value="1">').replace("%2", '<b id="ptotal">…</b>')
+    return HTMLResponse(_fill(_PDF_READER_HTML).replace("__PAGE_OF__", page_of).replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
 
@@ -4695,18 +4960,26 @@ async def epub_cover(msg_id: int):
     """
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return Response("not cached", status_code=404)
+    kind = _own_kind(row)
+    if kind:
+        book, _ = await _own_book(epub_path, kind)
+        got = await asyncio.to_thread(book.asset, book.cover) if book and book.cover else None
+        if not got:
+            return Response("no cover", status_code=404)
+        return Response(content=got[0], media_type=got[1],
+                        headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
     try:
         with _zipfile.ZipFile(epub_path) as zf:
             from xml.etree import ElementTree as _ET
-            container = zf.read("META-INF/container.xml").decode("utf-8", "replace")
+            container = _zread(zf, "META-INF/container.xml").decode("utf-8", "replace")
             ns_c = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
             opf_path = _ET.fromstring(container).find(".//c:rootfile", ns_c).attrib["full-path"]
             opf_dir = os.path.dirname(opf_path).replace("\\", "/")
-            opf_root = _ET.fromstring(zf.read(opf_path).decode("utf-8", "replace"))
+            opf_root = _ET.fromstring(_zread(zf, opf_path).decode("utf-8", "replace"))
             ns_opf = {"opf": "http://www.idpf.org/2007/opf"}
             manifest = {item.attrib["id"]: item
                         for item in opf_root.findall(".//opf:manifest/opf:item", ns_opf)}
@@ -4738,7 +5011,7 @@ async def epub_cover(msg_id: int):
                         chapter_href = _uq(chapter_item.attrib["href"])
                         chapter_path = (opf_dir + "/" + chapter_href).lstrip("/") if opf_dir else chapter_href
                         try:
-                            chap = zf.read(chapter_path).decode("utf-8", "replace")
+                            chap = _zread(zf, chapter_path).decode("utf-8", "replace")
                             m = _re.search(r"(?:xlink:)?href=[\"\']([^\"\']+\.(?:jpg|jpeg|png|webp|gif))[\"\']",
                                           chap, _re.IGNORECASE)
                             if not m:
@@ -4760,23 +5033,25 @@ async def epub_cover(msg_id: int):
                     cover_path = (opf_dir + "/" + cover_href).lstrip("/")
             cover_path = _re.sub(r"/+", "/", cover_path)
             try:
-                data = zf.read(cover_path)
-            except KeyError:
+                data = _zread(zf, cover_path, _EPUB_ASSET_MOST)
+            except (KeyError, ValueError):
                 # try common locations
                 for guess in [cover_href, "OEBPS/" + cover_href, "OPS/" + cover_href]:
                     try:
-                        data = zf.read(guess)
+                        data = _zread(zf, guess, _EPUB_ASSET_MOST)
                         break
-                    except KeyError:
+                    except (KeyError, ValueError):
                         continue
                 else:
                     return Response("cover file missing", status_code=404)
 
-            ext = cover_path.rsplit(".", 1)[-1].lower() if "." in cover_path else "jpg"
+            kind = ownbooks.picture_type(data)      # by its first bytes: a "cover.svg" or "cover.html" is not shown
+            if not kind:
+                return Response("no cover", status_code=404)
             return Response(
                 content=data,
-                media_type=_EPUB_MIME.get(ext, "image/jpeg"),
-                headers={"Cache-Control": "public, max-age=86400"})
+                media_type=kind,
+                headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
     except Exception as e:
         return Response(f"cover error: {e}", status_code=500)
 
@@ -4786,14 +5061,24 @@ async def epub_asset(msg_id: int, asset_path: str):
     """Serve embedded asset (image / css / etc) from inside the .epub zip."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT local_path FROM messages WHERE id=$1", msg_id)
+            "SELECT local_path, file_name FROM messages WHERE id=$1", msg_id)
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return Response("not cached", status_code=404)
+    kind = _own_kind(row)
+    if kind:
+        book, _ = await _own_book(epub_path, kind)
+        got = await asyncio.to_thread(book.asset, asset_path) if book else None
+        if not got:
+            return Response("asset not found", status_code=404)
+        return Response(content=got[0], media_type=got[1],
+                        headers={"Cache-Control": "public, max-age=3600",
+                                 "Content-Security-Policy": "sandbox; " + _EPUB_CSP,
+                                 "X-Content-Type-Options": "nosniff"})
     try:
         with _zipfile.ZipFile(epub_path) as zf:
-            data = zf.read(_uq(asset_path))
-    except (KeyError, _zipfile.BadZipFile):
+            data = _zread(zf, _uq(asset_path), _EPUB_ASSET_MOST)
+    except (KeyError, ValueError, _zipfile.BadZipFile):
         return Response("asset not found", status_code=404)
     ext = asset_path.rsplit(".", 1)[-1].lower() if "." in asset_path else ""
     return Response(
@@ -4924,7 +5209,7 @@ function tgFavBtn(){
   if (bk) bk.onclick = e => { e.preventDefault(); tgBack(MEDIA_TYPE === "video" ? "/videos" : MEDIA_TYPE === "audio" ? "/music" : "/library"); };
   const b = document.getElementById("favBtn"); if (!b) return;
   b.onclick = () => fetch("/api/fav/" + MSG_ID, {method: "POST"}).then(r => r.json()).then(j => {
-    if (j.fav === undefined) return; b.classList.toggle("on", j.fav); b.title = j.fav ? "in your favourites" : "add to favourites"; });
+    if (j.fav === undefined) return; b.classList.toggle("on", j.fav); b.title = j.fav ? "[[@js:in your favourites]]" : "[[@js:add to favourites]]"; });
 }
 function tgVideo(main){
   let prefs = {}; try { prefs = JSON.parse(localStorage.getItem("tgarr.video") || "{}"); } catch (e) {}
@@ -4934,16 +5219,16 @@ function tgVideo(main){
   main.innerHTML =
     '<div class="vshell"><div class="vstage" id="vStage"><video id="v" controls autoplay playsinline src="/media/' + MSG_ID + '"></video></div>' +
     '<div class="vbar">' +
-    '<button id="vBack" title="back 10 seconds (left arrow)">&#8630; 10s</button>' +
-    '<button id="vFwd" title="forward 10 seconds (right arrow)">10s &#8631;</button>' +
-    '<select id="vSpeed" title="playback speed (&lt; and &gt;)">' +
+    '<button id="vBack" title="[[@back 10 seconds (left arrow)]]">&#8630; 10s</button>' +
+    '<button id="vFwd" title="[[@forward 10 seconds (right arrow)]]">10s &#8631;</button>' +
+    '<select id="vSpeed" title="[[@playback speed (< and >)]]">' +
       [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(x => '<option value="' + x + '">' + x + '&times;</option>').join("") + '</select>' +
-    '<button id="vRot" title="turn the picture a quarter turn (r) - for phone videos lying on their side">&#8635; Rotate</button>' +
-    '<button id="vMir" title="mirror the picture left-right (h) - for selfie videos">&#8646; Mirror</button>' +
-    '<button id="vFill" title="fill the frame, cropping the edges (c)">Fill</button>' +
-    '<button id="vWide" title="fill the window (w)">Full width</button>' +
-    '<button id="vPip" title="keep playing in a small floating window">Picture-in-picture</button>' +
-    '<button id="vFull" title="full screen (f)">Full screen</button>' +
+    '<button id="vRot" title="[[@turn the picture a quarter turn (r) - for phone videos lying on their side]]">&#8635; [[@Rotate]]</button>' +
+    '<button id="vMir" title="[[@mirror the picture left-right (h) - for selfie videos]]">&#8646; [[@Mirror]]</button>' +
+    '<button id="vFill" title="[[@fill the frame, cropping the edges (c)]]">[[@Fill]]</button>' +
+    '<button id="vWide" title="[[@fill the window (w)]]">[[@Full width]]</button>' +
+    '<button id="vPip" title="[[@keep playing in a small floating window]]">[[@Picture-in-picture]]</button>' +
+    '<button id="vFull" title="[[@full screen (f)]]">[[@Full screen]]</button>' +
     '<span class="arr" id="vArr" style="display:none"><i><b id="vArrBar"></b></i><span id="vArrTxt"></span></span>' +
     '</div></div>';
   const v = document.getElementById("v"), $ = id => document.getElementById(id);
@@ -4985,7 +5270,7 @@ function tgVideo(main){
     let pos = 0; try { pos = +localStorage.getItem(KEY) || 0; } catch (e) {}
     if (pos > 30 && (!v.duration || pos < v.duration - 30)) {
       v.currentTime = pos;
-      const t = toast("continued from " + fmt(pos) + ' <a id="vRestart">start over</a>', 8000);
+      const t = toast('[[@continued from %1]]'.replace("%1", fmt(pos)) + ' <a id="vRestart">[[@start over]]</a>', 8000);
       t.querySelector("#vRestart").onclick = () => { v.currentTime = 0; t.remove(); };
     }
   });
@@ -5024,8 +5309,8 @@ function tgVideo(main){
         const pct = Math.min(100, j.bytes / j.total * 100);
         $("vArr").style.display = "flex"; $("vArrBar").style.width = pct + "%";
         $("vArrTxt").textContent = j.paused
-          ? "paused at " + pct.toFixed(0) + "% — resume it on the Downloads page, or reopen this film"
-          : "still arriving: " + pct.toFixed(0) + "% here — skipping further ahead will wait";
+          ? "[[@js:paused at %1% — resume it on the Downloads page, or reopen this film]]".replace("%1", pct.toFixed(0))
+          : "[[@js:still arriving: %1% here — skipping further ahead will wait]]".replace("%1", pct.toFixed(0));
       } else if (j.status === "ready") { $("vArr").style.display = "none"; return; }
     } catch (e) {}
     setTimeout(arrival, 3000);
@@ -5229,17 +5514,17 @@ video{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;b
 .time{font-variant-numeric:tabular-nums;font-size:13px;color:#cbd5e1;white-space:nowrap}
 @media (max-width:640px){.bar .hide-s{display:none}.ctl{gap:8px;padding:8px 10px 12px}}
 </style></head><body>
-<div class="bar"><a href="#" id="back">&larr; back</a><div class="title">__TITLE__</div>
-<span class="hide-s" id="what" style="color:#64748b"></span><a href="/media/__ID__" download>&#11015; download</a></div>
-<div class="stage"><video id="v" playsinline></video><div class="msg" id="msg">getting ready…</div></div>
+<div class="bar"><a href="#" id="back">&larr; [[@back]]</a><div class="title">__TITLE__</div>
+<span class="hide-s" id="what" style="color:#64748b"></span><a href="/media/__ID__" download>&#11015; [[@download]]</a></div>
+<div class="stage"><video id="v" playsinline></video><div class="msg" id="msg">[[@getting ready…]]</div></div>
 <div class="ctl">
-  <button id="pp" title="play or pause (space)">&#9654;</button>
-  <button id="b10" title="back ten seconds (left arrow)">&minus;10</button>
+  <button id="pp" title="[[@play or pause (space)]]">&#9654;</button>
+  <button id="b10" title="[[@back 10 seconds (left arrow)]]">&minus;10</button>
   <input type="range" id="bar" min="0" max="1" step="1" value="0" disabled>
-  <button id="f10" title="on thirty seconds (right arrow)">+30</button>
+  <button id="f10" title="[[@on thirty seconds (right arrow)]]">+30</button>
   <span class="time" id="time">0:00 / 0:00</span>
-  <select id="q" title="how tall the picture is made: smaller is lighter on this server and on the connection"></select>
-  <button id="fs" title="full screen (F)">&#9974;</button>
+  <select id="q" title="[[@how tall the picture is made: smaller is lighter on this server and on the connection]]"></select>
+  <button id="fs" title="[[@full screen (F)]]">&#9974;</button>
 </div>
 <script>
 const ID = __ID__, v = document.getElementById("v"), bar = document.getElementById("bar"), msg = document.getElementById("msg");
@@ -5251,9 +5536,9 @@ const now = () => Math.min(dur, base + (v.currentTime || 0));
 function say(t){ msg.textContent = t || ""; msg.style.display = t ? "flex" : "none"; }
 function from(t, keep){
   base = Math.max(0, Math.min(dur ? dur - 1 : 0, t));
-  say("converting…");
+  say("[[@js:converting…]]");
   v.src = "/transcode/" + ID + "?t=" + base.toFixed(2) + (height ? "&h=" + height : "");
-  v.play().catch(() => { document.getElementById("pp").innerHTML = "&#9654;"; say("press play"); });
+  v.play().catch(() => { document.getElementById("pp").innerHTML = "&#9654;"; say("[[@js:press play]]"); });
 }
 function tick(){
   if (!drag) bar.value = Math.floor(now());
@@ -5263,12 +5548,12 @@ function tick(){
 v.addEventListener("timeupdate", tick);
 v.addEventListener("playing", () => { tries = 0; say(""); document.getElementById("pp").innerHTML = "&#10074;&#10074;"; });
 v.addEventListener("pause", () => { document.getElementById("pp").innerHTML = "&#9654;"; });
-v.addEventListener("waiting", () => say("converting…"));
-v.addEventListener("ended", () => { if (dur - now() > 15 && tries++ < 3) from(now()); else { say("the end"); try { localStorage.removeItem(KEY); } catch (e) {} } });
+v.addEventListener("waiting", () => say("[[@js:converting…]]"));
+v.addEventListener("ended", () => { if (dur - now() > 15 && tries++ < 3) from(now()); else { say("[[@js:the end]]"); try { localStorage.removeItem(KEY); } catch (e) {} } });
 v.addEventListener("error", () => {
   if (!v.src) return;
   if (tries++ < 2) setTimeout(() => from(now()), 1500 * tries);
-  else say("it could not be played here - too many films are being converted at once, or this file cannot be read");
+  else say("[[@js:it could not be played here - too many films are being converted at once, or this file cannot be read]]");
 });
 bar.addEventListener("input", () => { drag = true; tick(); });
 bar.addEventListener("change", () => { drag = false; from(+bar.value); });
@@ -5286,19 +5571,19 @@ document.addEventListener("keydown", e => {
 });
 document.getElementById("back").onclick = e => { e.preventDefault(); if (history.length > 1) history.back(); else location.href = "/videos"; };
 fetch("/transcode/" + ID + "/info").then(r => r.json()).then(j => {
-  if (j.status !== "ok") { say(j.message || "this cannot be played"); return; }
+  if (j.status !== "ok") { say(j.message || "[[@js:this cannot be played]]"); return; }
   dur = j.duration; bar.max = Math.floor(dur); bar.disabled = false;
-  document.getElementById("what").textContent = [({dvd: "DVD image", bluray: "Blu-ray image", file: ""})[j.kind] || "",
-    j.hw ? "converted on the graphics card" : ""].filter(Boolean).join(" · ");
+  document.getElementById("what").textContent = [({dvd: "[[@js:DVD image]]", bluray: "[[@js:Blu-ray image]]", file: ""})[j.kind] || "",
+    j.hw ? "[[@js:converted on the graphics card]]" : ""].filter(Boolean).join(" · ");
   const q = document.getElementById("q"); let want = 0;
   try { want = +(localStorage.getItem("tgarr.play.h") || 0); } catch (e) {}
-  q.innerHTML = '<option value="0">' + (j.height ? j.height + "p" : "as it is") + '</option>'
+  q.innerHTML = '<option value="0">' + (j.height ? j.height + "p" : '[[@as it is]]') + '</option>'
     + j.heights.slice().reverse().map(h => '<option value="' + h + '">' + h + 'p</option>').join("");
   if (j.heights.includes(want)) { height = want; q.value = String(want); }
   if (!j.heights.length) q.style.display = "none";
   let at = 0; try { at = +(localStorage.getItem(KEY) || 0); } catch (e) {}
   from(at > 5 && at < dur - 30 ? at : 0);
-}).catch(() => say("this server did not answer"));
+}).catch(() => say("[[@js:this server did not answer]]"));
 </script></body></html>"""
 
 
@@ -5307,7 +5592,8 @@ async def page_play(msg_id: int):
     f = await _tc_file(msg_id)
     if not f:
         return RedirectResponse(f"/watch/{msg_id}")           # not here yet: the watch page fetches it and comes back
-    return HTMLResponse(_PLAY_HTML.replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
+    # the words first, the file's name after: a name is never read for marks
+    return HTMLResponse(_fill(_PLAY_HTML).replace("__TITLE__", html.escape(f[1])).replace("__ID__", str(int(msg_id))))
 
 
 @app.get("/watch/{msg_id}", response_class=HTMLResponse)
@@ -5322,7 +5608,7 @@ async def watch_page(msg_id: int):
                FROM messages m LEFT JOIN channels c ON c.id=m.channel_id
                WHERE m.id=$1""", msg_id)
     if not row:
-        return HTMLResponse("<h1>404 — message not indexed</h1>", status_code=404)
+        return HTMLResponse("<h1>404 — " + _t("message not indexed") + "</h1>", status_code=404)
     title = row["file_name"] or f"msg-{msg_id}"
     mt = row["media_type"] or "document"
     await _want_fetch(msg_id, opened=True)
@@ -5361,18 +5647,18 @@ audio {{ width:600px; max-width:96vw; }}
 {_WATCH_PLAYER_CSS}
 </style></head><body>
 <div class="bar">
-  <a href="#" id="backBtn">← back</a>
+  <a href="#" id="backBtn">← {_t("back")}</a>
   <div class="title">{html.escape(title)}</div>
-  <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{'in your favourites' if row["fav"] else 'add to favourites'}">♥ Favourite</button>
-  {f'<a href="/play/{msg_id}" title="no picture or no sound? this plays it converted for this device">▶ play converted</a>' if (transcode.available() and transcode.needs(title) == "maybe") else ""}
-  <a href="/media/{msg_id}" download>⬇ download</a>
+  <button class="fav{' on' if row["fav"] else ''}" id="favBtn" title="{_t("in your favourites") if row["fav"] else _t("add to favourites")}">♥ {_t("Favourite")}</button>
+  {f'<a href="/play/{msg_id}" title="{_t("no picture or no sound? this plays it converted for this device")}">▶ {_t("play converted")}</a>' if (transcode.available() and transcode.needs(title) == "maybe") else ""}
+  <a href="/media/{msg_id}" download>⬇ {_t("download")}</a>
 </div>
 <main id="main">
   <div class="loader">
     <div class="ico">⏳</div>
-    <div class="status" id="status">requesting from Telegram CDN…</div>
+    <div class="status" id="status">{_t("requesting from Telegram CDN…")}</div>
     <div class="progress"><div id="progBar"></div></div>
-    <div class="hint" id="hint">on-demand download — first chunk usually starts within seconds</div>
+    <div class="hint" id="hint">{_t("on-demand download — first chunk usually starts within seconds")}</div>
     <div class="hint" id="dchint" style="margin-top:6px"></div>
   </div>
 </main>
@@ -5383,9 +5669,10 @@ const MEDIA_TYPE = {_js_str(mt)};
 // while it is watched, on /play. 'maybe': tried as it is first, converted if that fails.
 const CONVERT = {_js_str(transcode.needs(title) if transcode.available() else "")};
 const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
-{_WATCH_PLAYER_JS}
+const OWN_KINDS = {_json.dumps(list(ownbooks.KINDS))};
+{_fill(_WATCH_PLAYER_JS)}
 tgFavBtn();
-let started = false, comicTried = false;
+let started = false, comicTried = false, ownTried = false, ownWhy = "";
 function fmtBytes(b) {{
   if (!b) return "0 B";
   const u = ["B","KB","MB","GB"]; let i = 0; let v = b;
@@ -5400,7 +5687,12 @@ function renderPlayer() {{
     tgVideo(main);
     if (CONVERT === "maybe") {{
       const vv = main.querySelector("video");
-      if (vv) vv.addEventListener("error", () => location.replace("/play/" + MSG_ID), {{once: true}});
+      // only when this device cannot decode it (3) or does not know the kind at all (4) -
+      // a connection that dropped (2) is not a reason to convert a film
+      if (vv) vv.addEventListener("error", () => {{
+        const c = vv.error ? vv.error.code : 4;
+        if (c === 3 || c === 4) location.replace("/play/" + MSG_ID);
+      }});
     }}
     return;
   }}
@@ -5414,9 +5706,20 @@ function renderPlayer() {{
     location.replace("/pdf/" + MSG_ID);
     return;
   }}
-  if (ext === "epub") {{
+  if (ext === "epub" || ext === "txt" || ext === "md" || ext === "csv") {{
     // Read in the built-in reader: instant, and no conversion to run.
     location.replace("/epub/" + MSG_ID);
+    return;
+  }}
+  if (OWN_KINDS.includes(ext) && !ownTried) {{
+    // read in the built-in reader as they are; the few that cannot be (a protected Kindle
+    // book, one packed in a way not read here) say why, further down
+    ownTried = true;
+    fetch("/epub/" + MSG_ID + "/toc").then(async r => {{
+      if (r.ok) {{ location.replace("/epub/" + MSG_ID); return; }}
+      try {{ ownWhy = (await r.json()).error || ""; }} catch (e) {{}}
+      started = false; renderPlayer();
+    }}).catch(() => {{ started = false; renderPlayer(); }});
     return;
   }}
   if ((ext === "cbz" || ext === "cbr") && !comicTried) {{
@@ -5429,17 +5732,15 @@ function renderPlayer() {{
     }}).catch(() => {{ started = false; renderPlayer(); }});
     return;
   }}
-  if (["mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
-    // Calibre-converted PDF — poll status, swap to iframe on ready.
+  if (["djvu","djv"].includes(ext)) {{
+    // a scanned book: made into a PDF once, then read like one
     const loader = document.createElement("div");
     loader.className = "loader";
     loader.innerHTML =
       '<div class="ico">📚</div>' +
-      '<div class="status" id="ebookStatus">checking…</div>' +
+      '<div class="status" id="ebookStatus">{_t("checking…")}</div>' +
       '<div class="progress"><div id="ebookBar"></div></div>' +
-      '<div class="hint">first open of a non-PDF ebook converts to PDF via calibre. ' +
-      'small books (<10MB): ~20s. medium: 1–2 min. big books (50MB+) queue automatically — leave the page, conversion continues in background, come back later (a few minutes to hours for very large books). ' +
-      'subsequent opens are instant.</div>' +
+      '<div class="hint">{_t("a scanned book is made into pages the first time it is opened: seconds for most, a few minutes for a very thick one. You may leave this page; it goes on. After that it opens at once.")}</div>' +
       '<div class="hint" id="ebookElapsed" style="margin-top:6px"></div>';
     main.innerHTML = "";
     main.appendChild(loader);
@@ -5450,57 +5751,31 @@ function renderPlayer() {{
         const r = await fetch(`/api/ebook-status/${{MSG_ID}}`, {{cache: "no-store"}});
         const j = await r.json();
         const elapsed = ((Date.now()-startedAt)/1000).toFixed(0);
-        document.getElementById("ebookElapsed").textContent = `elapsed: ${{elapsed}}s`;
+        document.getElementById("ebookElapsed").textContent = "{_tj("elapsed: %1s")}".replace("%1", elapsed);
         if (j.state === "ready") {{
           location.replace("/pdf/" + MSG_ID);
           return;
         }}
         if (j.state === "failed") {{
           document.getElementById("ebookStatus").textContent =
-            "✗ conversion failed: " + (j.reason || "calibre error");
-          return;
-        }}
-        if (j.state === "needs_converter") {{
-          // the converter (calibre) is fetched once, when a book first needs it
-          const st = document.getElementById("ebookStatus"), mb = Math.round((j.bytes || 0) / 1e6);
-          document.getElementById("ebookElapsed").textContent = "";
-          if (j.installing) {{
-            const pc = j.bytes ? Math.min(100, Math.round(j.done * 100 / j.bytes)) : 0;
-            st.textContent = pc < 100 ? "fetching the book converter… " + pc + "%" : "unpacking the book converter…";
-            document.getElementById("ebookBar").style.width = pc + "%";
-          }} else if (!j.possible) {{
-            st.textContent = "✗ this kind of book needs a converter that does not exist for this machine";
-            return;
-          }} else if (!st.querySelector("button")) {{
-            st.innerHTML = 'This kind of book is converted before it is read, and the converter is not part of tgarr: ' +
-              'it is fetched once (' + mb + ' MB, about 1 GB on the disk).' + (j.error ? '<br><span style="color:#fbbf24">Last try: ' +
-              String(j.error).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]) + '</span>' : '') +
-              '<br><button id="getConv" style="margin-top:10px;padding:9px 18px;border-radius:8px;border:0;background:#229ED9;color:#fff;font:inherit;font-weight:600;cursor:pointer">Fetch the converter</button>';
-            document.getElementById("getConv").onclick = () => {{
-              st.textContent = "starting…";
-              fetch("/api/packs/install", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{name: "books"}})}})
-                .then(r => r.json()).then(x => {{ if (x.status !== "ok") st.textContent = "✗ " + (x.message || "could not start"); }})
-                .catch(() => {{ st.textContent = "✗ this server did not answer"; }});
-            }};
-          }}
-          setTimeout(tick, 2000);
+            "✗ " + (j.reason || "{_tj("this book could not be made into pages")}");
           return;
         }}
         if (j.state === "no_source") {{
-          document.getElementById("ebookStatus").textContent = "✗ source not cached";
+          document.getElementById("ebookStatus").textContent = "✗ {_tj("source not cached")}";
           return;
         }}
 
         let msg;
         if (j.state === "downloading") {{
-          msg = "downloading…";
+          msg = "{_tj("downloading…")}";
         }} else if (j.state === "queued") {{
-          msg = `queued — position ${{j.position || 1}} in line`;
-          if (j.eta_s) msg += ` · est wait ~${{Math.ceil(j.eta_s/60)}} min`;
+          msg = "{_tj("queued — position %1 in line")}".replace("%1", j.position || 1);
+          if (j.eta_s) msg += " · " + "{_tj("est wait ~%1 min")}".replace("%1", Math.ceil(j.eta_s/60));
         }} else {{
-          msg = "converting…";
+          msg = "{_tj("converting…")}";
         }}
-        if (j.src_size) msg += ` (source ${{fmtBytes(j.src_size)}})`;
+        if (j.src_size) msg += " (" + "{_tj("source %1")}".replace("%1", fmtBytes(j.src_size)) + ")";
         document.getElementById("ebookStatus").textContent = msg;
         if (j.out_size && j.out_size !== lastSize) {{
           lastSize = j.out_size;
@@ -5510,7 +5785,7 @@ function renderPlayer() {{
         document.getElementById("ebookBar").style.width = pct + "%";
         setTimeout(tick, 2000);
       }} catch (e) {{
-        document.getElementById("ebookStatus").textContent = "✗ status check failed";
+        document.getElementById("ebookStatus").textContent = "✗ {_tj("status check failed")}";
         setTimeout(tick, 5000);
       }}
     }}
@@ -5518,9 +5793,24 @@ function renderPlayer() {{
     return;
     return;
   }}
+  if (OWN_KINDS.includes(ext) || ["lit","lrf","pdb","cbr","cbz"].includes(ext)) {{
+    // a book this reader cannot open: said plainly, with the file to take elsewhere
+    const box = document.createElement("div");
+    box.className = "loader";
+    const why = document.createElement("div");
+    why.className = "status";
+    why.textContent = ownWhy || "{_tj("This kind of book cannot be shown here.")}";
+    box.innerHTML = '<div class="ico">📚</div>';
+    box.appendChild(why);
+    box.insertAdjacentHTML("beforeend", '<div class="hint">{_t("It is kept as it is: download it to read it with another program.")}</div>' +
+      `<div style="margin-top:12px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ {_t("download")}</a></div>`);
+    main.innerHTML = "";
+    main.appendChild(box);
+    return;
+  }}
   // fallback: try iframe but offer download as escape hatch
-  main.innerHTML = `<iframe src="/media/${{MSG_ID}}" style="height:85vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>
-    <div style="margin-top:8px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5;font-size:13px">⬇ download raw</a></div>`;
+  main.innerHTML = `<iframe sandbox src="/media/${{MSG_ID}}" style="height:85vh;width:1200px;max-width:96vw;border:0;background:#fff"></iframe>
+    <div style="margin-top:8px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5;font-size:13px">⬇ {_t("download raw")}</a></div>`;
 }}
 async function poll() {{
   try {{
@@ -5532,31 +5822,31 @@ async function poll() {{
         dh.dataset.set = "1";
         const sameDc = !j.cross_dc;
         dh.innerHTML = sameDc
-          ? `<span style="color:#10b981">● file DC ${{j.file_dc}} = your DC ${{j.my_dc}} — fast path</span>`
-          : `<span style="color:#f59e0b">● file DC ${{j.file_dc}} ≠ your DC ${{j.my_dc}} — cross-DC, may hit FloodWait</span>`;
+          ? '<span style="color:#10b981">● ' + "{_t("file DC %1 = your DC %2 — fast path")}".replace("%1", j.file_dc).replace("%2", j.my_dc) + '</span>'
+          : '<span style="color:#f59e0b">● ' + "{_t("file DC %1 ≠ your DC %2 — cross-DC, may hit FloodWait")}".replace("%1", j.file_dc).replace("%2", j.my_dc) + '</span>';
       }}
     }}
     if (j.status === "signedout") {{
-      document.getElementById("status").textContent = "This file is not saved on this machine";
+      document.getElementById("status").textContent = "{_tj("This file is not saved on this machine")}";
       document.getElementById("hint").innerHTML =
-        'Fetching it needs a Telegram account. <a href="/login" style="color:#5eb6e5">Sign in</a> to play it.';
+        "{_t("Fetching it needs a Telegram account. %1Sign in%2 to play it.")}".replace("%1", '<a href="/login" style="color:#5eb6e5">').replace("%2", '</a>');
       return;
     }}
     if (j.status === "failed") {{
-      document.getElementById("status").textContent = "✗ could not fetch this file";
+      document.getElementById("status").textContent = "✗ {_tj("could not fetch this file")}";
       document.getElementById("hint").textContent =
-        "The source message may have been deleted or the channel is no longer reachable.";
+        "{_tj("The source message may have been deleted or the channel is no longer reachable.")}";
       return;
     }}
     if (j.status === "ready") {{
-      document.getElementById("status").textContent = "✓ ready — opening player…";
+      document.getElementById("status").textContent = "✓ {_tj("ready — opening player…")}";
       renderPlayer();
       return;
     }}
     if (j.status === "downloading") {{
       const pct = j.total > 0 ? (j.bytes / j.total * 100) : 0;
       document.getElementById("status").textContent =
-        `downloading ${{fmtBytes(j.bytes)}}${{j.total ? " / " + fmtBytes(j.total) : ""}} (${{pct.toFixed(0)}}%)`;
+        "{_tj("downloading %1")}".replace("%1", `${{fmtBytes(j.bytes)}}${{j.total ? " / " + fmtBytes(j.total) : ""}} (${{pct.toFixed(0)}}%)`);
       document.getElementById("progBar").style.width = pct + "%";
       // Start the player as soon as ~2MB or 10% is on disk — progressive
       // playback can then keep up with the download. Only for video and
@@ -5570,16 +5860,15 @@ async function poll() {{
       if (j.tg_wait && j.tg_wait.seconds_left > 0) {{
         const mins = Math.max(1, Math.round(j.tg_wait.seconds_left / 60));
         document.getElementById("status").textContent =
-          "⏸ Telegram asked us to slow down — starts by itself in about " + mins + " min";
+          "⏸ " + "{_tj("Telegram asked us to slow down — starts by itself in about %1 min")}".replace("%1", mins);
         document.getElementById("hint").textContent =
-          "Your request stays queued. Nothing is wrong with the file or your account; " +
-          "tgarr is waiting instead of pushing, to keep your Telegram account in good standing.";
+          "{_tj("Your request stays queued. Nothing is wrong with the file or your account; tgarr is waiting instead of pushing, to keep your Telegram account in good standing.")}";
       }} else {{
-        document.getElementById("status").textContent = "queued — waiting for crawler…";
+        document.getElementById("status").textContent = "{_tj("queued — waiting for crawler…")}";
       }}
     }}
   }} catch(e) {{
-    document.getElementById("status").textContent = "network error — retrying…";
+    document.getElementById("status").textContent = "{_tj("network error — retrying…")}";
   }}
   setTimeout(poll, 1500);
 }}
@@ -5594,8 +5883,8 @@ poll();
 # Login (Telegram QR + SMS)
 # ════════════════════════════════════════════════════════════════════
 LOGIN_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>tgarr — sign in to Telegram</title>
+<html lang="__LANG__" dir="__DIR__"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>tgarr — [[@Sign in to Telegram]]</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <style>
 :root { --bg:#f5f7fa; --bg2:#ffffff; --fg:#1e293b; --muted:#64748b; --accent:#229ED9; --tg-blue:#229ED9; --border:#e2e8f0; --ok:#15803d; --bad:#b91c1c; }
@@ -5633,31 +5922,31 @@ code { background:#f1f5f9; padding:3px 8px; border-radius:4px; color:#0369a1; fo
     <svg class="mark" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
     <h1>tg<span>arr</span></h1>
   </div>
-  <div class="tag">sign in to Telegram</div>
-  <div class="sub">tgarr needs to log in to your Telegram account once. Session is stored locally — never leaves your tgarr instance.</div>
+  <div class="tag">[[@Sign in to Telegram]]</div>
+  <div class="sub">[[@tgarr needs to log in to your Telegram account once. Session is stored locally — never leaves your tgarr instance.]]</div>
 
   <div class="tabs">
-    <div class="tab active" onclick="show('qr')">Scan QR</div>
-    <div class="tab" onclick="show('sms')">Phone + SMS</div>
+    <div class="tab active" onclick="show('qr')">[[@Scan QR]]</div>
+    <div class="tab" onclick="show('sms')">[[@Phone + SMS]]</div>
   </div>
 
   <div id="panel-qr" class="panel active">
-    <p class="hint">Open Telegram on your phone → <b>Settings → Devices → Link Desktop Device</b>, then scan:</p>
-    <img id="qrimg" alt="QR code" />
-    <div id="qr-status" class="status">starting…</div>
+    <p class="hint">__QRHINT__</p>
+    <img id="qrimg" alt="[[@QR code]]" />
+    <div id="qr-status" class="status">[[@starting…]]</div>
   </div>
 
   <div id="panel-sms" class="panel">
-    <p class="hint">tgarr will send a code to your Telegram account.</p>
-    <label>Phone (with country code)</label>
+    <p class="hint">[[@tgarr will send a code to your Telegram account.]]</p>
+    <label>[[@Phone (with country code)]]</label>
     <input id="phone" type="tel" placeholder="+12815551234" />
-    <button id="send-btn" onclick="smsSend()">Send code</button>
+    <button id="send-btn" onclick="smsSend()">[[@Send code]]</button>
     <div id="code-row" style="display:none">
-      <label>Code from Telegram</label>
+      <label>[[@Code from Telegram]]</label>
       <input id="code" type="text" placeholder="12345" />
-      <label id="pw-label" style="display:none">2FA password (if you set one)</label>
+      <label id="pw-label" style="display:none">[[@2FA password (if you set one)]]</label>
       <input id="password" type="password" style="display:none" />
-      <button onclick="smsVerify()">Sign in</button>
+      <button onclick="smsVerify()">[[@Sign in]]</button>
     </div>
     <div id="sms-status" class="status"></div>
   </div>
@@ -5679,10 +5968,10 @@ async function qrStart() {
     setStatus('qr', r.message, '');
     qrPoll();
   } else if (r.status === 'already_authed') {
-    setStatus('qr', 'already signed in — redirecting…', 'ok');
+    setStatus('qr', "[[@js:already signed in — redirecting…]]", 'ok');
     setTimeout(() => location.href = '/', 1000);
   } else {
-    setStatus('qr', r.message || 'error', 'error');
+    setStatus('qr', r.message || "[[@js:error]]", 'error');
   }
 }
 async function qrPoll() {
@@ -5699,7 +5988,7 @@ async function qrPoll() {
       if (s.message) setStatus('qr', s.message, '');
     }
     if (s.status === 'success') {
-      setStatus('qr', s.message + ' — redirecting…', 'ok');
+      setStatus('qr', "[[@js:%1 — redirecting…]]".replace("%1", s.message), 'ok');
       setTimeout(() => location.href = '/', 1500);
       return;
     }
@@ -5721,7 +6010,7 @@ async function smsSend() {
     setStatus('sms', r.message, 'ok');
     document.getElementById('code-row').style.display = 'block';
   } else {
-    setStatus('sms', r.message || 'error', 'error');
+    setStatus('sms', r.message || "[[@js:error]]", 'error');
     document.getElementById('send-btn').disabled = false;
   }
 }
@@ -5736,14 +6025,14 @@ async function smsVerify() {
     body: body,
   }).then(r => r.json());
   if (r.status === 'success') {
-    setStatus('sms', r.message + ' — redirecting…', 'ok');
+    setStatus('sms', "[[@js:%1 — redirecting…]]".replace("%1", r.message), 'ok');
     setTimeout(() => location.href = '/', 1500);
   } else if (r.status === 'needs_2fa') {
     document.getElementById('pw-label').style.display = 'block';
     document.getElementById('password').style.display = 'block';
-    setStatus('sms', '2FA password required — enter then click Sign in again', '');
+    setStatus('sms', "[[@js:2FA password required — enter it, then click Sign in again]]", '');
   } else {
-    setStatus('sms', r.message || 'error', 'error');
+    setStatus('sms', r.message || "[[@js:error]]", 'error');
   }
 }
 function setStatus(tab, msg, cls) {
@@ -5753,14 +6042,14 @@ function setStatus(tab, msg, cls) {
 }
 qrStart();
 </script>
-<a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">Not now - look around first &rarr;</a>
+<a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">[[@Not now - look around first]] &rarr;</a>
 </body></html>"""
 
 
 APP_SETUP_HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/>
+<html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>tgarr - first-time setup</title>
+<title>tgarr - [[@first-time setup]]</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
   display:flex;min-height:100vh;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
@@ -5780,23 +6069,20 @@ button:disabled{opacity:.6;cursor:default}
 small{color:#64748b;font-size:12.5px;line-height:1.5;display:block;margin-top:16px}
 a{color:#0284c7}
 </style></head><body><div class="card">
-<h1>tg<span>arr</span> - one step before signing in</h1>
-<p>Telegram asks every program that connects to it for an <b>app id</b> and <b>app hash</b>.
-They are free, belong to your own account, and take a minute to get:</p>
+<h1>tg<span>arr</span> - [[@one step before signing in]]</h1>
+<p>__APPWHY__</p>
 <ol>
-<li>Open <a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>
-and sign in with your phone number (the code arrives in Telegram itself).</li>
-<li>Fill in "Create new application" - any title and short name will do - and press Create.</li>
-<li>Copy <b>App api_id</b> and <b>App api_hash</b> into the two boxes below.</li>
+<li>__APPSTEP1__</li>
+<li>[[@Fill in "Create new application" - any title and short name will do - and press Create.]]</li>
+<li>__APPSTEP3__</li>
 </ol>
 <form id="f" autocomplete="off">
 <label for="i">App api_id</label><input id="i" name="api_id" inputmode="numeric" placeholder="1234567" required/>
-<label for="h">App api_hash</label><input id="h" name="api_hash" placeholder="32 letters and digits" required/>
-<button id="b" type="submit">Save and continue to sign-in</button>
+<label for="h">App api_hash</label><input id="h" name="api_hash" placeholder="[[@32 letters and digits]]" required/>
+<button id="b" type="submit">[[@Save and continue to sign-in]]</button>
 <div id="err"></div>
 </form>
-<small>The two values stay on this machine, beside the Telegram session. Setting TG_API_ID and
-TG_API_HASH in the .env file does the same thing and takes precedence.</small>
+<small>[[@The two values stay on this machine, beside the Telegram session. Setting TG_API_ID and TG_API_HASH in the .env file does the same thing and takes precedence.]]</small>
 </div>
 <script>
 document.getElementById("f").addEventListener("submit", async function (e) {
@@ -5806,11 +6092,11 @@ document.getElementById("f").addEventListener("submit", async function (e) {
   try {
     const r = await fetch("/api/login/app", {method: "POST", body: new FormData(e.target)}).then(r => r.json());
     if (r.status === "ok") { location.href = "/login"; return; }
-    err.textContent = r.message || "That did not work.";
-  } catch (x) { err.textContent = "Could not reach tgarr: " + x; }
+    err.textContent = r.message || "[[@js:That did not work.]]";
+  } catch (x) { err.textContent = "[[@js:Could not reach tgarr: %1]]".replace("%1", x); }
   b.disabled = false;
 });
-</script><a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">Not now - look around first &rarr;</a></body></html>"""
+</script><a href="/" style="position:fixed;top:14px;right:18px;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0284c7;background:#fff;border:1px solid #cbd5e1;border-radius:999px;padding:7px 14px;text-decoration:none">[[@Not now - look around first]] &rarr;</a></body></html>"""
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -5819,9 +6105,19 @@ async def login_page(preview: Optional[int] = None):
     # account was logged out upstream, must re-auth before doing anything.
     if login.session_exists() and not preview and not _is_revoked():
         return RedirectResponse("/")
+    def page(text: str) -> str:
+        return _fill(text).replace("__LANG__", _LANG.get()).replace("__DIR__", i18n.direction(_LANG.get()))
     if not login.app_configured():
-        return HTMLResponse(APP_SETUP_HTML)
-    return HTMLResponse(LOGIN_HTML)
+        return HTMLResponse(
+            page(APP_SETUP_HTML)
+            .replace("__APPWHY__", _t("Telegram asks every program that connects to it for an %1 and an %2. They are free, belong to your own account, and take a minute to get:")
+                     .replace("%1", "<b>app id</b>").replace("%2", "<b>app hash</b>"))
+            .replace("__APPSTEP1__", _t("Open %1 and sign in with your phone number (the code arrives in Telegram itself).")
+                     .replace("%1", '<a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>'))
+            .replace("__APPSTEP3__", _t("Copy %1 and %2 into the two boxes below.")
+                     .replace("%1", "<b>App api_id</b>").replace("%2", "<b>App api_hash</b>")))
+    return HTMLResponse(page(LOGIN_HTML).replace(
+        "__QRHINT__", _t("Open Telegram on your phone → %1, then scan:").replace("%1", "<b>" + _t("Settings → Devices → Link Desktop Device") + "</b>")))
 
 
 @app.post("/api/login/app")
@@ -6210,7 +6506,7 @@ _EXPORT_KIND_SQL = {
     "video": "m.media_type = 'video'",
     "audio": "m.media_type = 'audio'",
     "document": "m.media_type = 'document'",
-    "book": "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'",
+    "book": _book_sql("m.file_name"),
     "all": "(m.file_unique_id IS NOT NULL OR m.file_name IS NOT NULL)",
 }
 _EXPORT_KIND_NAME = {"photo": "photos", "video": "videos", "audio": "music", "document": "documents", "book": "books", "all": "all files"}
@@ -6220,20 +6516,20 @@ _EXPORT_JS = (
     'function ask(b){return fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},'
     'body:JSON.stringify(b)}).then(function(r){return r.json()})}'
     'ask(Object.assign({check:true},o)).then(function(j){'
-    'if(j.status!=="ok"){alert(j.message||"That cannot be downloaded.");return}'
-    'if(!j.files){alert("There is nothing to download here.");return}'
-    'var m=j.files+" files"+(j.size?" ("+j.size+")":"")+" as one zip.";'
-    'if(j.to_fetch){m+=" "+j.to_fetch+" of them are not on this machine yet"+(j.fetch_size?" ("+j.fetch_size+")":"")+'
-    '": they are fetched from Telegram first, which takes a while."}'
-    'if(!confirm(m+" Go on?"))return;'
-    'ask(o).then(function(k){if(k.status==="ok"){location.href=k.ready?"/export/"+k.id+"/download":"/exports"}else{alert(k.message||"That did not work.")}})'
+    'if(j.status!=="ok"){alert(j.message||"[[@js:That cannot be downloaded.]]");return}'
+    'if(!j.files){alert("[[@js:There is nothing to download here.]]");return}'
+    'var m="[[@js:%1 files as one zip.]]".replace("%1",j.files+(j.size?" ("+j.size+")":""));'
+    'if(j.to_fetch){m+=" "+"[[@js:%1 of them are not on this machine yet: they are fetched from Telegram first, which takes a while.]]"'
+    '.replace("%1",j.to_fetch+(j.fetch_size?" ("+j.fetch_size+")":""))}'
+    'if(!confirm(m+" "+"[[@js:Go on?]]"))return;'
+    'ask(o).then(function(k){if(k.status==="ok"){location.href=k.ready?"/export/"+k.id+"/download":"/exports"}else{alert(k.message||"[[@js:That did not work.]]")}})'
     '})}}</script>')
 
 
 def _export_btn(what: dict, label: str) -> str:
     return ('<button type="button" class="btn ghost" style="padding:5px 12px;font-size:12px" '
             f'data-exp="{html.escape(_json.dumps(what), quote=True)}" '
-            'onclick="tgExport(JSON.parse(this.dataset.exp))">' + label + '</button>' + _EXPORT_JS)
+            'onclick="tgExport(JSON.parse(this.dataset.exp))">' + label + '</button>' + _fill(_EXPORT_JS))
 
 
 async def _export_pick(scope: str, ch, kind: str) -> list:
@@ -6422,13 +6718,13 @@ async def page_exports():
         fetching = j["status"] == "fetching"
         busy = busy or fetching
         pct = int(100 * (st["ready"] + st["missed"]) / max(1, st["total"]))
-        line = f'{st["ready"]:,} of {st["total"]:,} files here'
+        line = _t("{n} of {total} files here", n=f'{st["ready"]:,}', total=f'{st["total"]:,}')
         if st["bytes"]:
             line += f' · {export.human(st["bytes"])}'
         if st["missed"]:
-            line += f' · {st["missed"]:,} could not be fetched'
+            line += ' · ' + _t("{n} could not be fetched", n=f'{st["missed"]:,}')
         if fetching:
-            line += ' · fetching the rest from Telegram…'
+            line += ' · ' + _t("fetching the rest from Telegram…")
         items.append(
             '<div class="dl-item"><div class="icon">🗜</div><div class="info">'
             f'<div class="name">{html.escape(j["title"])}</div><div class="meta">{line}</div>'
@@ -6436,31 +6732,37 @@ async def page_exports():
                f'<div style="height:100%;width:{pct}%;background:var(--accent)"></div></div>' if fetching else '')
             + '</div><div class="right" style="display:flex;gap:8px;align-items:center">'
             + (f'<a class="btn{" ghost" if fetching else ""}" href="/export/{j["id"]}/download">'
-               + ('⬇ What is here so far' if fetching else '⬇ Download zip') + '</a>' if st["ready"] else '')
+               + '⬇ ' + (_t("What is here so far") if fetching else _t("Download zip")) + '</a>' if st["ready"] else '')
             + f'<button type="button" class="btn ghost" onclick="exDel({j["id"]})">'
-            + ('Stop' if fetching else 'Remove') + '</button></div></div>')
+            + (_t("Stop") if fetching else _t("Remove")) + '</button></div></div>')
     opts = "".join(
         f'<option value="{c["id"]}">{html.escape(c["title"] or ("@" + (c["username"] or "chat")))}'
         + ('' if c["username"] else ' 🔒') + '</option>' for c in chats)
-    kinds = "".join(f'<option value="{k}">{html.escape(v)}</option>' for k, v in _EXPORT_KIND_NAME.items())
-    form = ('<div class="empty-state"><div>Sign in to Telegram to download many files at once.</div></div>'
+    # (the names of the kinds are English in _EXPORT_KIND_NAME, which the zip's own name is
+    #  made of too: they are put into the reader's language here, where they are shown)
+    kinds = "".join(f'<option value="{k}">{_t(v)}</option>' for k, v in _EXPORT_KIND_NAME.items())
+    # one sentence with the two lists and the button inside it, so that each language can
+    # put them in its own order
+    form = (f'<div class="empty-state"><div>{_t("Sign in to Telegram to download many files at once.")}</div></div>'
             if me is None else
             '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;'
             'margin-bottom:22px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
-            '<span>Download</span>'
-            f'<select id="exKind">{kinds}</select><span>of</span>'
-            f'<select id="exChat" style="max-width:min(360px,70vw)"><option value="saved">everything already saved here</option>'
-            f'<option value="private">all my private chats</option>{opts}</select>'
-            '<button type="button" class="btn" onclick="exGo()">as one zip</button></div>')
+            + re.sub(r"<span>\s*</span>", "", '<span>' + _dl_html(
+                _t("Download {what} of {where} {go}as one zip{end}", what="\x01", where="\x02", go="\x03", end="\x04"),
+                f'</span><select id="exKind">{kinds}</select><span>',
+                f'</span><select id="exChat" style="max-width:min(360px,70vw)"><option value="saved">{_t("everything already saved here")}</option>'
+                f'<option value="private">{_t("all my private chats")}</option>{opts}</select><span>',
+                '</span><button type="button" class="btn" onclick="exGo()">', '</button><span>') + '</span>')
+            + '</div>')
     body = (
-        '<p style="color:var(--muted);margin-top:0">A whole chat, or everything you have saved, as one zip. '
-        'Files that are not on this machine yet are fetched from Telegram first; the zip can be downloaded when they are here. '
-        'What gets fetched stays in <a href="/downloads">Downloads</a> afterwards.</p>'
+        '<p style="color:var(--muted);margin-top:0">'
+        + _dl_html(_t("A whole chat, or everything you have saved, as one zip. Files that are not on this machine yet are fetched from Telegram first; the zip can be downloaded when they are here. What gets fetched stays in {a}Downloads{b} afterwards.", a="\x01", b="\x02"),
+                   '<a href="/downloads">', '</a>') + '</p>'
         + form
-        + '<h2 class="section">Downloads prepared <span class="count">' + str(len(jobs)) + '</span></h2>'
+        + f'<h2 class="section">{_t("Downloads prepared")} <span class="count">' + str(len(jobs)) + '</span></h2>'
         + ('<div class="dl-list">' + "".join(items) + '</div>' if items else
-           '<div class="empty-state"><div class="icon">🗜</div><div>Nothing prepared yet.</div></div>')
-        + _EXPORT_JS
+           f'<div class="empty-state"><div class="icon">🗜</div><div>{_t("Nothing prepared yet.")}</div></div>')
+        + _fill(_EXPORT_JS)
         + '<script>function exGo(){var c=document.getElementById("exChat").value,k=document.getElementById("exKind").value;'
           'tgExport(c==="saved"||c==="private"?{scope:c,kind:k}:{scope:"chat",ch:c,kind:k})}'
           'function exDel(i){fetch("/api/export/"+i+"/delete",{method:"POST"}).then(function(){location.reload()})}'
@@ -6517,11 +6819,32 @@ async def _local_forget(conn, ch: int, paths: list) -> None:
 
 
 def _local_picture_make(src: str, dst: str, px: int) -> None:
+    """A JPEG no wider or taller than `px`, of any picture this machine can read: what Pillow
+    opens (JPEG, PNG, WebP, AVIF, TIFF ...), and what only ffmpeg does - a phone's HEIC, JPEG XL."""
+    import shutil
+    import subprocess
     from PIL import Image, ImageOps
-    with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
-        im.thumbnail((px, px))
-        im.convert("RGB").save(dst, "JPEG", quality=82)
+    try:
+        with Image.open(src) as im:
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((px, px))
+            im.convert("RGB").save(dst, "JPEG", quality=82)
+        return
+    except Exception:
+        if not shutil.which("ffmpeg"):
+            raise
+    tmp = dst + ".part.jpg"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file", "-i", src, "-frames:v", "1",
+             "-vf", f"scale='min({int(px)},iw)':'min({int(px)},ih)':force_original_aspect_ratio=decrease", "-q:v", "3", tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=60)
+        if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            raise ValueError("not a picture this machine can read")
+        os.replace(tmp, dst)
+    finally:
+        try: os.unlink(tmp)
+        except OSError: pass
 
 
 async def _local_picture(msg_id: int, col: str, folder: str, px: int):
@@ -6544,7 +6867,7 @@ async def _local_picture(msg_id: int, col: str, folder: str, px: int):
         pic = src + ".cover.jpg"
         if not os.path.exists(pic) and row["media_type"] == "document":
             e = localfiles.ext(src)
-            if e == "pdf" or e in _EBOOK_CONVERTIBLE:
+            if e in _COVER_KINDS:
                 try:
                     await _ebook_cover(src, pic)
                 except Exception:
@@ -6677,18 +7000,18 @@ _FILES_JS = (
     'function fAdd(l){for(var i=0;i<l.length;i++){fq.push(l[i]);fTotal++}fNext()}'
     'function fErr(t){fBad++;var d=document.createElement("div");d.textContent=t;document.getElementById("fErr").appendChild(d)}'
     'function fNext(){if(fBusy)return;var f=fq.shift(),s=document.getElementById("fState"),b=document.getElementById("fBar");'
-    'if(!f){if(fTotal){s.textContent=fDone+" of "+fTotal+" uploaded";if(!fBad){var t0=Date.now(),iv=setInterval(function(){'
+    'if(!f){if(fTotal){s.textContent="[[@js:%1 of %2 uploaded]]".replace("%1",fDone).replace("%2",fTotal);if(!fBad){var t0=Date.now(),iv=setInterval(function(){'
     'if(fPend<=0||Date.now()-t0>20000){clearInterval(iv);location.reload()}},400)}}return}'
     'fBusy=true;document.getElementById("fProg").style.display="block";var x=new XMLHttpRequest();'
     'x.open("PUT","/api/files/upload?name="+encodeURIComponent(f.name));'
     'x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(100*e.loaded/e.total);b.style.width=p+"%";'
-    's.textContent=(fDone+1)+" of "+fTotal+": "+f.name+" "+p+"%"}};'
+    's.textContent="[[@js:%1 of %2]]".replace("%1",fDone+1).replace("%2",fTotal)+": "+f.name+" "+p+"%"}};'
     'x.onload=function(){fBusy=false;if(x.status===200){fDone++;var r={};try{r=JSON.parse(x.responseText)}catch(e){}'
     'if(r.id&&r.kind==="video")fThumb(f,r.id)}else{var m="";try{m=JSON.parse(x.responseText).message}catch(e){}'
-    'fErr(f.name+": "+(m||"not uploaded"))}fNext()};'
-    'x.onerror=function(){fBusy=false;fErr(f.name+": the connection was lost");fNext()};x.send(f)}'
+    'fErr(f.name+": "+(m||"[[@js:not uploaded]]"))}fNext()};'
+    'x.onerror=function(){fBusy=false;fErr(f.name+": "+"[[@js:the connection was lost]]");fNext()};x.send(f)}'
     'function fDel(){var ids=[];document.querySelectorAll(".f-ck:checked").forEach(function(c){ids.push(+c.value)});'
-    'if(!ids.length||!confirm("Delete "+ids.length+" uploaded file(s) from this machine for good?"))return;'
+    'if(!ids.length||!confirm("[[@js:Delete the ticked files (%1) from this machine for good?]]".replace("%1",ids.length)))return;'
     'fetch("/api/files/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:ids})})'
     '.then(function(){location.reload()})}'
     'var dz=document.getElementById("fDrop");if(dz){'
@@ -6698,14 +7021,14 @@ _FILES_JS = (
     '</script>')
 _FILE_ICON = {"video": "🎬", "audio": "🎵", "photo": "🖼", "document": "📄"}
 FILES_PAGE = 100
-_FILE_TABS = {"": "All", "video": "🎬 Videos", "audio": "🎵 Music", "photo": "🖼 Photos", "document": "📄 Documents"}
+_FILE_TABS = {"": ("", "All"), "video": ("🎬 ", "Videos"), "audio": ("🎵 ", "Music"), "photo": ("🖼 ", "Photos"), "document": ("📄 ", "Documents")}
 
 
 def _file_href(r) -> str:
     e = localfiles.ext(r["file_name"] or "")
     if r["media_type"] == "video":
         return f'/watch/{r["id"]}'
-    if e == "epub":
+    if e == "epub" or e in ownbooks.KINDS:
         return f'/epub/{r["id"]}'
     if e == "pdf" or e in _EBOOK_CONVERTIBLE:
         return f'/pdf/{r["id"]}'          # read here (anything else is converted on first opening)
@@ -6737,21 +7060,21 @@ async def page_files(offset: int = 0, kind: str = "", q: str = ""):
         return "?" + "&".join(bits) if bits else ""
     # one tab per kind: an upload goes to its tab by itself, by what the file is
     tabs = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px">' + "".join(
-        _chip_link(f'{label} <span style="opacity:.6">{(per.get(k, {"n": 0})["n"] if k else everything["n"]):,}</span>',
+        _chip_link(f'{icon}{_t(label)} <span style="opacity:.6">{(per.get(k, {"n": 0})["n"] if k else everything["n"]):,}</span>',
                    "/files" + _fqs(kind=k or None, offset=None), k == kind)
-        for k, label in _FILE_TABS.items()) + '</div>'
+        for k, (icon, label) in _FILE_TABS.items()) + '</div>'
     find = ('<form method="get" action="/files" style="display:flex;gap:8px;margin:0 0 12px">'
             + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else '')
-            + f'<input type="text" name="q" value="{html.escape(q, quote=True)}" placeholder="find an uploaded file by name…" '
-              'style="flex:1;max-width:420px"/><button class="btn" type="submit">Find</button>'
-            + (f'<a class="btn ghost" href="/files{_fqs(q=None, offset=None)}">clear</a>' if q else '') + '</form>')
+            + f'<input type="text" name="q" value="{html.escape(q, quote=True)}" placeholder="{_t("find an uploaded file by name…")}" '
+              f'style="flex:1;max-width:420px"/><button class="btn" type="submit">{_t("Find")}</button>'
+            + (f'<a class="btn ghost" href="/files{_fqs(q=None, offset=None)}">{_t("clear")}</a>' if q else '') + '</form>')
     rows = "".join(
         '<div class="f-card">'
-        f'<a class="f-pic" href="{_file_href(r)}" title="{html.escape(r["file_name"] or "file", quote=True)}">'
+        f'<a class="f-pic" href="{_file_href(r)}" title="{html.escape(r["file_name"], quote=True) if r["file_name"] else _t("file")}">'
         f'<span>{_FILE_ICON.get(r["media_type"], "📄")}</span>'
         f'<img src="/api/thumb/{r["id"]}" loading="lazy" alt="" onerror="this.remove()"/></a>'
-        f'<label class="f-tick" title="tick to delete"><input type="checkbox" class="f-ck" value="{r["id"]}"/></label>'
-        f'<a class="f-name" href="{_file_href(r)}">{html.escape(r["file_name"] or "file")}</a>'
+        f'<label class="f-tick" title="{_t("tick to delete")}"><input type="checkbox" class="f-ck" value="{r["id"]}"/></label>'
+        f'<a class="f-name" href="{_file_href(r)}">{html.escape(r["file_name"]) if r["file_name"] else _t("file")}</a>'
         f'<div class="f-meta">{export.human(r["file_size"])} · {r["indexed_at"].strftime("%Y-%m-%d")}</div>'
         '</div>' for r in mine)
     pager = _page_nav("/files", _fqs, offset, FILES_PAGE, len(mine), tot["n"])
@@ -6770,27 +7093,26 @@ async def page_files(offset: int = 0, kind: str = "", q: str = ""):
         'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.f-name:hover{color:var(--accent)}'
         '.f-meta{padding:0 10px 9px;font-size:12px;color:var(--muted)}'
         '@media (max-width:640px){.f-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}</style>'
-        '<p style="color:var(--muted);margin-top:0">Your own films, music, photos and books, played and read here like '
-        'everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.</p>'
-        '<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">Drop files here</div>'
-        '<div style="color:var(--muted);font-size:13px;margin-top:4px">or choose them - as many as you like, of any size</div>'
-        '<label class="btn">Choose files<input type="file" multiple style="display:none" onchange="fAdd(this.files)"/></label>'
-        '<label class="btn ghost">Choose a whole folder<input type="file" webkitdirectory multiple style="display:none" '
+        f'<p style="color:var(--muted);margin-top:0">{_t("Your own films, music, photos and books, played and read here like everything else. They stay on this machine and belong to it, whichever Telegram account is signed in.")}</p>'
+        f'<div class="f-drop" id="fDrop"><div style="font-size:15px;font-weight:600">{_t("Drop files here")}</div>'
+        f'<div style="color:var(--muted);font-size:13px;margin-top:4px">{_t("or choose them - as many as you like, of any size")}</div>'
+        f'<label class="btn">{_t("Choose files")}<input type="file" multiple style="display:none" onchange="fAdd(this.files)"/></label>'
+        f'<label class="btn ghost">{_t("Choose a whole folder")}<input type="file" webkitdirectory multiple style="display:none" '
         'onchange="fAdd(this.files)"/></label>'
         '<div id="fProg" style="display:none;margin-top:14px"><div style="height:8px;border-radius:4px;background:var(--border);'
         'overflow:hidden"><div id="fBar" style="height:100%;width:0;background:var(--accent)"></div></div>'
         '<div id="fState" style="font-size:13px;color:var(--muted);margin-top:6px"></div></div>'
         '<div id="fErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>'
-        f'<h2 class="section">Uploaded <span class="count">{tot["n"]:,}</span>'
+        f'<h2 class="section">{_t("Uploaded")} <span class="count">{tot["n"]:,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;'
         f'margin-left:10px">{export.human(tot["b"]) or "0 MB"}'
-        + (' · <a href="#" onclick="fDel();return false">delete the ticked ones</a>' if mine else '') + '</span></h2>'
+        + (f' · <a href="#" onclick="fDel();return false">{_t("delete the ticked ones")}</a>' if mine else '') + '</span></h2>'
         + (find + tabs if (everything["n"] or q) else '')
         + ('<div class="f-grid">' + rows + '</div>' + pager if mine else
            '<div class="empty-state"><div class="icon">📂</div><div>'
-           + ('Nothing found by that name.' if q else 'Nothing of this kind uploaded yet.' if kind
-              else 'Nothing uploaded yet.') + '</div></div>')
-        + _FILES_JS)
+           + (_t("Nothing found by that name.") if q else _t("Nothing of this kind uploaded yet.") if kind
+              else _t("Nothing uploaded yet.")) + '</div></div>')
+        + _fill(_FILES_JS))
     return HTMLResponse(_layout("My files", "/files", body))
 
 
@@ -7138,6 +7460,19 @@ div.ub { cursor:default; }
                 border:1px solid var(--border); border-radius:8px; }
 .user .ub-menu a { color:var(--fg); font-weight:400; }
 .user a.ub-in { color:#fff; }
+/* the language, a line of the account menu that opens the list of languages inside it */
+.ub-menu button.ub-lgo, .ub-menu button.ub-lg { color:var(--fg); border-top:0; margin-top:0; border-radius:0; text-align:left; }
+.ub-menu button.ub-lgo { display:flex; justify-content:space-between; gap:10px; }
+.ub-menu button.ub-lgo span { color:var(--muted); white-space:nowrap; }
+.ub-lgl { max-height:min(46vh,320px); overflow:auto; border-top:1px solid var(--border); border-bottom:1px solid var(--border); }
+.ub-menu button.ub-lg { padding:7px 12px 7px 26px; font-size:13px; }
+.ub-menu button.ub-lg.on { font-weight:700; color:var(--accent); padding-left:12px; }
+.ub-lgw { margin:6px 10px 0; }
+.ub-lgw .ub-menu { left:0; right:0; }
+.ub-lgw .ub-lgl { border:0; }
+.ub-lgb { display:block; width:100%; padding:7px 10px; border-radius:8px; font:inherit; font-size:13px; text-align:left; cursor:pointer;
+  color:var(--muted); background:transparent; border:1px solid var(--border); }
+.ub-lgb:hover { color:var(--fg); border-color:var(--accent); }
 .ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
          color:#fff; text-align:center; text-decoration:none; font-weight:600; font-size:13px; }
 .user a { color:var(--accent); text-decoration:none; font-size:14px; font-weight:600; }
@@ -7408,8 +7743,15 @@ def _fmt_count(n) -> str:
     return str(n)
 
 
+_N_THINGS = {"films": "{n} films", "videos": "{n} videos", "songs": "{n} songs", "files": "{n} files",
+             "photos": "{n} photos", "books": "{n} books"}
+
+
 def _n_things(n, word: str) -> str:
-    """ "1 film", "3.1K films" """
+    """ "1 film", "3.1K films" - in the language of the request (the other languages have a
+    wording that reads right for any number) """
+    if _LANG.get() != "en" and word in _N_THINGS:
+        return _t(_N_THINGS[word], n=_fmt_count(n))
     return f"{_fmt_count(n)} {word[:-1] if n == 1 and word.endswith('s') else word}"
 
 
@@ -7425,13 +7767,13 @@ def _ago(dt) -> str:
     if sec < 0:
         return dt.strftime("%Y-%m-%d")
     if sec < 90:
-        return "just now"
+        return _t("just now")
     if sec < 3600:
-        return f"{int(sec // 60)} min ago"
+        return _t("{n} min ago", n=int(sec // 60))
     if sec < 86400:
-        return f"{int(sec // 3600)} h ago"
+        return _t("{n} h ago", n=int(sec // 3600))
     if sec < 86400 * 30:
-        return f"{int(sec // 86400)} d ago"
+        return _t("{n} d ago", n=int(sec // 86400))
     return dt.strftime("%Y-%m-%d")
 
 
@@ -7499,14 +7841,17 @@ def _ls_head(cols, sort: str, order: str, href) -> str:
     newest first for numbers and dates, A-Z for names)."""
     out = ['<div class="ls-head"><span style="width:40px;flex:none"></span>']
     for key, label, css, first in cols:
+        plain = i18n.t(_LANG.get(), label) if label else ""        # the label is the English: a key of the catalogue
+        label = html.escape(plain)
         if not key:
             out.append(f'<span class="{css}">{label}</span>')
             continue
         on = key == sort
         nxt = ("asc" if order == "desc" else "desc") if on else first
         arrow = ("▲" if order == "asc" else "▼") if on else ""
+        tip = _t("sort by {label} (click again to reverse)", label=plain) if on else _t("sort by {label}", label=plain)
         out.append(f'<a class="{css}{" on" if on else ""}" href="{href(key, nxt)}" '
-                   f'title="sort by {label}{" (click again to reverse)" if on else ""}">'
+                   f'title="{tip}">'
                    f'{label}<i>{arrow}</i></a>')
     return "".join(out) + "</div>"
 
@@ -7528,16 +7873,53 @@ def _color_for(s: str) -> str:
     return palette[sum(ord(c) for c in (s or "?")) % len(palette)]
 
 
+_LANG_JS = ('<script>'
+            'function tgLang(c){document.cookie="tgarr_lang="+c+"; path=/; max-age=31536000; SameSite=Lax";location.reload()}'
+            'function tgLangOpen(e){e.stopPropagation();var l=document.getElementById("tgLangList");if(l)l.hidden=!l.hidden}'
+            '</script>')
+
+
+def _lang_rows() -> str:
+    """One row for each language, the one in use marked."""
+    lang = _LANG.get()
+    return "".join(f'<button type="button" class="ub-lg{" on" if code == lang else ""}" lang="{code}" onclick="tgLang(\'{code}\')">'
+                   f'{"✓ " if code == lang else ""}{html.escape(name)}</button>' for code, name in i18n.LANGS)
+
+
+def _lang_item() -> str:
+    """The language as a line of the account menu: it opens the list inside the menu."""
+    lang = _LANG.get()
+    return (f'<button type="button" class="ub-lgo" onclick="tgLangOpen(event)">🌐 {html.escape(i18n.t(lang, "Language"))}'
+            f'<span>{html.escape(dict(i18n.LANGS)[lang])} ▾</span></button>'
+            f'<div class="ub-lgl" id="tgLangList" hidden>{_lang_rows()}</div>')
+
+
+def _lang_only() -> str:
+    """Where there is no account menu (nobody signed in, a locked browser): a small menu of
+    its own, in the same place and of the same kind, with the language alone in it."""
+    lang = _LANG.get()
+    return ('<div class="ub-wrap ub-lgw"><div class="ub-menu" id="tgLangMenu" hidden>'
+            f'<div class="ub-lgl">{_lang_rows()}</div></div>'
+            '<button type="button" class="ub-lgb" onclick="event.stopPropagation();var m=document.getElementById(\'tgLangMenu\');m.hidden=!m.hidden" '
+            f'title="{html.escape(i18n.t(lang, "Language"), quote=True)}">🌐 {html.escape(dict(i18n.LANGS)[lang])} ▴</button></div>'
+            '<script>document.addEventListener("click",function(){var m=document.getElementById("tgLangMenu");if(m)m.hidden=true});</script>'
+            + _LANG_JS)
+
+
 def _user_block() -> str:
     """The account at the foot of the side menu: picture, name, a small menu."""
+    lang = _LANG.get()
+
+    def tr(text: str) -> str:
+        return html.escape(i18n.t(lang, text), quote=True)
     if not _signed_in():
-        return ('<div class="ub"><div class="ub-av none">?</div>'
-                '<div class="ub-txt"><b>Not signed in</b><small>browsing what is already indexed</small></div></div>'
-                '<a class="ub-in" href="/login">Sign in to Telegram</a>'
-                + ('<a class="ub-lk" href="/lock">🔒 Lock</a>' if _ACCESS["pin"] else ''))
+        return (_lang_only() + '<div class="ub"><div class="ub-av none">?</div>'
+                f'<div class="ub-txt"><b>{tr("Not signed in")}</b><small>{tr("browsing what is already indexed")}</small></div></div>'
+                f'<a class="ub-in" href="/login">{tr("Sign in to Telegram")}</a>'
+                + (f'<a class="ub-lk" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else ''))
     user = login.ensure_user_info() or {}
     uname = user.get("username")
-    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or "Telegram account"
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or i18n.t(lang, "Telegram account")
     try:
         av_v = int(os.path.getmtime(login.AVATAR_FILE))
         av = f'<img class="ub-av" src="/api/me/avatar?v={av_v}" alt="">'
@@ -7547,17 +7929,19 @@ def _user_block() -> str:
     return (
         '<div class="ub-wrap">'
         '<div class="ub-menu" id="tgUserMenu" hidden>'
-        '<a href="/settings">Settings</a>'
-        '<a href="/system">System status</a>'
-        '<a href="/mediacenter/manage">Media Center &amp; PIN</a>'
-        + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
+        f'<a href="/settings">{tr("Settings")}</a>'
+        f'<a href="/system">{tr("System status")}</a>'
+        f'<a href="/mediacenter/manage">{tr("Media Center & PIN")}</a>'
+        + _lang_item()
+        + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">{tr("My Telegram profile")} ↗</a>'
            if uname else '')
-        + ('<a href="/lock">🔒 Lock (back to the Media Center)</a>' if _ACCESS["pin"] else '')
-        + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
+        + (f'<a href="/lock">🔒 {tr("Lock (back to the Media Center)")}</a>' if _ACCESS["pin"] else '')
+        + f'<button type="button" onclick="tgSignOut()">{tr("Sign out")}</button></div>'
         '<button type="button" class="ub" onclick="tgUserMenu(event)" title="account">'
         f'{av}<span class="ub-txt"><b>{html.escape(name)}</b>'
-        f'<small>{("@" + html.escape(uname)) if uname else "signed in"}</small></span>'
+        f'<small>{("@" + html.escape(uname)) if uname else tr("signed in")}</small></span>'
         '<span class="ub-ch">⋯</span></button></div>'
+        + _LANG_JS +
         '<script>'
         'function tgUserMenu(e){e.stopPropagation();var m=document.getElementById("tgUserMenu");m.hidden=!m.hidden}'
         'document.addEventListener("click",function(){var m=document.getElementById("tgUserMenu");if(m)m.hidden=true});'
@@ -7594,6 +7978,10 @@ MOBILE_CSS = """
   aside.nav .user .ub-av { width:32px; height:32px; font-size:14px; }
   aside.nav .user .ub-menu { top:calc(100% + 8px); bottom:auto; left:auto; right:0; width:220px; }
   aside.nav .user .ub-in { margin:0; padding:7px 10px; font-size:12px; white-space:nowrap; }
+  aside.nav .user { display:flex; align-items:center; gap:6px; }
+  aside.nav .user .ub-lgw { margin:0; position:relative; }
+  aside.nav .user .ub-lgb { width:auto; padding:6px 8px; font-size:12px; white-space:nowrap; }
+  aside.nav .user .ub-lgw .ub-menu { top:calc(100% + 8px); bottom:auto; left:auto; right:0; width:200px; }
   main.main { min-height:0; }
   .topbar { height:auto; padding:10px 14px; gap:10px; flex-wrap:wrap; }
   .topbar h1 { font-size:20px; }
@@ -7610,9 +7998,13 @@ MOBILE_CSS = """
 def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str] = None,
             top_actions_html: Optional[str] = None) -> str:
     locked = _LOCKED.get()
+    lang = _LANG.get()
+
+    def tr(text: str) -> str:
+        return html.escape(i18n.t(lang, text), quote=True)
     nav = "".join(
         f'<a href="{path}" class="navlink{" active" if path == active else ""}">'
-        f'{_icon(svg)}<span>{name}</span></a>'
+        f'{_icon(svg)}<span>{tr(name)}</span></a>'
         # a locked browser is shown the kids' pages and nothing else
         for path, name, svg in ([("/mediacenter", "Media Center", "M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z")]
                                 if locked else NAV_ITEMS)
@@ -7631,13 +8023,13 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
         action, placeholder = cfg.get(active, ("/search", "Search…"))
         top_actions_html = (
             f'<form action="{action}" method="GET" style="margin-left:auto">'
-            f'<input type="text" name="q" class="search" placeholder="{placeholder}" />'
+            f'<input type="text" name="q" class="search" placeholder="{tr(placeholder)}" />'
             f'</form>'
         )
     return f"""<!DOCTYPE html>
-<html><head>
+<html lang="{lang}"><head>
 <meta charset="utf-8">
-<title>{html.escape(title)} · tgarr</title>
+<title>{tr(title)} · tgarr</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 {_pwa_head()}
@@ -7652,11 +8044,11 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
     <a class="ver" href="/settings/update" title="this version; updating" style="text-decoration:none;display:block">v{TGARR_VERSION}</a>
   </div>
   <div class="navlinks">{nav}</div>
-  <div class="user">{'<a class="ub-in" href="/unlock">🔒 Enter PIN</a>' if locked else _user_block()}</div>
+  <div class="user">{(_lang_only() + f'<a class="ub-in" href="/unlock">🔒 {tr("Enter PIN")}</a>') if locked else _user_block()}</div>
 </aside>
 <main class="main">
   <header class="topbar">
-    <h1>{html.escape(page_title or title)}</h1>
+    <h1>{tr(page_title or title)}</h1>
     {top_actions_html}
   </header>
   <div class="content">{body_html}</div>
@@ -7689,18 +8081,18 @@ async function tgGrab(btn) {{
     const r = await fetch('/api/grab/' + guid, {{method: 'POST'}});
     const j = await r.json();
     if (j.status === 'queued') {{
-      btn.textContent = '✓ Queued';
+      btn.textContent = '✓ {_tj("Queued")}';
       btn.style.background = 'var(--ok)';
     }} else if (j.status === 'exists') {{
-      btn.textContent = '· already ' + j.existing_status;
+      btn.textContent = '· {_tj("already there")}';
       btn.style.background = 'var(--muted)';
     }} else {{
-      btn.textContent = '✗ ' + (j.message || 'error');
+      btn.textContent = '✗ ' + (j.message || '{_tj("that did not work")}');
       btn.style.background = 'var(--bad)';
       setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
     }}
   }} catch (e) {{
-    btn.textContent = '✗ network';
+    btn.textContent = '✗ {_tj("network error")}';
     btn.style.background = 'var(--bad)';
     setTimeout(() => {{ btn.textContent = orig; btn.style.background = ''; btn.disabled = false; }}, 2500);
   }}
@@ -8038,8 +8430,8 @@ async def _usenet_system_html() -> str:
         return ""
     h3 = 'style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em"'
     if not cfg.get("enabled"):
-        return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
-                '<div style="color:var(--muted)">Switched off. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
+        return (f'<section style="margin-bottom:28px"><h3 {h3}>{_t("Usenet")}</h3>'
+                f'<div style="color:var(--muted)">{_t("Switched off.")} <a href="/settings/usenet">{_t("Settings → Usenet")}</a></div></section>')
     ready = await _usenet_ready()
     async with db_pool.acquire() as conn:
         kept = await conn.fetchrow(
@@ -8049,30 +8441,36 @@ async def _usenet_system_html() -> str:
     day = lambda t: time.strftime("%Y-%m-%d", time.gmtime(t))
     w, last, state = _UN_INDEX.get("window"), _UN_INDEX.get("last"), _UN_INDEX.get("state") or ""
     if state == "reading" and w:
-        now = (f'reading <b>{html.escape(w["grp"])}</b>, {day(w["t_from"])} to {day(w["t_to"])} '
-               f'({html.escape(str(w["mode"]))}, {int(w.get("connections") or 1)} connection{"" if int(w.get("connections") or 1) == 1 else "s"} allowed)')
+        now = (_t("reading {grp}, {a} to {b} ({mode}; connections allowed: {n})", grp="%1", a=day(w["t_from"]), b=day(w["t_to"]),
+                  mode=str(w["mode"]), n=int(w.get("connections") or 1))
+               .replace("%1", f'<b>{html.escape(w["grp"])}</b>'))
+    elif state.startswith("waiting after a problem: "):
+        now = _t("waiting after a problem: {why}", why=state[len("waiting after a problem: "):])
     else:
-        now = html.escape(state)
-    rows = [("News server", ('<span class="pill ok">answering</span> ' if ready else
-                             f'<span class="pill bad">not answering</span> {html.escape(_USENET.get("msg") or "")} ')
+        now = _t(state)                   # what the index reader says of itself (see _usenet_index_loop), in the reader's language
+    rows = [(_t("News server"), (f'<span class="pill ok">{_t("answering")}</span> ' if ready else
+                                 f'<span class="pill bad">{_t("not answering")}</span> {html.escape(_USENET.get("msg") or "")} ')
              + html.escape(cfg["host"])),
-            ("Index reading", now or "starting")]
+            (_t("Index reading"), now or _t("starting"))]
     if last:
         st = last.get("stats") or {}
-        rows.append(("Last window",
-                     f'<b>{html.escape(str(last.get("grp")))}</b> ({html.escape(str(last.get("mode")))}) · {int(st.get("headers") or 0):,} headers in '
-                     f'{int(st.get("seconds") or 0):,} s, {(st.get("bytes") or 0) / 1e6:.1f} MB · {int(last.get("cards") or 0):,} cards found, '
-                     f'{int(last.get("accepted") or 0):,} taken by tgarr.me'
-                     + (f' · {int(st["unread"]):,} stretches unread' if st.get("unread") else "")
+        rows.append((_t("Last window"),
+                     f'<b>{html.escape(str(last.get("grp")))}</b> ({html.escape(str(last.get("mode")))}) · '
+                     + _t("{n} headers in {s} s, {mb} MB", n=f'{int(st.get("headers") or 0):,}', s=f'{int(st.get("seconds") or 0):,}',
+                          mb=f'{(st.get("bytes") or 0) / 1e6:.1f}')
+                     + ' · ' + _t("{n} cards found, {m} taken by tgarr.me", n=f'{int(last.get("cards") or 0):,}', m=f'{int(last.get("accepted") or 0):,}')
+                     + (' · ' + _t("{n} stretches unread", n=f'{int(st["unread"]):,}') if st.get("unread") else "")
                      + f' · {_ago(_dt.datetime.fromtimestamp(last["at"], _dt.timezone.utc))}'))
-    rows.append(("Cards kept here", f'{kept["n"]:,} ({kept["exact"]:,} read in full' + (f', {kept["adult"]:,} adult' if kept["adult"] else "") + ')'))
-    rows.append(("Connections for an NZB", f'{usenet_scan.next_connections(level, {})} next time - as many as the provider gives'))
+    rows.append((_t("Cards kept here"),
+                 _t("{n} ({exact} read in full, {adult} adult)", n=f'{kept["n"]:,}', exact=f'{kept["exact"]:,}', adult=f'{kept["adult"]:,}') if kept["adult"]
+                 else _t("{n} ({exact} read in full)", n=f'{kept["n"]:,}', exact=f'{kept["exact"]:,}')))
+    rows.append((_t("Connections for an NZB"), _t("{n} next time - as many as the provider gives", n=usenet_scan.next_connections(level, {}))))
     body = "".join(f'<tr><td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;color:#64748b;white-space:nowrap;width:1%">{k}</td>'
                    f'<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0">{v}</td></tr>' for k, v in rows)
-    return (f'<section style="margin-bottom:28px"><h3 {h3}>Usenet</h3>'
+    return (f'<section style="margin-bottom:28px"><h3 {h3}>{_t("Usenet")}</h3>'
             f'<table style="width:100%;border-collapse:collapse;font-size:14px">{body}</table>'
-            '<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr reads headers only and makes NZBs; the downloading is '
-            'your downloader\'s. <a href="/settings/usenet">Settings → Usenet</a></div></section>')
+            f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">{_t("tgarr reads headers only and makes NZBs; the downloading is done by your downloader.")} '
+            f'<a href="/settings/usenet">{_t("Settings → Usenet")}</a></div></section>')
 
 
 @app.get("/system", response_class=HTMLResponse)
@@ -8113,46 +8511,47 @@ async def page_system():
         _parts = []
         for _k, _n in sorted(_by.items(), key=lambda x: -x[1]):
             _bg = _k.startswith("bg:")
-            _name = _who.get(_k[3:] if _bg else _k, (_k[3:] if _bg else _k))
-            _parts.append(f'{html.escape(_name)} <b>{_n}</b>' + (' <span class="pill muted">background</span>' if _bg else ''))
+            _name = _k[3:] if _bg else _k
+            _name = _t(_who[_name]) if _name in _who else html.escape(_name)
+            _parts.append(f'{_name} <b>{_n}</b>' + (f' <span class="pill muted">{_t("background")}</span>' if _bg else ''))
         _pct = min(100, _used * 100 // _cap) if _cap else 0
         _col = "#ef4444" if _pct >= 100 else "#f59e0b" if _pct >= 75 else "#10b981"
         _rows.append(
-            f'<tr><td><b>{_label}</b><div style="font-size:12px;color:var(--muted)">{_hint}</div></td>'
-            f'<td style="white-space:nowrap"><b>{_used}</b> of {_cap if _cap else "–"}'
+            f'<tr><td><b>{_t(_label)}</b><div style="font-size:12px;color:var(--muted)">{_t(_hint)}</div></td>'
+            f'<td style="white-space:nowrap">{_t("{n} of {total}", n="%1", total=_cap if _cap else "–").replace("%1", f"<b>{_used}</b>")}'
             f'<div style="height:6px;width:120px;background:var(--border);border-radius:3px;margin-top:5px">'
             f'<div style="height:6px;width:{_pct}%;background:{_col};border-radius:3px"></div></div></td>'
-            f'<td style="font-size:13px">{" · ".join(_parts) or "<span style=color:var(--muted)>nothing yet today</span>"}</td></tr>')
+            f'<td style="font-size:13px">{" · ".join(_parts) or "<span style=color:var(--muted)>" + _t("nothing yet today") + "</span>"}</td></tr>')
     _share = int(float(_caps.get("bg_share", 0.4)) * 100)
     allowances_html = (
         '<section style="margin-bottom:28px">'
         '<h3 style="font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 8px">'
-        'Telegram allowances today (resets at 00:00 UTC)</h3>'
-        '<table><thead><tr><th>what</th><th>used</th><th>who used it</th></tr></thead>'
+        f'{_t("Telegram allowances today (resets at 00:00 UTC)")}</h3>'
+        f'<table><thead><tr><th>{_t("what")}</th><th>{_t("used")}</th><th>{_t("who used it")}</th></tr></thead>'
         f'<tbody>{"".join(_rows)}</tbody></table>'
-        f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">tgarr keeps well inside what Telegram '
-        f'tolerates so that your account is never slowed down. Background work may use at most {_share}% of an '
-        'allowance; the rest is kept for what you open yourself.</div></section>')
+        f'<div style="font-size:12.5px;color:var(--muted);margin-top:8px">'
+        + _t("tgarr keeps well inside what Telegram tolerates so that your account is never slowed down. Background work may use at most {share}% of an allowance; the rest is kept for what you open yourself.", share=_share)
+        + '</div></section>')
     body = """
-<h2 class="section">System</h2>
+<h2 class="section">[[@System]]</h2>
 __ALLOWANCES__
 __USENET__
 <section style="margin-bottom:28px">
-  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Workers</h3>
-  <div id="workersTable">loading...</div>
+  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">[[@Workers]]</h3>
+  <div id="workersTable">[[@loading…]]</div>
 </section>
 <section>
-  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">Deep backfill progress</h3>
-  <div id="deepBackfillTable">loading...</div>
+  <h3 style="color:#64748b;font-size:13px;text-transform:uppercase;letter-spacing:0.05em">[[@Deep backfill progress]]</h3>
+  <div id="deepBackfillTable">[[@loading…]]</div>
 </section>
 <script>
 function fmtAgo(iso) {
-  if (!iso) return "never";
+  if (!iso) return "[[@js:never]]";
   const sec = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (sec < 60) return Math.floor(sec) + "s ago";
-  if (sec < 3600) return Math.floor(sec/60) + "m ago";
-  if (sec < 86400) return Math.floor(sec/3600) + "h ago";
-  return Math.floor(sec/86400) + "d ago";
+  if (sec < 60) return "[[@js:%1 s ago]]".replace("%1", Math.floor(sec));
+  if (sec < 3600) return "[[@js:{n} min ago]]".replace("{n}", Math.floor(sec/60));
+  if (sec < 86400) return "[[@js:{n} h ago]]".replace("{n}", Math.floor(sec/3600));
+  return "[[@js:{n} d ago]]".replace("{n}", Math.floor(sec/86400));
 }
 function healthDot(h) {
   const c = {healthy:"#22c55e",idle:"#eab308",stale:"#ef4444",never:"#94a3b8",off:"#cbd5e1"}[h] || "#94a3b8";
@@ -8177,13 +8576,13 @@ async function loadWorkers() {
         <td style="color:#64748b;font-size:13px">${esc(w.last_action) || "—"}</td>
         <td style="text-align:right;color:#64748b">${w.iter_count.toLocaleString()}</td>
         <td style="text-align:right;color:${w.error_count ? errColor : "#64748b"}"
-            title="lifetime total">${w.error_count}</td>
+            title="[[@lifetime total]]">${w.error_count}</td>
         <td style="color:${errColor};font-size:12px">${errText}</td></tr>`; });
   document.getElementById("workersTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
-    <th>Worker</th><th>Last seen</th><th>Last action</th>
-    <th style="text-align:right">Iters</th><th style="text-align:right">Errors</th>
-    <th>Last error</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+    <th>[[@Worker]]</th><th>[[@Last seen]]</th><th>[[@Last action]]</th>
+    <th style="text-align:right">[[@Iters]]</th><th style="text-align:right">[[@Errors]]</th>
+    <th>[[@Last error]]</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 async function loadDeepBackfill() {
   const r = await fetch("/api/deep-backfill-progress");
@@ -8199,8 +8598,8 @@ async function loadDeepBackfill() {
     const s = m==="JOIN" ? "background:#fef3c7;color:#92400e"
             : m==="SUB"  ? "background:#dcfce7;color:#166534"
             : "background:#f1f5f9;color:#94a3b8";
-    const t = m==="JOIN" ? "加入+爬 (账号成员, 占 join 槽)"
-            : m==="SUB"  ? "订阅+爬 (公开轮询, 不 join)" : "未订阅/未加入";
+    const t = m==="JOIN" ? "[[@js:joined and read (the account is a member; takes one of its join slots)]]"
+            : m==="SUB"  ? "[[@js:followed and read (read as a public channel, without joining)]]" : "[[@js:neither followed nor joined]]";
     return `<span title="${t}" style="${s};padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600">${m}</span>`;
   };
   const rows = (j.channels || []).map(c => {
@@ -8221,15 +8620,15 @@ async function loadDeepBackfill() {
   });
   document.getElementById("deepBackfillTable").innerHTML = `<table style="width:100%;border-collapse:collapse">
     <thead><tr style="text-align:left;color:#64748b;font-size:12px">
-    <th>Status</th><th>Mode</th><th>Title</th>
-    <th style="text-align:right">Media (local/remote)</th>
-    <th>Progress</th>
-    <th style="text-align:right">Photos</th>
-    <th style="text-align:right">Videos</th>
-    <th style="text-align:right">Audio</th>
-    <th style="text-align:right">Docs</th>
-    <th style="text-align:right">Last run</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
-    + (j.private_count ? `<div style="font-size:12.5px;color:#64748b;margin-top:8px">Your ${j.private_count} private chat${j.private_count == 1 ? " is" : "s are"} read and kept whole; they are not listed here.</div>` : "");
+    <th>[[@Status]]</th><th>[[@Mode]]</th><th>[[@Name]]</th>
+    <th style="text-align:right">[[@Media (local/remote)]]</th>
+    <th>[[@Progress]]</th>
+    <th style="text-align:right">[[@Photos]]</th>
+    <th style="text-align:right">[[@Videos]]</th>
+    <th style="text-align:right">[[@Audio]]</th>
+    <th style="text-align:right">[[@Documents]]</th>
+    <th style="text-align:right">[[@Last run]]</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    + (j.private_count ? `<div style="font-size:12.5px;color:#64748b;margin-top:8px">${"[[@js:Your private chats (%1) are read and kept whole; they are not listed here.]]".replace("%1", j.private_count)}</div>` : "");
 }
 loadWorkers(); loadDeepBackfill();
 setInterval(loadWorkers, 30000);
@@ -8242,7 +8641,7 @@ setInterval(loadDeepBackfill, 60000);
 }
 </style>
 """
-    body = body.replace("__ALLOWANCES__", allowances_html)
+    body = _fill(body).replace("__ALLOWANCES__", allowances_html)
     try:
         body = body.replace("__USENET__", await _usenet_system_html())
     except Exception as e:
@@ -8289,7 +8688,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                          WHERE media_type='audio' AND channel_id NOT IN {_GOING}) AS audio,
                       (SELECT count(*) FROM messages
                          WHERE media_type='document' AND channel_id NOT IN {_GOING}
-                           AND file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$') AS books,
+                           AND {_book_sql()}) AS books,
                       (SELECT count(*) FROM downloads
                          WHERE status='pending')                     AS pending,
                       (SELECT count(*) FROM downloads
@@ -8421,24 +8820,24 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         return (f'<a class="st-card" href="{href}">{inner}</a>' if href
                 else f'<div class="st-card">{inner}</div>')
     if not authed:
-        tg = _status("bad", "Telegram", "not signed in — sign in to index and play", "/login")
+        tg = _status("bad", "Telegram", _t("not signed in — sign in to index and play"), "/login")
     elif flood:
         tg = _status("warn", "Telegram",
-                     f'asked us to slow down — resumes in about {max(1, flood["seconds_left"] // 60)} min')
+                     _t("asked us to slow down — resumes in about {n} min", n=max(1, flood["seconds_left"] // 60)))
     else:
         who = user.get("username") or user.get("first_name") or ""
-        tg = _status("ok", "Telegram", f'signed in{(" as @" + html.escape(str(who))) if who else ""}', "/settings")
+        tg = _status("ok", "Telegram", _t("signed in as @{who}", who=str(who)) if who else _t("signed in"), "/settings")
     if hb:
         age = (_dt.datetime.now(_dt.timezone.utc) - hb).total_seconds()
-        cr = (_status("ok", "Indexer", f"running · last activity {_ago(hb)}", "/system") if age < 900
-              else _status("bad", "Indexer", f"no activity since {_ago(hb)}", "/system"))
+        cr = (_status("ok", _t("Indexer"), _t("running · last activity %1").replace("%1", _ago(hb)), "/system") if age < 900
+              else _status("bad", _t("Indexer"), _t("no activity since %1").replace("%1", _ago(hb)), "/system"))
     else:
-        cr = _status("off", "Indexer", "has not reported yet", "/system")
+        cr = _status("off", _t("Indexer"), _t("has not reported yet"), "/system")
     if shared and shared["last"]:
-        sh = _status("ok" if shared["d1"] else "off", "Shared with tgarr.me",
-                     f'{_fmt_count(shared["d1"])} files today · last {_ago(shared["last"])}')
+        sh = _status("ok" if shared["d1"] else "off", _t("Shared with tgarr.me"),
+                     _t("{n} files today · last %1", n=_fmt_count(shared["d1"])).replace("%1", _ago(shared["last"])))
     else:
-        sh = _status("off", "Shared with tgarr.me", "nothing shared yet")
+        sh = _status("off", _t("Shared with tgarr.me"), _t("nothing shared yet"))
     used = sum(r["bytes"] for r in usage)
     try:
         import shutil as _sh
@@ -8446,31 +8845,33 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         _sto_lvl = _disk_level(_du.free, _du.total)
     except OSError:
         _sto_lvl = "off"
-    sto = _status(_sto_lvl, "Storage",
-                  f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
+    sto = _status(_sto_lvl, _t("Storage"),
+                  _t("{used} saved · {free} GB free", used=_fmt_size(used) or "0 MB", free=f"{free_gb:.0f}"), "/downloads")
     welcome_html = "" if authed else (
         '<div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:18px">'
-        + ('<h2 style="margin:0 0 6px;font-size:19px">Signed out of Telegram</h2>'
-           '<p style="margin:0 0 12px;color:var(--muted)">What was indexed from public channels is still here to browse. Playing a file from Telegram, '
-           'or indexing more, needs the account again.</p>' if (revoked or browsable) else
-           '<h2 style="margin:0 0 6px;font-size:19px">Welcome to tgarr</h2>'
-           '<p style="margin:0 0 12px;color:var(--muted)">Nothing is indexed yet. There are three ways to fill this library - start with any of them, '
-           'the others can follow later:</p>')
+        + (f'<h2 style="margin:0 0 6px;font-size:19px">{_t("Signed out of Telegram")}</h2>'
+           '<p style="margin:0 0 12px;color:var(--muted)">'
+           + _t("What was indexed from public channels is still here to browse. Playing a file from Telegram, or indexing more, needs the account again.")
+           + '</p>' if (revoked or browsable) else
+           f'<h2 style="margin:0 0 6px;font-size:19px">{_t("Welcome to tgarr")}</h2>'
+           '<p style="margin:0 0 12px;color:var(--muted)">'
+           + _t("Nothing is indexed yet. There are several ways to fill this library - start with any of them, the others can follow later:")
+           + '</p>')
         + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">'
         + "".join(
             f'<a href="{href}" style="display:block;border:1px solid var(--border);border-radius:10px;padding:12px 14px;text-decoration:none;color:inherit">'
             f'<b>{title}</b><div style="color:var(--muted);font-size:13px;margin-top:4px;line-height:1.45">{text}</div></a>'
             for href, title, text in (
-                ("/login", "📨 Telegram", "Sign in with your account: tgarr indexes the films, music and books of the channels you follow. "
-                           "The first time, Telegram asks for a free app id - it takes a minute and tgarr shows how."),
-                ("/settings/usenet", "📰 Usenet", "Have a Usenet provider? Enter it and tgarr indexes newsgroups: films through your downloader, "
-                                     "books, comics, music and pictures directly. No Telegram account needed."),
-                ("/files", "📁 Your own files", "Add folders of films, music, books or photos you already have. They play here and in the "
-                           "Media Center. No account needed."),
-                ("/archive", "🏛 Internet Archive", "Old films, radio plays, audiobooks, books and magazines that anybody may download. "
-                             "Search, press Get, and it is in your library. No account needed."),
-                ("/discover", "🔭 Public channels", "Look through the public Telegram channels tgarr knows and follow some: what they hold is "
-                              "listed right away, without an account. Playing a file is when Telegram wants one.")))
+                ("/login", "📨 Telegram",
+                 _t("Sign in with your account: tgarr indexes the films, music and books of the channels you follow. The first time, Telegram asks for a free app id - it takes a minute and tgarr shows how.")),
+                ("/settings/usenet", "📰 Usenet",
+                 _t("Have a Usenet provider? Enter it and tgarr indexes newsgroups: films through your downloader, books, comics, music and pictures directly. No Telegram account needed.")),
+                ("/files", "📁 " + _t("Your own files"),
+                 _t("Add folders of films, music, books or photos you already have. They play here and in the Media Center. No account needed.")),
+                ("/archive", "🏛 " + _t("Internet Archive"),
+                 _t("Old films, radio plays, audiobooks, books and magazines that anybody may download. Search, press Get, and it is in your library. No account needed.")),
+                ("/discover", "🔭 " + _t("Public channels"),
+                 _t("Look through the public Telegram channels tgarr knows and follow some: what they hold is listed right away, without an account. Playing a file is when Telegram wants one."))))
         + '</div></div>')
     status_html = f'{welcome_html}<div class="st-row">{tg}{cr}{sh}{sto}</div>'
     status_html = await _update_banner() + status_html
@@ -8480,17 +8881,16 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         status_html = (
             '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;'
             'padding:16px 18px;margin-bottom:16px;line-height:1.6">'
-            '<b>You are signed in. Nothing is indexed yet.</b><br>'
-            'tgarr is reading the channels your Telegram account follows; they appear here '
-            'within a few minutes, and their files over the next hours. If the account follows '
-            'no channels with files, pick some on <a href="/discover">Discover</a>.'
-            '</div>' + status_html)
+            f'<b>{_t("You are signed in. Nothing is indexed yet.")}</b><br>'
+            + _t("tgarr is reading the channels your Telegram account follows; they appear here within a few minutes, and their files over the next hours. If the account follows no channels with files, pick some on %1.")
+            .replace("%1", f'<a href="/discover">{_t("Discover")}</a>')
+            + '</div>' + status_html)
 
     # ── library ──
     def _tile(href, icon, n, label, plus=0):
         return (f'<a class="tile" href="{href}"><div class="ti">{icon}</div>'
                 f'<div class="tn">{n:,}</div><div class="tl">{label}</div>'
-                + (f'<div class="tp">+{_fmt_count(plus)} today</div>' if plus else '<div class="tp">&nbsp;</div>')
+                + (f'<div class="tp">{_t("+{n} today", n=_fmt_count(plus))}</div>' if plus else '<div class="tp">&nbsp;</div>')
                 + '</a>')
     _tn = lib.get("tile") or {}
 
@@ -8499,30 +8899,30 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
     # ("+N today" counts everything that arrived; it is left off where the page lists a
     # selection of it, so that a tile never says "10" with "+2.3K today" under it)
     tiles = (
-        _tile("/releases?cat=movie", "🎬", _shown("movie", lib["films"]), "films", 0)
-        + _tile("/releases?cat=tv", "📺", _shown("tv", lib["episodes"]), "episodes", 0)
-        + _tile("/videos", "▶", _shown("video", st["videos"]), "videos", 0 if "video" in _tn else new_today.get("video", 0))
-        + _tile("/music", "🎵", st["audio"], "songs", new_today.get("audio", 0))
-        + _tile("/library", "📚", st["books"], "books", 0)
-        + _tile("/gallery", "🖼", _shown("photo", st["photos"]), "photos", 0 if "photo" in _tn else new_today.get("photo", 0))
-        + _tile("/channels", "📡", st["channels"], "channels", 0))
+        _tile("/releases?cat=movie", "🎬", _shown("movie", lib["films"]), _t("films"), 0)
+        + _tile("/releases?cat=tv", "📺", _shown("tv", lib["episodes"]), _t("episodes"), 0)
+        + _tile("/videos", "▶", _shown("video", st["videos"]), _t("videos"), 0 if "video" in _tn else new_today.get("video", 0))
+        + _tile("/music", "🎵", st["audio"], _t("songs"), new_today.get("audio", 0))
+        + _tile("/library", "📚", st["books"], _t("books"), 0)
+        + _tile("/gallery", "🖼", _shown("photo", st["photos"]), _t("photos"), 0 if "photo" in _tn else new_today.get("photo", 0))
+        + _tile("/channels", "📡", st["channels"], _t("channels"), 0))
 
     # ── now ──
     now_bits = []
     # out of the box anyone on the same network opens this page as the owner
     if _signed_in() and not _ACCESS["pin"] and not _UI_PASSWORD:
-        now_bits.append('<a class="now-pill" href="/mediacenter/manage" title="with a PIN, other browsers get only '
-                        'the Media Center and what you allow there">🔓 No PIN yet: anyone on your network '
-                        'opens this page as you — set one</a>')
+        now_bits.append('<a class="now-pill" href="/mediacenter/manage" title="'
+                        + _t("with a PIN, other browsers get only the Media Center and what you allow there") + '">🔓 '
+                        + _t("No PIN yet: anyone on your network opens this page as you — set one") + '</a>')
     arriving = [f for f in fetches if f["state"] in ("queued", "fetching")]
     if arriving:
-        now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {len(arriving)} arriving for a player</a>')
+        now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {_t("{n} arriving for a player", n=len(arriving))}</a>')
     if st["pending"] or st["downloading"]:
-        now_bits.append(f'<a class="now-pill" href="/downloads?tab=grabs">⬇ {st["pending"] + st["downloading"]} '
-                        f'grab(s) in the queue</a>')
+        now_bits.append(f'<a class="now-pill" href="/downloads?tab=grabs">⬇ '
+                        f'{_t("{n} grab(s) in the queue", n=st["pending"] + st["downloading"])}</a>')
     if lib["rel_new"]:
-        now_bits.append(f'<a class="now-pill" href="/releases">✨ {lib["rel_new"]:,} films and episodes '
-                        f'recognised in the last day</a>')
+        now_bits.append(f'<a class="now-pill" href="/releases">✨ '
+                        f'{_t("{n} films and episodes recognised in the last day", n=format(lib["rel_new"], ","))}</a>')
     now_html = f'<div class="now-row">{"".join(now_bits)}</div>' if now_bits else ""
 
     # ── recently added ──
@@ -8540,7 +8940,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 + f'</div><div class="pt">{html.escape(r["t"] or "")}</div>'
                 f'<div class="ps">{html.escape(sub)}</div></a>')
         latest_html = (
-            '<h2 class="section">Recently added <span class="extra"><a href="/releases">all releases →</a></span></h2>'
+            f'<h2 class="section">{_t("Recently added")} <span class="extra"><a href="/releases">{_t("all releases →")}</a></span></h2>'
             f'<div class="strip">{"".join(cards)}</div>')
     else:
         latest_html = ""
@@ -8560,27 +8960,28 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         bars.append(
             f'<g><rect x="{x + bw * 0.16:.1f}" y="{H - PAD - h:.1f}" width="{bw * 0.68:.1f}" '
             f'height="{max(h, 1.5):.1f}" rx="3" fill="{"var(--accent)" if d == today else "rgba(94,182,229,.55)"}">'
-            f'<title>{d.strftime("%b %d")}: {n:,} added</title></rect>'
+            f'<title>{_t("{d}: {n} added", d=d.strftime("%b %d"), n=format(n, ","))}</title></rect>'
             + (f'<text x="{x + bw / 2:.1f}" y="{H - 6}" text-anchor="middle" font-size="10" '
                f'fill="var(--muted)">{d.strftime("%m-%d")}</text>' if i % 2 == 1 else '')
             + '</g>')
     total14 = sum(n for _, n in series)
     growth_html = (
-        '<div class="panel"><div class="ph"><span>Added per day</span>'
-        f'<span class="pn">{total14:,} in two weeks · peak {peak:,}</span></div>'
+        f'<div class="panel"><div class="ph"><span>{_t("Added per day")}</span>'
+        f'<span class="pn">{_t("{total} in two weeks · peak {peak}", total=format(total14, ","), peak=format(peak, ","))}</span></div>'
         f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block">'
         f'<line x1="0" y1="{H - PAD}" x2="{W}" y2="{H - PAD}" stroke="var(--border)"/>'
         f'{"".join(bars)}</svg></div>')
-    mix = [("photos", st["photos"], "#5eb6e5"), ("videos", st["videos"], "#94d2bd"),
-           ("songs", st["audio"], "#f4a261"), ("books", st["books"], "#e9c46a")]
+    mix = [(_t("photos"), st["photos"], "#5eb6e5"), (_t("videos"), st["videos"], "#94d2bd"),
+           (_t("songs"), st["audio"], "#f4a261"), (_t("books"), st["books"], "#e9c46a")]
     other = max(0, st["messages"] - sum(v for _, v, _ in mix))
     if other:
-        mix.append(("other files", other, "#cbd5e1"))
+        mix.append((_t("other files"), other, "#cbd5e1"))
     tot = sum(v for _, v, _ in mix) or 1
     mix_html = (
-        '<div class="panel"><div class="ph"><span title="Every file in the index. The tiles above count what each page '
-        'lists when opened: no 18+ channels, no clips, one card per film - so they are smaller.">Everything in the index</span>'
-        f'<span class="pn">{st["messages"]:,} items</span></div>'
+        '<div class="panel"><div class="ph"><span title="'
+        + _t("Every file in the index. The tiles above count what each page lists when opened: no 18+ channels, no clips, one card per film - so they are smaller.")
+        + f'">{_t("Everything in the index")}</span>'
+        f'<span class="pn">{_t("{n} items", n=format(st["messages"], ","))}</span></div>'
         '<div class="mixbar">'
         + "".join(f'<div style="width:{v * 100 / tot:.2f}%;background:{c}" title="{k}: {v:,}"></div>'
                   for k, v, c in mix if v)
@@ -8600,10 +9001,10 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
             items.append(
                 f'<div class="ls-row"><div style="width:26px;text-align:center">{icon}</div>'
                 f'<div class="ls-main"><div class="ls-title">{html.escape(d["name"])}</div>'
-                f'<div class="ls-sub"><span class="tag {cls}">{d["status"]}</span>'
+                f'<div class="ls-sub"><span class="tag {cls}">{_t(d["status"])}</span>'
                 f'<span>{_fmt_size(d["size_bytes"])}</span><span>{_ago(d["requested_at"])}</span></div></div></div>')
         grabs_html = (
-            '<h2 class="section">Recent grabs <span class="extra"><a href="/downloads?tab=grabs">all →</a></span></h2>'
+            f'<h2 class="section">{_t("Recent grabs")} <span class="extra"><a href="/downloads?tab=grabs">{_t("all →")}</a></span></h2>'
             f'<div class="ls">{"".join(items)}</div>')
     else:
         grabs_html = ""
@@ -8615,14 +9016,14 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 f'<div class="ls-main"><div class="ls-title">{name}</div><div class="ls-sub">{where}</div></div>'
                 f'<code class="wv">{value}</code>'
                 f'<button class="abtn" style="min-width:74px" onclick="tgCopy(this)" '
-                f'data-v="{value}">Copy</button></div>')
+                f'data-v="{value}">{_t("Copy")}</button></div>')
     wiring_html = (
-        '<h2 class="section">Connect Sonarr / Radarr</h2><div class="ls">'
-        + _wire("🔌", "Newznab indexer", "Settings → Indexers → + → Newznab → URL", f"{base_url}/newznab/")
-        + _wire("⬇", "SABnzbd download client",
-                "Settings → Download Clients → + → SABnzbd → same host and port, URL Base", "/sabnzbd")
+        f'<h2 class="section">{_t("Connect Sonarr / Radarr")}</h2><div class="ls">'
+        + _wire("🔌", _t("Newznab indexer"), "Settings → Indexers → + → Newznab → URL", f"{base_url}/newznab/")
+        + _wire("⬇", _t("SABnzbd download client"),
+                _t("Settings → Download Clients → + → SABnzbd → same host and port, URL Base"), "/sabnzbd")
         + '</div><script>function tgCopy(b){const v=b.dataset.v;const done=()=>{const o=b.textContent;'
-          'b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)};'
+          'b.textContent="' + _tj("Copied") + '";setTimeout(()=>b.textContent=o,1400)};'
           'if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);'
           'else{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();'
           'try{document.execCommand("copy");done()}catch(e){}t.remove()}}</script>')
@@ -8903,39 +9304,39 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
         return "?" + "&".join(bits) if bits else ""
 
+    _tip = html.unescape              # _chip_link escapes its tooltip itself: hand it the plain word
+
     def _n(k):
         return f' <span style="opacity:.6">{counts[k]:,}</span>'
     chips = (
-        _chip_link("all" + _n("all"), "/channels" + _cqs(show=None, offset=None), show == "all")
-        + _chip_link("🎬 with films" + _n("films"), "/channels" + _cqs(show="films", offset=None),
-                     show == "films", "channels that carry recognised films or episodes")
-        + _chip_link("joined" + _n("joined"), "/channels" + _cqs(show="joined", offset=None),
-                     show == "joined", "channels your Telegram account is a member of")
-        + _chip_link("followed" + _n("subscribed"), "/channels" + _cqs(show="subscribed", offset=None),
-                     show == "subscribed", "public channels tgarr reads without joining")
-        + _chip_link("shared" + _n("shared"), "/channels" + _cqs(show="shared", offset=None),
+        _chip_link(_t("all") + _n("all"), "/channels" + _cqs(show=None, offset=None), show == "all")
+        + _chip_link("🎬 " + _t("with films") + _n("films"), "/channels" + _cqs(show="films", offset=None),
+                     show == "films", _tip(_t("channels that carry recognised films or episodes")))
+        + _chip_link(_t("joined") + _n("joined"), "/channels" + _cqs(show="joined", offset=None),
+                     show == "joined", _tip(_t("channels your Telegram account is a member of")))
+        + _chip_link(_t("followed") + _n("subscribed"), "/channels" + _cqs(show="subscribed", offset=None),
+                     show == "subscribed", _tip(_t("public channels tgarr reads without joining")))
+        + _chip_link(_t("shared") + _n("shared"), "/channels" + _cqs(show="shared", offset=None),
                      show == "shared",
-                     f"{CONTRIB_MIN_MEMBERS}+ members and {CONTRIB_MIN_MEDIA}+ files: listed on tgarr.me "
-                     "for other people to find. Private chats and small groups never are.")
-        + (_chip_link("not followed" + _n("loose"), "/channels" + _cqs(show="loose", offset=None),
+                     _tip(_t("{members}+ members and {files}+ files: listed on tgarr.me for other people to find. Private chats and small groups never are.", members=CONTRIB_MIN_MEMBERS, files=CONTRIB_MIN_MEDIA)))
+        + (_chip_link(_t("not followed") + _n("loose"), "/channels" + _cqs(show="loose", offset=None),
                       show == "loose",
-                      "channels this install knows but no longer reads"
-                      + (": their files are being cleared from this index" if purge_on else ""))
+                      _tip(_t("channels this install knows but no longer reads: their files are being cleared from this index")
+                           if purge_on else _t("channels this install knows but no longer reads")))
            if counts["loose"] else "")
-        + _chip_link("no files" + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
-        + (_chip_link("gone" + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
-                      show == "dead", "channels Telegram no longer serves") if counts["dead"] else "")
-        + (_chip_link("being cleared" + _n("clearing"), "/channels" + _cqs(show="clearing", offset=None),
+        + _chip_link(_t("no files") + _n("empty"), "/channels" + _cqs(show="empty", offset=None), show == "empty")
+        + (_chip_link(_t("gone") + _n("dead"), "/channels" + _cqs(show="dead", offset=None),
+                      show == "dead", _tip(_t("channels Telegram no longer serves"))) if counts["dead"] else "")
+        + (_chip_link(_t("being cleared") + _n("clearing"), "/channels" + _cqs(show="clearing", offset=None),
                       show == "clearing",
-                      "channels you unfollowed: their index is being cleared and they then disappear. "
-                      "Follow one again here to keep it.") if counts["clearing"] else "")
+                      _tip(_t("channels you unfollowed: their index is being cleared and they then disappear. Follow one again here to keep it."))) if counts["clearing"] else "")
         # on a phone there is no room for the column header: the same sorts as chips
-        + '<span class="sort-chips"><span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("films", "/channels" + _cqs(sort=None, order=None, offset=None), sort == "films")
-        + _chip_link("files", "/channels" + _cqs(sort="media", order=None, offset=None), sort == "media")
-        + _chip_link("members", "/channels" + _cqs(sort="members", order=None, offset=None), sort == "members")
-        + _chip_link("latest post", "/channels" + _cqs(sort="recent", order=None, offset=None), sort == "recent")
-        + _chip_link("name", "/channels" + _cqs(sort="name", order=None, offset=None), sort == "name")
+        + '<span class="sort-chips"><span class="sep"></span><span class="lbl">' + _t("Sort:") + '</span>'
+        + _chip_link(_t("films"), "/channels" + _cqs(sort=None, order=None, offset=None), sort == "films")
+        + _chip_link(_t("files"), "/channels" + _cqs(sort="media", order=None, offset=None), sort == "media")
+        + _chip_link(_t("members"), "/channels" + _cqs(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link(_t("latest post"), "/channels" + _cqs(sort="recent", order=None, offset=None), sort == "recent")
+        + _chip_link(_t("name"), "/channels" + _cqs(sort="name", order=None, offset=None), sort == "name")
         + '</span>')
     head = _ls_head(
         (("name", "Channel", "ls-main", "asc"), ("films", "Films", "ls-num", "desc"),
@@ -8951,54 +9352,45 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                                ("sort", sort if sort != "films" else None),
                                ("order", order if order != first_dir.get(sort, "desc") else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-          'placeholder="find a channel by name or @username…" style="flex:1;max-width:420px"/>'
-          '<button class="btn" type="submit">Search</button>'
-        + (f'<a class="btn ghost" href="/channels{_cqs(q=None, offset=None)}">clear</a>' if q else '')
+          f'placeholder="{_t("find a channel by name or @username…")}" style="flex:1;max-width:420px"/>'
+          f'<button class="btn" type="submit">{_t("Search")}</button>'
+        + (f'<a class="btn ghost" href="/channels{_cqs(q=None, offset=None)}">{_t("clear")}</a>' if q else '')
         + '</form>')
 
     def _row(r):
-        title = r["title"] or (("@" + r["username"]) if r["username"] else "(untitled)")
+        title = r["title"] or (("@" + r["username"]) if r["username"] else html.unescape(_t("(untitled)")))
         handle = (f'<a href="https://t.me/{html.escape(r["username"])}" target="_blank" rel="noopener" '
-                  f'title="open in Telegram">@{html.escape(r["username"])}</a>'
-                  if r["username"] else '<span>private chat</span>')
+                  f'title="{_t("open in Telegram")}">@{html.escape(r["username"])}</a>'
+                  if r["username"] else f'<span>{_t("private chat")}</span>')
         tags = []
         if r["dead_at"]:
-            tags.append('<span class="tag bad" title="Telegram no longer serves this channel">gone</span>')
+            tags.append(f'<span class="tag bad" title="{_t("Telegram no longer serves this channel")}">{_t("gone")}</span>')
         elif r["is_joined"]:
-            tags.append('<span class="tag ok" title="your account is a member">joined</span>')
+            tags.append(f'<span class="tag ok" title="{_t("your account is a member")}">{_t("joined")}</span>')
         elif r["subscribed"] and not r["handle_known"]:
-            tags.append('<span class="tag acc" title="read from tgarr.me and Telegram\'s public web page; '
-                        'your account is not used until you open one of its files">'
-                        + ('followed · web' if r["web_preview"] else 'followed · listed') + '</span>')
+            tags.append(f'<span class="tag acc" title="{_t("read from tgarr.me and Telegram’s public web page; your account is not used until you open one of its files")}">'
+                        + (_t("followed · web") if r["web_preview"] else _t("followed · listed")) + '</span>')
         elif r["subscribed"]:
-            tags.append('<span class="tag acc" title="read without joining">followed</span>')
+            tags.append(f'<span class="tag acc" title="{_t("read without joining")}">{_t("followed")}</span>')
         elif r["unfollowed_at"]:
-            tags.append('<span class="tag warn" title="you unfollowed it: its films and files are being '
-                        'cleared from this index and it will leave this list. Follow it again to keep it.">'
-                        'unfollowed · being cleared</span>')
+            tags.append(f'<span class="tag warn" title="{_t("you unfollowed it: its films and files are being cleared from this index and it will leave this list. Follow it again to keep it.")}">{_t("unfollowed · being cleared")}</span>')
         elif r["purged_at"] and not purge_on:
-            tags.append('<span class="tag" title="unfollowed and cleared; only files you saved or marked '
-                        'as favourite are still here">not followed · cleared</span>')
+            tags.append(f'<span class="tag" title="{_t("unfollowed and cleared; only files you saved or marked as favourite are still here")}">{_t("not followed · cleared")}</span>')
         elif purge_on and r["purged_at"]:
-            tags.append('<span class="tag" title="not followed any more; its files have been cleared '
-                        'from this index. tgarr.me still lists it: follow it again to get them back.">'
-                        'not followed · cleared</span>')
+            tags.append(f'<span class="tag" title="{_t("not followed any more; its files have been cleared from this index. tgarr.me still lists it: follow it again to get them back.")}">{_t("not followed · cleared")}</span>')
         elif purge_on:
-            tags.append('<span class="tag warn" title="not followed any more: its films and files are '
-                        'being cleared from this index (tgarr.me keeps the record). Follow it again '
-                        'to keep them.">not followed · being cleared</span>')
+            tags.append(f'<span class="tag warn" title="{_t("not followed any more: its films and files are being cleared from this index (tgarr.me keeps the record). Follow it again to keep them.")}">{_t("not followed · being cleared")}</span>')
         else:
-            tags.append('<span class="tag" title="not read any more; what was indexed stays">'
-                        'not followed</span>')
+            tags.append(f'<span class="tag" title="{_t("not read any more; what was indexed stays")}">{_t("not followed")}</span>')
         if _shared(r):
-            tags.append('<span class="tag" title="listed on tgarr.me">shared</span>')
+            tags.append(f'<span class="tag" title="{_t("listed on tgarr.me")}">{_t("shared")}</span>')
         if (r["audience"] or "sfw") == "nsfw":
             tags.append('<span class="tag warn">18+</span>')
         if not r["backfilled"] and not r["dead_at"]:
-            tags.append('<span class="tag warn" title="still reading its history">reading…</span>')
+            tags.append(f'<span class="tag warn" title="{_t("still reading its history")}">{_t("reading…")}</span>')
         if r["subscribe_error"] and not r["dead_at"]:
             tags.append(f'<span class="tag bad" title="{html.escape(r["subscribe_error"], quote=True)}">'
-                        'cannot read</span>')
+                        f'{_t("cannot read")}</span>')
         has = []
         for n, ico, word, href in (
                 (r["films"], "🎬", "films", None),
@@ -9015,19 +9407,19 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                 f'data-uname="{html.escape(r["username"] or "", quote=True)}"')
         if r["subscribed"] and not r["is_joined"]:
             act = (f'<button class="abtn" {_ids} onclick="tgUnfollow(this)" '
-                   f'title="stop reading this channel">Unfollow</button>')
+                   f'title="{_t("stop reading this channel")}">{_t("Unfollow")}</button>')
         elif not r["is_joined"] and not r["dead_at"] and r["username"]:
             act = (f'<button class="abtn pri" {_ids} onclick="tgFollow(this)" '
-                   f'title="read this public channel again, without joining it">+ Follow</button>')
+                   f'title="{_t("read this public channel again, without joining it")}">+ {_t("Follow")}</button>')
             if not r["unfollowed_at"]:
                 # not followed, not joined, and nobody ever unfollowed it: it can be taken off the list
                 act += (f' <button class="abtn" {_ids} onclick="tgRemove(this)" '
-                        f'title="take this channel and its index off this tgarr">Remove</button>')
+                        f'title="{_t("take this channel and its index off this tgarr")}">{_t("Remove")}</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
             f'{" ".join(tags)}</div>'
-            f'<div class="ls-sub">{handle}{"".join(has) or "<span>no files indexed</span>"}</div></div>'
+            f'<div class="ls-sub">{handle}{"".join(has) or "<span>" + _t("no files indexed") + "</span>"}</div></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["films"]) if r["films"] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["media"]) if r["media"] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
@@ -9037,26 +9429,25 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
 
     if not page:
         listing = ('<div class="empty-state"><div class="icon">📡</div><div>'
-                   + ("No channel matches." if (q or show != "all") else
-                      "No channels yet. Join channels in Telegram, or follow some from Discover.")
+                   + (_t("No channel matches.") if (q or show != "all") else
+                      _t("No channels yet. Join channels in Telegram, or follow some from Discover."))
                    + '</div></div>')
     else:
         listing = (f'<div class="ls">{head}{"".join(_row(r) for r in page)}</div>'
                    + _page_nav("/channels", _cqs, page_offset, page_size, len(page), len(view)))
     body = (
         f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
-        f'<h2 class="section">Channels <span class="count">{len(view):,}'
-        + (f' of {len(rows):,}' if len(view) != len(rows) else '') + '</span>'
+        f'<h2 class="section">{_t("Channels")} <span class="count">'
+        + (_t("{n} of {total}", n=f"{len(view):,}", total=f"{len(rows):,}") if len(view) != len(rows) else f'{len(view):,}') + '</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
-        'letter-spacing:0;margin-left:10px"><a href="/discover">find more on Discover →</a></span></h2>'
+        'letter-spacing:0;margin-left:10px"><a href="/discover">' + _t("find more on Discover →") + '</a></span></h2>'
         f'{search}<div class="bar-tools">{chips}</div>{listing}'
         # The button changes where it is. Reloading the page for one click
         # threw the reader back to the top of a long list every time.
         '<script>var tgUnfollowAsk=' + _js_str(
-            "Stop reading this channel and take it off this list?\n\n"
-            "Its films and files are cleared from this index within a few hours. Files you saved to "
-            "this machine and your favourites are kept. You can find the channel again on Discover.")
-        + r""";
+            html.unescape(_t("Stop reading this channel and take it off this list?")) + "\n\n"
+            + html.unescape(_t("Its films and files are cleared from this index within a few hours. Files you saved to this machine and your favourites are kept. You can find the channel again on Discover.")))
+        + _fill(r""";
 function tgChGone(b, note) {
   var row = b.closest(".ls-row");
   b.disabled = true; b.textContent = note;
@@ -9069,36 +9460,36 @@ function tgChGone(b, note) {
 }
 function tgChSet(b, following) {
   // unfollowed: it has left the list. Followed again from "being cleared": it has left that view.
-  if (!following) { tgChGone(b, "Removed"); return; }
-  if (location.search.indexOf("show=clearing") >= 0) { tgChGone(b, "Following"); return; }
+  if (!following) { tgChGone(b, "[[@js:Removed]]"); return; }
+  if (location.search.indexOf("show=clearing") >= 0) { tgChGone(b, "[[@js:Following]]"); return; }
   b.disabled = false;
   if (following) {
-    b.className = "abtn"; b.textContent = "Unfollow"; b.title = "stop reading this channel";
+    b.className = "abtn"; b.textContent = "[[@js:Unfollow]]"; b.title = "[[@js:stop reading this channel]]";
     b.onclick = function () { tgUnfollow(b); };
   } else if (b.dataset.uname) {
-    b.className = "abtn pri"; b.textContent = "+ Follow";
-    b.title = "read this public channel again, without joining it";
+    b.className = "abtn pri"; b.textContent = "+ [[@js:Follow]]";
+    b.title = "[[@js:read this public channel again, without joining it]]";
     b.onclick = function () { tgFollow(b); };
   } else { b.remove(); }
 }
 function tgChFail(b, label, why) {
-  b.disabled = false; b.textContent = "Failed - retry"; b.title = why || "the request did not go through";
-  setTimeout(function () { if (b.textContent === "Failed - retry") b.textContent = label; }, 4000);
+  b.disabled = false; b.textContent = "[[@js:Failed - retry]]"; b.title = why || "[[@js:the request did not go through]]";
+  setTimeout(function () { if (b.textContent === "[[@js:Failed - retry]]") b.textContent = label; }, 4000);
 }
 function tgUnfollow(b) {
   if (!confirm(tgUnfollowAsk)) return;
   b.disabled = true; b.textContent = "…";
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChSet(b, false); })
-    .catch(function (e) { tgChFail(b, "Unfollow", e.message); });
+    .catch(function (e) { tgChFail(b, "[[@js:Unfollow]]", e.message); });
 }
 function tgRemove(b) {
-  if (!confirm("Remove this channel from tgarr?\n\nIts films and files leave the index within a few hours. "
-               + "Files you saved and favourites stay. It can be followed again from Discover.")) return;
+  if (!confirm("[[@js:Remove this channel from tgarr?]]\n\n"
+               + "[[@js:Its films and files leave the index within a few hours. Files you saved and favourites stay. It can be followed again from Discover.]]")) return;
   b.disabled = true; b.textContent = "…";
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
-    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChGone(b, "Removed"); })
-    .catch(function (e) { tgChFail(b, "Remove", e.message); });
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChGone(b, "[[@js:Removed]]"); })
+    .catch(function (e) { tgChFail(b, "[[@js:Remove]]", e.message); });
 }
 function tgFollow(b) {
   b.disabled = true; b.textContent = "…";
@@ -9108,9 +9499,9 @@ function tgFollow(b) {
     .then(function (r) { return r.json().then(function (j) {
       if (!r.ok || j.status === "error") throw new Error(j.message || ("HTTP " + r.status));
       tgChSet(b, true); }); })
-    .catch(function (e) { tgChFail(b, "+ Follow", e.message); });
+    .catch(function (e) { tgChFail(b, "+ [[@js:Follow]]", e.message); });
 }
-</script>""")
+</script>"""))
     return HTMLResponse(_layout("Channels", "/channels", body))
 
 
@@ -9205,26 +9596,26 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         return "?" + "&".join(bits) if bits else ""
 
     chips = (
-        _chip_link("All", "/discover" + _dq(kind=None, offset=None), not kind)
-        + _chip_link("🎬 Movies &amp; TV", "/discover" + _dq(kind="video", offset=None), kind == "video")
-        + _chip_link("📚 Books", "/discover" + _dq(kind="books", offset=None), kind == "books")
-        + _chip_link("🎵 Music", "/discover" + _dq(kind="music", offset=None), kind == "music")
+        _chip_link(_t("All"), "/discover" + _dq(kind=None, offset=None), not kind)
+        + _chip_link("🎬 " + _t("Movies & TV"), "/discover" + _dq(kind="video", offset=None), kind == "video")
+        + _chip_link("📚 " + _t("Books"), "/discover" + _dq(kind="books", offset=None), kind == "books")
+        + _chip_link("🎵 " + _t("Music"), "/discover" + _dq(kind="music", offset=None), kind == "music")
         + ('<span class="sep"></span>'
-           + _chip_link("SFW", "/discover" + _dq(audience=None, offset=None), audience == "sfw")
+           + _chip_link(_t("SFW"), "/discover" + _dq(audience=None, offset=None), audience == "sfw")
            + _chip_link("18+", "/discover" + _dq(audience="nsfw", offset=None), audience == "nsfw")
            if nsfw_on else '')
         + '<span class="sep"></span>'
-        + _chip_link("best match", "/discover" + _dq(sort=None, order=None, offset=None), sort == "best",
-                     "most of what you are looking at, then how many installs vouch for it")
-        + '<span class="sort-chips"><span class="lbl">Sort:</span>'
-        + _chip_link("most seen", "/discover" + _dq(sort="seen", order=None, offset=None), sort == "seen",
-                     "indexed by the most tgarr installs")
-        + _chip_link("members", "/discover" + _dq(sort="members", order=None, offset=None), sort == "members")
-        + _chip_link("files", "/discover" + _dq(sort="files", order=None, offset=None), sort == "files")
-        + _chip_link("latest file", "/discover" + _dq(sort="recent", order=None, offset=None), sort == "recent")
+        + _chip_link(_t("best match"), "/discover" + _dq(sort=None, order=None, offset=None), sort == "best",
+                     html.unescape(_t("most of what you are looking at, then how many installs vouch for it")))
+        + '<span class="sort-chips"><span class="lbl">' + _t("Sort:") + '</span>'
+        + _chip_link(_t("most seen"), "/discover" + _dq(sort="seen", order=None, offset=None), sort == "seen",
+                     html.unescape(_t("indexed by the most tgarr installs")))
+        + _chip_link(_t("members"), "/discover" + _dq(sort="members", order=None, offset=None), sort == "members")
+        + _chip_link(_t("files"), "/discover" + _dq(sort="files", order=None, offset=None), sort == "files")
+        + _chip_link(_t("latest file"), "/discover" + _dq(sort="recent", order=None, offset=None), sort == "recent")
         + '</span>'
         + '<span class="sep"></span>'
-        + _chip_link(f'include the {len(have):,} I already have', "/discover" + _dq(mine=None if mine else 1, offset=None),
+        + _chip_link(_t("include the {n} I already have", n=f"{len(have):,}"), "/discover" + _dq(mine=None if mine else 1, offset=None),
                      bool(mine)))
     search = (
         '<form method="GET" action="/discover" style="display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;align-items:center">'
@@ -9234,13 +9625,13 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
                                ("order", order if order != dfirst.get(sort, "desc") else None),
                                ("mine", 1 if mine else None)) if v)
         + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-          'placeholder="find a channel by name or @username…" style="flex:1;min-width:150px;max-width:420px"/>'
-          '<button class="btn" type="submit">Search</button>'
-        + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">clear</a>' if q else '')
+          f'placeholder="{_t("find a channel by name or @username…")}" style="flex:1;min-width:150px;max-width:420px"/>'
+          f'<button class="btn" type="submit">{_t("Search")}</button>'
+        + (f'<a class="btn ghost" href="/discover{_dq(q=None, offset=None)}">{_t("clear")}</a>' if q else '')
         + '<span style="flex:1"></span>'
           '<span id="tgPullToast" style="font-size:13px;color:var(--muted);display:none"></span>'
         + ('<button type="button" class="abtn" id="tgPullBtn" onclick="tgRegistryPull(this)" '
-           'title="ask tgarr.me for its current list now">↻ Refresh list</button>' if _signed_in() else '')
+           f'title="{_t("ask tgarr.me for its current list now")}">↻ {_t("Refresh list")}</button>' if _signed_in() else '')
         + '</form>')
 
     _in = _signed_in()
@@ -9248,11 +9639,11 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
     def _card(r):
         u = r["username"]
         mine_ = known.get(u.lower())
-        btn = ('<button class="abtn" disabled>✓ Following</button>' if mine_ else
+        btn = (f'<button class="abtn" disabled>✓ {_t("Following")}</button>' if mine_ else
                f'<button class="abtn pri" data-uname="{html.escape(u, quote=True)}" '
                f'onclick="tgDiscoverSubscribe(this)" '
-               + ('title="tgarr reads this public channel without your account joining it">+ Follow</button>' if _in else
-                  'title="tgarr lists what this public channel holds without an account; playing a file needs one">+ Follow</button>'))
+               + (f'title="{_t("tgarr reads this public channel without your account joining it")}">+ {_t("Follow")}</button>' if _in else
+                  f'title="{_t("tgarr lists what this public channel holds without an account; playing a file needs one")}">+ {_t("Follow")}</button>'))
         title = r["title"] or ("@" + u)
         has = []
         for n, ico, word in ((r["release_files"], "🎬", "films"), (r["book_files"], "📚", "books"),
@@ -9265,31 +9656,30 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
-            + ('<span class="tag ok" title="tgarr.me checked that this channel exists and is public">✓ verified</span> '
+            + (f'<span class="tag ok" title="{_t("tgarr.me checked that this channel exists and is public")}">✓ {_t("verified")}</span> '
                if r["verified"] else '')
             + ('<span class="tag warn">18+</span>' if r["audience"] == "nsfw" else '')
             + f'</div><div class="ls-sub"><a href="https://t.me/{html.escape(u)}" target="_blank" rel="noopener" '
-            f'title="open in Telegram">@{html.escape(u)}</a>{"".join(has)}</div></div>'
+            f'title="{_t("open in Telegram")}">@{html.escape(u)}</a>{"".join(has)}</div></div>'
             f'<div class="ls-num"><b>{_fmt_count(r[lead]) if r[lead] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["media_count"]) if r["media_count"] else "–"}</b></div>'
             f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b></div>'
-            f'<div class="ls-num" title="tgarr installs that index this channel"><b>{seen:,}</b></div>'
-            f'<div class="ls-num lp" title="when the newest file that tgarr installs have reported for this '
-            f'channel was posted"><b style="font-size:13px;font-weight:500">'
+            f'<div class="ls-num" title="{_t("tgarr installs that index this channel")}"><b>{seen:,}</b></div>'
+            f'<div class="ls-num lp" title="{_t("when the newest file that tgarr installs have reported for this channel was posted")}">'
+            f'<b style="font-size:13px;font-weight:500">'
             f'{_ago(r["last_file_at"]) or "–"}</b></div>'
             f'<div class="ls-act">{btn}</div></div>')
 
     if not rows and not total:
         listing = ('<div class="empty-state"><div class="icon">🔭</div>'
-                   '<div>The list from tgarr.me has not arrived yet.</div>'
-                   '<div style="margin-top:8px;font-size:13px">It is fetched every 12 hours; '
-                   '“Refresh list” asks for it now.</div></div>')
+                   f'<div>{_t("The list from tgarr.me has not arrived yet.")}</div>'
+                   f'<div style="margin-top:8px;font-size:13px">{_t("It is fetched every 12 hours; “Refresh list” asks for it now.")}</div></div>')
     elif not page:
         listing = ('<div class="empty-state"><div class="icon">🔭</div><div>'
-                   + ("No channel matches." if (q or kind) else
-                      "This part of the list has not arrived yet." if not rows else
-                      "You already follow everything on the list.") + '</div>'
-                   + ('<div style="margin-top:8px;font-size:13px">“Refresh list” asks tgarr.me for it now.</div>'
+                   + (_t("No channel matches.") if (q or kind) else
+                      _t("This part of the list has not arrived yet.") if not rows else
+                      _t("You already follow everything on the list.")) + '</div>'
+                   + (f'<div style="margin-top:8px;font-size:13px">{_t("“Refresh list” asks tgarr.me for it now.")}</div>'
                       if not rows and not (q or kind) else '') + '</div>')
     else:
         dhead = _ls_head(
@@ -9305,39 +9695,40 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
 
     body = (
         f'{_LIST_CSS}<style>.ls-num{{width:76px}}.ls-num.lp{{width:104px}}</style>'
-        f'<h2 class="section">Discover <span class="count">{len(view):,}</span>'
+        f'<h2 class="section">{_t("Discover")} <span class="count">{len(view):,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
-        f'letter-spacing:0;margin-left:10px">public channels other tgarr installs index · '
-        f'{total or 0:,} on tgarr.me'
-        + (f' · list from {_ago(last_pull)}' if last_pull else '') + '</span></h2>'
+        f'letter-spacing:0;margin-left:10px">{_t("public channels other tgarr installs index")} · '
+        + _t("{n} on tgarr.me", n=f"{total or 0:,}")
+        + (' · ' + _t("list from {when}", when=html.unescape(_ago(last_pull))) if last_pull else '') + '</span></h2>'
         f'{search}<div class="bar-tools">{chips}</div>{listing}'
+        + _fill(
         '<script>'
         '(() => {'
         '  window.tgRegistryPull = async function(btn) {'
         '    const toast = document.getElementById("tgPullToast");'
-        '    btn.disabled = true; btn.textContent = "Refreshing…";'
+        '    btn.disabled = true; btn.textContent = "[[@js:Refreshing…]]";'
         '    toast.style.display = "inline";'
-        '    toast.textContent = "asking tgarr.me (up to a minute)…";'
+        '    toast.textContent = "[[@js:asking tgarr.me (up to a minute)…]]";'
         '    toast.style.color = "var(--muted)";'
         '    try {'
         '      const r = await fetch("/api/registry/pull-now", {method:"POST"});'
         '      const j = await r.json();'
         '      if (j.status === "ok") {'
-        '        toast.textContent = "✓ " + j.affected + " channel(s) updated";'
+        '        toast.textContent = "✓ " + "[[@js:channels updated: %1]]".replace("%1", j.affected);'
         '        toast.style.color = "var(--ok)";'
         '        if (j.affected > 0) setTimeout(() => location.reload(), 1200);'
         '      } else if (j.status === "queued") {'
-        '        toast.textContent = "queued — it will run shortly";'
+        '        toast.textContent = "[[@js:queued — it will run shortly]]";'
         '        toast.style.color = "var(--warn)";'
         '      } else {'
-        '        toast.textContent = "✗ " + (j.message || "error");'
+        '        toast.textContent = "✗ " + (j.message || "[[@js:error]]");'
         '        toast.style.color = "var(--err)";'
         '      }'
         '    } catch (e) {'
-        '      toast.textContent = "✗ network error";'
+        '      toast.textContent = "✗ [[@js:network error]]";'
         '      toast.style.color = "var(--err)";'
         '    } finally {'
-        '      btn.disabled = false; btn.textContent = "↻ Refresh list";'
+        '      btn.disabled = false; btn.textContent = "↻ [[@js:Refresh list]]";'
         '    }'
         '  };'
         '  window.tgDiscoverSubscribe = async function(btn) {'
@@ -9349,12 +9740,12 @@ async def page_discover(audience: str = "sfw", kind: str = "", q: Optional[str] 
         '          body: "username=" + encodeURIComponent(u)});'
         '      const j = await r.json();'
         '      if (j.status === "queued" || j.status === "ok") {'
-        '        btn.textContent = "✓ Following"; btn.classList.remove("pri");'
-        '      } else { btn.disabled = false; btn.textContent = "✗ " + (j.message || "error"); }'
-        '    } catch(e) { btn.disabled = false; btn.textContent = "✗ network"; }'
+        '        btn.textContent = "✓ [[@js:Following]]"; btn.classList.remove("pri");'
+        '      } else { btn.disabled = false; btn.textContent = "✗ " + (j.message || "[[@js:error]]"); }'
+        '    } catch(e) { btn.disabled = false; btn.textContent = "✗ [[@js:network error]]"; }'
         '  };'
         '})();'
-        '</script>'
+        '</script>')
     )
     return HTMLResponse(_layout("Discover", "/discover", body))
 
@@ -9640,7 +10031,7 @@ def _usenet_item_xml(c, base_url: str, apikey: str) -> str:
 @app.get("/newznab/usenet/api", response_class=PlainTextResponse)
 @app.get("/newznab/usenet", response_class=PlainTextResponse)
 async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional[str] = Query(None),
-                         season: Optional[int] = None, ep: Optional[int] = None, cat: Optional[str] = None,
+                         season: Optional[str] = None, ep: Optional[str] = None, cat: Optional[str] = None,
                          limit: int = 100, offset: int = 0, apikey: Optional[str] = "tgarr",
                          id: Optional[str] = None):
     base_url = _base_url(request)
@@ -9710,11 +10101,18 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
             where.append(f"name ILIKE ${len(params)}")
     if t == "tvsearch":
         where.append(r"kind = 'video' AND name ~* 'S\d{1,2}E\d{1,3}|\d{4}[. ]\d{2}[. ]\d{2}'")
-        if season is not None and ep is not None:
-            params.append(rf"S0*{int(season)}E0*{int(ep)}(?!\d)")
+        def _n(v):
+            return int(v) if v and v.isascii() and v.isdigit() and len(v) < 6 else None
+        day = re.fullmatch(r"(\d{1,2})/(\d{1,2})", ep or "")
+        if _n(season) is not None and day:
+            # a show named by its date: 2026.11.15, 2026-11-15, 2026 11 15
+            params.append(rf"{_n(season)}[. _-]0?{int(day.group(1))}[. _-]0?{int(day.group(2))}(?!\d)")
             where.append(f"name ~* ${len(params)}")
-        elif season is not None:
-            params.append(rf"S0*{int(season)}(E\d|\M)")
+        elif _n(season) is not None and _n(ep) is not None:
+            params.append(rf"S0*{_n(season)}E0*{_n(ep)}(?!\d)")
+            where.append(f"name ~* ${len(params)}")
+        elif _n(season) is not None:
+            params.append(rf"S0*{_n(season)}(E\d|\M)")
             where.append(f"name ~* ${len(params)}")
     elif t == "movie":
         where.append(r"kind = 'video' AND name !~* 'S\d{1,2}E\d{1,3}'")
@@ -10330,10 +10728,10 @@ async def api_usenet_grabs():
 async def page_usenet(q: Optional[str] = None, kind: str = ""):
     cfg = await _usenet_cfg()
     if not (cfg.get("enabled") and cfg.get("host")):
-        body = (_KIDS_CSS + '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">Usenet is not set up</h3>'
-                '<p style="color:var(--muted);margin:0 0 12px">With a Usenet account tgarr reads the newsgroups as well: films and series '
-                'for Sonarr and Radarr, and books, songs and pictures it can fetch itself, straight into the Library, Music and the Gallery.</p>'
-                '<a class="btn" href="/settings/usenet">Set up</a></div></div>')
+        body = (_KIDS_CSS + '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">' + _t("Usenet is not set up") + '</h3>'
+                '<p style="color:var(--muted);margin:0 0 12px">'
+                + _t("With a Usenet account tgarr reads the newsgroups as well: films and series for Sonarr and Radarr, and books, songs and pictures it can fetch itself, straight into the Library, Music and the Gallery.")
+                + '</p><a class="btn" href="/settings/usenet">' + _t("Set up") + '</a></div></div>')
         return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=""))
     if kind == "have":
         return await _usenet_have_page()
@@ -10370,42 +10768,42 @@ async def page_usenet(q: Optional[str] = None, kind: str = ""):
     qs = f"&q={_q(q)}" if q else ""
     chips = "".join(
         f'<a class="btn ghost km-chip{" on" if k == kind else ""}" href="/usenet?kind={k}{qs}">{lbl} <span style="opacity:.6">{n:,}</span></a>'
-        for k, lbl, n in [("", "All", sum(counts.values()))] + [(s[0], f"{s[1]} {s[2]}", counts.get(s[0], 0)) for s in _UN_SHELVES])
+        for k, lbl, n in [("", _t("All"), sum(counts.values()))] + [(s[0], f"{s[1]} {_t(s[2])}", counts.get(s[0], 0)) for s in _UN_SHELVES])
     chips += ('<a class="btn ghost km-chip" href="/usenet?kind=have" style="margin-left:auto" '
-              f'title="what you fetched, and the room it takes">📥 Fetched <span style="opacity:.6">{_fmt_size(have_bytes) or "0"}</span></a>')
+              f'title="{_t("what you fetched, and the room it takes")}">📥 {_t("Fetched")} <span style="opacity:.6">{_fmt_size(have_bytes) or "0"}</span></a>')
     items = "".join(
         f'<div class="km-row"><span class="n">{ico.get(r["shelf"], "")} {html.escape(r["name"])}'
         + (' <small>· 18+</small>' if r["audience"] == "nsfw" else "")
         # a card from a sparse reading saw only some of a release: one file is measured,
         # several are an estimate, and the count is of those seen
-        + f'<br/><small>{"about " if r["sketch"] and (r["files"] or 0) > 1 else ""}{_fmt_size(r["size"]) or "?"}'
-        + (f' · {r["files"]}{"+" if r["sketch"] else ""} files' if (r["files"] or 0) > 1 else "")
+        + '<br/><small>' + (_t("about {size}", size=_fmt_size(r["size"]) or "?") if r["sketch"] and (r["files"] or 0) > 1 else (_fmt_size(r["size"]) or "?"))
+        + (' · ' + _t("{n} files", n=f'{r["files"]}{"+" if r["sketch"] else ""}') if (r["files"] or 0) > 1 else "")
         + f' · {html.escape(r["grp"])} · {time.strftime("%Y-%m-%d", time.gmtime(r["posted_from"] or 0))}</small></span>'
-        f'<span id="ug-{r["id"]}" style="white-space:nowrap"><button class="btn" onclick="ugGet(&quot;{r["id"]}&quot;,this)">Get</button></span></div>'
+        f'<span id="ug-{r["id"]}" style="white-space:nowrap"><button class="btn" onclick="ugGet(&quot;{r["id"]}&quot;,this)">{_t("Get")}</button></span></div>'
         for r in rows)
     body = (
         _KIDS_CSS
-        + '<p style="color:var(--muted);margin:0 0 14px">Books, songs and pictures found in the newsgroups. <b>Get</b> fetches one through your '
-          'Usenet account and puts it in the Library, Music or the Gallery. Only what was posted whole and can be opened as it is: nothing '
-          'packed, never a program, never video - films and series go to Sonarr and Radarr.</p>'
+        + '<p style="color:var(--muted);margin:0 0 14px">'
+        + _t("Books, songs and pictures found in the newsgroups. %1 fetches one through your Usenet account and puts it in the Library, Music or the Gallery. Only what was posted whole and can be opened as it is: nothing packed, never a program, never video - films and series go to Sonarr and Radarr.").replace("%1", "<b>" + _t("Get") + "</b>")
+        + '</p>'
         + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}</div>'
         + (f'<div class="km-box">{items}</div>' if items else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
-           + ("Nothing found for these words." if q else "Nothing yet. Cards appear here as the newsgroups are read; searching also asks the shared index.")
+           + (_t("Nothing found for these words.") if q else _t("Nothing yet. Cards appear here as the newsgroups are read; searching also asks the shared index."))
            + '</div></div>')
-        + """<script>
+        + _grab_note_js() + _fill("""<script>
 const ugEsc = t => String(t || "").replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
 function ugShow(g){
   const e = document.getElementById("ug-" + g.card_id);
   if (!e) return false;
-  const again = '<button class="btn ghost" onclick="ugGet(&quot;' + g.card_id + '&quot;,this)">Try again</button>';
-  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">Open</a>' : "";
-  if (g.state === "queued") e.innerHTML = '<small>waiting</small>';
-  else if (g.state === "working") e.innerHTML = '<small>fetching' + (g.percent != null ? " " + g.percent + "%" : "") + '</small>';
-  else if (g.state === "done") e.innerHTML = '<small>fetched</small> ' + open;
-  else if (g.state === "partial") e.innerHTML = '<small>' + ugEsc(g.note) + '</small> ' + open;
+  const again = '<button class="btn ghost" onclick="ugGet(&quot;' + g.card_id + '&quot;,this)">' + "[[@js:Try again]]" + '</button>';
+  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">' + "[[@js:Open]]" + '</a>' : "";
+  if (g.state === "queued") e.innerHTML = '<small>' + "[[@js:waiting]]" + '</small>';
+  else if (g.state === "working") e.innerHTML = '<small>' + (g.percent != null ? "[[@js:fetching %1%]]".replace("%1", g.percent) : "[[@js:fetching]]") + '</small>';
+  else if (g.state === "done") e.innerHTML = '<small>' + "[[@js:fetched]]" + '</small> ' + open;
+  else if (g.state === "partial") e.innerHTML = '<small>' + ugEsc(grabNote(g.note)) + '</small> ' + open;
   // "try again" only where trying again can help: not for what is refused for what it is
-  else e.innerHTML = '<small style="color:#b45309">' + ugEsc(g.note || "that did not work") + '</small> '
+  else e.innerHTML = '<small style="color:#b45309">' + ugEsc(grabNote(g.note) || "[[@js:that did not work]]") + '</small> '
     + (!g.note || /try again|room left/.test(g.note) ? again : "");
   return g.state === "queued" || g.state === "working";
 }
@@ -10419,14 +10817,14 @@ function ugPoll(){
 function ugGet(id, b){
   b.disabled = true;
   fetch("/api/usenet/grab", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: id})})
-    .then(r => r.json()).then(j => { if (j.status === "ok") ugPoll(); else { b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") ugPoll(); else { b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { b.disabled = false; });
 }
 ugPoll();
-</script>""")
+</script>"""))
     top = ('<form action="/usenet" method="GET" style="margin-left:auto">'
            + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else "")
-           + f'<input type="text" name="q" class="search" placeholder="Search books, songs, pictures on Usenet…" value="{html.escape(q, quote=True)}"/></form>')
+           + f'<input type="text" name="q" class="search" placeholder="{_t("Search books, songs, pictures on Usenet…")}" value="{html.escape(q, quote=True)}"/></form>')
     return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=top))
 
 
@@ -10832,13 +11230,13 @@ const agEsc = t => String(t || "").replace(/[&<>]/g, c => ({"&": "&amp;", "<": "
 function agShow(g){
   const e = document.querySelector('[data-ag="' + CSS.escape(g.item_id) + '"]');
   if (!e) return false;
-  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">Open</a>' : "";
-  if (g.state === "queued") e.innerHTML = '<small>waiting</small>';
-  else if (g.state === "working") e.innerHTML = '<small>fetching' + (g.percent != null ? " " + g.percent + "%" : "") + '</small>';
-  else if (g.state === "done") e.innerHTML = '<small>fetched</small> ' + open;
-  else if (g.state === "partial") e.innerHTML = '<small>' + agEsc(g.note) + '</small> ' + open;
-  else e.innerHTML = '<small style="color:#b45309">' + agEsc(g.note || "that did not work") + '</small> '
-    + (!g.note || /try again|room left/.test(g.note) ? '<button class="btn ghost" data-again="1">Try again</button>' : "");
+  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">' + "[[@js:Open]]" + '</a>' : "";
+  if (g.state === "queued") e.innerHTML = '<small>' + "[[@js:waiting]]" + '</small>';
+  else if (g.state === "working") e.innerHTML = '<small>' + (g.percent != null ? "[[@js:fetching %1%]]".replace("%1", g.percent) : "[[@js:fetching]]") + '</small>';
+  else if (g.state === "done") e.innerHTML = '<small>' + "[[@js:fetched]]" + '</small> ' + open;
+  else if (g.state === "partial") e.innerHTML = '<small>' + agEsc(grabNote(g.note)) + '</small> ' + open;
+  else e.innerHTML = '<small style="color:#b45309">' + agEsc(grabNote(g.note) || "[[@js:that did not work]]") + '</small> '
+    + (!g.note || /try again|room left/.test(g.note) ? '<button class="btn ghost" data-again="1">' + "[[@js:Try again]]" + '</button>' : "");
   const again = e.querySelector("[data-again]");
   if (again) again.onclick = () => agGet(e, again);
   return g.state === "queued" || g.state === "working";
@@ -10854,14 +11252,14 @@ function agGet(e, b){
   b.disabled = true;
   fetch("/api/archive/grab", {method: "POST", headers: {"Content-Type": "application/json"},
                               body: JSON.stringify({id: e.dataset.ag, name: e.dataset.name, shelf: e.dataset.shelf})})
-    .then(r => r.json()).then(j => { if (j.status === "ok") agPoll(); else { b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") agPoll(); else { b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { b.disabled = false; });
 }
 function agForget(body, what, b){
-  if (!confirm("Remove " + what + " from this server? The files are deleted; they can be fetched again from the Internet Archive.")) return;
+  if (!confirm(what)) return;
   if (b) b.disabled = true;
   fetch("/api/archive/forget", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
-    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { if (b) b.disabled = false; });
 }
 document.querySelectorAll("[data-ag] button").forEach(b => { b.onclick = () => agGet(b.parentElement, b); });
@@ -10890,27 +11288,32 @@ async def page_archive(q: Optional[str] = None, shelf: str = "film", page: int =
         cur.update(over)
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
         return "/archive" + ("?" + "&".join(bits) if bits else "")
-    chips = ("".join(_chip_link(f"{s[1]} {s[2]}", link(shelf=s[0] if s[0] != "film" else None), kind != "have" and shelf == s[0])
+    shelf_word = {"film": _t("Films"), "audiobook": _t("Audiobooks"), "audio": _t("Music and radio"),
+                  "book": _t("Books and magazines"), "picture": _t("Pictures")}
+    chips = ("".join(_chip_link(f"{s[1]} {shelf_word.get(s[0], s[2])}", link(shelf=s[0] if s[0] != "film" else None), kind != "have" and shelf == s[0])
                      for s in archive_org.SHELVES)
-             + (_chip_link(f"📥 Fetched {_fmt_size(have_bytes) or ''}".strip(), link(kind="have", q=None, shelf=None), kind == "have",
-                           "what you fetched from the Internet Archive, and the way to remove it") if have else ""))
+             + (_chip_link(("📥 " + _t("Fetched") + f" {_fmt_size(have_bytes) or ''}").strip(), link(kind="have", q=None, shelf=None), kind == "have",
+                           html.unescape(_t("what you fetched from the Internet Archive, and the way to remove it"))) if have else ""))
     if kind == "have":
+        ar_one = html.escape(_tj("Remove this item from this server? The files are deleted; they can be fetched again from the Internet Archive."), quote=True)
+        ar_all = html.escape(_tj("Remove everything fetched from the Internet Archive from this server? The files are deleted; they can be fetched again from the Internet Archive."), quote=True)
         items = "".join(
             f'<div class="km-row"><span class="n">{html.escape((r["cap"] or "").split(" · ")[0])}'
-            f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {r["files"]} file{"s" if r["files"] != 1 else ""} · fetched {_ago(r["fetched"])}</small></span>'
+            f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {_t("files: {n}", n=r["files"])} · {_t("fetched %1").replace("%1", _ago(r["fetched"]))}</small></span>'
             '<span style="white-space:nowrap">'
-            f'<a class="btn ghost" href="/watch/{r["first"]}">Open</a> '
-            f'<button class="btn ghost" onclick="agForget({{release:&quot;{r["key"]}&quot;}},&quot;this item&quot;,this)">Delete</button></span></div>'
+            f'<a class="btn ghost" href="/watch/{r["first"]}">{_t("Open")}</a> '
+            f'<button class="btn ghost" onclick="agForget({{release:&quot;{r["key"]}&quot;}},&quot;{ar_one}&quot;,this)">{_t("Delete")}</button></span></div>'
             for r in have)
         body = (_KIDS_CSS
-                + f'<p style="color:var(--muted);margin:0 0 14px">What you fetched from the Internet Archive: <b>{len(have):,}</b> item{"s" if len(have) != 1 else ""}, '
-                  f'<b>{_fmt_size(have_bytes) or "0 MB"}</b>. You asked for each of these, so tgarr never removes one by itself.</p>'
+                + '<p style="color:var(--muted);margin:0 0 14px">'
+                + _t("Items fetched from the Internet Archive: %1, taking %2. You asked for each of these, so tgarr never removes one by itself.")
+                  .replace("%1", f"<b>{len(have):,}</b>").replace("%2", f'<b>{_fmt_size(have_bytes) or "0 MB"}</b>') + '</p>'
                 + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}'
-                + ('<button class="btn ghost" style="margin-left:auto" onclick="agForget({all:true},&quot;everything fetched from the Internet Archive&quot;,this)">'
-                   f'🗑 Delete all ({_fmt_size(have_bytes) or "0"})</button>' if have else "")
+                + ('<button class="btn ghost" style="margin-left:auto" onclick="agForget({all:true},&quot;' + ar_all + '&quot;,this)">'
+                   f'🗑 {_t("Delete all ({size})", size=_fmt_size(have_bytes) or "0")}</button>' if have else "")
                 + '</div>'
-                + (f'<div class="km-box">{items}</div>' if items else '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing fetched yet.</div></div>')
-                + _AR_JS)
+                + (f'<div class="km-box">{items}</div>' if items else '<div class="km-box"><div class="km-pad" style="color:var(--muted)">' + _t("Nothing fetched yet.") + '</div></div>')
+                + _grab_note_js() + _fill(_AR_JS))
         return HTMLResponse(_layout("Archive", "/archive", body, page_title="Fetched from the Internet Archive", top_actions_html=""))
     total, found, trouble = await _archive_search(q, shelf, page)
     sign = archive_org.SHELF[shelf][1]
@@ -10919,35 +11322,35 @@ async def page_archive(q: Optional[str] = None, shelf: str = "film", page: int =
         + (f' <small>({html.escape(i["year"])})</small>' if i["year"] else "")
         + '<br/><small>'
         + " · ".join(x for x in ((html.escape(i["creator"]) if i["creator"] else ""),
-                                 (f'up to {_fmt_size(i["size"])}' if i["size"] else ""),
-                                 f'{i["downloads"]:,} downloads',
+                                 (_t("up to {size}", size=_fmt_size(i["size"])) if i["size"] else ""),
+                                 _t("{n} downloads", n=format(i["downloads"], ",")),
                                  f'<a href="https://archive.org/details/{html.escape(i["id"], quote=True)}" target="_blank" rel="noopener noreferrer">archive.org ↗</a>') if x)
         + '</small></span>'
         f'<span data-ag="{html.escape(i["id"], quote=True)}" data-name="{html.escape(i["title"], quote=True)}" data-shelf="{shelf}" style="white-space:nowrap">'
-        '<button class="btn">Get</button></span></div>'
+        '<button class="btn">' + _t("Get") + '</button></span></div>'
         for i in found)
     pages = ""
     if total > archive_org.ROWS or page > 1:
         last = min(250, (total + archive_org.ROWS - 1) // archive_org.ROWS)
         pages = ('<div style="display:flex;gap:8px;align-items:center;margin-top:14px">'
-                 + (f'<a class="btn ghost" href="{html.escape(link(page=page - 1 if page > 2 else None), quote=True)}">← Earlier</a>' if page > 1 else "")
-                 + f'<span style="color:var(--muted);font-size:13px">page {page} of {max(last, 1):,} · {total:,} found</span>'
-                 + (f'<a class="btn ghost" href="{html.escape(link(page=page + 1), quote=True)}">More →</a>' if page < last else "")
+                 + (f'<a class="btn ghost" href="{html.escape(link(page=page - 1 if page > 2 else None), quote=True)}">← {_t("Earlier")}</a>' if page > 1 else "")
+                 + f'<span style="color:var(--muted);font-size:13px">{_t("page {page} of {last} · {total} found", page=page, last=format(max(last, 1), ","), total=format(total, ","))}</span>'
+                 + (f'<a class="btn ghost" href="{html.escape(link(page=page + 1), quote=True)}">{_t("More")} →</a>' if page < last else "")
                  + '</div>')
     body = (
         _KIDS_CSS
-        + '<p style="color:var(--muted);margin:0 0 14px">The <a href="https://archive.org" target="_blank" rel="noopener noreferrer">Internet Archive</a> keeps '
-          'films, radio plays, audiobooks, books, magazines and recordings that anybody may download - no account, no provider. '
-          '<b>Get</b> fetches an item to this server and puts it in Videos, Music or the Library: one playable copy of it, never a program. '
-          'Without words, a shelf shows what is downloaded most.</p>'
+        + '<p style="color:var(--muted);margin:0 0 14px">'
+        + _t("The %1 keeps films, radio plays, audiobooks, books, magazines and recordings that anybody may download - no account, no provider. %2 fetches an item to this server and puts it in Videos, Music or the Library: one playable copy of it, never a program. Without words, a shelf shows what is downloaded most.")
+          .replace("%1", '<a href="https://archive.org" target="_blank" rel="noopener noreferrer">' + _t("Internet Archive") + '</a>').replace("%2", "<b>" + _t("Get") + "</b>")
+        + '</p>'
         + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}</div>'
         + (f'<div class="km-box">{items}</div>' if items else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
-           + (html.escape(trouble) if trouble else "Nothing found for these words on this shelf.") + '</div></div>')
-        + pages + _AR_JS)
+           + (_t(trouble) if trouble else _t("Nothing found for these words on this shelf.")) + '</div></div>')
+        + pages + _grab_note_js() + _fill(_AR_JS))
     top = ('<form action="/archive" method="GET" style="margin-left:auto">'
            + (f'<input type="hidden" name="shelf" value="{shelf}"/>' if shelf != "film" else "")
-           + f'<input type="text" name="q" class="search" placeholder="Search the Internet Archive…" value="{html.escape(q, quote=True)}"/></form>')
+           + f'<input type="text" name="q" class="search" placeholder="{_t("Search the Internet Archive…")}" value="{html.escape(q, quote=True)}"/></form>')
     return HTMLResponse(_layout("Archive", "/archive", body, page_title="Internet Archive", top_actions_html=top))
 
 
@@ -10979,12 +11382,44 @@ async def api_usenet_forget(request: Request):
     return {"status": "ok", "removed": len(paths), "freed": _fmt_size(sum(r["sz"] for r in rows)) or "0 MB"}
 
 
+# What a fetch says when it did not go well (usenet_grabs.note, archive_grabs.note) is kept in
+# English; a page shows it in the language of its reader. The same sentences as in
+# _usenet_grab_one, _archive_grab_one, usenet_fetch and archive_org.plan.
+_GRAB_NOTES = (
+    "it is no longer in the index", "it is no longer on the news server", "it is no longer whole on the news server",
+    "never fetched: the block list", "nothing in it that can be opened as it is", "not enough room left on the disk",
+    "the news server did not answer - try again later", "video is not fetched by tgarr - give it to Sonarr or Radarr",
+    "packed in an archive: it needs a real downloader to repair and unpack", "too large to fetch here",
+    "archive.org did not answer (asked three times) - try again later", "it did not arrive from archive.org - try again later",
+    "that did not work - try again later", "the Internet Archive no longer shows this item",
+    "this one can only be borrowed at archive.org, not downloaded", "not a film, a recording, a book or a picture",
+    "nothing in it that can be played or read as it is",
+)
+_GRAB_NOTE_JS = """<script>
+const grabNotes = __NOTES__;
+function grabNote(n){
+  return String(n || "").split("; ").map(p => {
+    let m = /^([0-9]+) of ([0-9]+) files arrived whole$/.exec(p);
+    if (m) return "[[@js:%1 of %2 files arrived whole]]".replace("%1", m[1]).replace("%2", m[2]);
+    m = /^the first ([0-9]+) of ([0-9]+) files: the rest is over what one fetch may be$/.exec(p);
+    if (m) return "[[@js:the first %1 of %2 files: the rest is over what one fetch may be]]".replace("%1", m[1]).replace("%2", m[2]);
+    return grabNotes[p] || p;
+  }).join("; ");
+}
+</script>"""
+
+
+def _grab_note_js() -> str:
+    words = _json.dumps({n: i18n.t(_LANG.get(), n) for n in _GRAB_NOTES}, ensure_ascii=False).replace("</", "<" + chr(92) + "/")
+    return _fill(_GRAB_NOTE_JS).replace("__NOTES__", words)
+
+
 _UN_FORGET_JS = """<script>
 function ugForget(body, what, b){
-  if (!confirm("Remove " + what + " from this server? The files are deleted; they can be fetched again only while the post is still on Usenet.")) return;
+  if (!confirm(what)) return;
   if (b) b.disabled = true;
   fetch("/api/usenet/forget", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
-    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { if (b) b.disabled = false; });
 }
 </script>"""
@@ -11003,29 +11438,32 @@ async def _usenet_have_page() -> HTMLResponse:
                 WHERE {_FROM_USENET} AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
                 GROUP BY 1 ORDER BY max(m.id) DESC LIMIT 500""")
     total = sum(r["bytes"] for r in rows)
+    un_one = html.escape(_tj("Remove this release from this server? The files are deleted; they can be fetched again only while the post is still on Usenet."), quote=True)
+    un_all = html.escape(_tj("Remove everything fetched from Usenet from this server? The files are deleted; they can be fetched again only while the post is still on Usenet."), quote=True)
     items = "".join(
         f'<div class="km-row"><span class="n">{html.escape((r["cap"] or "").split(" · ")[0] or os.path.basename(r["path"]))}'
-        + (' <small>· ♥ kept</small>' if r["fav"] else "")
-        + f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {r["files"]} file{"s" if r["files"] != 1 else ""}'
+        + (f' <small>· ♥ {_t("kept")}</small>' if r["fav"] else "")
+        + f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {_t("files: {n}", n=r["files"])}'
         + (f' · {html.escape(r["grp"])}' if r["grp"] else "")
-        + f' · fetched {_ago(r["fetched"])}' + (f' · opened {_ago(r["used"])}' if r["used"] else ' · not opened yet')
+        + ' · ' + _t("fetched %1").replace("%1", _ago(r["fetched"]))
+        + ' · ' + (_t("opened %1").replace("%1", _ago(r["used"])) if r["used"] else _t("not opened yet"))
         + '</small></span><span style="white-space:nowrap">'
-        f'<a class="btn ghost" href="/watch/{r["first"]}">Open</a> '
-        f'<button class="btn ghost" onclick="ugForget({{release:&quot;{r["key"]}&quot;}},&quot;this release&quot;,this)">Delete</button></span></div>'
+        f'<a class="btn ghost" href="/watch/{r["first"]}">{_t("Open")}</a> '
+        f'<button class="btn ghost" onclick="ugForget({{release:&quot;{r["key"]}&quot;}},&quot;{un_one}&quot;,this)">{_t("Delete")}</button></span></div>'
         for r in rows)
     body = (
         _KIDS_CSS
-        + f'<p style="color:var(--muted);margin:0 0 14px">What you fetched from Usenet: <b>{len(rows):,}</b> release{"s" if len(rows) != 1 else ""}, '
-          f'<b>{_fmt_size(total) or "0 MB"}</b>. '
-        + 'You asked for each of these, so tgarr never removes one by itself: they stay until you delete them here.</p>'
-        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
-        '<a class="btn ghost km-chip" href="/usenet">← Find more</a>'
-        + ('<button class="btn ghost" style="margin-left:auto" onclick="ugForget({all:true},&quot;everything fetched from Usenet&quot;,this)">'
-           f'🗑 Delete all ({_fmt_size(total) or "0"})</button>' if rows else "")
+        + '<p style="color:var(--muted);margin:0 0 14px">'
+        + _t("Releases fetched from Usenet: %1, taking %2. You asked for each of these, so tgarr never removes one by itself: they stay until you delete them here.")
+          .replace("%1", f"<b>{len(rows):,}</b>").replace("%2", f'<b>{_fmt_size(total) or "0 MB"}</b>')
+        + '</p><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+        '<a class="btn ghost km-chip" href="/usenet">← ' + _t("Find more") + '</a>'
+        + ('<button class="btn ghost" style="margin-left:auto" onclick="ugForget({all:true},&quot;' + un_all + '&quot;,this)">'
+           f'🗑 {_t("Delete all ({size})", size=_fmt_size(total) or "0")}</button>' if rows else "")
         + '</div>'
         + (f'<div class="km-box">{items}</div>' if items else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing fetched yet.</div></div>')
-        + _UN_FORGET_JS)
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">' + _t("Nothing fetched yet.") + '</div></div>')
+        + _fill(_UN_FORGET_JS))
     return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Fetched from Usenet", top_actions_html=""))
 
 
@@ -11251,18 +11689,15 @@ async def page_settings_pictures():
 .vi-cap{{padding:6px 8px 0;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .vi-card button{{margin:6px 8px 8px;font-size:12px;padding:4px 10px}}
 </style>
-<div class="vi-box"><h3>Looking at the pictures themselves <span id="viState"></span></h3>
-<p>Whether something is adult has so far been a matter of what its channel is called. With this installed, tgarr looks at every
-picture - at the picture, not its name - and decides for itself: adult or not, drawn or photographed. A picture found adult is never
-shown in the Media Center, whatever was ticked, and is left out of the gallery unless adult content is switched on. A channel that
-calls itself harmless and turns out to be mostly adult pictures is labelled 18+.</p>
-<p>Two small models do it, on this machine's processor; nothing is sent anywhere. They are fetched once, {mb}, from Hugging Face,
-and checked. A picture takes most of a second, so a large library is gone through once over some hours, quietly, newest first.
-What they cannot do is tell a person's age.</p>
+<div class="vi-box"><h3>[[@Looking at the pictures themselves]] <span id="viState"></span></h3>
+<p>[[@Whether something is adult has so far been a matter of what its channel is called. With this installed, tgarr looks at every picture - at the picture, not its name - and decides for itself: adult or not, drawn or photographed.]]
+[[@A picture found adult is never shown in the Media Center, whatever was ticked, and is left out of the gallery unless adult content is switched on. A channel that calls itself harmless and turns out to be mostly adult pictures is labelled 18+.]]</p>
+<p>{_t("Two small models do it, on this machine's processor; nothing is sent anywhere. They are fetched once, {mb}, from Hugging Face, and checked.", mb=mb)}
+[[@A picture takes most of a second, so a large library is gone through once over some hours, quietly, newest first. What they cannot do is tell a person's age.]]</p>
 <div class="vi-row" id="viRow"></div></div>
-<div class="vi-box"><h3>So far</h3><div class="vi-n" id="viNum"></div><div id="viCh" style="margin-top:12px;font-size:14px"></div></div>
-<div class="vi-box"><h3>Found adult</h3>
-<p>Blurred until the pointer is on them. Only what the model is very sure of (90% and up) is listed. It can still be wrong: say so, and your word stands, whatever a model says later.</p>
+<div class="vi-box"><h3>[[@So far]]</h3><div class="vi-n" id="viNum"></div><div id="viCh" style="margin-top:12px;font-size:14px"></div></div>
+<div class="vi-box"><h3>[[@Found adult]]</h3>
+<p>[[@Blurred until the pointer is on them. Only what the model is very sure of (90% and up) is listed. It can still be wrong: say so, and your word stands, whatever a model says later.]]</p>
 <div class="vi-grid" id="viFlag"></div><p id="viFlagNone" style="margin-top:8px"></p>
 <h3 style="margin-top:18px" id="viHandH"></h3><div class="vi-grid" id="viHand"></div></div>
 <script>
@@ -11271,38 +11706,39 @@ const post = (path, body) => fetch(path, {{method: "POST", headers: {{"Content-T
 const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
 const esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
 const n = x => (x || 0).toLocaleString();
+const fmt = (s, ...a) => s.replace(/%([1-9])/g, (m, i) => a[i - 1]);
 function show(j){{
-  document.getElementById("viState").innerHTML = j.installed ? (j.available ? pill("ok", j.state === "looking" ? "looking" : "installed") : pill("bad", "installed, but this build cannot run it")) : pill("muted", "not installed");
+  document.getElementById("viState").innerHTML = j.installed ? (j.available ? pill("ok", j.state === "looking" ? "[[@js:looking]]" : "[[@js:installed]]") : pill("bad", "[[@js:installed, but this build cannot run it]]")) : pill("muted", "[[@js:not installed]]");
   const row = document.getElementById("viRow");
   if (j.installing) {{
     const pc = Math.min(100, Math.round(j.done * 100 / SZ));
-    row.innerHTML = '<div class="vi-bar"><i style="width:' + pc + '%"></i></div><span>fetching, ' + pc + '%</span>';
+    row.innerHTML = '<div class="vi-bar"><i style="width:' + pc + '%"></i></div><span>' + fmt("[[@js:fetching, %1%]]", pc) + '</span>';
   }} else if (j.installed) {{
-    row.innerHTML = '<button class="btn ghost" onclick="viRemove(false)">Remove the models</button><button class="btn ghost" onclick="viRemove(true)">Remove, and forget what they found</button>';
+    row.innerHTML = '<button class="btn ghost" onclick="viRemove(false)">' + "[[@js:Remove the models]]" + '</button><button class="btn ghost" onclick="viRemove(true)">' + "[[@js:Remove, and forget what they found]]" + '</button>';
   }} else {{
-    row.innerHTML = '<button class="btn" onclick="viInstall()">Install (' + Math.round(SZ / 1e6) + ' MB)</button>' + (j.error ? '<span style="color:#b45309">' + esc(j.error) + '</span>' : "");
+    row.innerHTML = '<button class="btn" onclick="viInstall()">' + fmt("[[@js:Install (%1 MB)]]", Math.round(SZ / 1e6)) + '</button>' + (j.error ? '<span style="color:#b45309">' + esc(j.error) + '</span>' : "");
   }}
-  document.getElementById("viNum").innerHTML = '<div><b>' + n(j.looked) + '</b>pictures looked at</div><div><b>' + n(j.waiting) + '</b>waiting</div>'
-    + '<div><b>' + n(j.adult) + '</b>found adult</div><div><b>' + n(j.drawn) + '</b>drawn, not photographed</div>';
-  document.getElementById("viCh").innerHTML = (j.relabelled || []).map(c => 'Labelled 18+: <b>' + esc(c.name) + '</b> - ' + n(c.adult) + ' of ' + n(c.n) + ' pictures looked at were adult').join("<br/>");
+  document.getElementById("viNum").innerHTML = '<div><b>' + n(j.looked) + '</b>' + "[[@js:pictures looked at]]" + '</div><div><b>' + n(j.waiting) + '</b>' + "[[@js:waiting]]" + '</div>'
+    + '<div><b>' + n(j.adult) + '</b>' + "[[@js:found adult]]" + '</div><div><b>' + n(j.drawn) + '</b>' + "[[@js:drawn, not photographed]]" + '</div>';
+  document.getElementById("viCh").innerHTML = (j.relabelled || []).map(c => fmt("[[@js:Labelled 18+: %1 - %2 of %3 pictures looked at were adult]]", '<b>' + esc(c.name) + '</b>', n(c.adult), n(c.n))).join("<br/>");
   return j.installing || j.state === "looking";
 }}
 let timer = null;
 function poll(){{ fetch("/api/vision/status").then(r => r.json()).then(j => {{ clearTimeout(timer); timer = setTimeout(poll, show(j) ? 2500 : 20000); }}).catch(() => {{ timer = setTimeout(poll, 6000); }}); }}
 function viInstall(){{ post("/api/vision/install").then(poll); }}
 function viRemove(forget){{
-  if (!confirm(forget ? "Remove the models and forget what they found? Pictures will again be judged by their channel alone." : "Remove the models? What they found so far is kept.")) return;
+  if (!confirm(forget ? "[[@js:Remove the models and forget what they found? Pictures will again be judged by their channel alone.]]" : "[[@js:Remove the models? What they found so far is kept.]]")) return;
   post("/api/vision/remove", {{forget: forget}}).then(poll);
 }}
 function flagged(){{
   fetch("/api/vision/flagged").then(r => r.json()).then(j => {{
     const card = p => '<div class="vi-card' + (p.by_hand ? ' hand' : '') + '"><div class="vi-img"><img loading="lazy" src="/thumbs/' + encodeURIComponent(p.thumb) + '"/></div>'
-      + '<div class="vi-cap">' + esc(p.channel) + (p.by_hand ? (p.adult >= 0.5 ? ' - adult, you said' : ' - not adult, you said') + (p.model != null ? ' (model: ' + Math.round(p.model * 100) + '%)' : '') : ' - ' + Math.round(p.adult * 100) + '%') + '</div>'
-      + '<button class="btn ghost" data-t="' + encodeURIComponent(p.thumb) + '" data-a="' + (p.by_hand ? 'undo' : 'no') + '">' + (p.by_hand ? 'Take back' : 'Not adult') + '</button></div>';
+      + '<div class="vi-cap">' + esc(p.channel) + (p.by_hand ? ' - ' + (p.adult >= 0.5 ? "[[@js:adult, you said]]" : "[[@js:not adult, you said]]") + (p.model != null ? ' (' + fmt("[[@js:model: %1%]]", Math.round(p.model * 100)) + ')' : '') : ' - ' + Math.round(p.adult * 100) + '%') + '</div>'
+      + '<button class="btn ghost" data-t="' + encodeURIComponent(p.thumb) + '" data-a="' + (p.by_hand ? 'undo' : 'no') + '">' + (p.by_hand ? "[[@js:Take back]]" : "[[@js:Not adult]]") + '</button></div>';
     const ps = j.pictures || [], found = ps.filter(p => !p.by_hand), hand = ps.filter(p => p.by_hand);
     document.getElementById("viFlag").innerHTML = found.map(card).join("");
-    document.getElementById("viFlagNone").textContent = found.length ? (found.length >= 300 ? "The first 300." : "") : "None.";
-    document.getElementById("viHandH").textContent = hand.length ? "Decided by you" : "";
+    document.getElementById("viFlagNone").textContent = found.length ? (found.length >= 300 ? "[[@js:The first 300.]]" : "") : "[[@js:None.]]";
+    document.getElementById("viHandH").textContent = hand.length ? "[[@js:Decided by you]]" : "";
     document.getElementById("viHand").innerHTML = hand.map(card).join("");
   }}).catch(() => {{}});
 }}
@@ -11316,7 +11752,7 @@ poll();
 flagged();
 setInterval(flagged, 30000);
 </script>"""
-    return HTMLResponse(_layout("Pictures", "/settings", body, page_title="Looking at pictures", top_actions_html=""))
+    return HTMLResponse(_layout("Pictures", "/settings", _fill(body), page_title="Looking at pictures", top_actions_html=""))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -11423,77 +11859,76 @@ async def page_settings_voice():
 .vo-bar i{{display:block;height:100%;width:0;background:var(--accent);transition:width .4s}}
 .vo-in{{flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font:inherit;background:var(--surface);color:var(--fg)}}
 </style>
-<div class="vo-box"><h3>A voice of this machine's own <span id="voState"></span></h3>
-<p>A browser reads a book aloud with whatever voices it happens to have: natural ones in Edge, a robot in most others, none on many
-televisions. With this voice installed, tgarr makes the audio itself - on this machine's processor, nothing is sent anywhere - for
-every browser that has no natural voice of its own. Edge goes on reading with Microsoft's voices, which are better. The voice
-(Kokoro, an open model) reads Chinese and English; for other languages the browser's voice is used.</p>
-<p>The voice is not part of tgarr: it is fetched once, {mb(tts.SIZES["voice"])}, from GitHub (the sherpa-onnx project's files), checked,
-and kept in the downloads folder. It needs about 600 MB of memory while a book is being read, and lets go of it a quarter of an hour
-after. A sentence takes about a third of its length to make on an ordinary processor - on a small one, reading may halt between sentences.</p>
+<div class="vo-box"><h3>[[@A voice of this machine's own]] <span id="voState"></span></h3>
+<p>[[@A browser reads a book aloud with whatever voices it happens to have: natural ones in Edge, a robot in most others, none on many televisions.]]
+[[@With this voice installed, tgarr makes the audio itself - on this machine's processor, nothing is sent anywhere - for every browser that has no natural voice of its own.]]
+[[@Edge goes on reading with Microsoft's voices, which are better. The voice (Kokoro, an open model) reads Chinese and English; for other languages the browser's voice is used.]]</p>
+<p>{_t("The voice is not part of tgarr: it is fetched once, {mb}, from GitHub (the sherpa-onnx project's files), checked, and kept in the downloads folder.", mb=mb(tts.SIZES["voice"]))}
+[[@It needs about 600 MB of memory while a book is being read, and lets go of it a quarter of an hour after.]]
+[[@A sentence takes about a third of its length to make on an ordinary processor - on a small one, reading may halt between sentences.]]</p>
 <div class="vo-row" id="voVoice"></div></div>
-<div class="vo-box"><h3>Hard Chinese pronunciations <span id="prState"></span></h3>
-<p>长 in 路还长着呢, 得 in 你得去: which reading a character has depends on the sentence. tgarr decides the common cases by rules of
-its own. A second model that reads the whole sentence gets more of them right. It is large - {mb(tts.SIZES["pronunciation"])}, from Hugging Face
-(the g2pW project) - and needs about a gigabyte of memory while reading.</p>
+<div class="vo-box"><h3>[[@Hard Chinese pronunciations]] <span id="prState"></span></h3>
+<p>[[@长 in 路还长着呢, 得 in 你得去: which reading a character has depends on the sentence. tgarr decides the common cases by rules of its own. A second model that reads the whole sentence gets more of them right.]]
+{_t("It is large - {mb}, from Hugging Face (the g2pW project) - and needs about a gigabyte of memory while reading.", mb=mb(tts.SIZES["pronunciation"]))}</p>
 <div class="vo-row" id="voPron"></div></div>
-<div class="vo-box"><h3>Try it</h3>
+<div class="vo-box"><h3>[[@Try it]]</h3>
 <div class="vo-row"><input class="vo-in" id="voText" value="路还长着呢，孩子，不着急，慢慢走。 It was nearly midnight on platform 9." />
-<button class="btn" onclick="voTry()">Say it</button><span id="voMsg" style="color:var(--muted);font-size:13px"></span></div></div>
+<button class="btn" onclick="voTry()">[[@Say it]]</button><span id="voMsg" style="color:var(--muted);font-size:13px"></span></div></div>
 <script>
 const SZ = {{voice: {tts.SIZES["voice"]}, pronunciation: {tts.SIZES["pronunciation"]}}};
 const post = (path, body) => fetch(path, {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify(body)}}).then(r => r.json());
 const pill = (cls, t) => '<span class="pill ' + cls + '" style="font-size:12px;vertical-align:middle">' + t + '</span>';
 const esc = t => String(t).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]);
+const fmt = (s, ...a) => s.replace(/%([1-9])/g, (m, i) => a[i - 1]);
 function part(el, what, st, extra){{
   if (st.installing) {{
     const pc = Math.min(100, Math.round(st.done * 100 / SZ[what]));
-    el.innerHTML = '<div class="vo-bar"><i style="width:' + pc + '%"></i></div><span>fetching, ' + pc + '%</span>';
+    el.innerHTML = '<div class="vo-bar"><i style="width:' + pc + '%"></i></div><span>' + fmt("[[@js:fetching, %1%]]", pc) + '</span>';
   }} else if (st.installed) {{
-    el.innerHTML = (extra || "") + '<button class="btn ghost" data-w="' + what + '" onclick="voRemove(this.dataset.w)">Remove</button>';
+    el.innerHTML = (extra || "") + '<button class="btn ghost" data-w="' + what + '" onclick="voRemove(this.dataset.w)">' + "[[@js:Remove]]" + '</button>';
   }} else {{
-    el.innerHTML = '<button class="btn" data-w="' + what + '" onclick="voInstall(this.dataset.w)">Install (' + Math.round(SZ[what] / 1e6) + ' MB)</button>'
+    el.innerHTML = '<button class="btn" data-w="' + what + '" onclick="voInstall(this.dataset.w)">' + fmt("[[@js:Install (%1 MB)]]", Math.round(SZ[what] / 1e6)) + '</button>'
       + (st.error ? '<span style="color:#b45309">' + esc(st.error) + '</span>' : "");
   }}
 }}
 function show(j){{
-  document.getElementById("voState").innerHTML = j.voice.installed ? (j.available ? pill("ok", "installed") : pill("bad", "installed, but this build cannot run it")) : pill("muted", "not installed");
-  document.getElementById("prState").innerHTML = j.pronunciation.installed ? pill(j.pronunciation.on ? "ok" : "muted", j.pronunciation.on ? "in use" : "installed, switched off") : pill("muted", "not installed");
+  document.getElementById("voState").innerHTML = j.voice.installed ? (j.available ? pill("ok", "[[@js:installed]]") : pill("bad", "[[@js:installed, but this build cannot run it]]")) : pill("muted", "[[@js:not installed]]");
+  document.getElementById("prState").innerHTML = j.pronunciation.installed ? pill(j.pronunciation.on ? "ok" : "muted", j.pronunciation.on ? "[[@js:in use]]" : "[[@js:installed, switched off]]") : pill("muted", "[[@js:not installed]]");
   part(document.getElementById("voVoice"), "voice", j.voice,
-    '<span style="color:var(--muted)">' + (j.loaded ? "in memory now" : "not in memory") + ' · ' + j.cache.clips.toLocaleString() + ' clips kept, ' + (j.cache.bytes / 1e6).toFixed(0) + ' MB</span>');
+    '<span style="color:var(--muted)">' + (j.loaded ? "[[@js:in memory now]]" : "[[@js:not in memory]]") + ' · ' + fmt("[[@js:%1 clips kept, %2 MB]]", j.cache.clips.toLocaleString(), (j.cache.bytes / 1e6).toFixed(0)) + '</span>');
   const pr = document.getElementById("voPron");
-  if (!j.voice.installed && !j.pronunciation.installing) {{ pr.innerHTML = '<span style="color:var(--muted)">Install the voice first.</span>'; }}
+  if (!j.voice.installed && !j.pronunciation.installing) {{ pr.innerHTML = '<span style="color:var(--muted)">' + "[[@js:Install the voice first.]]" + '</span>'; }}
   else part(pr, "pronunciation", j.pronunciation,
-    '<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" ' + (j.pronunciation.on ? "checked" : "") + ' onchange="voPron(this.checked)"/> use it</label>');
+    '<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" ' + (j.pronunciation.on ? "checked" : "") + ' onchange="voPron(this.checked)"/> ' + "[[@js:use it]]" + '</label>');
   return j.voice.installing || j.pronunciation.installing;
 }}
 let timer = null;
 function poll(){{ fetch("/api/tts/status").then(r => r.json()).then(j => {{ clearTimeout(timer); timer = setTimeout(poll, show(j) ? 1500 : 15000); }}).catch(() => {{ timer = setTimeout(poll, 5000); }}); }}
-function voInstall(what){{ post("/api/tts/install", {{what: what}}).then(j => {{ if (j.status !== "ok") alert(j.message || "could not start"); poll(); }}); }}
+function voInstall(what){{ post("/api/tts/install", {{what: what}}).then(j => {{ if (j.status !== "ok") alert(j.message || "[[@js:could not start]]"); poll(); }}); }}
 function voRemove(what){{
-  if (!confirm(what === "voice" ? "Remove the voice (and the pronunciation model with it)? The browser's own voice will read again." : "Remove the pronunciation model?")) return;
+  if (!confirm(what === "voice" ? "[[@js:Remove the voice (and the pronunciation model with it)? The browser's own voice will read again.]]" : "[[@js:Remove the pronunciation model?]]")) return;
   post("/api/tts/remove", {{what: what}}).then(poll);
 }}
 function voPron(on){{ post("/api/tts/pronunciation", {{on: on}}).then(poll); }}
 function voTry(){{
-  const m = document.getElementById("voMsg"), t0 = Date.now(); m.textContent = "making it…";
+  const m = document.getElementById("voMsg"), t0 = Date.now(); m.textContent = "[[@js:making it…]]";
   fetch("/api/tts/say", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{text: document.getElementById("voText").value}})}})
-    .then(r => r.ok ? r.blob() : r.json().then(j => {{ throw new Error(j.message || "could not"); }}))
-    .then(b => {{ m.textContent = "made in " + ((Date.now() - t0) / 1000).toFixed(1) + " s"; new Audio(URL.createObjectURL(b)).play(); poll(); }})
+    .then(r => r.ok ? r.blob() : r.json().then(j => {{ throw new Error(j.message || "[[@js:could not]]"); }}))
+    .then(b => {{ m.textContent = fmt("[[@js:made in %1 s]]", ((Date.now() - t0) / 1000).toFixed(1)); new Audio(URL.createObjectURL(b)).play(); poll(); }})
     .catch(e => {{ m.textContent = e.message; }});
 }}
 poll();
 </script>"""
-    return HTMLResponse(_layout("Voice", "/settings", body, page_title="Reading aloud", top_actions_html=""))
+    return HTMLResponse(_layout("Voice", "/settings", _fill(body), page_title="Reading aloud", top_actions_html=""))
 
 
 @app.get("/settings/usenet", response_class=HTMLResponse)
 async def page_settings_usenet(request: Request):
     cfg = await _usenet_cfg(fresh=True)
     ready = await _usenet_ready() if cfg.get("enabled") and cfg.get("host") else False
-    state = ('<span class="pill ok">working</span>' if ready else
-             '<span class="pill muted">switched off</span>' if not cfg.get("enabled") else
-             f'<span class="pill bad">not working</span> <span style="color:var(--muted)">{html.escape(_USENET["msg"])}</span>')
+    state = (f'<span class="pill ok">{_t("working")}</span>' if ready else
+             f'<span class="pill muted">{_t("switched off")}</span>' if not cfg.get("enabled") else
+             f'<span class="pill bad">{_t("not working")}</span> <span style="color:var(--muted)">{html.escape(_USENET["msg"])}</span>')
     base = _base_url(request)
     body = f"""<style>.un-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
 .un-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0}}
@@ -11509,30 +11944,24 @@ async def page_settings_usenet(request: Request):
 </style>
 <div class="un-box"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px">
 <h3 style="margin:0;flex:1">Usenet {state}</h3>
-<label class="un-sw" title="switch Usenet on or off"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""} onchange="unToggle(this)"/><span></span><b>{"On" if cfg.get("enabled") else "Off"}</b></label></div>
-<p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
-card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
-Films and series are never downloaded by tgarr itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet). Small things posted whole - a book, a song, a picture - tgarr fetches itself, on the <a href="/usenet">Usenet</a> page.</p>
-<p style="color:var(--muted);margin:6px 0 4px">Newsgroups hold fifteen years of posts, far more than one account reads in a lifetime, so the
-reading is shared, as it is for Telegram: tgarr.me hands every install a different stretch of a group, takes back the cards found
-there - a name, who posted it, where it lies - and a search here also finds what the others found. No file, no NZB and nothing
-about your account or your provider's name is sent. Reading the index uses one connection, so that your downloader keeps the rest.</p>
+<label class="un-sw" title="{_t("switch Usenet on or off")}"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""} onchange="unToggle(this)"/><span></span><b>{_t("On") if cfg.get("enabled") else _t("Off")}</b></label></div>
+<p style="color:var(--muted);margin:0 0 4px">{_t("With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram. Films and series are never downloaded by tgarr itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet). Small things posted whole - a book, a song, a picture - tgarr fetches itself, on the %1 page.").replace("%1", '<a href="/usenet">Usenet</a>')}</p>
+<p style="color:var(--muted);margin:6px 0 4px">{_t("Newsgroups hold fifteen years of posts, far more than one account reads in a lifetime, so the reading is shared, as it is for Telegram: tgarr.me hands every install a different stretch of a group, takes back the cards found there - a name, who posted it, where it lies - and a search here also finds what the others found. No file, no NZB and nothing about your account or your provider's name is sent. Reading the index uses one connection, so that your downloader keeps the rest.")}</p>
 <div class="un-grid">
-<label>News server<input id="unHost" value="{html.escape(cfg.get("host") or "", quote=True)}" placeholder="news.example.com"/></label>
-<label>Port<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
-<label>User name<input id="unUser" value="{html.escape(cfg.get("user") or "", quote=True)}" autocomplete="off"/></label>
-<label>Password<input id="unPass" type="password" placeholder="{"kept - leave empty to keep it" if cfg.get("pass") else ""}" autocomplete="new-password"/></label>
-<label>Data it may use per day, in MB<input id="unDay" type="number" step="100" min="0" value="{round(cfg.get("per_day", 2000000) * 350 / 1e6)}"/></label>
+<label>{_t("News server")}<input id="unHost" value="{html.escape(cfg.get("host") or "", quote=True)}" placeholder="news.example.com"/></label>
+<label>{_t("Port")}<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
+<label>{_t("User name")}<input id="unUser" value="{html.escape(cfg.get("user") or "", quote=True)}" autocomplete="off"/></label>
+<label>{_t("Password")}<input id="unPass" type="password" placeholder="{_t("kept - leave empty to keep it") if cfg.get("pass") else ""}" autocomplete="new-password"/></label>
+<label>{_t("Data it may use per day, in MB")}<input id="unDay" type="number" step="100" min="0" value="{round(cfg.get("per_day", 2000000) * 350 / 1e6)}"/></label>
 </div>
-<label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
+<label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> {_t("use TLS (port 563)")}</label>
 <div style="height:8px"></div>
-<button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span>
-<p style="color:var(--muted);margin:14px 0 0;font-size:14px">No Usenet account yet, or thinking of a second one? What to look for, and which
-providers are the same network under another name: <a href="https://tgarr.me/usenet/" target="_blank" rel="noopener">tgarr.me/usenet</a>.</p></div>
-<h2 class="section">In Sonarr and Radarr</h2>
-<div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
-<p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
-Download client: <b>SABnzbd</b> (or NZBGet) - not "tgarr". An indexer goes to one download client, which is why Usenet needs its own entry.</p></div>
+<button class="btn" onclick="unSave()">{_t("Save and test")}</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span>
+<p style="color:var(--muted);margin:14px 0 0;font-size:14px">{_t("No Usenet account yet, or thinking of a second one? What to look for, and which providers are the same network under another name: %1.").replace("%1", '<a href="https://tgarr.me/usenet/" target="_blank" rel="noopener">tgarr.me/usenet</a>')}</p></div>
+<h2 class="section">{_t("In Sonarr and Radarr")}</h2>
+<div class="un-box"><p style="margin:0 0 8px">{_t("Add a second indexer (Newznab), beside the existing “tgarr” one, and give it your Usenet downloader:")}</p>
+<p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · {_t("API path")} <code>/api</code> · {_t("API key: the same as for “tgarr”")}<br/>
+{_t("Download client: %1 (or NZBGet) - not “tgarr”. An indexer goes to one download client, which is why Usenet needs its own entry.").replace("%1", "<b>SABnzbd</b>")}</p></div>
 <script>
 function unToggle(el){{
   // the switch works at once, without touching the account fields
@@ -11541,14 +11970,14 @@ function unToggle(el){{
     .catch(() => {{ el.checked = !el.checked; }});
 }}
 function unSave(){{
-  const m = document.getElementById("unMsg"); m.textContent = "testing…";
+  const m = document.getElementById("unMsg"); m.textContent = "{_tj("testing…")}";
   fetch("/api/usenet/settings", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{
     enabled: document.getElementById("unOn").checked, host: document.getElementById("unHost").value,
     port: +document.getElementById("unPort").value, ssl: document.getElementById("unSsl").checked,
     user: document.getElementById("unUser").value, password: document.getElementById("unPass").value,
     per_day: Math.round(+document.getElementById("unDay").value * 1e6 / 350)}})}}).then(r => r.json())
-    .then(j => {{ m.textContent = j.working ? "saved - the server answers" : "saved - " + (j.message || "not working"); setTimeout(() => location.reload(), 1200); }})
-    .catch(() => {{ m.textContent = "could not save"; }});
+    .then(j => {{ m.textContent = j.working ? "{_tj("saved - the server answers")}" : "{_tj("saved - %1")}".replace("%1", j.message || "{_tj("not working")}"); setTimeout(() => location.reload(), 1200); }})
+    .catch(() => {{ m.textContent = "{_tj("could not save")}"; }});
 }}
 </script>"""
     return HTMLResponse(_layout("Usenet", "/settings", body, page_title="Usenet", top_actions_html=""))
@@ -11557,7 +11986,7 @@ function unSave(){{
 # ════════════════════════════════════════════════════════════════════
 # Kids' pages, the PIN, the kids' list
 # ════════════════════════════════════════════════════════════════════
-_UNLOCK_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+_UNLOCK_HTML = """<!DOCTYPE html><html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr - PIN</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
@@ -11572,13 +12001,15 @@ label{display:flex;gap:8px;align-items:center;justify-content:center;font-size:1
 button{margin-top:12px;width:100%;padding:12px;font:inherit;font-size:15px;font-weight:600;color:#fff;background:#0ea5e9;
   border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.6}
 #err{color:#b91c1c;font-size:14px;min-height:20px;margin-top:10px}a{color:#0284c7;font-size:13px}
+@media (prefers-color-scheme:dark){body{background:#0b0d12;color:#f2f3f6}.card{background:#161922;border-color:#252a37;box-shadow:0 10px 28px rgba(0,0,0,.55)}
+  p,label{color:#99a0b0}input[type=password]{background:#0b0d12;color:#f2f3f6;border-color:#252a37}#err{color:#f87171}a{color:#38bdf8}}
 </style></head><body><div class="card">
-<h1>Enter the PIN</h1><p>Enter the PIN to open all of tgarr.</p>
+<h1>[[@Enter the PIN]]</h1><p>[[@Enter the PIN to open all of tgarr.]]</p>
 <form id="f" autocomplete="off">
 <input type="password" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="12" autofocus aria-label="PIN"/>
-<label><input type="checkbox" id="rem"/> keep this browser unlocked for 30 days</label>
-<button id="b" type="submit">Unlock</button><div id="err"></div></form>
-<a href="/mediacenter">&larr; back to the Media Center</a></div>
+<label><input type="checkbox" id="rem"/> [[@keep this browser unlocked for 30 days]]</label>
+<button id="b" type="submit">[[@Unlock]]</button><div id="err"></div></form>
+<a href="/mediacenter">&larr; [[@back to the Media Center]]</a></div>
 <script>
 document.getElementById("f").addEventListener("submit", async function (e) {
   e.preventDefault();
@@ -11589,8 +12020,8 @@ document.getElementById("f").addEventListener("submit", async function (e) {
       body: JSON.stringify({pin: document.getElementById("pin").value, remember: document.getElementById("rem").checked})});
     const j = await r.json();
     if (j.status === "ok") { location.href = "/"; return; }
-    err.textContent = j.message || "That is not the PIN.";
-  } catch (x) { err.textContent = "Could not reach tgarr."; }
+    err.textContent = (j.message && j.message !== "That is not the PIN.") ? j.message : "[[@js:That is not the PIN.]]";
+  } catch (x) { err.textContent = "[[@js:Could not reach tgarr.]]"; }
   document.getElementById("pin").value = ""; b.disabled = false; document.getElementById("pin").focus();
 });
 </script></body></html>"""
@@ -11600,7 +12031,8 @@ document.getElementById("f").addEventListener("submit", async function (e) {
 async def page_unlock(request: Request):
     if not await _is_locked(request):
         return RedirectResponse("/")
-    return HTMLResponse(_UNLOCK_HTML)
+    lang = await _lang(request)
+    return HTMLResponse(i18n.fill(lang, _UNLOCK_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang)))
 
 
 def _unlock_cookie(resp, secret: str, remember: bool):
@@ -11703,16 +12135,16 @@ async def api_mc_ping(request: Request):
     return v
 
 
-_MC_REST_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr Media Center</title>
+_MC_REST_HTML = """<!DOCTYPE html><html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr · [[@Media Center]]</title>
 <style>
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;
-  background:#fff8ef;color:#2b2140;font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC",system-ui,sans-serif;text-align:center}
-@media (prefers-color-scheme:dark){body{background:#191624;color:#f3eefc}}
-.big{font-size:96px;line-height:1}h1{font-size:34px;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
+  background:#f4f5f8;color:#12141a;font-family:"Inter","SF Pro Display","Segoe UI","Helvetica Neue","PingFang SC","Microsoft YaHei",system-ui,sans-serif;text-align:center}
+@media (prefers-color-scheme:dark){body{background:#0b0d12;color:#f2f3f6}}
+.big{font-size:96px;line-height:1}h1{font-size:34px;font-weight:800;letter-spacing:-.02em;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
 a{display:inline-block;margin-top:34px;font-size:13px;color:inherit;opacity:.55}
 </style></head><body><div><div class="big">__ICON__</div><h1>__TITLE__</h1><p>__TEXT__</p>
-<a href="/unlock">🔒 Enter PIN</a></div>
+<a href="/unlock">🔒 [[@Enter PIN]]</a></div>
 <script>
 // look again every half minute: when it is time, go back in
 setInterval(function(){ fetch("/api/mc/ping").then(function(r){ return r.json(); })
@@ -11728,12 +12160,17 @@ async def page_mc_rest(request: Request):
     v = _DEVICES.check(who, rules, time.time())
     if v["ok"] or not await _is_locked(request):
         return RedirectResponse("/mediacenter", status_code=303)
+    lang = await _lang(request)
+
+    def tr(text: str, **values) -> str:
+        return html.escape(i18n.t(lang, text, **values))
     icon, title, text = {
-        "hours": ("🌙", "The Media Center is closed now", f"It opens again at {v['until']}."),
-        "day": ("🌟", "That is all for today", "Well done. See you tomorrow!"),
-        "rest": ("🤸", "Time for a break", f"Stretch, drink some water, look far away. Back at {v['until']}."),
-    }.get(v["why"], ("🌙", "The Media Center is closed now", ""))
-    return HTMLResponse(_MC_REST_HTML.replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
+        "hours": ("🌙", tr("The Media Center is closed now"), tr("It opens again at {t}.", t=v["until"])),
+        "day": ("🌟", tr("That is all for today"), tr("Well done. See you tomorrow!")),
+        "rest": ("🤸", tr("Time for a break"), tr("Stretch, drink some water, look far away. Back at {t}.", t=v["until"])),
+    }.get(v["why"], ("🌙", tr("The Media Center is closed now"), ""))
+    return HTMLResponse(i18n.fill(lang, _MC_REST_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
+                        .replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
 
 
 @app.post("/api/kids/rules")
@@ -11858,9 +12295,117 @@ _MC_KINDS = {
     # key: (label, icon, colour, SQL)
     "video": ("Watch", "🎬", "#f97066", "m.media_type = 'video'"),
     "audio": ("Listen", "🎧", "#12b5a6", "m.media_type = 'audio'"),
-    "book": ("Read", "📖", "#f5a524", r"m.file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz)$'"),
+    "book": ("Read", "📖", "#f5a524", _book_sql("m.file_name")),
     "photo": ("Photos", "🖼️", "#8b6cf6", "m.media_type = 'photo'"),
 }
+# The four cards' icons: drawn (one line weight, round ends), so they look the same on every
+# system and take the colour of the card - an emoji is drawn by whatever font the device has.
+_MC_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+_MC_ICONS = {
+    "video": _MC_SVG + '<rect x="3" y="5" width="18" height="14" rx="3.5"/><path d="M10.2 9.2v5.6l4.8-2.8z" fill="currentColor"/></svg>',
+    "audio": _MC_SVG + '<path d="M4.5 14.5v-2.2a7.500 7.500 0 0 1 15 0v2.200"/><rect x="3" y="13.500" width="4.600" height="7" rx="2.200"/><rect x="16.400" y="13.500" width="4.600" height="7" rx="2.200"/></svg>',
+    "book": _MC_SVG + '<path d="M12 6.8C10.200 5.500 7.900 4.900 4.900 5a.9.9 0 0 0-.9.9v11.300c0 .5.400.9.900.9 2.900-.1 5.200.5 7.100 1.800 1.900-1.300 4.200-1.900 7.100-1.800.5 0 .9-.4.9-.9V5.900a.9.9 0 0 0-.9-.9c-3-.1-5.300.5-7.100 1.800z"/><path d="M12 6.800v13.100"/></svg>',
+    "photo": _MC_SVG + '<rect x="3" y="4.500" width="18" height="15" rx="3.500"/><circle cx="8.600" cy="9.700" r="1.700"/><path d="M21 15.300l-4.200-4.200a1.700 1.700 0 0 0-2.400 0L6.600 19.500"/></svg>',
+}
+_UI_LANG = {"at": 0.0, "v": ""}
+
+
+def _t(text: str, **values) -> str:
+    """A word of a page in the language of this request, safe to put into HTML (as text or
+    inside a quoted attribute). `text` is the English, written out where it is used, with
+    {blanks} for what is filled in. What the catalogue does not have comes back in English."""
+    return html.escape(i18n.t(_LANG.get(), text, **values), quote=True)
+
+
+def _tj(text: str, **values) -> str:
+    """The same, for the inside of a quoted string in a script."""
+    return _json.dumps(i18n.t(_LANG.get(), text, **values), ensure_ascii=False)[1:-1].replace("</", "<" + chr(92) + "/").replace("'", chr(92) + "'")
+
+
+def _fill(page: str) -> str:
+    """A long page or script kept as one text, with its words marked the way i18n.fill reads
+    them: filled in for this request."""
+    return i18n.fill(_LANG.get(), page)
+
+
+async def _lang(request: Request) -> str:
+    """The language this request is answered in: this screen's own choice (a cookie), else
+    the household's (config `ui_lang`), else what the browser asks for, else English."""
+    now = time.monotonic()
+    if now - _UI_LANG["at"] > 10 and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                _UI_LANG["v"] = (await conn.fetchval("SELECT value FROM config WHERE key = 'ui_lang'")) or ""
+        except Exception:
+            pass
+        _UI_LANG["at"] = now
+    return i18n.pick(request.cookies.get(i18n.COOKIE) or "", request.headers.get("accept-language") or "", _UI_LANG["v"])
+
+
+def _lang_panel(lang: str, may_set_default: bool) -> str:
+    out = [f'<button type="button" class="th lg{" on" if code == lang else ""}" data-lang="{code}" lang="{code}"><span><b>{html.escape(name)}</b></span></button>'
+           for code, name in i18n.LANGS]
+    if may_set_default:
+        out.append(f'<button type="button" class="th all" id="lgAll">{html.escape(i18n.t(lang, "Make this the language every screen starts with"))}</button>')
+    return "".join(out)
+
+
+@app.post("/api/kids/lang")
+async def api_kids_lang(request: Request):
+    """The language a screen starts in when it has not chosen one. '' = whatever its browser asks for."""
+    try:
+        lang = str((await request.json()).get("lang") or "")
+    except Exception:
+        lang = ""
+    if lang and lang not in i18n.CODES:
+        return JSONResponse({"status": "error", "message": "no such language"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('ui_lang', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", lang)
+    _UI_LANG.update(at=0.0)
+    return {"status": "ok", "lang": lang}
+
+
+# The looks of the Media Center: key, name, a line about it, and the two colours of its swatch.
+_MC_THEMES = (
+    ("auto", "Day & Night", "light by day, dark where the device is", "#f4f5f8", "#0b0d12"),
+    ("cinema", "Cinema", "a dark room and the pictures - for a television", "#07080c", "#f5c518"),
+    ("playroom", "Playroom", "big, round and coloured - for the youngest", "#bfe6ff", "#ffd166"),
+    ("paper", "Paper", "quiet, like a shelf of books", "#f4ecd8", "#8b4a2b"),
+    ("aurora", "Aurora", "glass over a night sky", "#1b1b4b", "#5eead4"),
+    ("clear", "Clear", "black, white and yellow, large", "#000000", "#ffe600"),
+    ("day", "Always light", "", "#f4f5f8", "#ffffff"),
+    ("night", "Always dark", "", "#191624", "#262234"),
+)
+_MC_THEME_KEYS = tuple(t[0] for t in _MC_THEMES)
+
+
+def _mc_theme_panel(may_set_default: bool, lang: str = "en") -> str:
+    out = []
+    for key, name, about, a, b in _MC_THEMES:
+        out.append(f'<button type="button" class="th" data-th="{key}"><i style="background:linear-gradient(135deg,{a} 0 55%,{b} 55% 100%)"></i>'
+                   f'<span><b>{html.escape(i18n.t(lang, name))}</b><small>{html.escape(i18n.t(lang, about) if about else "")}</small></span></button>')
+    if may_set_default:
+        out.append(f'<button type="button" class="th all" id="thAll">{html.escape(i18n.t(lang, "Make this the look every screen starts with"))}</button>')
+    return "".join(out)
+
+
+@app.post("/api/kids/theme")
+async def api_kids_theme(request: Request):
+    """The look a screen starts with when it has not chosen one. (A locked browser cannot
+    reach this: it may choose its own look, which it keeps to itself.)"""
+    try:
+        theme = str((await request.json()).get("theme") or "")
+    except Exception:
+        theme = ""
+    if theme not in _MC_THEME_KEYS:
+        return JSONResponse({"status": "error", "message": "no such look"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('mc_theme', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", theme)
+    return {"status": "ok", "theme": theme}
+
+
 _MC_JUNK_RX = re.compile(
     r"\b(2160p|1080p|720p|480p|4k|uhd|hdr\d*|dv|x26[45]|h\.?26[45]|hevc|avc|web-?dl|webrip|bluray|blu-ray|bdrip|"
     r"hdtv|dvdrip|remux|aac\d?(\.\d)?|ddp?\d?(\.\d)?|atmos|dts(-hd)?|flac|mp3|10bit|8bit|repack|proper|"
@@ -11888,19 +12433,29 @@ def _friendly_name(file_name, caption) -> str:
 
 
 _MEDIACENTER_HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/>
+<html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
-<title>tgarr Media Center</title>
+<title>tgarr · [[@Media Center]]</title>
 <link rel="icon" href="/favicon.svg"/>
 __PWA__
+<script>
+(function(){
+  var def = "__THEME__", own = null, known = __THEMES__;
+  try { own = localStorage.getItem("tgarr.mc.theme"); } catch (e) {}
+  var tv = /[?&]tv=1/.test(location.search) || /\\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\\b/i.test(navigator.userAgent);
+  if (known.indexOf(own) < 0) own = null;
+  // this screen's own choice, else the household's, else - on a television - the dark room
+  document.documentElement.setAttribute("data-th", own || (def !== "auto" ? def : (tv ? "cinema" : "auto")));
+})();
+</script>
 <style>
-:root{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--accent:__COLOR__;
-  --shadow:0 6px 18px rgba(64,40,10,.10);--r:22px}
-@media (prefers-color-scheme:dark){:root{--bg:#191624;--card:#262234;--ink:#f3eefc;--soft:#a79fbd;--line:#342f45;
-  --shadow:0 6px 18px rgba(0,0,0,.35)}}
+:root{--bg:#f4f5f8;--card:#ffffff;--ink:#12141a;--soft:#687083;--line:#e2e5eb;--accent:__COLOR__;
+  --shadow:0 8px 24px rgba(18,22,34,.10);--r:14px}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0d12;--card:#161922;--ink:#f2f3f6;--soft:#99a0b0;--line:#252a37;
+  --shadow:0 10px 28px rgba(0,0,0,.55)}}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--ink);
-  font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+  font-family:"Inter","SF Pro Display","Segoe UI","Helvetica Neue","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
 a{color:inherit;text-decoration:none}
 .top{display:flex;align-items:center;gap:14px;padding:18px clamp(16px,4vw,44px) 6px}
 .logo{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
@@ -11913,22 +12468,49 @@ a{color:inherit;text-decoration:none}
 .pill{font-size:13px;color:var(--soft);padding:9px 14px;border-radius:999px;border:1.5px solid var(--line);
   background:var(--card);white-space:nowrap}
 .pill:hover{border-color:var(--accent);color:var(--ink)}
-.cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);
-  padding:14px clamp(16px,4vw,44px) 4px}
-.cat{background:var(--card);border-radius:var(--r);padding:clamp(14px,2.4vw,24px) 10px;text-align:center;
-  box-shadow:var(--shadow);border:3px solid transparent;transition:transform .15s, border-color .15s}
-.cat:hover{transform:translateY(-3px)}
-.cat .ic{font-size:clamp(34px,6vw,56px);line-height:1.1;display:block}
-.cat b{display:block;font-size:clamp(15px,2.2vw,21px);margin-top:6px}
-.cat small{color:var(--soft);font-size:13px}
-.cat.on{border-color:var(--c);background:color-mix(in srgb, var(--c) 12%, var(--card))}
+.cats{display:flex;gap:6px;padding:10px clamp(16px,4vw,44px) 0;overflow-x:auto;scrollbar-width:none}
+.cats::-webkit-scrollbar{display:none}
+.cat{display:flex;align-items:center;gap:10px;padding:10px 18px 10px 12px;border-radius:12px;color:var(--soft);
+  border:2px solid transparent;white-space:nowrap;transition:background .15s, color .15s}
+.cat:hover{color:var(--ink);background:color-mix(in srgb, var(--ink) 6%, transparent)}
+.cat .ic{display:grid;place-items:center;width:34px;height:34px;flex:none;border-radius:10px;
+  color:var(--c);background:color-mix(in srgb, var(--c) 15%, transparent);transition:background .15s, color .15s, box-shadow .15s}
+.cat .ic svg{width:60%;height:60%;display:block}
+.cat b{font-size:clamp(15px,1.5vw,18px);font-weight:700;letter-spacing:-.01em}
+.cat small{color:var(--soft);font-size:12.5px;font-weight:600;opacity:.8}
+.cat.on{color:var(--ink);background:color-mix(in srgb, var(--c) 13%, var(--card));box-shadow:var(--shadow)}
+.cat.on .ic{color:#fff;background:linear-gradient(140deg, color-mix(in srgb, var(--c) 80%, #fff), var(--c));box-shadow:0 8px 18px -8px var(--c)}
+.hic{display:inline-grid;place-items:center;width:1.2em;height:1.2em;margin-inline-end:.15em;color:var(--c)}
+.hic svg{width:100%;height:100%;display:block}
+/* the first thing, wide: its own picture, blurred, behind its name */
+.hero{position:relative;margin:16px clamp(16px,4vw,44px) 0;border-radius:calc(var(--r) + 8px);overflow:hidden;isolation:isolate;
+  min-height:clamp(210px,34vh,400px);display:flex;align-items:flex-end;gap:clamp(16px,2.6vw,34px);padding:clamp(18px,3vw,40px);
+  background:linear-gradient(120deg, color-mix(in srgb, var(--c) 30%, #0b0d12), color-mix(in srgb, var(--c) 62%, #0b0d12));color:#fff;box-shadow:var(--shadow)}
+/* its kind, drawn large and faint at the far side: what is seen where there is no picture */
+.hero .hi{position:absolute;z-index:-1;inset-inline-end:clamp(10px,5vw,70px);top:50%;transform:translateY(-50%);height:74%;aspect-ratio:1;color:#fff;opacity:.13}
+.hero .hi svg{width:100%;height:100%;display:block}
+.hero .bk{position:absolute;inset:-40px;z-index:-2;background:var(--img) center/cover no-repeat;filter:blur(34px) saturate(1.25);transform:scale(1.15)}
+.hero::after{content:"";position:absolute;inset:0;z-index:-1;
+  background:linear-gradient(90deg, rgba(8,10,16,.86) 0%, rgba(8,10,16,.55) 48%, rgba(8,10,16,.12) 100%),linear-gradient(0deg, rgba(8,10,16,.55), rgba(8,10,16,0) 55%)}
+.hero .po{flex:none;height:clamp(150px,26vh,300px);border-radius:12px;box-shadow:0 18px 40px rgba(0,0,0,.55);background:rgba(255,255,255,.06);display:block}
+.hero .tx{min-width:0;padding-bottom:4px}
+.hero .ey{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:color-mix(in srgb, var(--c) 55%, #fff)}
+.hero .ey .hic{color:inherit}
+.hero h1{margin:10px 0 18px;font-size:clamp(26px,4.2vw,54px);line-height:1.08;font-weight:800;letter-spacing:-.025em;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;text-shadow:0 2px 18px rgba(0,0,0,.45)}
+.hbtn{display:inline-flex;align-items:center;gap:10px;font-size:17px;font-weight:800;padding:13px 26px;border-radius:999px;background:#fff;color:#0b0d12;
+  transition:transform .15s}
+.hbtn:hover{transform:scale(1.04)}.hbtn:focus-visible{outline:5px solid var(--accent);outline-offset:3px;transform:scale(1.05)}
+.hbtn svg{width:18px;height:18px}
+html[dir=rtl] .hero::after{transform:scaleX(-1)}
+@media (max-width:560px){.hero .po{display:none}.hero{min-height:180px}}
 .find{padding:16px clamp(16px,4vw,44px) 0;display:flex;gap:10px}
-.find input{flex:1;max-width:520px;font:inherit;font-size:18px;padding:13px 20px;border-radius:999px;
-  border:2px solid var(--line);background:var(--card);color:var(--ink);outline:none}
+.find input{flex:1;max-width:440px;font:inherit;font-size:16.500px;padding:12px 18px;border-radius:12px;
+  border:1.500px solid var(--line);background:var(--card);color:var(--ink);outline:none}
 .find input:focus{border-color:var(--accent)}
-.find button{font:inherit;font-size:17px;font-weight:700;padding:0 24px;border-radius:999px;border:0;
+.find button{font:inherit;font-size:16px;font-weight:700;padding:0 22px;border-radius:12px;border:0;
   background:var(--accent);color:#fff;cursor:pointer}
-h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items:center;gap:8px}
+h2{font-size:clamp(20px,2vw,26px);font-weight:800;letter-spacing:-.02em;margin:30px clamp(16px,4vw,44px) 14px;display:flex;align-items:center;gap:8px}
 .row{display:flex;gap:14px;overflow-x:auto;padding:2px clamp(16px,4vw,44px) 10px;scrollbar-width:none}
 .row::-webkit-scrollbar{display:none}
 .row .card{flex:0 0 clamp(170px,22vw,240px)}
@@ -11938,7 +12520,7 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
 .grid.photo{grid-template-columns:repeat(auto-fill,minmax(clamp(110px,14vw,170px),1fr));gap:8px}
 .card{background:var(--card);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);display:flex;
   flex-direction:column;transition:transform .15s, box-shadow .15s;position:relative}
-.card:hover,.card:focus-visible{transform:translateY(-4px) scale(1.015);box-shadow:0 12px 26px rgba(64,40,10,.18);outline:none}
+.card:hover,.card:focus-visible{transform:translateY(-4px) scale(1.015);box-shadow:0 16px 34px rgba(18,22,34,.20);outline:none}
 /* what the remote control is on: seen from the sofa */
 .card:focus-visible{outline:5px solid var(--accent);outline-offset:3px;transform:translateY(-4px) scale(1.04)}
 .cat:focus-visible,.pill:focus-visible,.more a:focus-visible,.find button:focus-visible,.logo:focus-visible{outline:5px solid var(--accent);outline-offset:3px}
@@ -11946,13 +12528,18 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
 html.tv .name{font-size:18px}html.tv h2{font-size:25px}
 .pic{aspect-ratio:16/10;background:linear-gradient(135deg,color-mix(in srgb,var(--c) 55%,#fff),var(--c));
   display:flex;align-items:center;justify-content:center;font-size:54px;position:relative;overflow:hidden}
+.pic .ph{width:32%;max-width:76px;color:rgba(255,255,255,.9);display:block}.pic .ph svg{width:100%;height:auto;display:block}
 .pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .book .pic{aspect-ratio:3/4}.photo .pic{aspect-ratio:1/1}.audio .pic{aspect-ratio:1/1}
-.play{position:absolute;right:10px;bottom:10px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.94);
-  display:flex;align-items:center;justify-content:center;font-size:20px;color:var(--c);box-shadow:0 3px 10px rgba(0,0,0,.25)}
-.saved{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.94);color:#157f3d;font-size:11.5px;font-weight:700;
-  padding:3px 9px;border-radius:999px}
-.name{padding:11px 14px 14px;font-size:15.5px;font-weight:700;line-height:1.3;word-break:break-word}
+.play{position:absolute;right:10px;bottom:10px;width:46px;height:46px;border-radius:50%;background:rgba(255,255,255,.96);
+  display:flex;align-items:center;justify-content:center;font-size:18px;padding-left:3px;color:#0b0d12;box-shadow:0 6px 16px rgba(0,0,0,.35);
+  transition:opacity .15s, transform .15s}
+@media (hover:hover){.play{opacity:0;transform:scale(.8)}.card:hover .play,.card:focus-visible .play{opacity:1;transform:none}}
+html.tv .play{opacity:0}html.tv .card:focus-visible .play{opacity:1;transform:none}
+.saved{position:absolute;left:10px;top:10px;display:flex;align-items:center;gap:6px;background:rgba(8,10,16,.62);color:#fff;font-size:11.500px;font-weight:600;
+  padding:4px 9px;border-radius:999px;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.saved::before{content:"";width:7px;height:7px;border-radius:50%;background:#34d399}
+.name{padding:11px 14px 14px;font-size:15px;font-weight:600;line-height:1.3;word-break:break-word}
 .name span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .photo .name{display:none}
 .empty{margin:30px clamp(16px,4vw,44px);padding:46px 20px;text-align:center;background:var(--card);border-radius:var(--r);
@@ -11965,21 +12552,145 @@ html.tv .name{font-size:18px}html.tv h2{font-size:25px}
 .lb.on{display:flex}.lb img{max-width:96vw;max-height:92vh;border-radius:12px}
 .lb button{position:fixed;top:14px;right:16px;width:50px;height:50px;border-radius:50%;border:0;font-size:24px;cursor:pointer}
 .lb .nv{top:50%;transform:translateY(-50%)}.lb .pv{left:14px;right:auto}.lb .nx{right:14px}
-@media (max-width:560px){.cats{grid-template-columns:repeat(4,1fr);gap:8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
+/* ── looks ──────────────────────────────────────────────────────────────────────────
+   A look is a set of colours and a few shapes, chosen on the page (the 🎨 button) and kept by
+   each screen. "auto" is the page as it always was: light by day, dark where the device is. */
+html[data-th=day]{--bg:#f4f5f8;--card:#ffffff;--ink:#12141a;--soft:#687083;--line:#e2e5eb;--shadow:0 8px 24px rgba(18,22,34,.10);color-scheme:light}
+html[data-th=night]{--bg:#0b0d12;--card:#161922;--ink:#f2f3f6;--soft:#99a0b0;--line:#252a37;--shadow:0 10px 28px rgba(0,0,0,.55);color-scheme:dark}
+
+/* Cinema: a dark room and the pictures. Made for a television. */
+html[data-th=cinema]{--bg:#07080c;--card:#14161d;--ink:#f2f3f5;--soft:#9aa0ad;--line:#262b38;--accent:#f5c518;
+  --shadow:0 10px 28px rgba(0,0,0,.6);--r:12px;color-scheme:dark}
+html[data-th=cinema] body{background:radial-gradient(1100px 520px at 18% -12%,#1b2540 0%,rgba(27,37,64,0) 62%),
+  radial-gradient(900px 480px at 96% 0%,#2a1730 0%,rgba(42,23,48,0) 60%),#07080c;background-attachment:fixed;
+  font-family:"Inter","Segoe UI","Helvetica Neue","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+html[data-th=cinema] .cats{display:flex;flex-wrap:wrap;gap:10px}
+html[data-th=cinema] .cat{display:flex;align-items:center;gap:10px;padding:10px 22px;border-radius:999px;box-shadow:none;
+  border:2px solid var(--line);background:rgba(255,255,255,.04)}
+html[data-th=cinema] .cat .ic,html[data-th=cinema] .cat.on .ic{width:24px;height:24px;margin:0;border-radius:0;background:none;box-shadow:none;color:inherit}
+html[data-th=cinema] .cat.on{box-shadow:none}html[data-th=cinema] .hbtn{background:var(--accent)}
+html[data-th=cinema] .cat .ic svg{width:100%;height:100%}
+html[data-th=cinema] .cat b{display:inline;margin:0;font-size:17px}
+html[data-th=cinema] .cat small{display:none}
+html[data-th=cinema] .cat.on{background:var(--accent);border-color:var(--accent);color:#111}
+html[data-th=cinema] .card{background:transparent;box-shadow:none;overflow:visible}
+html[data-th=cinema] .pic{border-radius:12px;box-shadow:var(--shadow);background:linear-gradient(160deg,#262c3f,#0e1016)}
+html[data-th=cinema] .name{padding:11px 4px 6px;font-weight:600}
+html[data-th=cinema] .card:hover,html[data-th=cinema] .card:focus-visible{transform:scale(1.06);box-shadow:none;z-index:2}
+html[data-th=cinema] .card:focus-visible{outline:none}
+html[data-th=cinema] .card:focus-visible .pic{outline:4px solid var(--accent);outline-offset:3px;
+  box-shadow:0 0 0 10px rgba(245,197,24,.16),var(--shadow)}
+html[data-th=cinema] .play,html[data-th=cinema] .find button,html[data-th=cinema] .more a.go{background:var(--accent);color:#111}
+html[data-th=cinema] .pill{background:rgba(255,255,255,.05)}
+html[data-th=cinema] .logo .wm b{color:#fff}
+html[data-th=cinema] h2{font-weight:700;letter-spacing:.2px}
+
+/* Playroom: for the youngest. Big, round, coloured. */
+html[data-th=playroom]{--bg:#e8f6ff;--card:#ffffff;--ink:#27314d;--soft:#62739a;--line:#c9e3fa;
+  --shadow:0 8px 0 rgba(39,49,77,.10);--r:30px;color-scheme:light}
+html[data-th=playroom] body{background:linear-gradient(180deg,#bfe6ff 0%,#e8f6ff 34%,#fff4d6 100%);background-attachment:fixed;
+  font-family:"Baloo 2","Comic Neue",ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+html[data-th=playroom] .cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);padding-top:14px;overflow:visible}
+html[data-th=playroom] .cat{display:block;text-align:center;padding:clamp(14px,2.4vw,24px) 10px;border:4px solid var(--c);background:var(--card);
+  border-radius:var(--r);box-shadow:var(--shadow);color:var(--ink);white-space:normal}
+html[data-th=playroom] .cat b{display:block;margin-top:10px;font-size:clamp(15px,2.2vw,21px)}
+html[data-th=playroom] .cat .ic{width:clamp(56px,7.6vw,84px);height:clamp(56px,7.6vw,84px);margin:0 auto;border-radius:30%}
+html[data-th=playroom] .cat.on .ic{background:#fff;color:var(--c);box-shadow:none}
+html[data-th=playroom] .cat.on{background:var(--c);color:#fff}
+html[data-th=playroom] .cat.on small{color:#fff}
+html[data-th=playroom] .card{border:4px solid #fff}
+html[data-th=playroom] .card:hover{transform:translateY(-6px) rotate(-1deg) scale(1.03)}
+html[data-th=playroom] .pill,html[data-th=playroom] .find input{border-width:3px;font-weight:700}
+html[data-th=playroom] h2{font-size:25px}
+html[data-th=playroom] .name{font-size:17px}
+
+/* Paper: quiet, like a shelf of books. */
+html[data-th=paper]{--bg:#f4ecd8;--card:#fbf6e9;--ink:#3a2f22;--soft:#8a7860;--line:#dccfb0;--accent:#8b4a2b;--shadow:none;--r:6px;color-scheme:light}
+html[data-th=paper] body{font-family:"Iowan Old Style","Palatino Linotype",Georgia,"Songti SC","SimSun","Noto Serif CJK SC",serif}
+html[data-th=paper] .card,html[data-th=paper] .cat{border:1px solid var(--line);box-shadow:none}
+html[data-th=paper] .cat.on{border-color:var(--accent);background:#efe2c4}
+html[data-th=paper] .pic{filter:sepia(.16)}
+html[data-th=paper] h2{font-weight:600;border-bottom:1px solid var(--line);padding-bottom:8px}
+html[data-th=paper] .play,html[data-th=paper] .find button,html[data-th=paper] .more a.go{background:var(--accent);color:#fff}
+html[data-th=paper] .card:hover,html[data-th=paper] .card:focus-visible{box-shadow:0 6px 16px rgba(58,47,34,.18)}
+
+/* Aurora: glass over a night sky. */
+html[data-th=aurora]{--bg:#0b1026;--card:rgba(255,255,255,.09);--ink:#eef2ff;--soft:#aab5dc;--line:rgba(255,255,255,.16);--accent:#5eead4;
+  --shadow:0 10px 30px rgba(0,0,0,.35);--r:20px;color-scheme:dark}
+html[data-th=aurora] body{background:linear-gradient(135deg,#0b1026 0%,#1b1b4b 36%,#3b1d60 68%,#0f3d5c 100%);background-attachment:fixed}
+html[data-th=aurora] .card,html[data-th=aurora] .cat,html[data-th=aurora] .pill,html[data-th=aurora] .find input,
+html[data-th=aurora] .more a,html[data-th=aurora] .empty{-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border:1px solid var(--line)}
+html[data-th=aurora] .cat.on{background:rgba(94,234,212,.2);border-color:var(--accent)}
+html[data-th=aurora] .find button,html[data-th=aurora] .more a.go,html[data-th=aurora] .play{background:var(--accent);color:#062925}
+html[data-th=aurora] .logo .wm b{color:#fff}
+
+/* Clear: black, white and yellow, large - for tired eyes and far sofas. */
+html[data-th=clear]{--bg:#000;--card:#000;--ink:#fff;--soft:#e8e8e8;--line:#fff;--accent:#ffe600;--shadow:none;--r:8px;color-scheme:dark}
+html[data-th=clear] .card,html[data-th=clear] .cat,html[data-th=clear] .pill,html[data-th=clear] .find input{border:3px solid #fff}
+html[data-th=clear] .cat.on{background:#ffe600;border-color:#ffe600;color:#000}
+html[data-th=clear] .cat.on small{color:#000}
+html[data-th=clear] .cat .ic{background:none;color:#fff;box-shadow:none}
+html[data-th=clear] .cat.on .ic{background:none;color:#000;box-shadow:none}
+html[data-th=clear] .hic{color:#fff}
+html[data-th=clear] .name{font-size:19px}
+html[data-th=clear] h2{font-size:26px}
+html[data-th=clear] .cat b{font-size:clamp(18px,2.4vw,24px)}
+html[data-th=clear] .cat small,html[data-th=clear] .pill{font-size:16px}
+html[data-th=clear] .find button,html[data-th=clear] .more a.go,html[data-th=clear] .play{background:#ffe600;color:#000}
+html[data-th=clear] .logo .wm,html[data-th=clear] .logo .mark,html[data-th=clear] .logo .wm b{color:#fff}
+html[data-th=clear] .card:focus-visible,html[data-th=clear] .cat:focus-visible,html[data-th=clear] .pill:focus-visible{outline:6px solid #ffe600}
+
+/* a picture that is not there yet: in the colours of the look, not a bright tile in a dark room */
+html[data-th=aurora] .pic{background:linear-gradient(135deg,color-mix(in srgb,var(--c) 34%,#1b1b4b),color-mix(in srgb,var(--c) 50%,#0b1026))}
+html[data-th=night] .pic,html[data-th=clear] .pic{background:linear-gradient(135deg,color-mix(in srgb,var(--c) 30%,#262234),color-mix(in srgb,var(--c) 50%,#000))}
+html[data-th=paper] .pic{background:linear-gradient(135deg,#efe2c4,color-mix(in srgb,var(--c) 30%,#e2d2ad))}
+/* a short page still fills the screen with its background */
+body{min-height:100vh}
+/* room for the ring around what the remote is on */
+.grid{padding-top:8px;padding-bottom:8px}
+/* the list of looks */
+.thp{position:fixed;top:66px;right:clamp(12px,4vw,44px);z-index:8;background:var(--card);color:var(--ink);border:1.5px solid var(--line);
+  border-radius:18px;box-shadow:0 18px 44px rgba(0,0,0,.35);padding:12px;display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;
+  width:min(440px,calc(100vw - 24px))}
+.thp.on{display:grid}
+html[data-th=aurora] .thp{background:#1b1b4b}
+.th{font:inherit;color:inherit;text-align:left;cursor:pointer;background:transparent;border:2px solid var(--line);border-radius:14px;padding:10px;
+  display:flex;gap:10px;align-items:center}
+.th i{flex:none;width:46px;height:34px;border-radius:8px;border:1px solid rgba(128,128,128,.45)}
+.th b{display:block;font-size:15px}.th small{display:block;color:var(--soft);font-size:12px;line-height:1.25}
+.th.on{border-color:var(--accent)}
+.th:focus-visible{outline:5px solid var(--accent);outline-offset:2px}
+.thp.lgp{grid-template-columns:repeat(3,minmax(0,1fr))}.th.lg{justify-content:center;text-align:center}
+[dir=rtl] .th{text-align:right}[dir=rtl] .logo .mc{padding-left:0;margin-left:0;border-left:0;padding-right:12px;margin-right:4px;border-right:2px solid var(--line)}
+.thp .all{grid-column:1/-1;font-size:13px;color:var(--soft);text-align:center;border-style:dashed;justify-content:center}
+button.pill{font-family:inherit;cursor:pointer}
+/* on a television: seen from three metres */
+html.tv .top{padding-top:26px}
+html.tv .pill{font-size:16px;padding:12px 18px}
+html.tv .grid{grid-template-columns:repeat(auto-fill,minmax(clamp(190px,17vw,300px),1fr))}
+html.tv .grid.book{grid-template-columns:repeat(auto-fill,minmax(clamp(150px,12vw,220px),1fr))}
+html.tv .cat b{font-size:clamp(18px,1.9vw,26px)}
+html.tv .th b{font-size:18px}html.tv .th small{font-size:14px}
+html.tv .thp{width:min(620px,calc(100vw - 24px))}
+@media (max-width:720px){.top{flex-wrap:wrap;row-gap:10px;column-gap:8px}.logo{flex:1 0 100%}.top .pill{padding:7px 11px;font-size:12.500px}}
+@media (max-width:560px){.cats{gap:4px}.cat{padding:8px 12px 8px 8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
 </style></head>
 <body>
 <div class="top">
   <a class="logo" href="/mediacenter" aria-label="tgarr Media Center">
     <svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-    <span class="wm">tg<b>arr</b></span><span class="mc">Media Center</span></a>
+    <span class="wm">tg<b>arr</b></span><span class="mc">[[@Media Center]]</span></a>
   __TOPRIGHT__
 </div>
 <nav class="cats">__CATS__</nav>
 <form class="find" method="GET" action="/mediacenter">
   <input type="hidden" name="kind" value="__KIND__"/>
-  <input type="search" name="q" value="__Q__" placeholder="What are you looking for?" aria-label="search"/>
-  <button type="submit">Find</button>
+  <input type="search" name="q" value="__Q__" placeholder="[[@What are you looking for?]]" aria-label="[[@Find]]"/>
+  <button type="submit">[[@Find]]</button>
 </form>
+<div class="thp" id="thP" role="dialog" aria-label="[[@Look]]">__THEMEPANEL__</div>
+<div class="thp lgp" id="lgP" role="dialog" aria-label="[[@Language]]">__LANGPANEL__</div>
+__HERO__
 <div id="recent"></div>
 <h2>__HEADING__</h2>
 __GRID__
@@ -12003,7 +12714,7 @@ __MORE__
   });
   var rec = load();
   if (rec.length && !"__Q__" && !__OFFSET__) {
-    var h = '<h2>⭐ Carry on</h2><div class="row">';
+    var h = '<h2>⭐ [[@js:Carry on]]</h2><div class="row">';
     rec.forEach(function(x){
       var name = document.createElement("div"); name.textContent = x.name;
       h += '<a class="card ' + x.kind + '" style="--c:' + x.c + '" href="' + x.href + '"><div class="pic">' + (x.icon || "") +
@@ -12031,14 +12742,70 @@ __MORE__
 
 <script>
 (function(){
+  // The look of the page: chosen here, kept by this screen.
+  var panel = document.getElementById("thP"), btn = document.getElementById("thB"), root = document.documentElement;
+  if (!panel || !btn) return;
+  function mark(){ panel.querySelectorAll("button.th[data-th]").forEach(function(b){ b.classList.toggle("on", b.dataset.th === root.getAttribute("data-th")); }); }
+  function open(on){ panel.classList.toggle("on", on); if (on) { mark(); var f = panel.querySelector("button.th.on") || panel.querySelector("button.th"); if (f) f.focus(); } else btn.focus(); }
+  btn.addEventListener("click", function(){ open(!panel.classList.contains("on")); });
+  panel.addEventListener("click", function(ev){
+    var b = ev.target.closest("button.th");
+    if (!b) return;
+    if (b.dataset.th) {
+      root.setAttribute("data-th", b.dataset.th);
+      try { localStorage.setItem("tgarr.mc.theme", b.dataset.th); } catch (e) {}
+      mark();
+    } else if (b.id === "thAll") {
+      // for the one who looks after this tgarr: the look every screen starts with
+      fetch("/api/kids/theme", {method: "POST", headers: {"Content-Type": "application/json"},
+                                body: JSON.stringify({theme: root.getAttribute("data-th")})})
+        .then(function(r){ return r.json(); })
+        .then(function(j){ b.textContent = j.status === "ok" ? "✓ [[@js:every screen now starts with this look]]" : "✗ [[@js:not saved]]"; })
+        .catch(function(){ b.textContent = "✗ [[@js:not saved]]"; });
+    }
+  });
+  document.addEventListener("keydown", function(ev){ if (ev.key === "Escape" && panel.classList.contains("on")) { ev.stopPropagation(); open(false); } });
+  document.addEventListener("click", function(ev){ if (panel.classList.contains("on") && !panel.contains(ev.target) && ev.target !== btn) panel.classList.remove("on"); });
+})();
+</script>
+<script>
+(function(){
+  // The language of the page: chosen here, kept by this screen (a cookie, so the page comes in it).
+  var panel = document.getElementById("lgP"), btn = document.getElementById("lgB");
+  if (!panel || !btn) return;
+  function open(on){ panel.classList.toggle("on", on); if (on) { var f = panel.querySelector("button.th.on") || panel.querySelector("button.th"); if (f) f.focus(); } else btn.focus(); }
+  btn.addEventListener("click", function(){ document.getElementById("thP").classList.remove("on"); open(!panel.classList.contains("on")); });
+  panel.addEventListener("click", function(ev){
+    var b = ev.target.closest("button.th");
+    if (!b) return;
+    if (b.dataset.lang) {
+      document.cookie = "tgarr_lang=" + b.dataset.lang + "; path=/; max-age=31536000; SameSite=Lax";
+      location.reload();
+    } else if (b.id === "lgAll") {
+      fetch("/api/kids/lang", {method: "POST", headers: {"Content-Type": "application/json"},
+                               body: JSON.stringify({lang: document.documentElement.lang})})
+        .then(function(r){ return r.json(); })
+        .then(function(j){ b.textContent = j.status === "ok" ? "✓ [[@js:every screen now starts in this language]]" : "✗ [[@js:not saved]]"; })
+        .catch(function(){ b.textContent = "✗ [[@js:not saved]]"; });
+    }
+  });
+  document.addEventListener("keydown", function(ev){ if (ev.key === "Escape" && panel.classList.contains("on")) { ev.stopPropagation(); open(false); } });
+  document.addEventListener("click", function(ev){ if (panel.classList.contains("on") && !panel.contains(ev.target) && ev.target !== btn) panel.classList.remove("on"); });
+})();
+</script>
+<script>
+(function(){
   // With a remote control (or a keyboard): the arrows go to the nearest thing in that
   // direction that can be chosen, OK / Enter opens it. A television has no pointer.
-  var TV = /[?&]tv=1/.test(location.search) || /\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\b/i.test(navigator.userAgent);
+  var TV = /[?&]tv=1/.test(location.search) || /\\b(TV|AFT[A-Z0-9]+|BRAVIA|SmartTV|Tizen|Web0S|tgarr-tv)\\b/i.test(navigator.userAgent);
   // On a television the search box is not among what the arrows go to: the moment it is
   // chosen the on-screen keyboard opens and takes the arrows for itself, and the remote is
   // caught in it. There the way to search is OK on "Find", which opens the keyboard on purpose.
-  var SEL = "a.cat, " + (TV ? "" : ".find input[type=search], ") + ".find button, a.card, .more a, a.pill, button.pill, .top a.logo";
-  function all(){ return Array.prototype.filter.call(document.querySelectorAll(SEL), function(e){ var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }); }
+  var SEL = "a.cat, " + (TV ? "" : ".find input[type=search], ") + ".find button, a.hbtn, a.card, .more a, a.pill, button.pill, .top a.logo, button.th";
+  function all(){
+    var open = document.querySelector(".thp.on");      // the list of looks is open: the arrows stay in it
+    return Array.prototype.filter.call((open || document).querySelectorAll(open ? "button.th" : SEL), function(e){ var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+  }
   if (TV) {
     var fm = document.querySelector("form.find"), box = fm && fm.querySelector("input[type=search]");
     if (fm && box) fm.addEventListener("submit", function(ev){ if (!box.value.trim()) { ev.preventDefault(); box.focus(); } });
@@ -12096,6 +12863,10 @@ async def page_kids_old():
 async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
     """What a locked browser gets: the items on the Media Center list, as a
     page of its own - large pictures, four big choices, nothing to configure."""
+    lang = await _lang(request)
+
+    def tr(text: str, **values) -> str:
+        return html.escape(i18n.t(lang, text, **values))
     kind = kind if kind in _MC_KINDS else "video"
     offset, per = max(0, int(offset)), 48
     label, icon, colour, cond = _MC_KINDS[kind]
@@ -12113,55 +12884,71 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
         counts = {k: await conn.fetchval(f"""
             SELECT count(*) FROM messages m JOIN channels c ON c.id = m.channel_id
             WHERE {_kid_sql()} AND {v[3]}""") for k, v in _MC_KINDS.items()}
+        theme = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_theme'")
+    theme = theme if theme in _MC_THEME_KEYS else "auto"
     more, rows = len(rows) > per, rows[:per]
     locked = _LOCKED.get()
     cats = "".join(
         f'<a class="cat{" on" if k == kind else ""}" style="--c:{v[2]}" href="/mediacenter?kind={k}">'
-        f'<span class="ic">{v[1]}</span><b>{v[0]}</b><small>{counts[k]:,}</small></a>'
+        f'<span class="ic">{_MC_ICONS[k]}</span><b>{tr(v[0])}</b><small>{counts[k]:,}</small></a>'
         for k, v in _MC_KINDS.items())
     cards = []
+    hero, ph = "", f'<span class="ph">{_MC_ICONS[kind]}</span>'
     for r in rows:
         name = _friendly_name(r["file_name"], r["caption"])
         if kind == "book":
-            pic, href, ic = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", "📖"
+            pic, href, ic = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", ph
         elif kind == "audio":
-            pic, href, ic = "", f"/watch/{r['id']}", "🎵"
+            pic, href, ic = "", f"/watch/{r['id']}", ph
         elif kind == "photo":
             pic, href, ic = f"/api/thumb/{r['id']}", f"/api/photo-preview/{r['id']}", ""
         else:
-            pic, href, ic = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", "🎬"
+            pic, href, ic = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", ph
+        if not hero and kind != "photo" and not q and not offset:
+            # the first thing gets the wide banner: its picture behind its name, and one button
+            shown = (f'<img class="po" src="{pic}" alt="" onerror="this.remove()"/>' if pic else "")
+            hero = (f'<section class="hero" style="--c:{colour};--img:url({pic or "data:,"})"><div class="bk"></div><span class="hi">{_MC_ICONS[kind]}</span>{shown}'
+                    f'<div class="tx"><span class="ey"><span class="hic">{_MC_ICONS[kind]}</span>{tr(label)}</span>'
+                    f'<h1>{html.escape(name)}</h1>'
+                    f'<a class="hbtn" href="{href}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.500v13l11-6.500z"/></svg>'
+                    f'{tr({"video": "Watch", "audio": "Listen", "book": "Read"}[kind])}</a></div></section>')
         img = f'<img loading="lazy" src="{pic}" alt="" onerror="this.remove()"/>' if pic else ""
         cards.append(
             f'<a class="card {kind}" style="--c:{colour}" href="{href}" data-id="{r["id"]}" data-kind="{kind}" '
-            f'data-name="{html.escape(name, quote=True)}" data-pic="{pic}" data-c="{colour}" data-icon="{ic}">'
+            f'data-name="{html.escape(name, quote=True)}" data-pic="{pic}" data-c="{colour}" data-icon="{html.escape(ic, quote=True)}">'
             f'<div class="pic">{ic}{img}'
-            + ('<span class="saved">ready</span>' if r["saved"] and kind != "photo" else "")
+            + (f'<span class="saved">{tr("ready")}</span>' if r["saved"] and kind != "photo" else "")
             + ('' if kind == "photo" else '<span class="play">▶</span>')
             + f'</div><div class="name"><span>{html.escape(name)}</span></div></a>')
     if cards:
         grid = f'<div class="grid {kind}">{"".join(cards)}</div>'
     elif q:
-        grid = '<div class="empty"><i>🔎</i>Nothing found. Try another word?</div>'
+        grid = f'<div class="empty"><i>🔎</i>{tr("Nothing found. Try another word?")}</div>'
     else:
-        grid = ('<div class="empty"><i>🌱</i>Nothing here yet.<br/>Things show up here once they are added to the Media Center.</div>')
+        grid = (f'<div class="empty"><i>🌱</i>{tr("Nothing here yet.")}<br/>{tr("Things show up here once they are added to the Media Center.")}</div>')
     qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
     nav = ""
     if offset or more:
         nav = ('<div class="more">'
-               + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← Back</a>' if offset else "")
-               + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">More →</a>' if more else "")
+               + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← {tr("Back")}</a>' if offset else "")
+               + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">{tr("More")} →</a>' if more else "")
                + "</div>")
     prof = _PROFILE.get()
     whose = (f'<span class="pill">👤 {html.escape(prof["name"])}</span>'
-             '<a class="pill" href="/lock" title="this is not me">Leave</a>') if prof else ""
-    top_right = (whose + '<a class="pill" href="/unlock" title="your own PIN, or the one that opens all of tgarr">🔒 Enter PIN</a>' if locked else
-             ('<a class="pill" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
-             + '<a class="pill" href="/mediacenter/manage">⚙ Choose what is shown</a>'
-             '<a class="pill" href="/">← Back to tgarr</a>')
-    heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
-    page = (_MEDIACENTER_HTML.replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
+             f'<a class="pill" href="/lock" title="{tr("this is not me")}">{tr("Leave")}</a>') if prof else ""
+    look = (f'<button type="button" class="pill" id="thB" aria-haspopup="dialog">🎨 {tr("Look")}</button>'
+            f'<button type="button" class="pill" id="lgB" aria-haspopup="dialog" title="{tr("Language")}">🌐 {html.escape(dict(i18n.LANGS)[lang])}</button>')
+    top_right = look + (whose + f'<a class="pill" href="/unlock">🔒 {tr("Enter PIN")}</a>' if locked else
+             (f'<a class="pill" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else '')
+             + f'<a class="pill" href="/mediacenter/manage">⚙ {tr("Choose what is shown")}</a>'
+             f'<a class="pill" href="/">← {tr("Back to tgarr")}</a>')
+    heading = f'<span class="hic" style="--c:{colour}">{_MC_ICONS[kind]}</span>{tr(label)}' + (f' · “{html.escape(q)}”' if q else "")
+    page = (i18n.fill(lang, _MEDIACENTER_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
+            .replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
+            .replace("__THEME__", theme).replace("__THEMES__", _json.dumps(list(_MC_THEME_KEYS)))
+            .replace("__THEMEPANEL__", _mc_theme_panel(not locked, lang)).replace("__LANGPANEL__", _lang_panel(lang, not locked))
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
-            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
+            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading).replace("__HERO__", hero)
             .replace("__GRID__", grid).replace("__MORE__", nav))
     return HTMLResponse(page)
 
@@ -12226,26 +13013,27 @@ async def page_kids_manage():
         return (f'<input type="checkbox" {"checked" if on else ""} {dis} '
                 f'onchange="kmAllow(\'{kind}\',{ref},this)"/>')
     pin_box = (
-        '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">PIN</h3>'
-        + ('<p style="color:var(--muted);margin:0 0 12px">A PIN is set. Any browser that has not entered it sees only '
-           'the Media Center with what is ticked below. This browser is unlocked.</p>' if cfg["pin"] else
-           '<p style="color:var(--muted);margin:0 0 12px"><b style="color:#b45309">No PIN is set:</b> anybody who opens '
-           'this address sees everything you see. Set a PIN and other browsers get only the Media Center.</p>')
+        '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">' + _t("PIN") + '</h3>'
+        + ('<p style="color:var(--muted);margin:0 0 12px">'
+           + _t("A PIN is set. Any browser that has not entered it sees only the Media Center with what is ticked below. This browser is unlocked.") + '</p>' if cfg["pin"] else
+           '<p style="color:var(--muted);margin:0 0 12px">'
+           + _t("%1 anybody who opens this address sees everything you see. Set a PIN and other browsers get only the Media Center.")
+           .replace("%1", '<b style="color:#b45309">' + _t("No PIN is set:") + '</b>') + '</p>')
         + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-        + ('<input class="km-in" id="kmCur" type="password" inputmode="numeric" maxlength="12" placeholder="current PIN" style="width:140px"/>'
+        + (f'<input class="km-in" id="kmCur" type="password" inputmode="numeric" maxlength="12" placeholder="{_t("current PIN")}" style="width:140px"/>'
            if cfg["pin"] else "")
         + '<input class="km-in" id="kmNew" type="password" inputmode="numeric" maxlength="12" '
-          f'placeholder="{"new PIN" if cfg["pin"] else "PIN, 4 to 12 digits"}" style="width:170px"/>'
-        + f'<button class="btn" onclick="kmPin(false)">{"Change PIN" if cfg["pin"] else "Set PIN"}</button>'
-        + ('<button class="btn ghost" onclick="kmPin(true)">Remove PIN</button>'
-           '<button class="btn ghost" onclick="kmLock()">Lock this browser now</button>' if cfg["pin"] else "")
+          f'placeholder="{_t("new PIN") if cfg["pin"] else _t("PIN, 4 to 12 digits")}" style="width:170px"/>'
+        + f'<button class="btn" onclick="kmPin(false)">{_t("Change PIN") if cfg["pin"] else _t("Set PIN")}</button>'
+        + (f'<button class="btn ghost" onclick="kmPin(true)">{_t("Remove PIN")}</button>'
+           f'<button class="btn ghost" onclick="kmLock()">{_t("Lock this browser now")}</button>' if cfg["pin"] else "")
         + '<span id="kmMsg" style="color:var(--muted);font-size:13px"></span></div></div></div>')
     chan_rows = "".join(
         f'<label class="km-row">{box("channel", c["id"], c["allowed"], "disabled" if c["audience"] != "sfw" else "")}'
-        f'<span class="n">{html.escape(c["title"] or c["username"] or "chat")}'
-        + (f' <small>@{html.escape(c["username"])}</small>' if c["username"] else ' <small>🔒 private</small>')
-        + (' <small>· 18+, never shown there</small>' if c["audience"] != "sfw" else "")
-        + f'</span><small>{c["n"]:,} items</small></label>' for c in chans)
+        f'<span class="n">{html.escape(c["title"] or c["username"] or "") or _t("chat")}'
+        + (f' <small>@{html.escape(c["username"])}</small>' if c["username"] else f' <small>🔒 {_t("private")}</small>')
+        + (f' <small>· {_t("18+, never shown there")}</small>' if c["audience"] != "sfw" else "")
+        + f'</span><small>{_t("{n} items", n=format(c["n"], ","))}</small></label>' for c in chans)
     ico = {"video": "🎬", "audio": "🎵", "photo": "🖼"}
 
     def kind_of(r):
@@ -12257,41 +13045,44 @@ async def page_kids_manage():
         + (box("message", r["id"], True, "disabled") if r["by_channel"] and not r["allowed"]
            else box("message", r["id"], r["allowed"]))
         + f'<span class="n">{ico.get(r["media_type"], "📄")} '
-          f'{html.escape(r["file_name"] or "item " + str(r["id"]))} <small>{html.escape(r["title"] or "")}</small>'
-        + (' <small>· shown already: its channel is ticked</small>' if r["by_channel"] and not r["allowed"] else "")
-        + ("" if r["saved"] else ' <small>· no longer saved here</small>')
+          f'{html.escape(r["file_name"]) if r["file_name"] else _t("item {n}", n=r["id"])} <small>{html.escape(r["title"] or "")}</small>'
+        + (f' <small>· {_t("shown already: its channel is ticked")}</small>' if r["by_channel"] and not r["allowed"] else "")
+        + ("" if r["saved"] else f' <small>· {_t("no longer saved here")}</small>')
         + f'</span><small>{_fmt_size(r["file_size"]) or ""}</small></label>' for r in items)
     n_kind = {k: sum(1 for r in items if kind_of(r) == k) for k in ("video", "audio", "book")}
     chips = "".join(
-        f'<button type="button" class="btn ghost km-chip{" on" if k == "all" else ""}" data-k="{k}" onclick="kmShow(this)">{lbl} '
+        f'<button type="button" class="btn ghost km-chip{" on" if k == "all" else ""}" data-k="{k}" onclick="kmShow(this)">{ic}{_t(lbl)} '
         f'<span style="opacity:.6">{n:,}</span></button>'
-        for k, lbl, n in (("all", "All", len(items)), ("video", "🎬 Videos", n_kind["video"]),
-                          ("audio", "🎵 Music", n_kind["audio"]), ("book", "📄 Books", n_kind["book"])))
+        for k, ic, lbl, n in (("all", "", "All", len(items)), ("video", "🎬 ", "Videos", n_kind["video"]),
+                              ("audio", "🎵 ", "Music", n_kind["audio"]), ("book", "📄 ", "Books", n_kind["book"])))
+    lang = _LANG.get()
+
     def mins(x):
         x = int(x or 0)
-        return f"{x // 3600} h {x % 3600 // 60:02d} min" if x >= 3600 else f"{x // 60} min"
+        # (not yet made safe for HTML: it goes into a sentence that is)
+        return i18n.t(lang, "{h} h {m} min", h=x // 3600, m=f"{x % 3600 // 60:02d}") if x >= 3600 else i18n.t(lang, "{n} min", n=x // 60)
     time_box = (
         '<div class="km-box"><div class="km-pad">'
-        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><h3 style="margin:0;flex:1">Time</h3>'
-        f'<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="mcOn" {"checked" if rules["on"] else ""}/> <b>use time rules</b></label></div>'
-        '<p style="color:var(--muted);margin:0 0 12px">For browsers that have not entered your PIN. Counted per person where a child has entered their own, otherwise per device; '
-        'only while a page is in front or something is playing.</p>'
+        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><h3 style="margin:0;flex:1">' + _t("Time") + '</h3>'
+        f'<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="mcOn" {"checked" if rules["on"] else ""}/> <b>{_t("use time rules")}</b></label></div>'
+        f'<p style="color:var(--muted);margin:0 0 12px">{_t("For browsers that have not entered your PIN. Counted per person where a child has entered their own, otherwise per device; only while a page is in front or something is playing.")}</p>'
         '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
-        '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
+        f'<span></span><small>{_t("open from")}</small><small>{_t("until")}</small><small>{_t("minutes a day (0 = no limit)")}</small>'
         + "".join(
-            f'<b>{lbl}</b><input class="km-in" type="time" id="mc_{k}_from" value="{rules[k]["from"]}"/>'
+            f'<b>{_t(lbl)}</b><input class="km-in" type="time" id="mc_{k}_from" value="{rules[k]["from"]}"/>'
             f'<input class="km-in" type="time" id="mc_{k}_to" value="{rules[k]["to"]}"/>'
             f'<input class="km-in" type="number" min="0" max="1440" id="mc_{k}_limit" value="{rules[k]["limit"]}"/>'
             for k, lbl in (("wd", "Monday to Friday"), ("we", "Saturday, Sunday")))
         + '</div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px">'
-        f'<span>A break of <input class="km-in" type="number" min="0" max="240" id="mcRest" value="{rules["rest"]}" style="width:74px"/> minutes '
-        f'after <input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/> minutes in one go</span>'
-        '<button class="btn" onclick="mcSave()">Save</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
+        '<span>' + _t("A break of %1 minutes after %2 minutes in one go")
+        .replace("%1", f'<input class="km-in" type="number" min="0" max="240" id="mcRest" value="{rules["rest"]}" style="width:74px"/>')
+        .replace("%2", f'<input class="km-in" type="number" min="0" max="600" id="mcSession" value="{rules["session"]}" style="width:74px"/>') + '</span>'
+        f'<button class="btn" onclick="mcSave()">{_t("Save")}</button><span id="mcMsg" style="color:var(--muted);font-size:13px"></span></div>'
         '</div></div>')
     def who_label(w):
         if w[:1] == "p" and w[1:].isdigit():
             p = profs.get(int(w[1:]))
-            return "👤 " + html.escape(p["name"] if p else "someone since removed")
+            return "👤 " + (html.escape(p["name"]) if p else _t("someone since removed"))
         return "📱 " + html.escape(w)
     used_today = {u["who"]: u["today"] for u in usage}
     levels = (("kid", "Little: only what is ticked"), ("teen", "Older: everything from all-ages channels"))
@@ -12299,80 +13090,78 @@ async def page_kids_manage():
     def person(p):
         r, i = p["rules"] or rules, p["id"]
         return (
-            f'<div class="km-row"><span class="n">👤 <b>{html.escape(p["name"])}</b> <small>today {mins(used_today.get("p" + str(i)))}'
-            + (" · own time rules" if p["rules"] else "") + '</small></span>'
+            f'<div class="km-row"><span class="n">👤 <b>{html.escape(p["name"])}</b> <small>{_t("today {t}", t=mins(used_today.get("p" + str(i))))}'
+            + (" · " + _t("own time rules") if p["rules"] else "") + '</small></span>'
             + f'<select class="km-in" onchange="kpPost({{id:{i},level:this.value}})">'
-            + "".join(f'<option value="{k}"{" selected" if p["level"] == k else ""}>{lbl}</option>' for k, lbl in levels)
-            + f'</select><button class="btn ghost" onclick="kpTime({i})">Time</button>'
-              f'<button class="btn ghost" onclick="kpPin({i})">New PIN</button>'
-              f'<button class="btn ghost" onclick="kpDel({i})">Remove</button></div>'
+            + "".join(f'<option value="{k}"{" selected" if p["level"] == k else ""}>{_t(lbl)}</option>' for k, lbl in levels)
+            + f'</select><button class="btn ghost" onclick="kpTime({i})">{_t("Time")}</button>'
+              f'<button class="btn ghost" onclick="kpPin({i})">{_t("New PIN")}</button>'
+              f'<button class="btn ghost" onclick="kpDel({i})">{_t("Remove")}</button></div>'
             + f'<div class="km-pad" id="kpT{i}" hidden style="border-bottom:1px solid var(--border)">'
               f'<label style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><input type="checkbox" id="kp{i}_own" {"checked" if p["rules"] else ""}/> '
-              f'<b>{html.escape(p["name"])} has time rules of their own</b> <small style="color:var(--muted)">(otherwise the ones under PIN &amp; time; breaks are always those)</small></label>'
+              f'<b>{_t("{name} has time rules of their own", name=p["name"])}</b> <small style="color:var(--muted)">{_t("(otherwise the ones under PIN & time; breaks are always those)")}</small></label>'
               '<div style="display:grid;grid-template-columns:auto repeat(3,minmax(90px,150px));gap:8px 12px;align-items:center;max-width:620px">'
-              '<span></span><small>open from</small><small>until</small><small>minutes a day (0 = no limit)</small>'
+              f'<span></span><small>{_t("open from")}</small><small>{_t("until")}</small><small>{_t("minutes a day (0 = no limit)")}</small>'
             + "".join(
-                f'<b>{lbl}</b><input class="km-in" type="time" id="kp{i}_{k}_from" value="{r[k]["from"]}"/>'
+                f'<b>{_t(lbl)}</b><input class="km-in" type="time" id="kp{i}_{k}_from" value="{r[k]["from"]}"/>'
                 f'<input class="km-in" type="time" id="kp{i}_{k}_to" value="{r[k]["to"]}"/>'
                 f'<input class="km-in" type="number" min="0" max="1440" id="kp{i}_{k}_limit" value="{r[k]["limit"]}"/>'
                 for k, lbl in (("wd", "Monday to Friday"), ("we", "Saturday, Sunday")))
-            + f'</div><div style="margin-top:12px"><button class="btn" onclick="kpSave({i})">Save</button></div></div>')
+            + f'</div><div style="margin-top:12px"><button class="btn" onclick="kpSave({i})">{_t("Save")}</button></div></div>')
     people_box = (
-        '<p class="note">Give each child a PIN of their own. A browser where it is entered still shows only the Media Center, but tgarr '
-        'knows whose it is: time is counted per person, on whatever device, and an older child gets more than what is ticked - everything '
-        'from all-ages public channels and the folders of this machine, never your private chats, never a picture found adult. '
-        'A browser with no PIN at all stays as it was: only what is ticked.</p>'
+        '<p class="note">' + _t("Give each child a PIN of their own. A browser where it is entered still shows only the Media Center, but tgarr knows whose it is: time is counted per person, on whatever device, and an older child gets more than what is ticked - everything from all-ages public channels and the folders of this machine, never your private chats, never a picture found adult. A browser with no PIN at all stays as it was: only what is ticked.") + '</p>'
         + ('<div class="km-box">' + "".join(person(p) for p in profs.values()) + '</div>' if profs else "")
-        + ('<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 10px">Add a person</h3>'
+        + ('<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 10px">' + _t("Add a person") + '</h3>'
            '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-           '<input class="km-in" id="kpName" maxlength="40" placeholder="name" style="width:150px"/>'
-           '<select class="km-in" id="kpLevel">' + "".join(f'<option value="{k}">{lbl}</option>' for k, lbl in levels) + '</select>'
-           '<input class="km-in" id="kpNewPin" type="password" inputmode="numeric" maxlength="12" placeholder="their PIN, 4 to 12 digits" style="width:200px"/>'
-           '<button class="btn" onclick="kpAdd()">Add</button></div></div></div>' if cfg["pin"] else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Set your own PIN first (under PIN &amp; time).</div></div>'))
+           f'<input class="km-in" id="kpName" maxlength="40" placeholder="{_t("name")}" style="width:150px"/>'
+           '<select class="km-in" id="kpLevel">' + "".join(f'<option value="{k}">{_t(lbl)}</option>' for k, lbl in levels) + '</select>'
+           f'<input class="km-in" id="kpNewPin" type="password" inputmode="numeric" maxlength="12" placeholder="{_t("their PIN, 4 to 12 digits")}" style="width:200px"/>'
+           f'<button class="btn" onclick="kpAdd()">{_t("Add")}</button></div></div></div>' if cfg["pin"] else
+           f'<div class="km-box"><div class="km-pad" style="color:var(--muted)">{_t("Set your own PIN first (under PIN & time).")}</div></div>'))
     used_rows = (
         "".join(f'<div class="km-row"><span class="n">{who_label(u["who"])}</span>'
-                f'<small>today {mins(u["today"])} · last 7 days {mins(u["week"])}</small></div>' for u in usage)
+                f'<small>{_t("today {t}", t=mins(u["today"]))} · {_t("last 7 days {t}", t=mins(u["week"]))}</small></div>' for u in usage)
         + "".join(f'<div class="km-row"><span class="n">{html.escape(_friendly_name(o["file_name"], o["caption"]))}</span>'
                   f'<small>{_fmt_time(o["at"])} · {who_label(o["who"])}</small></div>' for o in opened))
     n_chan = sum(1 for c in chans if c["allowed"])
     n_file = sum(1 for r in items if r["allowed"])
-    tabs = (("pin", "PIN &amp; time", ""), ("people", "People", f"{len(profs)}" if profs else ""), ("channels", "Channels", f"{n_chan:,} shown" if n_chan else ""),
-            ("files", "Files", f"{n_file:,} shown" if n_file else ""), ("usage", "Usage", ""))
+    tabs = (("pin", "PIN & time", ""), ("people", "People", f"{len(profs)}" if profs else ""),
+            ("channels", "Channels", _t("{n} shown", n=f"{n_chan:,}") if n_chan else ""),
+            ("files", "Files", _t("{n} shown", n=f"{n_file:,}") if n_file else ""), ("usage", "Usage", ""))
     body = (
         _KIDS_CSS
         + '<div class="km-tabs" role="tablist">'
         + "".join(f'<button type="button" class="km-tab{" on" if k == "pin" else ""}" role="tab" data-t="{k}" onclick="kmTab(\'{k}\')">'
-                  f'{lbl}{f"<span class=c>{c}</span>" if c else ""}</button>' for k, lbl, c in tabs)
+                  f'{_t(lbl)}{f"<span class=c>{c}</span>" if c else ""}</button>' for k, lbl, c in tabs)
         + '</div>'
         + f'<div class="km-pane" id="km-pin">{pin_box}{time_box}</div>'
         + f'<div class="km-pane" id="km-people" hidden>{people_box}</div>'
         + '<div class="km-pane" id="km-channels" hidden>'
-          '<p class="note">Everything in a ticked channel is shown in the Media Center, now and as it grows.</p>'
-        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>no channels yet</div>"}</div></div>'
+          '<p class="note">' + _t("Everything in a ticked channel is shown in the Media Center, now and as it grows.") + '</p>'
+        + f'<div class="km-box km-list">{chan_rows or "<div class=km-pad>" + _t("no channels yet") + "</div>"}</div></div>'
         + '<div class="km-pane" id="km-files" hidden>'
-          '<p class="note">The files already saved on this machine. Tick the ones to show in the Media Center.</p>'
+          '<p class="note">' + _t("The files already saved on this machine. Tick the ones to show in the Media Center.") + '</p>'
         + (f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">{chips}</div>'
            f'<div class="km-box km-list" id="kmItems">{item_rows}</div>' if items else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing is saved yet. Files you open in a player '
-           'are kept and appear here.</div></div>')
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
+           + _t("Nothing is saved yet. Files you open in a player are kept and appear here.") + '</div></div>')
         + '</div>'
         + '<div class="km-pane" id="km-usage" hidden>'
-          '<p class="note">Kept on this machine only: time per person or device, and what was opened in the Media Center.</p>'
+          '<p class="note">' + _t("Kept on this machine only: time per person or device, and what was opened in the Media Center.") + '</p>'
         + (f'<div class="km-box km-list">{used_rows}</div>' if used_rows else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing yet. Time and what was opened are listed '
-           'here once a browser without the PIN has used the Media Center.</div></div>')
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
+           + _t("Nothing yet. Time and what was opened are listed here once a browser without the PIN has used the Media Center.") + '</div></div>')
         + '</div>'
-        + '<p><a class="btn ghost" href="/mediacenter">Open the Media Center &rarr;</a></p>'
-        + """<script>
+        + '<p><a class="btn ghost" href="/mediacenter">' + _t("Open the Media Center") + ' &rarr;</a></p>'
+        + _fill("""<script>
 const G = id => document.getElementById(id);
 function kpPost(b){
   return fetch("/api/kids/profile", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(b)})
-    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "that did not work"); });
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "[[@js:that did not work]]"); });
 }
 function kpAdd(){ kpPost({name: G("kpName").value, level: G("kpLevel").value, pin: G("kpNewPin").value}); }
-function kpPin(id){ const p = prompt("A new PIN for this person, 4 to 12 digits"); if (p) kpPost({id: id, pin: p}); }
-function kpDel(id){ if (confirm("Remove this person? Their PIN stops working; what they used stays in the record.")) kpPost({id: id, delete: true}); }
+function kpPin(id){ const p = prompt("[[@js:A new PIN for this person, 4 to 12 digits]]"); if (p) kpPost({id: id, pin: p}); }
+function kpDel(id){ if (confirm("[[@js:Remove this person? Their PIN stops working; what they used stays in the record.]]")) kpPost({id: id, delete: true}); }
 function kpTime(id){ const e = G("kpT" + id); e.hidden = !e.hidden; }
 function kpSave(id){
   const part = k => ({from: G("kp" + id + "_" + k + "_from").value, to: G("kp" + id + "_" + k + "_to").value, limit: +G("kp" + id + "_" + k + "_limit").value});
@@ -12386,10 +13175,10 @@ function kmAllow(kind, ref, el){
 }
 function kmPin(remove){
   const cur = document.getElementById("kmCur"), nw = document.getElementById("kmNew"), msg = document.getElementById("kmMsg");
-  if (remove && !confirm("Remove the PIN? Anybody who opens this address will see everything again.")) return;
+  if (remove && !confirm("[[@js:Remove the PIN? Anybody who opens this address will see everything again.]]")) return;
   fetch("/api/kids/pin", {method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({pin: remove ? "" : nw.value, current: cur ? cur.value : ""})}).then(r => r.json())
-    .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "that did not work"; });
+    .then(j => { if (j.status === "ok") location.reload(); else msg.textContent = j.message || "[[@js:that did not work]]"; });
 }
 function mcSave(){
   const g = id => document.getElementById(id), msg = g("mcMsg");
@@ -12397,7 +13186,7 @@ function mcSave(){
   fetch("/api/kids/rules", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({
     on: g("mcOn").checked, wd: part("wd"), we: part("we"), session: +g("mcSession").value, rest: +g("mcRest").value,
     tz: -new Date().getTimezoneOffset()})}).then(r => r.json())
-    .then(j => { msg.textContent = j.status === "ok" ? "saved" : (j.message || "that did not work"); });
+    .then(j => { msg.textContent = j.status === "ok" ? "[[@js:saved]]" : (j.message || "[[@js:that did not work]]"); });
 }
 function kmShow(b){
   document.querySelectorAll(".km-chip").forEach(x => x.classList.toggle("on", x === b));
@@ -12413,7 +13202,7 @@ function kmTab(t, quiet){
 }
 kmTab((location.hash || "#pin").slice(1), true);
 window.addEventListener("hashchange", () => kmTab((location.hash || "#pin").slice(1), true));
-</script>""")
+</script>"""))
     return HTMLResponse(_layout("Media Center", "/settings", body, page_title="Media Center & PIN", top_actions_html=""))
 
 
@@ -12629,6 +13418,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
         return "?" + "&".join(bits) if bits else ""
 
+    _tip = html.unescape              # _chip_link escapes its tooltip itself: hand it the plain word
     picked = None
     for r in all_channels:
         if (ch and r["id"] == ch) or (channel and r["username"] == channel):
@@ -12637,27 +13427,27 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     priv = [r for r in all_channels if r["private"]]
 
     def _name(r):
-        return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
+        return r["title"] or (("@" + r["username"]) if r["username"] else html.unescape(_t("private chat")))
     opts = "".join(
         f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None)}" '
         f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
         f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
         + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
-           else '<small>🔒 private</small>' if r["private"]
-           else '<small>📰 from the newsgroups</small>' if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT)
-           else '<small>🏛 from the Internet Archive</small>' if r["local_root"] == ARCHIVE_ROOT
-           else '<small>📁 files of this server</small>' if r["local_root"]
-           else '<small>group · no public name</small>')
+           else f'<small>🔒 {_t("private")}</small>' if r["private"]
+           else f'<small>📰 {_t("from the newsgroups")}</small>' if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT)
+           else f'<small>🏛 {_t("from the Internet Archive")}</small>' if r["local_root"] == ARCHIVE_ROOT
+           else f'<small>📁 {_t("files of this server")}</small>' if r["local_root"]
+           else f'<small>{_t("group · no public name")}</small>')
         + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
         for r in all_channels)
     picker = (
         '<div class="gp" id="gp">'
         f'<button type="button" class="btn ghost gp-btn{" on" if picked else ""}" id="gpBtn">'
         + (f'📡 {html.escape(_name(picked)[:28])} <span style="opacity:.6">{picked["n"]:,}</span>'
-           if picked else f'📡 Choose a channel… <span style="opacity:.6">{len(all_channels):,}</span>')
+           if picked else f'📡 {_t("Choose a channel…")} <span style="opacity:.6">{len(all_channels):,}</span>')
         + ' ▾</button>'
         '<div class="gp-pop" id="gpPop">'
-        '<input type="text" id="gpQ" placeholder="type to find a channel or chat…" autocomplete="off"/>'
+        f'<input type="text" id="gpQ" placeholder="{_t("type to find a channel or chat…")}" autocomplete="off"/>'
         f'<div class="gp-list" id="gpList">{opts}</div></div></div>')
     ch_chips_html = (
         '<style>'
@@ -12681,20 +13471,20 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '.gp-c{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}'
         '</style>'
         '<div class="bar-tools" style="margin-bottom:16px">'
-        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None),
+        + _chip_link(_t("All photos"), "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None),
                      not (picked or private or usenet or archive))
-        + (_chip_link(f'🔒 My private chats <span style="opacity:.6">{priv_n:,}</span>',
+        + (_chip_link(f'🔒 {_t("My private chats")} <span style="opacity:.6">{priv_n:,}</span>',
                       "/gallery" + _gqs(ch=None, channel=None, private=1, usenet=None, grp=None, archive=None, item=None, offset=None), bool(private),
-                      "photos from chats and groups that have no public @username - yours alone")
+                      _tip(_t("photos from chats and groups that have no public @username - yours alone")))
            if priv else "")
         # Usenet opens into its newsgroups, as "Choose a channel" opens into the chats
         + (('<details class="gp gu"><summary class="btn ghost gp-btn' + (" on" if usenet else "") + '" '
-            'title="pictures fetched from the newsgroups">📰 '
+            f'title="{_t("pictures fetched from the newsgroups")}">📰 '
             + (html.escape(grp[:34]) if grp else "Usenet")
             + f' <span style="opacity:.6">{(next((r["n"] for r in usenet_groups if r["g"] == grp), 0) if grp else usenet_n):,}</span> ▾</summary>'
             '<div class="gp-pop"><div class="gp-list">'
             f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=1, grp=None, archive=None, item=None, offset=None)}">'
-            f'<span class="gp-n">All of Usenet</span><span class="gp-c">{usenet_n:,}</span></a>'
+            f'<span class="gp-n">{_t("All of Usenet")}</span><span class="gp-c">{usenet_n:,}</span></a>'
             + "".join(
                 f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=r["g"], archive=None, item=None, offset=None)}">'
                 f'<span class="gp-n">{html.escape(r["g"])}</span><span class="gp-c">{r["n"]:,}</span></a>' for r in usenet_groups)
@@ -12702,12 +13492,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
            if usenet_n else "")
         # and the Internet Archive into the items that were fetched from it
         + (('<details class="gp gu"><summary class="btn ghost gp-btn' + (" on" if archive else "") + '" '
-            'title="pictures fetched from the Internet Archive">🏛 '
-            + (html.escape(item[:34]) if item else "Internet Archive")
+            f'title="{_t("pictures fetched from the Internet Archive")}">🏛 '
+            + (html.escape(item[:34]) if item else _t("Internet Archive"))
             + f' <span style="opacity:.6">{(next((r["n"] for r in archive_items if r["g"] == item), 0) if item else archive_n):,}</span> ▾</summary>'
             '<div class="gp-pop"><div class="gp-list">'
             f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=1, item=None, offset=None)}">'
-            f'<span class="gp-n">All from the Archive</span><span class="gp-c">{archive_n:,}</span></a>'
+            f'<span class="gp-n">{_t("All from the Archive")}</span><span class="gp-c">{archive_n:,}</span></a>'
             + "".join(
                 f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=r["g"], offset=None)}">'
                 f'<span class="gp-n">{html.escape(r["g"])}</span><span class="gp-c">{r["n"]:,}</span></a>' for r in archive_items)
@@ -12715,35 +13505,34 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
            if archive_n else "")
         + picker
         + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
-                       "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
-           else _export_btn({"scope": "private", "kind": "photo"}, "⬇ Download all") if (private and _in)
+                       "⬇ " + _t("Download all {n}", n=format(picked["n"], ","))) if (picked and _in)
+           else _export_btn({"scope": "private", "kind": "photo"}, "⬇ " + _t("Download all")) if (private and _in)
            else ('<button class="btn ghost" style="padding:5px 12px;font-size:12px" '
-                 f'onclick="ugForget({{grp:{html.escape(_json.dumps(grp), quote=True)}}},&quot;everything fetched from this newsgroup&quot;,this)">'
-                 '🗑 Delete this newsgroup</button>' + _UN_FORGET_JS) if grp
-           else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 Manage…</a>' if usenet
-           else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/archive?kind=have">🗑 Manage…</a>' if archive
+                 f'onclick="ugForget({{grp:{html.escape(_json.dumps(grp), quote=True)}}},&quot;{html.escape(_tj("Remove everything fetched from this newsgroup from this server? The files are deleted; they can be fetched again only while the post is still on Usenet."), quote=True)}&quot;,this)">'
+                 f'🗑 {_t("Delete this newsgroup")}</button>' + _fill(_UN_FORGET_JS)) if grp
+           else f'<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 {_t("Manage…")}</a>' if usenet
+           else f'<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/archive?kind=have">🗑 {_t("Manage…")}</a>' if archive
            else "")
         + (('<span class="sep"></span>'
-            + _chip_link("all", "/gallery" + _gqs(rate=None if _rate0 == "all" else "all", offset=None), rate == "all")
+            + _chip_link(_t("all"), "/gallery" + _gqs(rate=None if _rate0 == "all" else "all", offset=None), rate == "all")
             + _chip_link("SFW", "/gallery" + _gqs(rate=None if _rate0 == "sfw" else "sfw", offset=None), rate == "sfw",
-                         "only pictures that are neither from an 18+ channel nor found to be adult")
+                         _tip(_t("only pictures that are neither from an 18+ channel nor found to be adult")))
             + _chip_link("18+", "/gallery" + _gqs(rate=None if _rate0 == "adult" else "adult", offset=None), rate == "adult",
-                         "only pictures from an 18+ channel, or found to be adult")) if _nsfw_on else "")
+                         _tip(_t("only pictures from an 18+ channel, or found to be adult")))) if _nsfw_on else "")
         + (('<span class="sep"></span>'
-            + _chip_link("all", "/gallery" + _gqs(art=None, offset=None), not art)
-            + _chip_link("Photos", "/gallery" + _gqs(art="photo", offset=None), art == "photo",
-                         "only photographs - of the pictures that have been looked at")
-            + _chip_link("Drawings", "/gallery" + _gqs(art="drawn", offset=None), art == "drawn",
-                         "only drawings, comics and paintings - of the pictures that have been looked at")) if (_looked or art) else "")
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
-        + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
+            + _chip_link(_t("all"), "/gallery" + _gqs(art=None, offset=None), not art)
+            + _chip_link(_t("Photos"), "/gallery" + _gqs(art="photo", offset=None), art == "photo",
+                         _tip(_t("only photographs - of the pictures that have been looked at")))
+            + _chip_link(_t("Drawings"), "/gallery" + _gqs(art="drawn", offset=None), art == "drawn",
+                         _tip(_t("only drawings, comics and paintings - of the pictures that have been looked at")))) if (_looked or art) else "")
+        + f'<span class="sep"></span><span class="lbl">{_t("Sort:")}</span>'
+        + _chip_link(_t("newest"), "/gallery" + _gqs(sort=None, offset=None), sort != "old")
+        + _chip_link(_t("oldest"), "/gallery" + _gqs(sort="old", offset=None), sort == "old")
         + (('<span class="sep"></span>'
-            + _chip_link(f"only my data center (DC {my_dc})",
+            + _chip_link(_t("only my data center (DC {dc})", dc=my_dc),
                          "/gallery" + _gqs(dc=None if same_dc_only else "mine", offset=None),
                          same_dc_only,
-                         "photos stored on your own Telegram data center load fastest; "
-                         "the others work too")) if my_dc else "")
+                         _tip(_t("photos stored on your own Telegram data center load fastest; the others work too")))) if my_dc else "")
         + '</div>'
         '<script>(function(){const gp=document.getElementById("gp"),q=document.getElementById("gpQ");'
         'document.getElementById("gpBtn").onclick=e=>{e.stopPropagation();gp.classList.toggle("open");'
@@ -12754,20 +13543,23 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         'q.addEventListener("keydown",e=>{if(e.key==="Escape")gp.classList.remove("open");'
         'if(e.key==="Enter"){const f=[...document.querySelectorAll("#gpList .gp-opt")].find(o=>o.style.display!=="none");'
         'if(f)location.href=f.href}})})()</script>')
-    _where_txt = (f'in {html.escape(_name(picked))}' if picked else
-                  'in my private chats' if private else f'from {html.escape(grp)}' if grp else 'fetched from Usenet' if usenet
-                  else f'from {html.escape(item)}' if item else 'fetched from the Internet Archive' if archive else '')
+    # which photos these are, said as whole phrases (each one a sentence of its own in every language)
+    _where_txt = (_t("photos in {name}", name=_name(picked)) if picked else
+                  _t("photos in my private chats") if private else _t("photos from {name}", name=grp) if grp
+                  else _t("photos fetched from Usenet") if usenet
+                  else _t("photos from {name}", name=item) if item
+                  else _t("photos fetched from the Internet Archive") if archive else _t("photos"))
 
     if not rows:
         body = (
-            f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">0</span></h2>'
+            f'{_LIST_CSS}<h2 class="section">{_t("Gallery")} <span class="count">0</span></h2>'
             f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
-            + ('<div>No photo matches.</div>' if (picked or private or usenet or archive or q or same_dc_only or page_offset or rate) else
-               '<div>No photos yet.</div>'
-               f'<div style="margin-top:8px;font-size:13px">{pending:,} photos are indexed; their '
-               'thumbnails are fetched as pages are opened.</div>')
+            + (f'<div>{_t("No photo matches.")}</div>' if (picked or private or usenet or archive or q or same_dc_only or page_offset or rate) else
+               f'<div>{_t("No photos yet.")}</div>'
+               f'<div style="margin-top:8px;font-size:13px">'
+               f'{_t("{n} photos are indexed; their thumbnails are fetched as pages are opened.", n=format(pending, ","))}</div>')
             + '</div>'
         )
         return HTMLResponse(_layout("Gallery", "/gallery", body))
@@ -12792,7 +13584,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         f'data-cap="{html.escape(_said(r)[1][:300])}" '
         f'data-ch="{html.escape(_said(r)[0])}">'
         f'<img src="/api/thumb/{r["id"]}" loading="lazy" data-mid="{r["id"]}" class="lazy-thumb" />'
-        + (f'<div class="dup-badge" title="shared across {r["dup_count"]} channels">×{r["dup_count"]}</div>'
+        + (f'<div class="dup-badge" title="{_t("shared across {n} channels", n=r["dup_count"])}">×{r["dup_count"]}</div>'
            if r.get("dup_count") and r["dup_count"] > 1 else '')
         + f'<figcaption class="meta">'
         f'<div class="ch">{html.escape(_said(r)[0] if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT, ARCHIVE_ROOT) else (r["ch_title"] or ""))}</div>'
@@ -12803,24 +13595,24 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     )
 
     body = (
-        f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">{matched:,}</span>'
+        f'{_LIST_CSS}<h2 class="section">{_t("Gallery")} <span class="count">{matched:,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
-        f'letter-spacing:0;margin-left:10px">photos {_where_txt}'
-        + (f' matching “{html.escape(q)}”' if q else '')
-        + ' · the same picture posted in several places is shown once · click one for the slideshow</span></h2>'
+        f'letter-spacing:0;margin-left:10px">{_where_txt}'
+        + (' · ' + _t("matching “{q}”", q=q) if q else '')
+        + f' · {_t("the same picture posted in several places is shown once")} · {_t("click one for the slideshow")}</span></h2>'
         f'{ch_chips_html}'
         f'<div class="gallery">{items}</div>'
         + _page_nav("/gallery", _gqs, page_offset, page_size, len(rows), matched or 0) +
         '<div class="lightbox">'
         '  <div class="lb-progress"><div class="lb-progress-bar" id="lbProgress"></div></div>'
         '  <button class="lb-close" id="lbClose">×</button>'
-        '  <button class="lb-prev" id="lbPrev" title="previous"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>'
-        '  <button class="lb-next" id="lbNext" title="next"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></button>'
+        f'  <button class="lb-prev" id="lbPrev" title="{_t("previous")}">' '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>'
+        f'  <button class="lb-next" id="lbNext" title="{_t("next")}">' '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></button>'
         '  <img id="lbImg" alt="" />'
         '  <div class="lb-controls">'
-        '    <button id="lbPlay" title="play / pause (Space)">▶</button>'
+        f'    <button id="lbPlay" title="{_t("play / pause (Space)")}">▶</button>'
         '    <span class="lb-count" id="lbCount">– / –</span>'
-        '    <button id="lbDel" title="delete (Del) — will not be redownloaded">🗑</button>'
+        f'    <button id="lbDel" title="{_t("delete (Del) — will not be redownloaded")}">🗑</button>'
         '  </div>'
         '  <div class="lb-meta"><div class="ch" id="lbCh"></div><div id="lbCap"></div></div>'
         '</div>'
@@ -12980,14 +13772,14 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '  function pause() { playing = false; playBtn.textContent = "▶"; clearTimeout(timer); prog.style.transition = "none"; prog.style.width = "0"; }'
         '  async function del() {'
         '    const p = photos[cur];'
-        '    if (!confirm("Delete this photo? Will not be redownloaded.")) return;'
+        '    if (!confirm("' + _tj("Delete this photo? Will not be redownloaded.") + '")) return;'
         '    try {'
         '      const r = await fetch("/api/photo/" + p.id + "/delete", {method:"POST"});'
         '      if (!r.ok) throw new Error("HTTP " + r.status);'
         '      p.el.remove(); photos.splice(cur, 1);'
         '      if (!photos.length) { close(); return; }'
         '      show(cur);'
-        '    } catch (e) { alert("Delete failed: " + e.message); }'
+        '    } catch (e) { alert("' + _tj("Delete failed: %1") + '".replace("%1", e.message)); }'
         '  }'
         '  function open(id) {'
         '    const idx = photos.findIndex(p => p.id === id);'
@@ -13105,9 +13897,9 @@ _MUSIC_PLAYER_HTML = r"""
 <div class="np-panel" id="npPanel">
   <div class="bgimg" id="npBg"></div>
   <div class="top">
-    <button id="vizBtn" title="moving spectrum on / off">Spectrum</button>
-    <button id="lyrBtn" title="lyrics on / off">Lyrics</button>
-    <button id="npClose">Close ✕</button>
+    <button id="vizBtn" title="[[@moving spectrum on / off]]">[[@Spectrum]]</button>
+    <button id="lyrBtn" title="[[@lyrics on / off]]">[[@Lyrics]]</button>
+    <button id="npClose">[[@Close]] ✕</button>
   </div>
   <div class="mid">
     <div class="art"><div class="cv" id="npCover">🎵</div><div class="t" id="npT2"></div><div class="a" id="npA2"></div></div>
@@ -13116,22 +13908,22 @@ _MUSIC_PLAYER_HTML = r"""
   <canvas id="viz"></canvas>
 </div>
 <div class="player-bar">
-  <div class="np" id="npOpen" title="open the now-playing view">
+  <div class="np" id="npOpen" title="[[@open the now-playing view]]">
     <div class="np-icon" id="npIcon">🎵</div>
-    <div class="np-text"><div class="np-t" id="npT">— select a track —</div><div class="np-a" id="npA"></div></div>
+    <div class="np-text"><div class="np-t" id="npT">[[@— select a track —]]</div><div class="np-a" id="npA"></div></div>
   </div>
   <div class="ctl">
-    <button class="ghost" id="prevBtn" title="previous (p)">⏮</button>
-    <button id="pp" title="play / pause (space)">▶</button>
-    <button class="ghost" id="nextBtn" title="next (n)">⏭</button>
+    <button class="ghost" id="prevBtn" title="[[@previous (p)]]" aria-label="[[@previous (p)]]">⏮</button>
+    <button id="pp" title="[[@play / pause (space)]]" aria-label="[[@play / pause (space)]]">▶</button>
+    <button class="ghost" id="nextBtn" title="[[@next (n)]]" aria-label="[[@next (n)]]">⏭</button>
   </div>
   <div class="seek"><span id="tCur">0:00</span><input type="range" id="seek" min="0" max="1000" value="0"><span id="tDur">0:00</span></div>
   <canvas id="mini"></canvas>
   <div class="ctl">
-    <button class="ghost" id="shuffleBtn" title="shuffle">🔀</button>
-    <button class="ghost" id="favBtn" title="favourite (f)">♥</button>
-    <a class="btn ghost" id="dlBtn" title="download this file" download>⬇</a>
-    <button class="ghost" id="npBtn" title="cover, lyrics and spectrum (l)">♪ Now playing</button>
+    <button class="ghost" id="shuffleBtn" title="[[@shuffle]]" aria-label="[[@shuffle]]">🔀</button>
+    <button class="ghost" id="favBtn" title="[[@favourite (f)]]" aria-label="[[@favourite (f)]]">♥</button>
+    <a class="btn ghost" id="dlBtn" title="[[@download this file]]" aria-label="[[@download this file]]" download>⬇</a>
+    <button class="ghost" id="npBtn" title="[[@cover, lyrics and spectrum (l)]]">♪ [[@Now playing]]</button>
   </div>
   <audio id="audio" preload="metadata"></audio>
 </div>
@@ -13198,11 +13990,11 @@ _MUSIC_PLAYER_HTML = r"""
   $("lyrBtn").onclick = () => { prefs.lyr = !prefs.lyr; save(); lyrUi(); if (prefs.lyr && cur >= 0 && lines === null) loadLyrics(rows[cur].dataset.id); };
   function loadLyrics(id){
     const box = $("lyr"); lines = null; lineEls = []; lineIdx = -1;
-    box.className = "lyr"; box.innerHTML = '<div class="none">looking for lyrics…</div>';
+    box.className = "lyr"; box.innerHTML = '<div class="none">' + esc("[[@js:looking for lyrics…]]") + "</div>";
     if (!prefs.lyr) return;
     fetch("/api/lyrics/" + id).then(r => r.json()).then(j => {
       if (cur < 0 || rows[cur].dataset.id !== String(id)) return;
-      if (!j.found) { lines = []; box.innerHTML = '<div class="none">No lyrics found for this track.</div>'; return; }
+      if (!j.found) { lines = []; box.innerHTML = '<div class="none">' + esc("[[@js:No lyrics found for this track.]]") + "</div>"; return; }
       if (j.synced) {
         lines = j.lines;
         box.innerHTML = lines.map((l, i) => '<div data-i="' + i + '">' + (esc(l[1]) || "♪") + "</div>").join("");
@@ -13212,7 +14004,7 @@ _MUSIC_PLAYER_HTML = r"""
         lines = []; box.className = "lyr plain";
         box.innerHTML = j.text.split("\n").map(t => "<div>" + (esc(t) || "&nbsp;") + "</div>").join("");
       }
-    }).catch(() => { lines = []; box.innerHTML = '<div class="none">Could not load lyrics.</div>'; });
+    }).catch(() => { lines = []; box.innerHTML = '<div class="none">' + esc("[[@js:Could not load lyrics.]]") + "</div>"; });
   }
   function lyrTick(){
     if (!lines || !lines.length || !lineEls.length) return;
@@ -13270,7 +14062,7 @@ _MUSIC_PLAYER_HTML = r"""
   audio.addEventListener("play", () => { $("pp").textContent = "⏸"; vizStart(); });
   audio.addEventListener("pause", () => { $("pp").textContent = "▶"; });
   audio.addEventListener("ended", tgMusicNext);
-  audio.addEventListener("error", () => { if (cur >= 0) $("npA").textContent = "could not play this file — try the next one"; });
+  audio.addEventListener("error", () => { if (cur >= 0) $("npA").textContent = "[[@js:could not play this file — try the next one]]"; });
   audio.addEventListener("timeupdate", () => {
     $("tCur").textContent = fmt(audio.currentTime); $("tDur").textContent = fmt(audio.duration);
     if (audio.duration && !seeking) $("seek").value = Math.round(audio.currentTime / audio.duration * 1000);
@@ -13322,7 +14114,8 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
 
     _music_my_dc = await _get_my_dc()
     book = 1 if book else 0
-    what = "Audiobooks" if book else "Music"
+    what = "Audiobooks" if book else "Music"              # the title: _layout puts it into words
+    what_t = _t("Audiobooks") if book else _t("Music")
     # Composite quality: MB-canonical hit + has cover + duration > 1min
     sort_clause = {
         "quality": (
@@ -13422,7 +14215,7 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     lang_chips_html = (
         f'<a class="btn ghost" href="/music{"?book=1" if book else ""}" style="' +
         ('background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);' if not lang else '') +
-        'padding:5px 12px;font-size:12px">all</a>' +
+        f'padding:5px 12px;font-size:12px">{_t("all")}</a>' +
         "".join(_music_lang_chip(r["lang"], r["n"]) for r in lang_dist if r["lang"] != 'unknown' and r["n"] > 0)
     )
 
@@ -13433,44 +14226,48 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips_html = (
-        _music_sort_chip("quality", "In order" if book else "★ Best") +
-        _music_sort_chip("recent",  "Recent") +
-        _music_sort_chip("longest", "Longest") +
-        _music_sort_chip("size",    "Largest") +
+        _music_sort_chip("quality", _t("In order") if book else "★ " + _t("Best")) +
+        _music_sort_chip("recent",  _t("Recent")) +
+        _music_sort_chip("longest", _t("Longest")) +
+        _music_sort_chip("size",    _t("Largest")) +
         '<span style="margin-left:10px"></span>' + _src_chips("/music", _music_qs, src, src_n) + _saved_chip("/music", _music_qs, local) +
         f'<a class="btn ghost" href="/music{_music_qs(fav=None if fav else 1)}" '
         f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
-        f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>')
+        f'padding:5px 12px;font-size:12px" title="{_t("only my favourites")}">♥ {_t("favourites")}</a>')
     # the other shelf: books that are listened to stand apart from songs
     shelf_chip = (f'<a class="btn ghost" href="/music{"" if book else "?book=1"}" style="padding:5px 12px;font-size:12px;margin-left:auto" '
-                  f'title="{"back to the songs" if book else "books that are listened to"}">'
-                  + ("🎵 Music" if book else f'🎧 Audiobooks <span style="opacity:.6">{books_n:,}</span>') + '</a>')
+                  f'title="{_t("back to the songs") if book else _t("books that are listened to")}">'
+                  + ("🎵 " + _t("Music") if book else f'🎧 {_t("Audiobooks")} <span style="opacity:.6">{books_n:,}</span>') + '</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">'
         + lang_chips_html + shelf_chip + '</div>'
         '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;align-items:center">'
-        '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>'
+        f'<span style="color:var(--muted);font-size:12px;margin-right:4px">{_t("Sort:")}</span>'
         + sort_chips_html + '</div>'
     )
 
     if not rows:
+        # (the link is put in after the sentence is translated: a blank is filled with text, not HTML)
+        why_empty = _t("A sound file stands here when it is an .m4b, when its name, title or album calls it an audiobook, or when it was fetched from the Audiobooks shelf of {usenet}.",
+                       usenet="%USENET%").replace("%USENET%", '<a href="/usenet?kind=audiobook">Usenet</a>')
         body = (
-            f'<h2 class="section">{what} <span class="count">0</span></h2>'
+            f'<h2 class="section">{what_t} <span class="count">0</span></h2>'
             f'{toolbar}'
             '<div class="empty-state">'
             f'<div class="icon">{"🎧" if book else "🎵"}</div>'
-            + ('<div>No audiobooks here yet.</div><div style="margin-top:8px;font-size:13px">A sound file stands here when it is an '
-               '.m4b, when its name, title or album calls it an audiobook, or when it was fetched from the Audiobooks shelf of '
-               '<a href="/usenet?kind=audiobook">Usenet</a>.</div>' if book and not (q or lang or local or fav) else
-               '<div>No audio matches these filters.</div>'
-               f'<div style="margin-top:8px;font-size:13px">{pending_n:,} audio indexed — click to fetch.</div>')
+            + (f'<div>{_t("No audiobooks here yet.")}</div><div style="margin-top:8px;font-size:13px">{why_empty}</div>'
+               if book and not (q or lang or local or fav) else
+               f'<div>{_t("No audio matches these filters.")}</div>'
+               f'<div style="margin-top:8px;font-size:13px">{_t("{n} audio indexed — click to fetch.", n=f"{pending_n:,}")}</div>')
             + '</div>'
         )
         return HTMLResponse(_layout(what, "/music", body))
 
+    untitled, tip_fav, tip_dl = i18n.t(_LANG.get(), "(untitled)"), _t("favourite"), _t("download this file")
+
     def _row(r):
-        title = r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or "(untitled)"
+        title = r["audio_canonical_title"] or r["audio_title"] or r["file_name"] or untitled
         artist = r["audio_performer"] or ""
         album = r["audio_album"] or (os.path.basename(os.path.dirname(r["local_path"] or "")) if book else "") or r["ch_title"] or ""
         sub = artist + ((" · " + album) if album else "") + \
@@ -13490,9 +14287,9 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
             f'<td class="num">{_fmt_size(r["file_size"])}</td>'
             f'<td class="num">{_fmt_time(r["posted_at"])[:10]}</td>'
             f'<td class="act">'
-            f'<button class="mbtn fav{" on" if r["fav"] else ""}" title="favourite" '
+            f'<button class="mbtn fav{" on" if r["fav"] else ""}" title="{tip_fav}" aria-label="{tip_fav}" '
             f'onclick="event.stopPropagation();tgFav(this.closest(\'tr\'))">♥</button>'
-            f'<a class="mbtn" title="download this file" href="/media/{r["id"]}" '
+            f'<a class="mbtn" title="{tip_dl}" aria-label="{tip_dl}" href="/media/{r["id"]}" '
             f'download="{html.escape(r["file_name"] or "", quote=True)}" '
             f'onclick="event.stopPropagation()">⬇</a>'
             f'</td>'
@@ -13501,18 +14298,18 @@ async def page_music(limit: int = 100, q: Optional[str] = None,
     rows_html = "".join(_row(r) for r in rows)
 
     body = (
-        f'<h2 class="section">{what} <span class="count">{len(rows)} of {total:,}</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
+        f'<h2 class="section">{what_t} <span class="count">{_t("{n} of {total}", n=len(rows), total=f"{total:,}")}</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{_t("{n} indexed (click to fetch)", n=f"{pending_n:,}")}</span>'
            if pending_n else '')
         + '</h2>'
         f'{toolbar}'
         '<table class="music-list">'
-        '<thead><tr><th style="width:40px"></th><th>title</th><th>duration</th><th>size</th>'
-        '<th>posted</th><th style="width:84px"></th></tr></thead>'
+        f'<thead><tr><th style="width:40px"></th><th>{_t("title")}</th><th>{_t("duration")}</th><th>{_t("size")}</th>'
+        f'<th>{_t("posted")}</th><th style="width:84px"></th></tr></thead>'
         f'<tbody>{rows_html}</tbody></table>'
         + _page_nav("/music", _music_qs, page_offset, page_size, len(rows), total)
         + ('<script>window.tgBook=1</script>' if book else '')
-        + _MUSIC_PLAYER_HTML
+        + _fill(_MUSIC_PLAYER_HTML)
     )
     return HTMLResponse(_layout(what, "/music", body))
 
@@ -13561,7 +14358,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     }.get(sort, "m.posted_at DESC NULLS LAST")
 
     where_parts = ["m.media_type = 'document'" + _pub_m(),
-                   "m.file_name ~* '\\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'"]
+                   _book_sql("m.file_name")]
     params = []
     if q:
         params.append(f"%{q}%")
@@ -13586,16 +14383,13 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
             f"SELECT count(*) FROM messages m WHERE {' AND '.join(where_parts)}", *params)
         src_n = await _src_counts(conn, "messages m", where_nosrc, params)
         pending_n = await conn.fetchval(
-            r"""SELECT count(*) FROM messages
-               WHERE media_type='document' AND local_path IS NULL
-                 AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'""")
+            "SELECT count(*) FROM messages m WHERE m.media_type='document' AND m.local_path IS NULL"
+            f" AND {_book_sql('m.file_name')}{_pub_m()}")
         # Language distribution chips
         lang_dist = await conn.fetch(
-            r"""SELECT COALESCE(detected_lang,'unknown') AS lang, count(*) AS n
-               FROM messages
-               WHERE media_type='document'
-                 AND file_name ~* '\.(pdf|epub|mobi|azw3?|djvu|fb2|cbr|cbz|lit|txt)$'
-               GROUP BY detected_lang ORDER BY count(*) DESC""")
+            "SELECT COALESCE(m.detected_lang,'unknown') AS lang, count(*) AS n FROM messages m"
+            f" WHERE m.media_type='document' AND {_book_sql('m.file_name')}{_pub_m()}"
+            " GROUP BY m.detected_lang ORDER BY count(*) DESC")
         rows = await conn.fetch(f"""
             SELECT m.id, m.file_name, m.file_size, m.mime_type, m.posted_at,
                    m.local_path, m.file_dc, m.detected_lang,
@@ -13610,17 +14404,19 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     def _ext(fn):
         return (fn or "").rsplit(".", 1)[-1].upper() if "." in (fn or "") else "DOC"
     def _ico(ext):
-        return {"PDF": "📄", "EPUB": "📘", "MOBI": "📕", "AZW3": "📕", "AZW": "📕",
-                "DJVU": "📃", "CBR": "📚", "CBZ": "📚", "FB2": "📖",
-                "TXT": "📝"}.get(ext, "📄")
+        return {"PDF": "📄", "EPUB": "📘", "MOBI": "📕", "AZW3": "📕", "AZW": "📕", "PRC": "📕",
+                "DJVU": "📃", "DJV": "📃", "CBR": "📚", "CBZ": "📚", "FB2": "📖", "CHM": "📖",
+                "TXT": "📝", "MD": "📝", "MARKDOWN": "📝", "RTF": "📝", "DOCX": "📝", "ODT": "📝", "HTML": "🌐", "HTM": "🌐",
+                "CSV": "📈", "TSV": "📈", "IPYNB": "📓",
+                "PPTX": "📊", "PPSX": "📊", "XLSX": "📈", "XLSM": "📈"}.get(ext, "📄")
 
-    if not rows:
+    if not rows and not (q or lang or fmt or local or src or offset):
         body = (
-            '<h2 class="section">Library <span class="count">0 cached</span></h2>'
+            f'<h2 class="section">{_t("Library")} <span class="count">{_t("{n} cached", n=0)}</span></h2>'
             '<div class="empty-state">'
             '<div class="icon">📚</div>'
-            '<div>No ebooks cached yet.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook indexed — click to fetch.</div>'
+            f'<div>{_t("No ebooks cached yet.")}</div>'
+            f'<div style="margin-top:8px;font-size:13px">{_t("{n} ebooks indexed — click to fetch.", n=f"{pending_n:,}")}</div>'
             '</div>'
         )
         return HTMLResponse(_layout("Library", "/library", body))
@@ -13648,7 +14444,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     lang_chips = (
         '<a class="btn ghost" href="/library" style="' +
         ('background:rgba(94,182,229,0.15);color:var(--accent-hi);border-color:var(--accent);' if not lang else '') +
-        'padding:5px 12px;font-size:12px">all</a>' +
+        f'padding:5px 12px;font-size:12px">{_t("all")}</a>' +
         "".join(_lang_chip(r["lang"], r["n"]) for r in lang_dist if r["lang"] != 'unknown' and r["n"] > 0)
     )
 
@@ -13659,30 +14455,30 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         return f'<a class="btn ghost" href="{href}" style="{bg}padding:5px 10px;font-size:12px">{label}</a>'
 
     sort_chips = (
-        _sort_chip("quality", "★ Best") +
-        _sort_chip("recent",  "Recent") +
-        _sort_chip("size",    "Largest") +
-        _sort_chip("title",   "Title") +
+        _sort_chip("quality", "★ " + _t("Best")) +
+        _sort_chip("recent",  _t("Recent")) +
+        _sort_chip("size",    _t("Largest")) +
+        _sort_chip("title",   _t("Title")) +
         '<span style="margin-left:10px"></span>' + _src_chips("/library", _qs, src, src_n) + _saved_chip("/library", _qs, local) +
         '<a class="btn ghost" href="/music?book=1" style="padding:5px 12px;font-size:12px;margin-left:auto" '
-        'title="books that are listened to">🎧 Audiobooks</a>')
+        f'title="{_t("books that are listened to")}">🎧 {_t("Audiobooks")}</a>')
 
     toolbar = (
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">' +
         lang_chips + '</div>'
-        '<div style="display:flex;gap:6px;margin-bottom:18px;align-items:center">'
-        '<span style="color:var(--muted);font-size:12px;margin-right:4px">Sort:</span>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px;align-items:center">'
+        f'<span style="color:var(--muted);font-size:12px;margin-right:4px">{_t("Sort:")}</span>' +
         sort_chips + '</div>'
     )
 
     if not rows:
         body = (
-            f'<h2 class="section">Library <span class="count">0</span></h2>'
+            f'<h2 class="section">{_t("Library")} <span class="count">0</span></h2>'
             f'{toolbar}'
             '<div class="empty-state">'
             '<div class="icon">📚</div>'
-            '<div>No ebooks match these filters.</div>'
-            f'<div style="margin-top:8px;font-size:13px">{pending_n:,} ebook indexed — click to fetch.</div>'
+            f'<div>{_t("No ebooks match these filters.")}</div>'
+            f'<div style="margin-top:8px;font-size:13px">{_t("{n} ebooks indexed — click to fetch.", n=f"{pending_n:,}")}</div>'
             '</div>'
         )
         return HTMLResponse(_layout("Library", "/library", body))
@@ -13697,10 +14493,10 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         f'<div class="book-card">'
         + (f'<img class="book-cover" src="/ebook-cover/{r["id"]}" alt="" '
            f'onerror="this.outerHTML=\'<div class=&quot;book-ico&quot;>{_ico(_ext(r["file_name"]))}</div>\'" />'
-           if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]) in ("EPUB","MOBI","AZW","AZW3")
+           if r["local_path"] and not r["local_path"].startswith("__") and _ext(r["file_name"]).lower() in _COVER_KINDS
            else f'<div class="book-ico">{_ico(_ext(r["file_name"]))}</div>')
         + f'<div class="book-body">'
-        f'<div class="book-title">{html.escape(r["file_name"] or "(untitled)")}</div>'
+        f'<div class="book-title">{html.escape(r["file_name"]) if r["file_name"] else _t("(untitled)")}</div>'
         f'<div class="book-meta">'
         f'{_dc_badge(r.get("file_dc"), _lib_my_dc)}'
         f'{_lang_badge(r.get("detected_lang"))}'
@@ -13711,16 +14507,16 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         f'</div>'
         f'</div>'
         f'<div class="book-actions">'
-        f'<a class="btn" href="/watch/{r["id"]}">Open</a>'
-        f'<a class="btn ghost" href="/media/{r["id"]}" download="{html.escape(r["file_name"] or "")}">Download</a>'
+        f'<a class="btn" href="/watch/{r["id"]}">{_t("Open")}</a>'
+        f'<a class="btn ghost" href="/media/{r["id"]}" download="{html.escape(r["file_name"] or "")}">{_t("Download")}</a>'
         f'</div>'
         f'</div>'
         for r in rows
     )
 
     body = (
-        f'<h2 class="section">Library <span class="count">{len(rows)} of {total:,}</span>'
-        + (f' · <span style="color:var(--muted);font-size:13px">{pending_n:,} indexed (click to fetch)</span>'
+        f'<h2 class="section">{_t("Library")} <span class="count">{_t("{n} of {total}", n=len(rows), total=f"{total:,}")}</span>'
+        + (f' · <span style="color:var(--muted);font-size:13px">{_t("{n} indexed (click to fetch)", n=f"{pending_n:,}")}</span>'
            if pending_n else '')
         + '</h2>'
         f'{toolbar}'
@@ -13819,32 +14615,34 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
     _nsfw_on = await _is_nsfw_enabled()
 
     def _vc(label, href, on, tip=""):
-        return _chip_link(label, "/videos" + href, on, tip)
+        # (_chip_link escapes its tooltip itself: it is handed the plain word)
+        return _chip_link(label, "/videos" + href, on, html.unescape(tip))
     toolbar = (
         '<div class="bar-tools" style="margin-bottom:18px">'
         + ((_vc("SFW", _qs(aud=None if _aud0 == "sfw" else "sfw", offset=None), aud == "sfw")
             + _vc("18+", _qs(aud=None if _aud0 == "nsfw" else "nsfw", offset=None), aud == "nsfw")
-            + _vc("both", _qs(aud=None if _aud0 == "any" else "any", offset=None), aud == "any")
+            + _vc(_t("both"), _qs(aud=None if _aud0 == "any" else "any", offset=None), aud == "any")
             + '<span class="sep"></span>') if _nsfw_on else '')
-        + '<span class="lbl">Size:</span>'
-        + _vc("any", _qs(min_mb=0, offset=None), min_mb <= 0)
-        + _vc("50 MB+", _qs(min_mb=None, offset=None), min_mb == 50, "leaves out clips")
-        + _vc("300 MB+", _qs(min_mb=300, offset=None), min_mb == 300, "film-sized")
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _vc("newest", _qs(sort=None, offset=None), sort != "size")
-        + _vc("largest", _qs(sort="size", offset=None), sort == "size")
+        + f'<span class="lbl">{_t("Size:")}</span>'
+        + _vc(_t("any"), _qs(min_mb=0, offset=None), min_mb <= 0)
+        + _vc("50 MB+", _qs(min_mb=None, offset=None), min_mb == 50, _t("leaves out clips"))
+        + _vc("300 MB+", _qs(min_mb=300, offset=None), min_mb == 300, _t("film-sized"))
+        + f'<span class="sep"></span><span class="lbl">{_t("Sort:")}</span>'
+        + _vc(_t("newest"), _qs(sort=None, offset=None), sort != "size")
+        + _vc(_t("largest"), _qs(sort="size", offset=None), sort == "size")
         + '<span class="sep"></span>'
         + _src_chips("/videos", _qs, src, src_n) + _saved_chip("/videos", _qs, local)
         + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1, offset=None)}" '
           f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
-          f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>'
+          f'padding:5px 12px;font-size:12px" title="{_t("only my favourites")}">♥ {_t("favourites")}</a>'
         + '</div>' + _FAV_CARD_JS + _THUMB_RETRY_JS)
 
     def _card(r):
+        # (the card escapes its title: it is handed the plain words)
         title = (r["canonical_title"] or r["movie_title"] or r["series_title"]
-                 or r["file_name"] or (r["caption"] or "")[:80] or f"video {r['id']}")
+                 or r["file_name"] or (r["caption"] or "")[:80] or html.unescape(_t("video {n}", n=r["id"])))
         if r["rel_part"]:
-            title += f" — part {r['rel_part']}"
+            title = html.unescape(_t("{title} — part {n}", title=title, n=r["rel_part"]))
         ch = r["ch_title"] or r["ch_user"] or ""
         date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
         return _media_card(
@@ -13859,13 +14657,13 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         grid_html = '<div class="mc-grid wide">' + ''.join(_card(r) for r in rows) + '</div>'
     else:
         grid_html = ('<div class="empty-state"><div class="icon">🎬</div>'
-                     '<div>No video matches.</div></div>')
+                     f'<div>{_t("No video matches.")}</div></div>')
     _note = []
     if q:
-        _note.append(f'matching “{html.escape(q)}”')
+        _note.append(_t("matching “{q}”", q=q))
     body = (
         f'{_LIST_CSS}'
-        f'<h2 class="section">Videos <span class="count">{total:,}</span>'
+        f'<h2 class="section">{_t("Videos")} <span class="count">{total:,}</span>'
         f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
         f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
         f'{toolbar}{grid_html}'
@@ -13889,10 +14687,10 @@ def _dc_badge(file_dc, my_dc) -> str:
     """Tiny DC indicator: 🟢 same DC (fast), 🟡 cross-DC (may hit FloodWait),
     ⚪ unknown (file_dc not yet recorded — backfills on first click)."""
     if not file_dc:
-        return '<span class="pill muted" title="DC unknown — backfills on first click" style="font-size:11px">⚪</span>'
+        return f'<span class="pill muted" title="{_t("data centre unknown: found out on the first click")}" style="font-size:11px">⚪</span>'
     if not my_dc or file_dc == my_dc:
-        return f'<span class="pill ok" title="same DC {file_dc} — fast" style="font-size:11px">🟢 DC{file_dc}</span>'
-    return f'<span class="pill warn" title="cross-DC ({file_dc} vs your {my_dc}) — may hit FloodWait" style="font-size:11px">🟡 DC{file_dc}</span>'
+        return f'<span class="pill ok" title="{_t("same data centre ({dc}): fast", dc=file_dc)}" style="font-size:11px">🟢 DC{file_dc}</span>'
+    return f'<span class="pill warn" title="{_t("another data centre ({dc}, yours is {mine}): Telegram may make it wait", dc=file_dc, mine=my_dc)}" style="font-size:11px">🟡 DC{file_dc}</span>'
 
 
 def _part_pill(r) -> str:
@@ -13928,8 +14726,8 @@ def _dc_mark(file_dc, my_dc) -> str:
     if not file_dc:
         return ""
     same = bool(my_dc and file_dc == my_dc)
-    tip = ("on your Telegram data center: the fast path" if same else
-           "on another Telegram data center: it works, a little slower to start")
+    tip = (_t("on your Telegram data center: the fast path") if same else
+           _t("on another Telegram data center: it works, a little slower to start"))
     return f'<span class="dc{" same" if same else ""}" title="{tip}">DC{file_dc}</span>'
 
 
@@ -13937,7 +14735,8 @@ def _fmt_dur_short(sec) -> str:
     if not sec:
         return ""
     sec = int(sec)
-    return f"{sec // 3600}h {sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60} min"
+    return (_t("{h}h {m}m", h=sec // 3600, m=f"{sec % 3600 // 60:02d}") if sec >= 3600
+            else _t("{n} min", n=sec // 60))
 
 
 def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=None,
@@ -13951,26 +14750,31 @@ def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=No
     if quality:
         badges += f'<span class="bq">{html.escape(quality)}</span>'
     if saved:
-        badges += '<span class="bs" title="already downloaded: opens instantly">● saved</span>'
+        badges += f'<span class="bs" title="{_t("already downloaded: opens instantly")}">● {_t("saved")}</span>'
     if part:
-        badges += f'<span class="bp" title="this film was posted in several parts">part {int(part)}</span>'
+        badges += (f'<span class="bp" title="{_t("this film was posted in several parts")}">'
+                   f'{_t("part {n}", n=int(part))}</span>')
     more = ""
     if work and versions and versions > 1:
         more = (f'<a class="bv" href="/releases?work={_q(work)}" '
-                f'title="other copies of this title: other resolutions or uploads">{versions} versions</a>')
+                f'title="{_t("other copies of this title: other resolutions or uploads")}">'
+                f'{_t("{n} versions", n=versions)}</a>')
     meta = [x for x in (_fmt_size(size), _fmt_dur_short(duration)) if x]
-    acts = f'<a class="b pri" href="{watch}">▶ Play</a>'
+    acts = f'<a class="b pri" href="{watch}">▶ {_t("Play")}</a>'
     if not _signed_in():
         fav = None                        # favourites and grabs belong to the account
     if guid and _signed_in():
         acts += (f'<button class="b grab-btn" data-guid="{guid}" onclick="tgGrab(this)" '
-                 f'title="save it to the download folder (the one Sonarr/Radarr read)">⬇ Grab</button>')
+                 f'title="{_t("save it to the download folder (the one Sonarr/Radarr read)")}">⬇ {_t("Grab")}</button>')
     elif _signed_in() or saved:
         # signed out, only a file that is already on this machine can be handed over
-        acts += (f'<a class="b sq" href="/media/{msg_id}" download title="download to this device">⬇</a>')
+        acts += (f'<a class="b sq" href="/media/{msg_id}" download title="{_t("download to this device")}">⬇</a>')
     if fav is not None:
+        # (both tooltips ride on the button: the script that flips the heart is one text for
+        #  every language, and takes its words from here)
+        _on, _off = _t("in your favourites"), _t("add to favourites")
         acts += (f'<button class="b sq{" on" if fav else ""}" onclick="tgFavCard(this,{msg_id})" '
-                 f'title="{"in your favourites" if fav else "add to favourites"}">♥</button>')
+                 f'data-on="{_on}" data-off="{_off}" title="{_on if fav else _off}">♥</button>')
     return (
         f'<div class="mc{" wide" if wide else ""}">'
         f'<a class="mc-img" href="{watch}"><span class="fb">{fallback}</span>{img_html}'
@@ -14001,7 +14805,7 @@ _THUMB_RETRY_JS = (
 
 _FAV_CARD_JS = ('<script>function tgFavCard(b,id){fetch("/api/fav/"+id,{method:"POST"}).then(r=>r.json())'
                 '.then(j=>{if(j.fav===undefined)return;b.classList.toggle("on",j.fav);'
-                'b.title=j.fav?"in your favourites":"add to favourites"})}</script>')
+                'b.title=j.fav?(b.dataset.on||"in your favourites"):(b.dataset.off||"add to favourites")})}</script>')
 
 
 def _release_card(r, my_dc=None) -> str:
@@ -14013,7 +14817,7 @@ def _release_card(r, my_dc=None) -> str:
     if _rk(r, "movie_year"):
         bits.append(str(r["movie_year"]))
     if not bits and r["posted_at"]:
-        bits.append("posted " + _fmt_time(r["posted_at"])[:10])
+        bits.append(html.unescape(_t("posted {date}", date=_fmt_time(r["posted_at"])[:10])))   # (the card escapes it)
     pmid = r["primary_msg_id"]
     return _media_card(
         msg_id=pmid, title=title, sub=" · ".join(bits),
@@ -14161,25 +14965,25 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     list_active = "active" if view == "list" else ""
     toolbar = (
         f'<div style="display:flex;gap:10px;margin-bottom:22px;align-items:center;flex-wrap:wrap">'
-        f'{_chip("","all")}{_chip("movie","🎬 films")}{_chip("tv","📺 episodes")}'
+        f'{_chip("", _t("all"))}{_chip("movie", "🎬 " + _t("films"))}{_chip("tv", "📺 " + _t("episodes"))}'
         + (f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
-           f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","18+")}{_aud_chip("any","both")}'
+           f'{_aud_chip("sfw","SFW")}{_aud_chip("nsfw","18+")}{_aud_chip("any", _t("both"))}'
            if _nsfw_on else '')
         + f'<span style="width:1px;height:22px;background:var(--border);margin:0 4px"></span>'
-        f'<span style="font-size:12px;color:var(--muted)">Sort:</span>'
-        + "".join(_chip_link(lbl, "/releases" + _qs(sort=None if k == "best" else k, offset=None), sort == k, tip)
-                  for k, lbl, tip in (("best", "best", "known titles and good copies first"),
-                                      ("new", "newest", "most recently posted"),
-                                      ("size", "largest", ""), ("name", "name", "")))
+        f'<span style="font-size:12px;color:var(--muted)">{_t("Sort:")}</span>'
+        + "".join(_chip_link(lbl, "/releases" + _qs(sort=None if k == "best" else k, offset=None), sort == k, html.unescape(tip))   # (the chip escapes it)
+                  for k, lbl, tip in (("best", _t("best"), _t("known titles and good copies first")),
+                                      ("new", _t("newest"), _t("most recently posted")),
+                                      ("size", _t("largest"), ""), ("name", _t("name"), "")))
         + f'<div style="margin-left:auto" class="view-toggle">'
-        f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ Grid</a>'
-        f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ List</a>'
+        f'<a class="{grid_active}" href="/releases{_qs(view=None)}">▦ {_t("Grid")}</a>'
+        f'<a class="{list_active}" href="/releases{_qs(view="list")}">☰ {_t("List")}</a>'
         f'</div></div>'
     )
 
     if not rows:
         body_html = ('<div class="empty-state"><div class="icon">🎬</div>'
-                    '<div>No releases match this filter.</div></div>')
+                    f'<div>{_t("No releases match this filter.")}</div></div>')
     elif view == "list":
         def _row_thumb(url, pmid=None):
             if not url and pmid:
@@ -14199,7 +15003,7 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
             f'{(html.escape(r["canonical_title"]) + "<br>") if r["canonical_title"] and r["canonical_title"] != r["name"] else ""}'
             f'<span style="color:var(--muted);font-weight:400;font-size:13px">{html.escape(r["name"])}</span>'
             f'</td>'
-            f'<td><span class="pill {"accent" if r["category"]=="movie" else "ok" if r["category"]=="tv" else "muted"}">{r["category"]}</span></td>'
+            f'<td><span class="pill {"accent" if r["category"]=="movie" else "ok" if r["category"]=="tv" else "muted"}">{_t(str(r["category"]))}</span></td>'
             f'<td>{("S%02dE%02d" % (r["season"], r["episode"])) if r["season"] and r["episode"] else ""}</td>'
             f'<td>{r["quality"] or ""}</td>'
             f'<td class="num">{_fmt_size(r["size_bytes"])}</td>'
@@ -14208,8 +15012,8 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
             for r in rows
         )
         body_html = (f'<table><thead><tr>'
-                    f'<th></th><th>name</th><th>cat</th><th>S/E</th><th>quality</th>'
-                    f'<th>size</th><th>posted</th>'
+                    f'<th></th><th>{_t("name")}</th><th>{_t("cat")}</th><th>S/E</th><th>{_t("quality")}</th>'
+                    f'<th>{_t("size")}</th><th>{_t("posted")}</th>'
                     f'</tr></thead><tbody>{body_rows}</tbody></table>')
     else:
         body_html = (f'<div class="poster-grid">'
@@ -14232,32 +15036,32 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
     next_offset = page_offset + page_size
     nav_links = []
     if page_offset > 0:
-        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=prev_offset if prev_offset else None)}">← prev</a>')
+        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=prev_offset if prev_offset else None)}">← {_t("Prev")}</a>')
     if next_offset < (total_matched or 0):
-        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=next_offset)}">next →</a>')
+        nav_links.append(f'<a class="btn ghost" href="/releases{_qs(offset=next_offset)}">{_t("Next")} →</a>')
     pagination_html = (
         f'<div style="display:flex;justify-content:space-between;align-items:center;'
         f'margin-top:18px;padding:12px 0;border-top:1px solid var(--border, #e2e8f0)">'
         f'<span style="color:var(--muted, #64748b);font-size:13px">'
-        f'showing {start_idx}–{end_idx} of {total_matched:,}</span>'
+        f'{_t("showing {a}–{b} of {total}", a=start_idx, b=end_idx, total=f"{total_matched:,}")}</span>'
         f'<div style="display:flex;gap:8px">{"".join(nav_links)}</div>'
         f'</div>')
-    _what = ("Versions of this title" if work else
-             {"movie": "Films", "tv": "Episodes"}.get(cat or "", "Films and episodes"))
+    _what = (_t("Versions of this title") if work else
+             {"movie": _t("Films"), "tv": _t("Episodes")}.get(cat or "", _t("Films and episodes")))
     _note = []
     if q:
-        _note.append(f'matching “{html.escape(q)}”')
+        _note.append(_t("matching “{q}”", q=q))
     if min_mb > 0 and not work:
-        _note.append(f'{min_mb} MB and larger · <a href="/releases{_qs(min_mb=0, offset=None)}">show smaller too</a>')
+        _note.append(f'{_t("{n} MB and larger", n=min_mb)} · <a href="/releases{_qs(min_mb=0, offset=None)}">{_t("show smaller too")}</a>')
     if work:
-        _note.append('<a href="/releases">← all releases</a>')
+        _note.append(f'<a href="/releases">← {_t("all releases")}</a>')
     body = (f'{_THUMB_RETRY_JS}<h2 class="section">{_what} '
            f'<span class="count">{total_matched:,}</span>'
            f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
            f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
            f'{toolbar}{body_html}{pagination_html}')
     actions = (f'<form action="/releases" method="GET" style="margin-left:auto">'
-              f'<input type="text" name="q" class="search" placeholder="filter…" '
+              f'<input type="text" name="q" class="search" placeholder="{_t("filter…")}" '
               f'value="{html.escape(q) if q else ""}" /></form>')
     return HTMLResponse(_layout("Releases", "/releases", body, top_actions_html=actions))
 
@@ -14265,6 +15069,16 @@ async def page_releases(q: Optional[str] = None, cat: Optional[str] = None,
 # ════════════════════════════════════════════════════════════════════
 # Page: Downloads (queue + history)
 # ════════════════════════════════════════════════════════════════════
+def _dl_html(sentence: str, *tags) -> str:
+    """A translated sentence with a link, bold words or a control inside it. The sentence is
+    one text in the catalogue, with blanks where the tags go; the blanks are filled with
+    chr(1), chr(2) ... when the word is looked up (so that the tags are not escaped with the
+    words around them), and those are replaced here by the tags, in that order."""
+    for i, tag in enumerate(tags, 1):
+        sentence = sentence.replace(chr(i), tag)
+    return sentence
+
+
 async def _archive_activity() -> tuple:
     """(html, how many are under way): everything tgarr is fetching or has fetched from the
     Internet Archive, whoever asked - the Get button or Radarr - newest first, the ones under
@@ -14306,32 +15120,35 @@ async def _archive_activity() -> tuple:
         if r["pct"] is not None:
             bar = (f'<div style="height:6px;border-radius:999px;background:var(--border);overflow:hidden;margin-top:8px;max-width:520px">'
                    f'<div style="height:100%;width:{r["pct"]}%;background:var(--accent)"></div></div>'
-                   f'<div style="font-size:12px;color:var(--muted);margin-top:4px">{r["pct"]}%'
-                   + (f' of {_fmt_size(r["size"])}' if r["size"] else "")
+                   f'<div style="font-size:12px;color:var(--muted);margin-top:4px">'
+                   + (_t("{pct}% of {size}", pct=r["pct"], size=_fmt_size(r["size"])) if r["size"] else f'{r["pct"]}%')
                    + (f' · {r["speed"] / 1024:.1f} MB/s' if r["speed"] >= 1024 else f' · {r["speed"]} kB/s' if r["speed"] else "") + '</div>')
         note = f'<div style="font-size:12.5px;color:#b45309;margin-top:4px">{html.escape(r["note"])}</div>' if r["note"] else ""
         return (
             f'<div class="dl-item"><div class="icon">{r["sign"]}</div><div class="info">'
             f'<div class="name">{html.escape(r["name"])}</div><div class="meta">'
-            f'<span class="pill {"bad" if r["bad"] else "accent" if r["busy"] else "ok"}">{r["state"]}</span>'
-            f'<span class="pill muted" title="who asked for it">{r["who"]}</span>'
+            # (the state is put into the reader's language here, where it is shown; what is
+            #  stored and compared stays as it is)
+            f'<span class="pill {"bad" if r["bad"] else "accent" if r["busy"] else "ok"}">{_t(r["state"])}</span>'
+            f'<span class="pill muted" title="{_t("who asked for it")}">{_t(r["who"])}</span>'
             + (f'<span>· {_fmt_size(r["size"])}</span>' if r["size"] and r["pct"] is None else "")
-            + (f'<span>· {r["files"]} files</span>' if r["files"] > 1 else "")
-            + f'<span>· asked {_ago(r["at"])}</span>'
+            + (f'<span>· {_t("{n} files", n=r["files"])}</span>' if r["files"] > 1 else "")
+            + f'<span>· {_t("asked {when}", when=_ago(r["at"]))}</span>'
             + f'<span>· <a href="https://archive.org/details/{html.escape(r["item"], quote=True)}" target="_blank" rel="noopener noreferrer">archive.org ↗</a></span>'
             + f'</div>{bar}{note}</div><div class="right">'
-            + (f'<a class="dl-btn" href="{r["open"]}">Open</a>' if r["open"] else "")
+            + (f'<a class="dl-btn" href="{r["open"]}">{_t("Open")}</a>' if r["open"] else "")
             + (f'<div class="dl-time">{_fmt_time(r["done"])}</div>' if r["done"] and not r["busy"] else "")
             + '</div></div>')
     under = [r for r in rows if r["busy"]]
     past = [r for r in rows if not r["busy"]]
-    out = (f'<h2 class="section">Under way <span class="count">{len(under)}</span></h2>'
+    out = (f'<h2 class="section">{_t("Under way")} <span class="count">{len(under)}</span></h2>'
            + (f'<div class="dl-list">{"".join(one(r) for r in under)}</div>' if under else
-              '<div style="color:var(--muted);margin-bottom:22px">Nothing is being fetched from the Internet Archive right now. '
-              'Find something on the <a href="/archive">Archive</a> page and press Get - or let Radarr ask.</div>')
-           + f'<h2 class="section">Arrived, or not <span class="count">last {len(past)}</span></h2>'
+              '<div style="color:var(--muted);margin-bottom:22px">'
+              + _dl_html(_t("Nothing is being fetched from the Internet Archive right now. Find something on the {a}Archive{b} page and press Get - or let Radarr ask.", a="\x01", b="\x02"),
+                         '<a href="/archive">', '</a>') + '</div>')
+           + f'<h2 class="section">{_t("Arrived, or not")} <span class="count">{_t("last {n}", n=len(past))}</span></h2>'
            + (f'<div class="dl-list">{"".join(one(r) for r in past)}</div>' if past else
-              '<div style="color:var(--muted)">Nothing yet.</div>'))
+              f'<div style="color:var(--muted)">{_t("Nothing yet.")}</div>'))
     return out, busy
 
 
@@ -14395,48 +15212,48 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
         def cnt(n):
             return f' <span style="opacity:.6">{n:,}</span>'
         chips = (
-            chip("all", _dqs(kind=None, offset=None), not kind, cnt(all_n))
-            + chip("🎬 films", _dqs(kind="video", offset=None), kind == "video", cnt(kinds.get("video", 0)))
-            + chip("🎵 songs", _dqs(kind="audio", offset=None), kind == "audio", cnt(kinds.get("audio", 0)))
-            + chip("📄 books", _dqs(kind="book", offset=None), kind == "book", cnt(kinds.get("library", 0)))
+            chip(_t("all"), _dqs(kind=None, offset=None), not kind, cnt(all_n))
+            + chip("🎬 " + _t("films"), _dqs(kind="video", offset=None), kind == "video", cnt(kinds.get("video", 0)))
+            + chip("🎵 " + _t("songs"), _dqs(kind="audio", offset=None), kind == "audio", cnt(kinds.get("audio", 0)))
+            + chip("📄 " + _t("books"), _dqs(kind="book", offset=None), kind == "book", cnt(kinds.get("library", 0)))
             + '<span style="margin-left:8px"></span>'
-            + chip("♥ favourites", _dqs(fav=None if fav else 1, offset=None), bool(fav))
-            + '<span style="margin-left:14px;color:var(--muted);font-size:12px">Sort:</span>'
-            + chip("last opened", _dqs(sort=None, offset=None), sort == "recent")
-            + chip("oldest", _dqs(sort="oldest", offset=None), sort == "oldest")
-            + chip("largest", _dqs(sort="size", offset=None), sort == "size")
-            + chip("name", _dqs(sort="name", offset=None), sort == "name"))
+            + chip("♥ " + _t("favourites"), _dqs(fav=None if fav else 1, offset=None), bool(fav))
+            + f'<span style="margin-left:14px;color:var(--muted);font-size:12px">{_t("Sort:")}</span>'
+            + chip(_t("last opened"), _dqs(sort=None, offset=None), sort == "recent")
+            + chip(_t("oldest"), _dqs(sort="oldest", offset=None), sort == "oldest")
+            + chip(_t("largest"), _dqs(sort="size", offset=None), sort == "size")
+            + chip(_t("name"), _dqs(sort="name", offset=None), sort == "name"))
         search = (
             '<form method="GET" action="/downloads" style="display:flex;gap:8px;margin:0 0 12px">'
             + "".join(f'<input type="hidden" name="{k}" value="{html.escape(str(v), quote=True)}"/>'
                       for k, v in (("kind", kind), ("sort", sort if sort != "recent" else None),
                                    ("fav", 1 if fav else None)) if v)
             + f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-              'placeholder="find a saved file by name…" style="flex:1;max-width:420px"/>'
-              '<button class="btn" type="submit">Search</button>'
-            + (f'<a class="btn ghost" href="/downloads{_dqs(q=None, offset=None)}">clear</a>' if q else '')
+              f'placeholder="{_t("find a saved file by name…")}" style="flex:1;max-width:420px"/>'
+              f'<button class="btn" type="submit">{_t("Search")}</button>'
+            + (f'<a class="btn ghost" href="/downloads{_dqs(q=None, offset=None)}">{_t("clear")}</a>' if q else '')
             + '</form>')
-        head = (f'<h2 class="section">Saved from players <span class="count">{saved["total"]:,}</span>'
+        head = (f'<h2 class="section">{_t("Saved from players")} <span class="count">{saved["total"]:,}</span>'
                 f'<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;'
                 f'text-transform:none;letter-spacing:0;margin-left:10px">'
                 f'{_fmt_size(saved["bytes"]) or "0 MB"}'
-                + ('' if ro else ' · <a href="/settings#cache">clean-up rules</a>'
-                   ' · <a href="/exports">download many at once</a>') + '</span></h2>'
+                + ('' if ro else f' · <a href="/settings#cache">{_t("clean-up rules")}</a>'
+                   f' · <a href="/exports">{_t("Download many at once")}</a>') + '</span></h2>'
                 f'{search}'
                 f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center">{chips}</div>')
         if not saved["rows"]:
             return head + ('<div class="empty-state"><div class="icon">💾</div><div>'
-                           + ("Nothing saved matches." if (q or kind or fav or page_offset) else
-                              "Films, songs and books you open are kept here so they open "
-                              "instantly next time.") + '</div></div>')
+                           + (_t("Nothing saved matches.") if (q or kind or fav or page_offset) else
+                              _t("Films, songs and books you open are kept here so they open instantly next time."))
+                           + '</div></div>')
         ico = {"video": "🎬", "audio": "🎵"}
         trs = []
         for r, have in zip(saved["rows"], saved["have"]):
             total = r["file_size"] or 0
             if have is None:
-                state = '<span class="pill bad" title="the file is no longer on disk">missing</span>'
+                state = f'<span class="pill bad" title="{_t("the file is no longer on disk")}">{_t("missing")}</span>'
             elif total and have < total:
-                state = (f'<span class="pill warn" title="not all of it has arrived">'
+                state = (f'<span class="pill warn" title="{_t("not all of it has arrived")}">'
                          f'{have * 100 // total}%</span>')
             else:
                 state = ""
@@ -14451,10 +15268,10 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<td class="num">{_fmt_time(r["used"]) if r["used"] else ""}</td>'
                 f'<td class="ac"><div class="dl-ctrls">'
                 f'<a class="dl-btn sq" href="/media/{r["id"]}" download '
-                f'title="download to this device">⬇</a>'
+                f'title="{_t("download to this device")}">⬇</a>'
                 + ('' if ro else
                    f'<button class="dl-btn bad sq" onclick="fetchRemove({r["id"]})" '
-                   f'title="remove from the server">✗</button>') + '</div></td></tr>')
+                   f'title="{_t("remove from the server")}">✗</button>') + '</div></td></tr>')
         table = (
             '<style>.sv-list{width:100%;border-collapse:collapse;background:var(--surface);'
             'border:1px solid var(--border);border-radius:10px;overflow:hidden}'
@@ -14477,21 +15294,24 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             '.sv-list td.ac{grid-column:3;grid-row:1 / span 2}.sv-list .dl-ctrls{flex-wrap:nowrap}}</style>'
             + ('' if ro else
                '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;font-size:13px">'
-               '<label style="cursor:pointer"><input type="checkbox" id="svAll"/> select this page</label>'
-               '<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ Remove selected</button>'
+               f'<label style="cursor:pointer"><input type="checkbox" id="svAll"/> {_t("select this page")}</label>'
+               f'<button class="dl-btn bad" id="svRm" disabled onclick="svRemove()" style="min-width:150px">✗ {_t("Remove selected")}</button>'
                '<span id="svN" style="color:var(--muted)"></span></div>')
-            + '<table class="sv-list"><thead><tr><th></th><th></th><th>name</th><th>size</th>'
-            '<th>last opened</th><th></th></tr></thead>'
+            + f'<table class="sv-list"><thead><tr><th></th><th></th><th>{_t("name")}</th><th>{_t("size")}</th>'
+            f'<th>{_t("last opened")}</th><th></th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table>'
             + _page_nav("/downloads", _dqs, page_offset, page_size, len(saved["rows"]), saved["total"])
+            # (%1 in a sentence of the script is where the script puts the number)
             + ('' if ro else '<script>(function(){const all=document.getElementById("svAll"),rm=document.getElementById("svRm"),'
               'n=document.getElementById("svN");const boxes=()=>[...document.querySelectorAll(".sv")];'
-              'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;n.textContent=c?c+" selected":""}'
+              'function upd(){const c=boxes().filter(b=>b.checked).length;rm.disabled=!c;'
+              'n.textContent=c?"' + _tj("%1 selected") + '".replace("%1",c):""}'
               'all.onchange=()=>{boxes().forEach(b=>b.checked=all.checked);upd()};'
               'boxes().forEach(b=>b.onchange=upd);'
               'window.svRemove=function(){const ids=boxes().filter(b=>b.checked).map(b=>+b.closest("tr").dataset.id);'
-              'if(!ids.length||!confirm("Remove "+ids.length+" file(s) from the server? They stay in the index '
-              'and can be fetched again."))return;'
+              'if(!ids.length||!confirm("'
+              + _tj("Remove the selected files (%1) from the server? They stay in the index and can be fetched again.")
+              + '".replace("%1",ids.length)))return;'
               'fetch("/api/fetch/remove",{method:"POST",headers:{"Content-Type":"application/json"},'
               'body:JSON.stringify({ids:ids})}).then(()=>location.reload())}})()</script>'))
         return head + table
@@ -14500,8 +15320,9 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                  '.then(()=>location.reload())}'
                  'function fetchAct(id,a){fetch("/api/fetch/"+id+"/"+a,{method:"POST"})'
                  '.then(()=>setTimeout(()=>location.reload(),600))}'
-                 'function fetchRemove(id){if(confirm("Remove this file from the server? '
-                 'It stays in the index and can be fetched again."))fetchCancel(id)}</script>')
+                 'function fetchRemove(id){if(confirm("'
+                 + _tj("Remove this file from the server? It stays in the index and can be fetched again.")
+                 + '"))fetchCancel(id)}</script>')
 
     def _render_fetches():
         if not fetches:
@@ -14516,19 +15337,20 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 "stopped": ("stopped — nobody is watching", "muted", "⏸"),
                 "paused": ("paused", "muted", "⏸"),
             }[it["state"]]
+            label = _t(label)
             if it.get("pinned") and it["state"] in ("queued", "fetching"):
-                label += " · will finish on its own"
+                label += " · " + _t("will finish on its own")
             if it["state"] in ("queued", "fetching"):
                 act = (f'<button class="dl-btn" onclick="fetchAct({r["id"]},\'pause\')" '
-                       f'title="stop for now and keep what has arrived">⏸ Pause</button>')
+                       f'title="{_t("stop for now and keep what has arrived")}">⏸ {_t("Pause")}</button>')
             else:
                 act = (f'<button class="dl-btn ok" onclick="fetchAct({r["id"]},\'resume\')" '
-                       f'title="fetch the rest, even with no player open">▶ Resume</button>')
+                       f'title="{_t("fetch the rest, even with no player open")}">▶ {_t("Resume")}</button>')
             dc = _dc_badge(r["file_dc"], _my_dc) if r["file_dc"] else ""
             items.append(
                 f'<div class="dl-item"><div class="icon">{icon}</div><div class="info">'
                 f'<div class="name"><a href="/watch/{r["id"]}" style="color:inherit;text-decoration:none">'
-                f'{html.escape(r["file_name"] or "(no name)")}</a></div>'
+                f'{html.escape(r["file_name"]) if r["file_name"] else _t("(no name)")}</a></div>'
                 f'<div class="meta"><span class="pill {cls}">{label}</span>{dc}'
                 f'<span>· {_fmt_size(total)}</span></div>'
                 f'<div class="dl-progress"><div class="dl-progress-bar"><div class="dl-progress-fill" '
@@ -14536,20 +15358,18 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<div class="dl-progress-meta">{pct:.1f}% · {_fmt_size(have) or "0"} / {_fmt_size(total)}</div></div>'
                 f'</div><div class="right"><div class="dl-ctrls">{act}'
                 f'<button class="dl-btn bad" onclick="fetchCancel({r["id"]})" '
-                f'title="stop, and remove what has arrived">✗ Cancel</button></div></div></div>')
+                f'title="{_t("stop, and remove what has arrived")}">✗ {_t("Cancel")}</button></div></div></div>')
         return (
-            f'<h2 class="section">Opened in a player <span class="count">{len(fetches)}</span></h2>'
+            f'<h2 class="section">{_t("Opened in a player")} <span class="count">{len(fetches)}</span></h2>'
             '<div style="color:var(--muted);font-size:13px;margin:-6px 0 12px">'
-            'Opening a film fetches it from Telegram. It keeps arriving while its player is open, '
-            'stops when it is closed, and continues from the same point when it is opened again. '
-            '<b>Resume</b> here fetches the rest with no player open; <b>Pause</b> stops it and keeps '
-            'what has arrived.</div>'
+            + _dl_html(_t("Opening a film fetches it from Telegram. It keeps arriving while its player is open, stops when it is closed, and continues from the same point when it is opened again. {b}Resume{e} here fetches the rest with no player open; {b}Pause{e} stops it and keeps what has arrived.", b="\x01", e="\x02"),
+                       '<b>', '</b>') + '</div>'
             f'<div class="dl-list">{"".join(items)}</div>')
 
     def _render(rows, show_finished):
         if not rows:
             return ('<div class="empty-state"><div class="icon">⬇</div>'
-                   '<div>nothing here yet</div></div>')
+                   f'<div>{_t("nothing here yet")}</div></div>')
         items = []
         for d in rows:
             icon = ({"pending": "⏳", "downloading": "⬇", "completed": "✓",
@@ -14588,7 +15408,7 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                     f'style="width:{pct}%"></div></div>'
                     f'<div class="dl-progress-meta">'
                     f'{pct:.1f}% · {_fmt_size(done_b)} / {_fmt_size(size_b)} '
-                    f'· {speed_str} · ETA {eta_str}'
+                    f'· {speed_str} · {_t("ETA {t}", t=eta_str)}'
                     f'</div></div>'
                 )
             # DC badge: same-DC = fast direct download, cross-DC = slow
@@ -14597,9 +15417,9 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             file_dc = d["file_dc"] if "file_dc" in d.keys() else None
             if file_dc:
                 if _my_dc and file_dc == _my_dc:
-                    dc_html = f'<span class="pill ok" title="same DC — fast">DC{file_dc} ⚡</span>'
+                    dc_html = f'<span class="pill ok" title="{_t("same DC — fast")}">DC{file_dc} ⚡</span>'
                 else:
-                    dc_html = f'<span class="pill warn" title="cross-DC — slower">DC{file_dc} ✗</span>'
+                    dc_html = f'<span class="pill warn" title="{_t("cross-DC — slower")}">DC{file_dc} ✗</span>'
             # Per-row controls. Buttons depend on status:
             #   pending/downloading → Pause + Delete
             #   paused/failed       → Resume + Delete
@@ -14608,11 +15428,11 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
             st = d["status"]
             if st in ("pending", "downloading"):
                 btns.append(f'<button class="dl-btn" '
-                           f'onclick="dlAct({d["id"]},\'pause\')">⏸ Pause</button>')
+                           f'onclick="dlAct({d["id"]},\'pause\')">⏸ {_t("Pause")}</button>')
             if st in ("paused", "failed"):
                 btns.append(f'<button class="dl-btn ok" '
-                           f'onclick="dlAct({d["id"]},\'resume\')">▶ Resume</button>')
-            btns.append(f'<button class="dl-btn bad" '
+                           f'onclick="dlAct({d["id"]},\'resume\')">▶ {_t("Resume")}</button>')
+            btns.append(f'<button class="dl-btn bad" title="{_t("Delete")}" '
                        f'onclick="dlAct({d["id"]},\'delete\')">✗</button>')
             ctrls = f'<div class="dl-ctrls">{" ".join(btns)}</div>'
             items.append(
@@ -14621,7 +15441,8 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                 f'<div class="info">'
                 f'<div class="name">{html.escape(d["name"])}</div>'
                 f'<div class="meta">'
-                f'<span class="pill {pill_cls}">{d["status"]}</span>'
+                # (the word shown; the status itself stays as the database has it)
+                f'<span class="pill {pill_cls}">{_t(d["status"])}</span>'
                 f'{dc_html}'
                 f'<span>· {_fmt_size(d["size_bytes"])}</span>'
                 f'<span>· {_fmt_time(d["requested_at"])}{local}</span>'
@@ -14640,16 +15461,16 @@ async def page_downloads(tab: str = "players", q: Optional[str] = None,
                   if ((tab == "archive" and ar_busy) or (tab == "grabs" and active) or
                       (tab == "players" and any(f["state"] != "stopped" for f in fetches)
                        and not page_offset and not q)) else '')
-    ctrl_js = '''<script>
+    ctrl_js = _fill('''<script>
 function dlAct(id, action){
-  if(action==='delete' && !confirm('Delete this download?')) return;
+  if(action==='delete' && !confirm("[[@js:Delete this download?]]")) return;
   fetch('/api/downloads/'+id+'/'+action,{method:'POST'})
     .then(r=>r.json())
     .then(_=>location.reload())
-    .catch(e=>alert('failed: '+e));
+    .catch(e=>alert("[[@js:That did not work: %1]]".replace("%1", e)));
 }
 </script>
-'''
+''')
     # one look for every action button on this page: same height, same width
     # for the worded ones, square for the icon-only ones in the table
     dl_css = """<style>
@@ -14679,25 +15500,25 @@ function dlAct(id, action){
                 f'text-decoration:none;font-size:15px">{label}'
                 + (f' <span style="font-size:12px;opacity:.7">{n}</span>' if n else '') + '</a>')
     tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
-            + _tab("players", "Opened in players", len(fetches))
-            + _tab("grabs", "Grabs (Sonarr · Radarr · Grab button)", len(active))
-            + _tab("archive", "🏛 Internet Archive", ar_busy) + '</div>')
+            + _tab("players", _t("Opened in players"), len(fetches))
+            + _tab("grabs", _t("Grabs (Sonarr · Radarr · Grab button)"), len(active))
+            + _tab("archive", "🏛 " + _t("Internet Archive"), ar_busy) + '</div>')
     if ro:
         tabs = ('<div style="display:flex;border-bottom:1px solid var(--border);margin-bottom:20px">'
-                + _tab("players", "Opened in players", len(fetches)) + _tab("archive", "🏛 Internet Archive", ar_busy) + '</div>'
+                + _tab("players", _t("Opened in players"), len(fetches)) + _tab("archive", "🏛 " + _t("Internet Archive"), ar_busy) + '</div>'
                 '<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;'
                 'padding:12px 16px;margin-bottom:20px;color:var(--muted);font-size:14px">'
-                'Not signed in: files already saved from public channels can be opened and downloaded. '
-                '<a href="/login">Sign in to Telegram</a> to fetch more or to remove any.</div>')
+                + _dl_html(_t("Not signed in: files already saved from public channels can be opened and downloaded. {a}Sign in to Telegram{b} to fetch more or to remove any.", a="\x01", b="\x02"),
+                           '<a href="/login">', '</a>') + '</div>')
     if tab == "archive":
         body = f'{dl_css}{tabs}{ar_html}{refresh_js}'
     elif tab == "players":
         body = f'{dl_css}{tabs}{_fetch_js}{_render_fetches()}{_render_saved()}{refresh_js}'
     else:
         body = (f'{dl_css}{tabs}'
-                f'<h2 class="section">Queue <span class="count">{len(active)}</span></h2>'
+                f'<h2 class="section">{_t("Queue")} <span class="count">{len(active)}</span></h2>'
                 f'{_render(active, show_finished=False)}'
-                f'<h2 class="section">History <span class="count">last 100</span></h2>'
+                f'<h2 class="section">{_t("History")} <span class="count">{_t("last {n}", n=100)}</span></h2>'
                 f'{_render(done, show_finished=True)}'
                 f'{ctrl_js}'
                 f'{refresh_js}')
@@ -14746,11 +15567,11 @@ async def page_search(q: Optional[str] = None,
                     f'<div class="ls-row"><div style="width:30px;text-align:center;font-size:20px">'
                     f'{ico.get(r["media_type"], "📄")}</div>'
                     f'<div class="ls-main"><div class="ls-title"><a href="{href}">{html.escape(name)}</a> '
-                    + ('<span class="tag ok">saved</span>' if _is_local(r["local_path"]) else '')
+                    + (f'<span class="tag ok">{_t("saved")}</span>' if _is_local(r["local_path"]) else '')
                     + f'</div><div class="ls-sub"><span>{html.escape(r["ch_title"] or r["ch_user"] or "")}</span>'
                     f'<span>{_fmt_size(r["file_size"])}</span>'
                     f'<span>{_fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""}</span></div></div>'
-                    f'<div class="ls-act"><a class="abtn" href="{href}">Open</a></div></div>')
+                    f'<div class="ls-act"><a class="abtn" href="{href}">{_t("Open")}</a></div></div>')
             results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         elif scope == "channels":
             res = await meili_search("channels", q, limit=80)
@@ -14767,16 +15588,16 @@ async def page_search(q: Optional[str] = None,
             items = []
             for r in rows:
                 title = r["title"] or ("@" + r["username"])
-                tag = ('<span class="tag bad">gone</span>' if r["dead_at"] else
-                       '<span class="tag ok">joined</span>' if r["is_joined"] else
-                       '<span class="tag acc">followed</span>' if r["subscribed"] else '')
+                tag = (f'<span class="tag bad">{_t("gone")}</span>' if r["dead_at"] else
+                       f'<span class="tag ok">{_t("joined")}</span>' if r["is_joined"] else
+                       f'<span class="tag acc">{_t("followed")}</span>' if r["subscribed"] else '')
                 items.append(
                     f'<div class="ls-row">{_avatar(title)}'
                     f'<div class="ls-main"><div class="ls-title">{html.escape(title)} {tag}</div>'
                     f'<div class="ls-sub"><a href="https://t.me/{html.escape(r["username"])}" target="_blank" '
                     f'rel="noopener">@{html.escape(r["username"])}</a></div></div>'
-                    f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>members</span></div>'
-                    f'<div class="ls-act"><a class="abtn" href="/channels?q={_q(r["username"])}">Details</a></div></div>')
+                    f'<div class="ls-num"><b>{_fmt_count(r["members_count"])}</b><span>{_t("members")}</span></div>'
+                    f'<div class="ls-act"><a class="abtn" href="/channels?q={_q(r["username"])}">{_t("Details")}</a></div></div>')
             results_html = f'<div class="ls">{"".join(items)}</div>' if items else ""
         else:
             res = await meili_search("releases", q, limit=150)
@@ -14812,14 +15633,12 @@ async def page_search(q: Optional[str] = None,
         elapsed_ms = int((time.time() - t0) * 1000)
         if not results_html:
             results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
-                            f'<div>Nothing found for <strong>{html.escape(q)}</strong></div>'
-                            '<div style="margin-top:8px;font-size:13px">Try fewer words, another spelling, '
-                            'or one of the other tabs.</div></div>')
+                            '<div>' + _t("Nothing found for %1").replace("%1", f'<strong>{html.escape(q)}</strong>') + '</div>'
+                            f'<div style="margin-top:8px;font-size:13px">{_t("Try fewer words, another spelling, or one of the other tabs.")}</div></div>')
     else:
         results_html = ('<div class="empty-state"><div class="icon">🔍</div>'
-                        '<div>Search everything tgarr has indexed.</div>'
-                        '<div style="margin-top:8px;font-size:13px">Films and episodes by title · '
-                        'any file by its name · channels by name or @username.</div></div>')
+                        f'<div>{_t("Search everything tgarr has indexed.")}</div>'
+                        f'<div style="margin-top:8px;font-size:13px">{_t("Films and episodes by title · any file by its name · channels by name or @username.")}</div></div>')
 
     def tab(name, label):
         on = scope == name
@@ -14832,12 +15651,12 @@ async def page_search(q: Optional[str] = None,
         f'{_LIST_CSS}{_THUMB_RETRY_JS}'
         '<form action="/search" method="GET" style="margin-bottom:16px;display:flex;gap:10px">'
         f'<input type="text" name="q" value="{html.escape(q or "", quote=True)}" '
-        'placeholder="a film, a file name, a channel…" '
+        f'placeholder="{_t("a film, a file name, a channel…")}" '
         'style="flex:1;font-size:16px;padding:12px 16px" autofocus />'
         f'<input type="hidden" name="scope" value="{scope}">'
-        '<button type="submit" style="padding:0 22px">Search</button></form>'
+        f'<button type="submit" style="padding:0 22px">{_t("Search")}</button></form>'
         '<div style="display:flex;align-items:flex-end;border-bottom:1px solid var(--border);margin-bottom:20px">'
-        + tab("releases", "Films &amp; episodes") + tab("messages", "All files") + tab("channels", "Channels")
+        + tab("releases", _t("Films & episodes")) + tab("messages", _t("All files")) + tab("channels", _t("Channels"))
         + (f'<span style="margin-left:auto;font-size:11px;color:var(--muted);padding-bottom:10px">'
            f'{elapsed_ms} ms</span>' if q else '')
         + f'</div>{results_html}')
@@ -14925,17 +15744,17 @@ async def page_settings(request: Request):
     # which part of this machine makes the picture when a film is converted while it is watched
     _hw = await api_transcode_hw()
     if _hw["setting"] == "off":
-        _hw_meta = "In software, because it was switched to that here." + (" A graphics card that can do it was found." if _hw["found"] else "")
-        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="auto"/><button class="btn" type="submit">Use the graphics card</button></form>'
+        _hw_meta = _t("In software, because it was switched to that here.") + (" " + _t("A graphics card that can do it was found.") if _hw["found"] else "")
+        _hw_btn = f'<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="auto"/><button class="btn" type="submit">{_t("Use the graphics card")}</button></form>'
     elif _hw["kind"]:
-        _hw_meta = (f"On {html.escape(_hw['name'])}{' at ' + html.escape(_hw['device']) if _hw['device'] else ''}: a film takes a fraction of the processor it takes in software. "
-                    "If a film will not play, or looks wrong, switch to software.")
-        _hw_btn = '<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="off"/><button class="btn ghost" type="submit">Use software</button></form>'
+        _hw_meta = ((_t("On {name} at {device}: a film takes a fraction of the processor it takes in software.", name=_hw["name"], device=_hw["device"])
+                     if _hw["device"] else _t("On {name}: a film takes a fraction of the processor it takes in software.", name=_hw["name"]))
+                    + " " + _t("If a film will not play, or looks wrong, switch to software."))
+        _hw_btn = f'<form method="POST" action="/api/settings/transcode_hw" style="margin:0"><input type="hidden" name="value" value="off"/><button class="btn ghost" type="submit">{_t("Use software")}</button></form>'
     else:
-        _hw_meta = ("In software: this tgarr was not given a graphics card that can encode. On Linux, running the installer again hands it "
-                    "the card if there is one; the guide says how to do it by hand.")
-        _hw_btn = '<a class="btn ghost" href="https://github.com/tgarrpro/tgarr/blob/main/docs/install/gpu.md" target="_blank" rel="noopener">How</a>'
-    hw_row = ('<div class="dl-item"><div class="icon">🎞</div><div class="info"><div class="name">Converting films</div>'
+        _hw_meta = _t("In software: this tgarr was not given a graphics card that can encode. On Linux, running the installer again hands it the card if there is one; the guide says how to do it by hand.")
+        _hw_btn = f'<a class="btn ghost" href="https://github.com/tgarrpro/tgarr/blob/main/docs/install/gpu.md" target="_blank" rel="noopener">{_t("How")}</a>'
+    hw_row = (f'<div class="dl-item"><div class="icon">🎞</div><div class="info"><div class="name">{_t("Converting films")}</div>'
               f'<div class="meta">{_hw_meta}</div></div><div class="right">{_hw_btn}</div></div>')
     authed = login.session_exists()
     user = login.ensure_user_info() or {}
@@ -14959,14 +15778,19 @@ async def page_settings(request: Request):
     my_dc_disp = (await _get_my_dc()) or "?"
     cache_ttl, cache_gb = await _cache_settings()
     _usage = await _cache_usage()
-    _kind = {"video": "videos", "audio": "songs", "library": "books"}
+    _kind = {"video": "{n} videos ({size})", "audio": "{n} songs ({size})", "library": "{n} books ({size})"}
     cache_total = _fmt_size(sum(r["bytes"] for r in _usage)) or "0 MB"
+    # (unescaped here: the sentence it is put into is escaped as a whole)
     cache_detail = " · ".join(
-        f'{r["n"]:,} {_kind.get(r["kind"], r["kind"])} ({_fmt_size(r["bytes"]) or "0"})'
-        for r in _usage) or "nothing downloaded yet"
+        html.unescape(_t(_kind[r["kind"]], n=f'{r["n"]:,}', size=_fmt_size(r["bytes"]) or "0")) if r["kind"] in _kind
+        else f'{r["n"]:,} {r["kind"]} ({_fmt_size(r["bytes"]) or "0"})'
+        for r in _usage)
+    cache_now = _t("Now on disk: {what}.", what=cache_detail) if cache_detail else _t("Now on disk: nothing downloaded yet.")
     _full = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
     _uname = user.get("username")
-    _shown = _full or (("@" + _uname) if _uname else "Telegram account")
+    _shown = _full or (("@" + _uname) if _uname else html.unescape(_t("Telegram account")))
+    _out_ask = html.escape(_tj("Sign out of Telegram on this tgarr?") + "\\n\\n" + _tj(
+        "Your private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay."), quote=True)
     try:                                   # the account's own picture, when it has one
         _av = (f'<img class="acct-av" src="/api/me/avatar?v={int(os.path.getmtime(login.AVATAR_FILE))}" alt="">')
     except OSError:
@@ -14977,12 +15801,11 @@ async def page_settings(request: Request):
         f'<div class="acct-name">{html.escape(_shown)}</div>'
         f'<div class="acct-sub">'
         + (f'@{html.escape(_uname)} · ' if _uname and _full else '')
-        + f'Telegram data center {my_dc_disp} <span class="pill ok">signed in</span></div>'
+        + f'{_t("Telegram data center {dc}", dc=my_dc_disp)} <span class="pill ok">{_t("signed in")}</span></div>'
         f'<div class="acct-meta">API ID <code>{html.escape(str(login.API_ID or "-"))}</code> · '
-        f'session at <code>_data/session/tgarr.session</code></div></div>'
-        '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'Sign out of Telegram on this tgarr?'
-        '\\n\\nYour private chats are put away on this machine and come back when you sign in again. Public channels and saved files stay.\'))'
-        'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">Sign out</button></div></div>')
+        + _t("session at %1").replace("%1", '<code>_data/session/tgarr.session</code>') + '</div></div>'
+        '<div class="acct-act"><button class="ghost" onclick="if(confirm(\'' + _out_ask + '\'))'
+        'fetch(\'/api/login/logout\',{method:\'POST\'}).then(()=>location.href=\'/\')">' + _t("Sign out") + '</button></div></div>')
 
     # ── this machine ──
     host = await asyncio.to_thread(_host_info)
@@ -15002,42 +15825,44 @@ async def page_settings(request: Request):
     tiles, alerts = [], []
     for d in host["disks"]:
         used_share = d["used"] / d["total"] if d["total"] else 0
+        # "Downloads folder", "tgarr data", or both joined with " + " when they share a disk
+        label = " + ".join(html.unescape(_t(x)) for x in d["label"].split(" + "))
         tiles.append(
-            f'<div class="sys-t {d["level"]}"><div class="sys-l">💽 {html.escape(d["label"])}</div>'
-            f'<div class="sys-n">{_gb(d["free"])} <small>free</small></div>'
+            f'<div class="sys-t {d["level"]}"><div class="sys-l">💽 {html.escape(label)}</div>'
+            f'<div class="sys-n">{_gb(d["free"])} <small>{_t("free")}</small></div>'
             f'{_bar(used_share, d["level"])}'
-            f'<div class="sys-s">{_gb(d["used"])} used of {_gb(d["total"])} · {used_share * 100:.0f}% full</div></div>')
+            f'<div class="sys-s">{_t("{used} used of {total} · {pct}% full", used=_gb(d["used"]), total=_gb(d["total"]), pct=format(used_share * 100, ".0f"))}</div></div>')
         if d["level"] in ("warn", "bad"):
             alerts.append((d["level"],
-                           f'<b>{html.escape(d["label"])}: {_gb(d["free"])} free.</b> '
-                           + ("New downloads and plays will start failing. " if d["level"] == "bad" else
-                              "Space is getting short. ")
-                           + 'Free some under <a href="#files">Downloaded files</a> below, or set an automatic clean-up there.'))
+                           f'<b>{_t("{label}: {free} free.", label=label, free=_gb(d["free"]))}</b> '
+                           + (_t("New downloads and plays will start failing.") if d["level"] == "bad" else
+                              _t("Space is getting short.")) + " "
+                           + _t("Free some under %1Downloaded files%2 below, or set an automatic clean-up there.").replace("%1", '<a href="#files">').replace("%2", "</a>")))
     if host["mem"]:
         m = host["mem"]
         tiles.append(
-            f'<div class="sys-t {m["level"]}"><div class="sys-l">🧠 Memory</div>'
-            f'<div class="sys-n">{_gb(m["avail"])} <small>available</small></div>'
+            f'<div class="sys-t {m["level"]}"><div class="sys-l">🧠 {_t("Memory")}</div>'
+            f'<div class="sys-n">{_gb(m["avail"])} <small>{_t("available")}</small></div>'
             f'{_bar(1 - m["avail"] / m["total"], m["level"])}'
-            f'<div class="sys-s">of {_gb(m["total"])} in this machine</div></div>')
+            f'<div class="sys-s">{_t("of {total} in this machine", total=_gb(m["total"]))}</div></div>')
         if m["level"] == "bad":
-            alerts.append(("bad", f'<b>Memory: only {_gb(m["avail"])} available.</b> '
-                                  'Converting e-books and playing several files at once may fail.'))
+            alerts.append(("bad", f'<b>{_t("Memory: only {avail} available.", avail=_gb(m["avail"]))}</b> '
+                                  + _t("Making a scanned book into pages and playing several files at once may fail.")))
     if host["load"]:
         ld = host["load"]
         tiles.append(
-            f'<div class="sys-t {ld["level"]}"><div class="sys-l">⚙ Processor</div>'
-            f'<div class="sys-n">{host["cores"]} <small>cores</small></div>'
-            f'<div class="sys-s">load {ld["l1"]:.2f} · {ld["l5"]:.2f} · {ld["l15"]:.2f}'
-            f'<br>(1, 5 and 15 minutes)</div></div>')
+            f'<div class="sys-t {ld["level"]}"><div class="sys-l">⚙ {_t("Processor")}</div>'
+            f'<div class="sys-n">{host["cores"]} <small>{_t("cores")}</small></div>'
+            f'<div class="sys-s">{_t("load {a} · {b} · {c}", a=format(ld["l1"], ".2f"), b=format(ld["l5"], ".2f"), c=format(ld["l15"], ".2f"))}'
+            f'<br>{_t("(1, 5 and 15 minutes)")}</div></div>')
     tiles.append(
-        f'<div class="sys-t"><div class="sys-l">🗂 Index</div>'
+        f'<div class="sys-t"><div class="sys-l">🗂 {_t("Index")}</div>'
         f'<div class="sys-n">{_fmt_size(db_bytes) or "0"}</div>'
-        f'<div class="sys-s">{idx_counts["ch"]:,} channels · {_fmt_count(idx_counts["msgs"])} posts<br>'
-        f'downloaded files: {html.escape(cache_total)}</div></div>')
+        f'<div class="sys-s">{_t("{ch} channels · {msgs} posts", ch=format(idx_counts["ch"], ","), msgs=_fmt_count(idx_counts["msgs"]))}<br>'
+        f'{_t("downloaded files: {size}", size=cache_total)}</div></div>')
     tiles.append(
-        f'<div class="sys-t"><div class="sys-l">🖥 System</div>'
-        f'<div class="sys-n">{_fmt_uptime(host["uptime_s"])} <small>up</small></div>'
+        f'<div class="sys-t"><div class="sys-l">🖥 {_t("System")}</div>'
+        f'<div class="sys-n">{_fmt_uptime(host["uptime_s"])} <small>{_t("up")}</small></div>'
         f'<div class="sys-s">Linux {html.escape(host["kernel"])}<br>{html.escape(host["arch"])} · '
         f'tgarr {TGARR_VERSION}</div></div>')
     alerts.sort(key=lambda a: a[0] != "bad")
@@ -15091,37 +15916,34 @@ async def page_settings(request: Request):
 .settings details.adv summary {{ cursor:pointer; font-size:13px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.07em; }}
 .settings details.adv summary:hover {{ color:var(--accent); }}
 </style>
-<script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
+<script>function tgCopy(b){{const v=b.dataset.v;const done=()=>{{const o=b.textContent;b.textContent="{_tj("Copied")}";setTimeout(()=>b.textContent=o,1400)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);else{{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();try{{document.execCommand("copy");done()}}catch(e){{}}t.remove()}}}}</script>
 <div class="settings">
 {account_html}
 
-<h2 class="section">This machine</h2>
+<h2 class="section">{_t("This machine")}</h2>
 {machine_html}
 
-<h2 class="section">Library</h2>
+<h2 class="section">{_t("Content")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🎯</div>
     <div class="info">
-      <div class="name">When a title has several versions, show first — <span class="pill ok">{'my data center' if version_pref == 'dc' else 'best quality'}</span></div>
+      <div class="name">{_t("When a title has several versions, show first")} — <span class="pill ok">{_t("my data center") if version_pref == 'dc' else _t("best quality")}</span></div>
       <div class="meta">
-        The same film is often posted more than once: different resolutions, or
-        the same file uploaded to different Telegram data centers. tgarr shows
-        one card per title and keeps every version one click away.
-        Your account is on <strong>DC {my_dc_disp}</strong>; a copy on that data
-        center is your fastest path.
+        {_t("The same film is often posted more than once: different resolutions, or the same file uploaded to different Telegram data centers. tgarr shows one card per title and keeps every version one click away.")}
+        {_t("Your account is on %1; a copy on that data center is your fastest path.").replace("%1", f"<strong>DC {my_dc_disp}</strong>")}
       </div>
       <form method="POST" action="/api/settings/version_preference" style="margin-top:12px;font-size:14px;line-height:1.7">
         <label style="display:block;cursor:pointer">
           <input type="radio" name="value" value="quality" {'checked' if version_pref != 'dc' else ''} onchange="this.form.submit()" />
-          <strong>Best quality first</strong> — higher resolution wins; between equal resolutions, the copy on my data center wins.
+          <strong>{_t("Best quality first")}</strong> — {_t("higher resolution wins; between equal resolutions, the copy on my data center wins.")}
         </label>
         <label style="display:block;cursor:pointer">
           <input type="radio" name="value" value="dc" {'checked' if version_pref == 'dc' else ''} onchange="this.form.submit()" />
-          <strong>My data center first</strong> — a copy on my data center wins, then resolution.
+          <strong>{_t("My data center first")}</strong> — {_t("a copy on my data center wins, then resolution.")}
         </label>
         <div style="color:var(--muted);font-size:12px;margin-top:6px">
-          While Telegram is rate-limiting cross-data-center access, tgarr leads with your data center regardless of this choice.
+          {_t("While Telegram is rate-limiting cross-data-center access, tgarr leads with your data center regardless of this choice.")}
         </div>
       </form>
     </div>
@@ -15129,211 +15951,193 @@ async def page_settings(request: Request):
   <div class="dl-item" id="cache">
     <div class="icon" id="files">💾</div>
     <div class="info">
-      <div class="name">Downloaded files — <span class="pill ok">{cache_total}</span></div>
+      <div class="name">{_t("Downloaded files")} — <span class="pill ok">{cache_total}</span></div>
       <div class="meta">
-        Opening a film, a song or a book downloads it here so it plays, and
-        opens instantly next time. Saved items carry a
-        <span class="pill ok" style="font-size:11px">● saved</span> mark in the lists.
-        Now on disk: {cache_detail}.<br/>
-        tgarr tidies up by itself: a file nobody opened for a while is removed
-        (it stays in the index; opening it again fetches it again). Files
-        grabbed through Sonarr/Radarr are never touched.<br/>
-        What you fetched from <a href="/usenet?kind=have">Usenet</a> is not part of this: you asked for
-        each of those files by hand, and they stay until you delete them there. A favourite is never
-        removed by these rules.
+        {_t("Opening a film, a song or a book downloads it here so it plays, and opens instantly next time.")}
+        {_t("Saved items carry a %1 mark in the lists.").replace("%1", f'<span class="pill ok" style="font-size:11px">● {_t("saved")}</span>')}
+        {cache_now}<br/>
+        {_t("tgarr tidies up by itself: a file nobody opened for a while is removed (it stays in the index; opening it again fetches it again). Files grabbed through Sonarr/Radarr are never touched.")}<br/>
+        {_t("What you fetched from %1Usenet%2 is not part of this: you asked for each of those files by hand, and they stay until you delete them there. A favourite is never removed by these rules.").replace("%1", '<a href="/usenet?kind=have">').replace("%2", "</a>")}
       </div>
       <form method="POST" action="/api/settings/cache" style="margin-top:12px;font-size:14px;line-height:2.2">
-        Remove a file not opened for
-        <input type="number" name="ttl_days" value="{cache_ttl}" min="0" style="width:70px" /> days,
-        and keep the total under
-        <input type="number" name="max_gb" value="{cache_gb}" min="0" style="width:70px" /> GB
-        <span style="color:var(--muted);font-size:12px">(0 = no limit)</span>
-        <button class="btn" type="submit" style="margin-left:8px">Save</button>
+        {_t("Remove a file not opened for %1 days, and keep the total under %2 GB").replace("%1", f'<input type="number" name="ttl_days" value="{cache_ttl}" min="0" style="width:70px" />').replace("%2", f'<input type="number" name="max_gb" value="{cache_gb}" min="0" style="width:70px" />')}
+        <span style="color:var(--muted);font-size:12px">{_t("(0 = no limit)")}</span>
+        <button class="btn" type="submit" style="margin-left:8px">{_t("Save")}</button>
       </form>
       <form method="POST" action="/api/settings/cache_clear" style="margin-top:6px"
-            onsubmit="return confirm('Remove every film, song and book downloaded from Telegram from this server? They stay in the index and can be fetched again. What was fetched from Usenet is not touched - it is removed on the Usenet page.')">
-        <button class="ghost" type="submit">Remove all downloaded files now</button>
+            onsubmit="return confirm('{html.escape(_tj("Remove every film, song and book downloaded from Telegram from this server? They stay in the index and can be fetched again. What was fetched from Usenet is not touched - it is removed on the Usenet page."), quote=True)}')">
+        <button class="ghost" type="submit">{_t("Remove all downloaded files now")}</button>
       </form>
     </div>
   </div>
   <div class="dl-item">
     <div class="icon">🔞</div>
     <div class="info">
-      <div class="name">Adult content (NSFW) — <span class="pill {'ok' if nsfw_on else 'muted'}">{'enabled' if nsfw_on else 'hidden (default)'}</span></div>
+      <div class="name">{_t("Adult content (NSFW)")} — <span class="pill {'ok' if nsfw_on else 'muted'}">{_t("enabled") if nsfw_on else _t("hidden (default)")}</span></div>
       <div class="meta">
-        By default, channels flagged adult are hidden everywhere in tgarr.
-        You can opt in below — only enable if you are <strong>18+</strong> and
-        understand you are responsible for compliance with your local laws.
-        tgarr is content-neutral self-hosted software; <strong>we are not
-        responsible for materials shared by others on Telegram</strong>.
+        {_t("By default, channels flagged adult are hidden everywhere in tgarr.")}
+        {_t("You can opt in below — only enable if you are %1 and understand you are responsible for compliance with your local laws.").replace("%1", "<strong>18+</strong>")}
+        {_t("tgarr is content-neutral self-hosted software; %1we are not responsible for materials shared by others on Telegram%2.").replace("%1", "<strong>").replace("%2", "</strong>")}
       </div>
       <form method="POST" action="/api/settings/nsfw_enabled" style="margin-top:12px">
         <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:14px;line-height:1.55">
           <input type="checkbox" name="value" value="true" {'checked' if nsfw_on else ''} onchange="this.form.submit()" style="margin-top:4px" />
-          <span>I am 18+ and want to view channels tgarr has classified as adult.
-            I understand tgarr is a viewer/indexer of Telegram content I have already joined,
-            not the publisher.</span>
+          <span>{_t("I am 18+ and want to view channels tgarr has classified as adult. I understand tgarr is a viewer/indexer of Telegram content I have already joined, not the publisher.")}</span>
         </label>
       </form>
       {('<form method="POST" action="/api/settings/adult_default" style="margin-top:10px;font-size:14px">'
-        'What the lists show first: <select name="value" onchange="this.form.submit()" style="padding:5px 8px;border-radius:6px">'
-        + "".join(f'<option value="{k}"{" selected" if aud_default == k else ""}>{label}</option>' for k, label in
+        + _t("What the lists show first:") + ' <select name="value" onchange="this.form.submit()" style="padding:5px 8px;border-radius:6px">'
+        + "".join(f'<option value="{k}"{" selected" if aud_default == k else ""}>{_t(label)}</option>' for k, label in
                   (("sfw", "All-ages only (default)"), ("any", "Everything"), ("nsfw", "18+ only")))
-        + '</select><div class="meta" style="margin-top:4px">Videos, Releases and the Gallery open this way and let you switch on the page; '
-          'the Usenet page, search and the home page follow it.</div></form>') if nsfw_on else ""}
+        + '</select><div class="meta" style="margin-top:4px">'
+        + _t("Videos, Releases and the Gallery open this way and let you switch on the page; the Usenet page, search and the home page follow it.")
+        + '</div></form>') if nsfw_on else ""}
     </div>
   </div>
   <div class="dl-item">
     <div class="icon">🛑</div>
     <div class="info">
-      <div class="name">CSAM hard block — <span class="pill bad">always on, cannot be disabled</span></div>
+      <div class="name">{_t("CSAM hard block")} — <span class="pill bad">{_t("always on, cannot be disabled")}</span></div>
       <div class="meta">
-        Child Sexual Abuse Material. Channels matching a hardcoded keyword
-        blocklist (loli/shota/child-porn/etc. across multiple scripts) are
-        permanently blocked regardless of any setting. They are never displayed
-        in tgarr, never federated to <code>registry.tgarr.me</code>, and never
-        downloaded. Matches are logged at <code>/tmp/tgarr-csam-flags.log</code>
-        for review. If you encounter CSAM, report to
-        <a href="https://report.cybertip.org" target="_blank">NCMEC CyberTipline</a>
-        or your jurisdiction's hotline via
-        <a href="https://www.inhope.org" target="_blank">INHOPE</a>.
+        {_t("Child Sexual Abuse Material. Channels matching a hardcoded keyword blocklist (loli/shota/child-porn/etc. across multiple scripts) are permanently blocked regardless of any setting.")}
+        {_t("They are never displayed in tgarr, never federated to %1, and never downloaded. Matches are logged at %2 for review.").replace("%1", "<code>registry.tgarr.me</code>").replace("%2", "<code>/tmp/tgarr-csam-flags.log</code>")}
+        {_t("If you encounter CSAM, report to %1 or your jurisdiction's hotline via %2.").replace("%1", '<a href="https://report.cybertip.org" target="_blank">NCMEC CyberTipline</a>').replace("%2", '<a href="https://www.inhope.org" target="_blank">INHOPE</a>')}
       </div>
     </div>
   </div>
 </div>
 
-<h2 class="section">Privacy</h2>
+<h2 class="section">{_t("Privacy")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🔒</div>
     <div class="info">
-      <div class="name">Private chats after signing out</div>
-      <div class="meta">Signing out puts your private chats away on this machine, so that signing in again brings them
-      straight back without fetching them a second time. Another Telegram account signing in here never sees them. Kept for
-      <input id="pkDays" type="number" min="1" max="3650" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg)"/>
-      days without a sign-in, then removed for good. <span id="pkMsg" style="color:var(--muted)"></span></div>
+      <div class="name">{_t("Private chats after signing out")}</div>
+      <div class="meta">{_t("Signing out puts your private chats away on this machine, so that signing in again brings them straight back without fetching them a second time. Another Telegram account signing in here never sees them.")}
+      {_t("Kept for %1 days without a sign-in, then removed for good.").replace("%1", '<input id="pkDays" type="number" min="1" max="3650" style="width:80px;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--fg)"/>')}
+      <span id="pkMsg" style="color:var(--muted)"></span></div>
     </div>
-    <div class="right"><button class="btn" onclick="pkSave()">Save</button></div>
+    <div class="right"><button class="btn" onclick="pkSave()">{_t("Save")}</button></div>
   </div>
 </div>
 <script>
 fetch("/api/settings/private_keep_days").then(r => r.json()).then(j => {{ document.getElementById("pkDays").value = j.days; }});
 function pkSave(){{ fetch("/api/settings/private_keep_days", {{method: "POST", headers: {{"Content-Type": "application/json"}},
   body: JSON.stringify({{days: +document.getElementById("pkDays").value}})}}).then(r => r.json())
-  .then(j => {{ document.getElementById("pkMsg").textContent = j.status === "ok" ? "saved" : (j.message || "not saved"); }}); }}
+  .then(j => {{ document.getElementById("pkMsg").textContent = j.status === "ok" ? "{_tj("saved")}" : (j.message || "{_tj("not saved")}"); }}); }}
 </script>
-<h2 class="section">Other sources</h2>
+<h2 class="section">{_t("Other sources")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">📰</div>
     <div class="info">
       <div class="name">Usenet</div>
-      <div class="meta">With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.</div>
+      <div class="meta">{_t("With a Usenet account, tgarr also indexes newsgroups and offers what it finds to Sonarr and Radarr.")}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/usenet">Set up</a></div>
+    <div class="right"><a class="btn" href="/settings/usenet">{_t("Set up")}</a></div>
   </div>
   {hw_row}
   <div class="dl-item">
     <div class="icon">⬆</div>
     <div class="info">
-      <div class="name">Updating tgarr</div>
-      <div class="meta">Running {TGARR_VERSION}. tgarr updates itself within the hour of a release; here you can have it look now.</div>
+      <div class="name">{_t("Updating tgarr")}</div>
+      <div class="meta">{_t("Running {v}. tgarr updates itself within the hour of a release; here you can have it look now.", v=TGARR_VERSION)}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/update">Update…</a></div>
+    <div class="right"><a class="btn" href="/settings/update">{_t("Update…")}</a></div>
   </div>
   <div class="dl-item">
     <div class="icon">🔊</div>
     <div class="info">
-      <div class="name">Reading aloud</div>
-      <div class="meta">A natural voice of this machine's own for books, in every browser - Chinese and English. Fetched when you ask for it.</div>
+      <div class="name">{_t("Reading aloud")}</div>
+      <div class="meta">{_t("A natural voice of this machine's own for books, in every browser - Chinese and English. Fetched when you ask for it.")}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/voice">Set up</a></div>
+    <div class="right"><a class="btn" href="/settings/voice">{_t("Set up")}</a></div>
   </div>
   <div class="dl-item">
     <div class="icon">🖼</div>
     <div class="info">
-      <div class="name">Looking at pictures</div>
-      <div class="meta">tgarr looks at each picture itself - adult or not, drawn or photographed - instead of going by what its channel is called. Fetched when you ask for it.</div>
+      <div class="name">{_t("Looking at pictures")}</div>
+      <div class="meta">{_t("tgarr looks at each picture itself - adult or not, drawn or photographed - instead of going by what its channel is called. Fetched when you ask for it.")}</div>
     </div>
-    <div class="right"><a class="btn" href="/settings/pictures">Set up</a></div>
+    <div class="right"><a class="btn" href="/settings/pictures">{_t("Set up")}</a></div>
   </div>
 </div>
-<h2 class="section">Metadata sources</h2>
+<h2 class="section">{_t("Metadata sources")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🔑</div>
     <div class="info">
-      <div class="name">TMDB API key <span class="pill {('ok' if tmdb_raw else 'muted')}">{('configured' if tmdb_raw else 'not set — using Wikidata only')}</span></div>
-      <div class="meta">Posters &amp; canonical titles from <a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a> (free, personal use). Without a key, titles are still recognised through Wikidata (free, no key), with fewer posters.</div>
+      <div class="name">{_t("TMDB API key")} <span class="pill {('ok' if tmdb_raw else 'muted')}">{(_t("configured") if tmdb_raw else _t("not set — using Wikidata only"))}</span></div>
+      <div class="meta">{_t("Posters & canonical titles from %1 (free, personal use). Without a key, titles are still recognised through Wikidata (free, no key), with fewer posters.").replace("%1", '<a href="https://www.themoviedb.org/settings/api" target="_blank">themoviedb.org</a>')}</div>
       <form method="POST" action="/api/settings/tmdb_key" style="margin-top:12px;display:flex;gap:10px;max-width:600px">
-        <input type="text" name="value" placeholder="paste your TMDB API key (or leave blank to clear)" value="{html.escape(tmdb_masked)}" style="flex:1" />
-        <button type="submit">Save</button>
+        <input type="text" name="value" placeholder="{_t("paste your TMDB API key (or leave blank to clear)")}" value="{html.escape(tmdb_masked)}" style="flex:1" />
+        <button type="submit">{_t("Save")}</button>
       </form>
     </div>
   </div>
   <div class="dl-item">
     <div class="icon">📊</div>
     <div class="info">
-      <div class="name">Enrichment progress</div>
+      <div class="name">{_t("Enrichment progress")}</div>
       <div class="meta">
         <span class="pill accent">TMDB {meta_stats['tmdb']:,}</span>
         <span class="pill ok">Wikidata {meta_stats['wiki']:,}</span>
-        <span class="pill warn">Not found {meta_stats['missed']:,}</span>
-        <span class="pill muted">Pending {meta_stats['pending']:,}</span>
-        / total {meta_stats['total']:,}
+        <span class="pill warn">{_t("Not found {n}", n=format(meta_stats['missed'], ","))}</span>
+        <span class="pill muted">{_t("Pending {n}", n=format(meta_stats['pending'], ","))}</span>
+        {_t("/ total {n}", n=format(meta_stats['total'], ","))}
       </div>
     </div>
   </div>
 </div>
 
-<h2 class="section">Connect Sonarr / Radarr</h2>
+<h2 class="section">{_t("Connect Sonarr / Radarr")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">🔌</div>
-    <div class="info"><div class="name">Newznab indexer</div>
+    <div class="info"><div class="name">{_t("Newznab indexer")}</div>
       <div class="meta">Settings → Indexers → + → Newznab → URL</div></div>
     <div class="right" style="display:flex;gap:8px;align-items:center"><code>{html.escape(_base_url(request))}/newznab/</code>
-      <button class="ghost" onclick="tgCopy(this)" data-v="{html.escape(_base_url(request))}/newznab/">Copy</button></div>
+      <button class="ghost" onclick="tgCopy(this)" data-v="{html.escape(_base_url(request))}/newznab/">{_t("Copy")}</button></div>
   </div>
   <div class="dl-item">
     <div class="icon">⬇</div>
-    <div class="info"><div class="name">SABnzbd download client</div>
-      <div class="meta">Settings → Download Clients → + → SABnzbd → same host and port, URL Base</div></div>
+    <div class="info"><div class="name">{_t("SABnzbd download client")}</div>
+      <div class="meta">Settings → Download Clients → + → SABnzbd → {_t("same host and port, URL Base")}</div></div>
     <div class="right" style="display:flex;gap:8px;align-items:center"><code>/sabnzbd</code>
-      <button class="ghost" onclick="tgCopy(this)" data-v="/sabnzbd">Copy</button></div>
+      <button class="ghost" onclick="tgCopy(this)" data-v="/sabnzbd">{_t("Copy")}</button></div>
   </div>
 </div>
 
-<details class="adv"><summary>Advanced — values set when the containers were started</summary>
+<details class="adv"><summary>{_t("Advanced — values set when the containers were started")}</summary>
 <div class="dl-list" style="margin-top:12px">
   <div class="dl-item">
     <div class="icon">⚙</div>
-    <div class="info"><div class="name">Parser score threshold</div>
-      <div class="meta">A file whose name scores below this is not treated as a film or an episode · TG_PARSE_SCORE_MIN</div></div>
+    <div class="info"><div class="name">{_t("Parser score threshold")}</div>
+      <div class="meta">{_t("A file whose name scores below this is not treated as a film or an episode")} · TG_PARSE_SCORE_MIN</div></div>
     <div class="right"><code>{os.environ.get("TG_PARSE_SCORE_MIN","0.30")}</code></div>
   </div>
   <div class="dl-item">
     <div class="icon">📁</div>
-    <div class="info"><div class="name">Download root</div>
-      <div class="meta">Where grabbed files are written · TG_DOWNLOAD_ROOT</div></div>
+    <div class="info"><div class="name">{_t("Download root")}</div>
+      <div class="meta">{_t("Where grabbed files are written")} · TG_DOWNLOAD_ROOT</div></div>
     <div class="right"><code>{os.environ.get("TG_DOWNLOAD_ROOT","/downloads/tgarr")}</code></div>
   </div>
   <div class="dl-item">
     <div class="icon">🔢</div>
-    <div class="info"><div class="name">Backfill limit per channel</div>
-      <div class="meta">How far back a channel is read the first time · TG_BACKFILL_LIMIT</div></div>
+    <div class="info"><div class="name">{_t("Backfill limit per channel")}</div>
+      <div class="meta">{_t("How far back a channel is read the first time")} · TG_BACKFILL_LIMIT</div></div>
     <div class="right"><code>{os.environ.get("TG_BACKFILL_LIMIT","5000")}</code></div>
   </div>
 </div>
-<div style="font-size:12.5px;color:var(--muted);margin:10px 4px">Change them in <code>docker-compose.yml</code> / <code>.env</code> and restart. Background jobs and their state: <a href="/system">System</a>.</div>
+<div style="font-size:12.5px;color:var(--muted);margin:10px 4px">{_t("Change them in %1 / %2 and restart.").replace("%1", "<code>docker-compose.yml</code>").replace("%2", "<code>.env</code>")} {_t("Background jobs and their state: %1.").replace("%1", f'<a href="/system">{_t("System")}</a>')}</div>
 </details>
 
-<h2 class="section">About</h2>
+<h2 class="section">{_t("About")}</h2>
 <div class="dl-list">
   <div class="dl-item">
     <div class="icon">ℹ</div>
     <div class="info"><div class="name">tgarr v{TGARR_VERSION}</div>
-      <div class="meta">Self-hosted Telegram-as-source bridge · MIT license</div></div>
+      <div class="meta">{_t("Self-hosted Telegram-as-source bridge · MIT license")}</div></div>
     <div class="right"><a class="btn ghost" href="https://tgarr.me" target="_blank">tgarr.me ↗</a></div>
   </div>
 </div>

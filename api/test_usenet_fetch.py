@@ -79,6 +79,8 @@ for name in ("film.mkv", "setup.exe", "book.rar", "book.epub.exe", "noext", "", 
 check("name in quotes", F.file_name('[01/12] - "My Book - Vol 2.epub" yEnc (1/3)'), "My Book - Vol 2.epub")
 check("name without quotes", F.file_name("Some.Song.mp3 yEnc (1/9)"), "Some.Song.mp3")
 check("no name", F.file_name("hello there"), "")
+check("a quote left hanging after the name", F.file_name('Bill Emerson - Eclipse - Dickenson County Breakdown.mp3" yEnc (1/14)'), "Bill Emerson - Eclipse - Dickenson County Breakdown.mp3")
+check("and such a file is taken", F.kind_of(F.file_name('Dickenson County Breakdown.mp3" yEnc (1/14)')), "audio")
 
 
 def rel(files: dict) -> dict:

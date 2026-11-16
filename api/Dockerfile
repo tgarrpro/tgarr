@@ -1,19 +1,16 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-ENV QTWEBENGINE_DISABLE_SANDBOX=1 \
-    QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox --disable-gpu"
-
-# What every install uses, and no more. The image was 2.3 GB, nearly all of it calibre (with
-# the browser engine it prints through) and 480 MB of fonts for it - there for the few who
-# open a .mobi. calibre is now fetched when a book first needs it (packs.py), as its own
-# standalone build; here are only the dozen small libraries that build expects of a system.
+# What every install uses, and no more. The image was 2.3 GB once, nearly all of it calibre and
+# fonts for it. calibre is gone: the reader opens books by itself (ownbooks.py).
 #   ffmpeg          plays what a browser cannot (disc images, avi, wmv ...) by converting
 #                   while it is watched (transcode.py)
 #   poppler-utils   the PDF reader's pages and text (it used to come in with calibre)
 #   fonts-wqy-microhei, fonts-dejavu-core   Chinese, Japanese, Korean and Latin for a PDF
-#                   that brings no fonts of its own, and for books calibre converts
-#   libegl1 ... libice6   what calibre's standalone build needs to start (11 MB together)
+#                   that brings no fonts of its own
+#   djvulibre-bin   a scanned .djvu made into a PDF by itself (ddjvu), without calibre
+#   libarchive-tools, 7zip   bsdtar opens the comics that are a real RAR archive, 7zz the
+#                   .chm help files (unpack.py); a few megabytes together
 #   intel-media-va-driver, mesa-va-drivers   the drivers through which ffmpeg reaches an
 #                   Intel or an AMD graphics card, when the container is given one, to make
 #                   the picture there (transcode.py). An NVIDIA card brings its own.
@@ -22,12 +19,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         poppler-utils \
-        xz-utils \
+        djvulibre-bin \
+        libarchive-tools \
+        7zip \
         fontconfig \
         fonts-wqy-microhei \
         fonts-dejavu-core \
-        libegl1 libopengl0 libnss3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
-        libxcb-render-util0 libxcb-xkb1 libxkbcommon-x11-0 libsm6 libice6 \
         mesa-va-drivers \
         $( [ "$(dpkg --print-architecture)" = amd64 ] && echo intel-media-va-driver ) \
     && fc-cache -fv > /dev/null \

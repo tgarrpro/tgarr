@@ -89,7 +89,7 @@ BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 # Single source for the version this crawler reports to the registry.
-TGARR_VERSION = "0.5.12"
+TGARR_VERSION = "0.5.13"
 TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
@@ -1075,6 +1075,31 @@ async def meili_sync_worker():
 
 SAFE_NAME = re.compile(r"[^\w\-._]+")
 
+# What the api's readers open as a book (keep in step with BOOK_KINDS in api/main.py: the two
+# containers share no code). A book is small, is wanted years after it was posted, and never
+# becomes a "release" - three things the rules below for films would otherwise hold against it.
+BOOK_KINDS = ("pdf", "epub", "djvu", "djv", "cbz", "cbr", "txt", "md", "markdown", "fb2", "docx", "odt", "rtf", "mobi", "azw",
+              "azw3", "prc", "html", "htm", "xhtml", "chm", "pptx", "ppsx", "xlsx", "xlsm", "ipynb")
+BOOK_RX = re.compile(r"\.(" + "|".join(BOOK_KINDS) + r")$", re.I)
+BOOK_SQL = "file_name ~* '\\.(" + "|".join(BOOK_KINDS) + ")$'"
+BOOK_MIN_BYTES = 1000             # a text of a page; under that it is a note, not a book
+
+
+def stored_name(file_name, row_id, taken: bool = False) -> str:
+    """The name a file is kept under in its folder: the sender's, made safe, cut to a length a
+    file system takes without losing what kind of file it is - and, when another file already
+    has that name (`taken`), with this row's number in it, so two different books called
+    "book.pdf" do not become one."""
+    base = SAFE_NAME.sub("_", file_name or "") or f"item-{row_id}"
+    stem, dot, ext = base.rpartition(".")
+    if not dot or len(ext) > 10 or not stem:
+        stem, ext = base, ""
+    if taken:
+        stem = f"{stem[:150]}.{row_id}"
+    else:
+        stem = stem[:170]
+    return f"{stem}.{ext}" if ext else stem
+
 # Time-sensitive content category detection. News-style channels have
 # rapidly-decaying value — 20-year-old news is historical archive territory,
 # not Sonarr/Radarr/Jellyfin replacement use case. Deep-backfill these only
@@ -1172,6 +1197,8 @@ def _quality_check(file_name: str | None, file_size: int | None,
         if media_type == "photo" and _AD_KEYWORDS_PHOTO.search(blob):
             return False, "ad-keyword-photo"
     floor = _MIN_SIZES.get(media_type)
+    if media_type == "document" and file_name and BOOK_RX.search(file_name):
+        floor = BOOK_MIN_BYTES        # a short story in a .txt is 5 KB
     if floor and file_size and file_size < floor:
         return False, f"micro-{media_type}"
     return True, None
@@ -5946,7 +5973,7 @@ async def on_demand_media_downloader() -> None:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow("""
                     SELECT m.id, m.tg_chat_id, m.tg_message_id, m.media_type,
-                           m.file_name, m.file_size
+                           m.file_name, m.file_size, m.file_unique_id
                     FROM messages m
                     WHERE m.local_path = '__user_queued__'
                       AND m.id <> ALL($1::bigint[])
@@ -6006,10 +6033,22 @@ async def _ondemand_fetch_one(row) -> None:
     root = (AUDIO_ROOT if mt == "audio"
             else VIDEO_ROOT if mt == "video"
             else LIBRARY_ROOT)
-    base = (row["file_name"] or f"item-{row['id']}")
-    safe = SAFE_NAME.sub("_", base)[:180]
-    target = os.path.join(root, safe)
+    target = os.path.join(root, stored_name(row["file_name"], row["id"]))
     rel = os.path.relpath(target, "/downloads")
+    # Two different files with one name (every scan is "book.pdf" to somebody): the second
+    # one must not be taken for the first, nor be written over it. If another row already
+    # holds this place with another file, this one gets its row number in its name.
+    try:
+        async with db_pool.acquire() as conn:
+            other = await conn.fetchval(
+                """SELECT 1 FROM messages WHERE local_path = $1 AND id <> $2
+                    AND (file_unique_id IS DISTINCT FROM $3 OR $3 IS NULL) LIMIT 1""",
+                rel, row["id"], row["file_unique_id"])
+        if other:
+            target = os.path.join(root, stored_name(row["file_name"], row["id"], taken=True))
+            rel = os.path.relpath(target, "/downloads")
+    except Exception as e:
+        log.warning("[on-demand-media] id=%s: could not look whether its name is taken: %s", row["id"], e)
     expected = row["file_size"] or 0
     watched = expected >= ONDEMAND_WATCH_BYTES
     mb = 1024 * 1024
@@ -6271,6 +6310,8 @@ async def decay_eviction_worker() -> None:
                            AND posted_at < NOW() - ($2 || ' days')::INTERVAL
                            AND channel_id NOT IN (SELECT id FROM channels WHERE {PRIVATE_CHAT_SQL})
                            AND COALESCE(local_path, '') = ''
+                           AND NOT (media_type = 'document' AND COALESCE(file_name, '') <> '' AND {BOOK_SQL})
+                           AND id NOT IN (SELECT msg_id FROM favorites)
                            AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)""",
                         category, str(cutoff_days))
                 # asyncpg returns "DELETE N" — parse the number
@@ -6350,7 +6391,8 @@ async def decay_eviction_worker() -> None:
                     WHERE (
                       (media_type='video'    AND file_size < 5000000) OR
                       (media_type='audio'    AND file_size < 100000)  OR
-                      (media_type='document' AND file_size < 10000)
+                      (media_type='document' AND file_size < 10000 AND NOT (COALESCE(file_name, '') <> '' AND """ + BOOK_SQL + """) OR
+                      (media_type='document' AND file_size < """ + str(BOOK_MIN_BYTES) + """)
                     )
                     AND COALESCE(local_path, '') = ''
                     AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)

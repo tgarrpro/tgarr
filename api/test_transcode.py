@@ -17,12 +17,15 @@ def ok(cond, what):
 for name in ("Film.iso", "a.VOB", "old.avi", "x.wmv", "clip.flv", "tv.mpg", "b.mpeg", "c.rmvb", "cam.3gp", "rec.ts", "bd.m2ts", "d.divx"):
     ok(T.needs(name) == "always", f"{name}: no browser plays it")
 ok(T.needs("film.mkv") == "maybe" and T.needs("clip.MOV") == "maybe", "mkv and mov: some browsers do, with some sound")
-ok(T.needs("film.mp4") == "" and T.needs("a.webm") == "" and T.needs("b.m4v") == "" and T.needs("noext") == "" and T.needs("") == "" and T.needs(None) == "",
+ok(T.needs("film.mp4") == "maybe" and T.needs("a.webm") == "maybe" and T.needs("b.m4v") == "maybe",
+   "mp4 and webm too, since AV1 and HEVC live in them: played as they are, converted if this device cannot")
+ok(T.needs("song.mp3") == "" and T.needs("noext") == "" and T.needs("") == "" and T.needs(None) == "",
    "what plays as it is; and what is no file name")
 
 # ---- how a file is opened -------------------------------------------------------------------------
 ok(T.openings("/d/Film.iso") == [("dvd", ["-f", "dvdvideo", "-i", "/d/Film.iso"]), ("bluray", ["-i", "bluray:/d/Film.iso"])], "a disc image: as a DVD, then as a Blu-ray")
-ok(T.openings("/d/film.mkv") == [("file", ["-i", "/d/film.mkv"])], "anything else is a file")
+ok(T.openings("/d/film.mkv") == [("file", ["-protocol_whitelist", "file,crypto,data", "-i", "/d/film.mkv"])],
+   "anything else is a file - read from this disk only: a list of addresses named .ts fetches nothing")
 
 # ---- what ffprobe said ----------------------------------------------------------------------------
 dvd = {"streams": [{"codec_type": "video", "codec_name": "mpeg2video", "width": 720, "height": 480, "pix_fmt": "yuv420p"},
