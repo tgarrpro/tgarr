@@ -61,6 +61,11 @@ themes = re.search(r"_MC_THEMES = \((.*?)\n\)\n", src, re.S).group(1)
 for key, name, about in re.findall(r'\("(\w+)", "([^"]+)", "([^"]*)"', themes):
     asked |= {name} | ({about} if about else set())
 asked |= {"Watch", "Listen", "Read", "Photos"}                 # the four shelves of the Media Center
+# the frame of the main pages: the side menu, each page's title, the search boxes
+nav = re.search(r"^NAV_ITEMS = \[(.*?)^\]", src, re.S | re.M).group(1)
+asked |= set(re.findall(r'^\s*\("/[^"]*",\s*"([^"]+)"', nav, re.M))
+asked |= set(re.findall(r'_layout\("([^"]+)"', src)) | set(re.findall(r'page_title="([^"]+)"', src))
+asked |= set(re.findall(r'"/\w+":\s+\("/\w+",\s*"(Search [^"]+)"\)', src)) | {"Search…"}
 ok(len(asked) > 40, f"the pages ask for {len(asked)} words")
 missing = sorted(a for a in asked if a not in I.T)
 ok(not missing, f"asked for by a page, not in the catalogue: {missing}")

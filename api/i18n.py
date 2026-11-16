@@ -10,8 +10,9 @@ translation yet is shown in English - a page is never broken by a missing word.
                                                [[@js:English text]] for text inside a script
 
 Which pages speak these languages so far: the Media Center, the PIN page, the page shown when
-the Media Center is closed. (The rest of tgarr - the pages of whoever looks after it - is
-English still; the catalogue below is where they will be added.)
+the Media Center is closed - and the frame of every other page: the side menu, the titles, the
+search boxes, the account menu. (What stands inside those other pages is English still; the
+catalogue below is where it will be added.)
 
 The translations were written by the same hand as the code and have not been read by native
 speakers of every language: corrections are welcome and cost one line each.
@@ -73,6 +74,51 @@ T = {
     "Make this the language every screen starts with": ("设为所有屏幕的默认语言", "設為所有螢幕的預設語言", "Usar este idioma al empezar en todas las pantallas", "En faire la langue de départ de tous les écrans", "Als Startsprache für alle Bildschirme festlegen", "Usar este idioma ao iniciar em todas as telas", "Сделать языком по умолчанию для всех экранов", "すべての画面の最初の言語にする", "모든 화면의 기본 언어로 하기", "להפוך לשפת ההתחלה בכל המסכים", "اجعلها اللغة الافتراضية لكل الشاشات"),
     "every screen now starts in this language": ("所有屏幕现在默认用这种语言", "所有螢幕現在預設用這種語言", "todas las pantallas empiezan ahora en este idioma", "tous les écrans démarrent désormais dans cette langue", "alle Bildschirme starten jetzt in dieser Sprache", "todas as telas agora começam neste idioma", "теперь все экраны начинают на этом языке", "すべての画面がこの言語で始まります", "이제 모든 화면이 이 언어로 시작합니다", "כל המסכים מתחילים עכשיו בשפה הזאת", "كل الشاشات تبدأ الآن بهذه اللغة"),
     "not saved": ("未保存", "未儲存", "no se guardó", "non enregistré", "nicht gespeichert", "não salvo", "не сохранено", "保存できませんでした", "저장되지 않았습니다", "לא נשמר", "لم يُحفظ"),
+    # ── the frame of the main pages: the side menu, titles, search boxes, the account ──
+    "Dashboard": ("总览", "總覽", "Panel", "Tableau de bord", "Übersicht", "Painel", "Обзор", "ダッシュボード", "대시보드", "לוח בקרה", "لوحة التحكم"),
+    "Channels": ("频道", "頻道", "Canales", "Chaînes", "Kanäle", "Canais", "Каналы", "チャンネル", "채널", "ערוצים", "القنوات"),
+    "Discover": ("发现", "探索", "Descubrir", "Découvrir", "Entdecken", "Descobrir", "Обзор каналов", "見つける", "둘러보기", "גילוי", "استكشاف"),
+    "Releases": ("影视", "影視", "Estrenos", "Sorties", "Veröffentlichungen", "Lançamentos", "Релизы", "リリース", "릴리스", "מהדורות", "الإصدارات"),
+    "Gallery": ("图库", "圖庫", "Galería", "Galerie", "Galerie", "Galeria", "Галерея", "ギャラリー", "갤러리", "גלריה", "المعرض"),
+    "Videos": ("视频", "影片", "Vídeos", "Vidéos", "Videos", "Vídeos", "Видео", "動画", "동영상", "סרטונים", "الفيديو"),
+    "Music": ("音乐", "音樂", "Música", "Musique", "Musik", "Música", "Музыка", "音楽", "음악", "מוזיקה", "الموسيقى"),
+    "Library": ("书库", "書庫", "Biblioteca", "Bibliothèque", "Bibliothek", "Biblioteca", "Библиотека", "ライブラリ", "서재", "ספרייה", "المكتبة"),
+    "Downloads": ("下载", "下載", "Descargas", "Téléchargements", "Downloads", "Downloads", "Загрузки", "ダウンロード", "다운로드", "הורדות", "التنزيلات"),
+    "Usenet": ("Usenet", "Usenet", "Usenet", "Usenet", "Usenet", "Usenet", "Usenet", "Usenet", "Usenet", "Usenet", "Usenet"),
+    "Archive": ("互联网档案馆", "網際網路檔案館", "Archivo", "Archive", "Archiv", "Arquivo", "Архив", "アーカイブ", "아카이브", "ארכיון", "الأرشيف"),
+    "My files": ("我的文件", "我的檔案", "Mis archivos", "Mes fichiers", "Meine Dateien", "Meus arquivos", "Мои файлы", "マイファイル", "내 파일", "הקבצים שלי", "ملفاتي"),
+    "Search": ("搜索", "搜尋", "Buscar", "Recherche", "Suche", "Busca", "Поиск", "検索", "검색", "חיפוש", "بحث"),
+    "Settings": ("设置", "設定", "Ajustes", "Réglages", "Einstellungen", "Configurações", "Настройки", "設定", "설정", "הגדרות", "الإعدادات"),
+    "System": ("系统", "系統", "Sistema", "Système", "System", "Sistema", "Система", "システム", "시스템", "מערכת", "النظام"),
+    "System status": ("系统状态", "系統狀態", "Estado del sistema", "État du système", "Systemstatus", "Estado do sistema", "Состояние системы", "システムの状態", "시스템 상태", "מצב המערכת", "حالة النظام"),
+    "Update": ("更新", "更新", "Actualizar", "Mise à jour", "Aktualisieren", "Atualizar", "Обновление", "アップデート", "업데이트", "עדכון", "تحديث"),
+    "Updating tgarr": ("更新 tgarr", "更新 tgarr", "Actualizar tgarr", "Mettre tgarr à jour", "tgarr aktualisieren", "Atualizar o tgarr", "Обновление tgarr", "tgarr のアップデート", "tgarr 업데이트", "עדכון tgarr", "تحديث tgarr"),
+    "Download many at once": ("批量下载", "批次下載", "Descargar muchos a la vez", "Télécharger en nombre", "Viele auf einmal herunterladen", "Baixar vários de uma vez", "Скачать сразу много", "まとめてダウンロード", "한꺼번에 내려받기", "הורדה של רבים בבת אחת", "تنزيل الكثير دفعة واحدة"),
+    "Pictures": ("图片", "圖片", "Imágenes", "Images", "Bilder", "Imagens", "Картинки", "画像", "사진", "תמונות", "الصور"),
+    "Looking at pictures": ("图片识别", "圖片辨識", "Analizar imágenes", "Analyse des images", "Bilder erkennen", "Analisar imagens", "Распознавание картинок", "画像の判定", "사진 살펴보기", "זיהוי תמונות", "تحليل الصور"),
+    "Voice": ("语音", "語音", "Voz", "Voix", "Stimme", "Voz", "Голос", "音声", "음성", "קול", "الصوت"),
+    "Reading aloud": ("朗读", "朗讀", "Lectura en voz alta", "Lecture à voix haute", "Vorlesen", "Leitura em voz alta", "Чтение вслух", "読み上げ", "소리 내어 읽기", "הקראה", "القراءة بصوت عالٍ"),
+    "Internet Archive": ("互联网档案馆", "網際網路檔案館", "Internet Archive", "Internet Archive", "Internet Archive", "Internet Archive", "Архив Интернета", "インターネットアーカイブ", "인터넷 아카이브", "ארכיון האינטרנט", "أرشيف الإنترنت"),
+    "Fetched from the Internet Archive": ("从互联网档案馆取回的", "從網際網路檔案館取回的", "Traído del Internet Archive", "Récupéré sur Internet Archive", "Vom Internet Archive geholt", "Trazido do Internet Archive", "Получено из Архива Интернета", "インターネットアーカイブから取得", "인터넷 아카이브에서 가져온 것", "הובא מארכיון האינטרנט", "ما جُلب من أرشيف الإنترنت"),
+    "Fetched from Usenet": ("从 Usenet 取回的", "從 Usenet 取回的", "Traído de Usenet", "Récupéré sur Usenet", "Aus dem Usenet geholt", "Trazido da Usenet", "Получено из Usenet", "Usenet から取得", "Usenet에서 가져온 것", "הובא מ-Usenet", "ما جُلب من Usenet"),
+    "Media Center & PIN": ("媒体中心与 PIN", "媒體中心與 PIN", "Centro multimedia y PIN", "Médiathèque et code", "Mediencenter & PIN", "Central de mídia e PIN", "Медиацентр и PIN", "メディアセンターと PIN", "미디어 센터와 PIN", "מרכז המדיה והקוד", "مركز الوسائط والرمز"),
+    "Search…": ("搜索…", "搜尋…", "Buscar…", "Rechercher…", "Suchen…", "Buscar…", "Поиск…", "検索…", "검색…", "חיפוש…", "بحث…"),
+    "Search photos…": ("搜索照片…", "搜尋照片…", "Buscar fotos…", "Rechercher des photos…", "Fotos suchen…", "Buscar fotos…", "Поиск фото…", "写真を検索…", "사진 검색…", "חיפוש תמונות…", "بحث في الصور…"),
+    "Search videos…": ("搜索视频…", "搜尋影片…", "Buscar vídeos…", "Rechercher des vidéos…", "Videos suchen…", "Buscar vídeos…", "Поиск видео…", "動画を検索…", "동영상 검색…", "חיפוש סרטונים…", "بحث في الفيديو…"),
+    "Search discovered channels…": ("搜索发现的频道…", "搜尋探索到的頻道…", "Buscar canales descubiertos…", "Rechercher parmi les chaînes découvertes…", "Entdeckte Kanäle durchsuchen…", "Buscar canais descobertos…", "Поиск по найденным каналам…", "見つけたチャンネルを検索…", "찾은 채널 검색…", "חיפוש בערוצים שהתגלו…", "بحث في القنوات المكتشفة…"),
+    "Search music…": ("搜索音乐…", "搜尋音樂…", "Buscar música…", "Rechercher de la musique…", "Musik suchen…", "Buscar música…", "Поиск музыки…", "音楽を検索…", "음악 검색…", "חיפוש מוזיקה…", "بحث في الموسيقى…"),
+    "Search ebooks…": ("搜索电子书…", "搜尋電子書…", "Buscar libros…", "Rechercher des livres…", "Bücher suchen…", "Buscar livros…", "Поиск книг…", "本を検索…", "책 검색…", "חיפוש ספרים…", "بحث في الكتب…"),
+    "Search channels…": ("搜索频道…", "搜尋頻道…", "Buscar canales…", "Rechercher des chaînes…", "Kanäle suchen…", "Buscar canais…", "Поиск каналов…", "チャンネルを検索…", "채널 검색…", "חיפוש ערוצים…", "بحث في القنوات…"),
+    "Search downloads…": ("搜索下载…", "搜尋下載…", "Buscar descargas…", "Rechercher dans les téléchargements…", "Downloads durchsuchen…", "Buscar downloads…", "Поиск по загрузкам…", "ダウンロードを検索…", "다운로드 검색…", "חיפוש בהורדות…", "بحث في التنزيلات…"),
+    "Search releases…": ("搜索影视…", "搜尋影視…", "Buscar estrenos…", "Rechercher des sorties…", "Veröffentlichungen suchen…", "Buscar lançamentos…", "Поиск релизов…", "リリースを検索…", "릴리스 검색…", "חיפוש מהדורות…", "بحث في الإصدارات…"),
+    "Not signed in": ("未登录", "未登入", "Sin iniciar sesión", "Non connecté", "Nicht angemeldet", "Sem login", "Вход не выполнен", "サインインしていません", "로그인하지 않음", "לא מחובר", "لم يُسجَّل الدخول"),
+    "browsing what is already indexed": ("正在浏览已索引的内容", "正在瀏覽已索引的內容", "viendo lo que ya está indexado", "parcours de ce qui est déjà indexé", "es wird gezeigt, was schon erfasst ist", "vendo o que já está indexado", "просмотр уже проиндексированного", "すでに索引済みのものを表示中", "이미 색인된 것을 보는 중", "גלישה במה שכבר נאסף", "تصفّح ما فُهرس من قبل"),
+    "Sign in to Telegram": ("登录 Telegram", "登入 Telegram", "Iniciar sesión en Telegram", "Se connecter à Telegram", "Bei Telegram anmelden", "Entrar no Telegram", "Войти в Telegram", "Telegram にサインイン", "Telegram에 로그인", "כניסה לטלגרם", "تسجيل الدخول إلى تيليغرام"),
+    "My Telegram profile": ("我的 Telegram 主页", "我的 Telegram 個人檔案", "Mi perfil de Telegram", "Mon profil Telegram", "Mein Telegram-Profil", "Meu perfil do Telegram", "Мой профиль в Telegram", "自分の Telegram プロフィール", "내 Telegram 프로필", "הפרופיל שלי בטלגרם", "ملفي في تيليغرام"),
+    "Lock (back to the Media Center)": ("锁定（回到媒体中心）", "鎖定（回到媒體中心）", "Bloquear (volver al Centro multimedia)", "Verrouiller (retour à la Médiathèque)", "Sperren (zurück zum Mediencenter)", "Bloquear (voltar à Central de mídia)", "Заблокировать (назад в Медиацентр)", "ロック（メディアセンターに戻る）", "잠금 (미디어 센터로 돌아가기)", "נעילה (חזרה למרכז המדיה)", "قفل (العودة إلى مركز الوسائط)"),
+    "Sign out": ("退出登录", "登出", "Cerrar sesión", "Se déconnecter", "Abmelden", "Sair", "Выйти", "サインアウト", "로그아웃", "יציאה מהחשבון", "تسجيل الخروج"),
+    "signed in": ("已登录", "已登入", "sesión iniciada", "connecté", "angemeldet", "conectado", "вход выполнен", "サインイン済み", "로그인됨", "מחובר", "تم تسجيل الدخول"),
+    "Telegram account": ("Telegram 账号", "Telegram 帳號", "Cuenta de Telegram", "Compte Telegram", "Telegram-Konto", "Conta do Telegram", "Аккаунт Telegram", "Telegram アカウント", "Telegram 계정", "חשבון טלגרם", "حساب تيليغرام"),
     # ── the PIN page ──
     "Enter the PIN": ("输入 PIN", "輸入 PIN", "Introduce el PIN", "Saisissez le code", "PIN eingeben", "Digite o PIN", "Введите PIN", "PIN を入力してください", "PIN을 입력하세요", "הזינו את הקוד", "أدخل الرمز"),
     "Enter the PIN to open all of tgarr.": ("输入 PIN 以打开完整的 tgarr。", "輸入 PIN 以開啟完整的 tgarr。", "Introduce el PIN para abrir todo tgarr.", "Saisissez le code pour ouvrir tout tgarr.", "Gib die PIN ein, um ganz tgarr zu öffnen.", "Digite o PIN para abrir todo o tgarr.", "Введите PIN, чтобы открыть весь tgarr.", "PIN を入力すると tgarr のすべてが開きます。", "PIN을 입력하면 tgarr 전체가 열립니다.", "הזינו את הקוד כדי לפתוח את כל tgarr.", "أدخل الرمز لفتح tgarr كاملًا."),

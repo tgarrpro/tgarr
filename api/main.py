@@ -174,6 +174,7 @@ def _pub_m(alias: str = "m") -> str:
 # else. This is decided here, for every request, not by hiding links.
 # ════════════════════════════════════════════════════════════════════
 _LOCKED = contextvars.ContextVar("tgarr_locked", default=False)
+_LANG = contextvars.ContextVar("tgarr_lang", default="en")      # the language this request is answered in
 _ACCESS = {"at": 0.0, "pin": None, "secret": None}
 _GUESSES = access.Guesses()
 _KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
@@ -396,6 +397,7 @@ def _ct_equal(a: str, b: str) -> bool:
 
 async def _request_guard(request: Request, call_next):
     path = request.url.path
+    _LANG.set(await _lang(request))
     # a different account than a moment ago: put the other one's private
     # chats into keeping (and take this one's out) before anything is shown
     if db_pool is not None and _me_id() != _PRIVATE_FOR[0]:
@@ -7440,6 +7442,11 @@ div.ub { cursor:default; }
                 border:1px solid var(--border); border-radius:8px; }
 .user .ub-menu a { color:var(--fg); font-weight:400; }
 .user a.ub-in { color:#fff; }
+/* the language of this screen, chosen at the foot of the side menu */
+.lang-sel { display:block; width:calc(100% - 20px); margin:8px 10px 6px; padding:7px 10px; border-radius:8px; font:inherit; font-size:13px;
+  color:var(--fg); background:var(--surface); border:1px solid var(--border); cursor:pointer; }
+.lang-sel:hover, .lang-sel:focus { border-color:var(--accent); outline:none; }
+
 .ub-in { display:block; margin:6px 10px 4px; padding:8px 12px; border-radius:8px; background:var(--accent);
          color:#fff; text-align:center; text-decoration:none; font-weight:600; font-size:13px; }
 .user a { color:var(--accent); text-decoration:none; font-size:14px; font-weight:600; }
@@ -7832,14 +7839,18 @@ def _color_for(s: str) -> str:
 
 def _user_block() -> str:
     """The account at the foot of the side menu: picture, name, a small menu."""
+    lang = _LANG.get()
+
+    def tr(text: str) -> str:
+        return html.escape(i18n.t(lang, text), quote=True)
     if not _signed_in():
         return ('<div class="ub"><div class="ub-av none">?</div>'
-                '<div class="ub-txt"><b>Not signed in</b><small>browsing what is already indexed</small></div></div>'
-                '<a class="ub-in" href="/login">Sign in to Telegram</a>'
-                + ('<a class="ub-lk" href="/lock">🔒 Lock</a>' if _ACCESS["pin"] else ''))
+                f'<div class="ub-txt"><b>{tr("Not signed in")}</b><small>{tr("browsing what is already indexed")}</small></div></div>'
+                f'<a class="ub-in" href="/login">{tr("Sign in to Telegram")}</a>'
+                + (f'<a class="ub-lk" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else ''))
     user = login.ensure_user_info() or {}
     uname = user.get("username")
-    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or "Telegram account"
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or uname or i18n.t(lang, "Telegram account")
     try:
         av_v = int(os.path.getmtime(login.AVATAR_FILE))
         av = f'<img class="ub-av" src="/api/me/avatar?v={av_v}" alt="">'
@@ -7849,16 +7860,16 @@ def _user_block() -> str:
     return (
         '<div class="ub-wrap">'
         '<div class="ub-menu" id="tgUserMenu" hidden>'
-        '<a href="/settings">Settings</a>'
-        '<a href="/system">System status</a>'
-        '<a href="/mediacenter/manage">Media Center &amp; PIN</a>'
-        + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">My Telegram profile ↗</a>'
+        f'<a href="/settings">{tr("Settings")}</a>'
+        f'<a href="/system">{tr("System status")}</a>'
+        f'<a href="/mediacenter/manage">{tr("Media Center & PIN")}</a>'
+        + (f'<a href="https://t.me/{html.escape(uname)}" target="_blank" rel="noopener">{tr("My Telegram profile")} ↗</a>'
            if uname else '')
-        + ('<a href="/lock">🔒 Lock (back to the Media Center)</a>' if _ACCESS["pin"] else '')
-        + '<button type="button" onclick="tgSignOut()">Sign out</button></div>'
+        + (f'<a href="/lock">🔒 {tr("Lock (back to the Media Center)")}</a>' if _ACCESS["pin"] else '')
+        + f'<button type="button" onclick="tgSignOut()">{tr("Sign out")}</button></div>'
         '<button type="button" class="ub" onclick="tgUserMenu(event)" title="account">'
         f'{av}<span class="ub-txt"><b>{html.escape(name)}</b>'
-        f'<small>{("@" + html.escape(uname)) if uname else "signed in"}</small></span>'
+        f'<small>{("@" + html.escape(uname)) if uname else tr("signed in")}</small></span>'
         '<span class="ub-ch">⋯</span></button></div>'
         '<script>'
         'function tgUserMenu(e){e.stopPropagation();var m=document.getElementById("tgUserMenu");m.hidden=!m.hidden}'
@@ -7896,6 +7907,8 @@ MOBILE_CSS = """
   aside.nav .user .ub-av { width:32px; height:32px; font-size:14px; }
   aside.nav .user .ub-menu { top:calc(100% + 8px); bottom:auto; left:auto; right:0; width:220px; }
   aside.nav .user .ub-in { margin:0; padding:7px 10px; font-size:12px; white-space:nowrap; }
+  aside.nav .user { display:flex; align-items:center; gap:6px; }
+  aside.nav .user .lang-sel { width:auto; max-width:120px; margin:0; padding:6px 8px; font-size:12px; }
   main.main { min-height:0; }
   .topbar { height:auto; padding:10px 14px; gap:10px; flex-wrap:wrap; }
   .topbar h1 { font-size:20px; }
@@ -7912,9 +7925,13 @@ MOBILE_CSS = """
 def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str] = None,
             top_actions_html: Optional[str] = None) -> str:
     locked = _LOCKED.get()
+    lang = _LANG.get()
+
+    def tr(text: str) -> str:
+        return html.escape(i18n.t(lang, text), quote=True)
     nav = "".join(
         f'<a href="{path}" class="navlink{" active" if path == active else ""}">'
-        f'{_icon(svg)}<span>{name}</span></a>'
+        f'{_icon(svg)}<span>{tr(name)}</span></a>'
         # a locked browser is shown the kids' pages and nothing else
         for path, name, svg in ([("/mediacenter", "Media Center", "M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 17.2 5.9 20.6l1.4-6.8L2.2 9.1l6.9-.8z")]
                                 if locked else NAV_ITEMS)
@@ -7933,13 +7950,17 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
         action, placeholder = cfg.get(active, ("/search", "Search…"))
         top_actions_html = (
             f'<form action="{action}" method="GET" style="margin-left:auto">'
-            f'<input type="text" name="q" class="search" placeholder="{placeholder}" />'
+            f'<input type="text" name="q" class="search" placeholder="{tr(placeholder)}" />'
             f'</form>'
         )
+    # the language of this screen, changed in the side menu (kept in a cookie, so every page comes in it)
+    chooser = ('<select class="lang-sel" aria-label="Language" onchange="document.cookie=\'tgarr_lang=\'+this.value+\'; path=/; max-age=31536000; SameSite=Lax\';location.reload()">'
+               + "".join(f'<option value="{code}"{" selected" if code == lang else ""}>{"🌐 " if code == lang else ""}{html.escape(name)}</option>' for code, name in i18n.LANGS)
+               + "</select>")
     return f"""<!DOCTYPE html>
-<html><head>
+<html lang="{lang}"><head>
 <meta charset="utf-8">
-<title>{html.escape(title)} · tgarr</title>
+<title>{tr(title)} · tgarr</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 {_pwa_head()}
@@ -7954,11 +7975,11 @@ def _layout(title: str, active: str, body_html: str, *, page_title: Optional[str
     <a class="ver" href="/settings/update" title="this version; updating" style="text-decoration:none;display:block">v{TGARR_VERSION}</a>
   </div>
   <div class="navlinks">{nav}</div>
-  <div class="user">{'<a class="ub-in" href="/unlock">🔒 Enter PIN</a>' if locked else _user_block()}</div>
+  <div class="user">{chooser}{f'<a class="ub-in" href="/unlock">🔒 {tr("Enter PIN")}</a>' if locked else _user_block()}</div>
 </aside>
 <main class="main">
   <header class="topbar">
-    <h1>{html.escape(page_title or title)}</h1>
+    <h1>{tr(page_title or title)}</h1>
     {top_actions_html}
   </header>
   <div class="content">{body_html}</div>
