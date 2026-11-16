@@ -128,6 +128,39 @@ def order_lessons(parts, files) -> list:
     return out
 
 
+def report(rows, shipped: dict) -> list:
+    """What the registry is told about this install's courses. rows: [{kind, slug, title,
+    lang, level, subject, license, parts (JSON text), lessons, done: [lessons done by each
+    person who began it]}].
+
+    Only a course made of Internet Archive items is told of at all - one of the shipped lists
+    by its name, any other by the items it names (pointers to what is public at archive.org).
+    A course over a channel, a folder or file names is not in what comes back: nothing of it
+    leaves the install. With each go two numbers: how many began it, and the middle of how
+    many lessons they did. Never who."""
+    out = []
+    for r in rows:
+        if r.get("kind") != "pack":
+            continue
+        try:
+            parts = [p["ia"] for p in json.loads(r.get("parts") or "[]")]
+        except Exception:
+            continue
+        if not parts or not all(isinstance(p, str) and IA_RX.match(p) for p in parts):
+            continue
+        done = sorted(int(d) for d in (r.get("done") or []))
+        one = {"title": r.get("title") or "", "lang": r.get("lang") or "", "level": r.get("level") or "all",
+               "subject": r.get("subject") or "other", "right": r.get("license") or "", "lessons": int(r.get("lessons") or 0),
+               "learners": len(done), "done_median": done[len(done) // 2] if done else 0}
+        pk = shipped.get(r.get("slug") or "")
+        if pk and [p["ia"] for p in pk["parts"]] == parts:
+            one["slug"] = pk["slug"]                   # a shipped list, unchanged: its name says all
+        else:
+            one["parts"] = parts
+        out.append(one)
+    return out
+
+
 def clean_reward(raw) -> dict:
     raw = raw if isinstance(raw, dict) else {}
 

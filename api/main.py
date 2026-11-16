@@ -698,6 +698,7 @@ async def _startup():
     asyncio.create_task(_vision_worker())
     asyncio.create_task(_usenet_grab_worker())
     asyncio.create_task(_archive_grab_worker())
+    asyncio.create_task(_course_report_worker())
     asyncio.create_task(_archive_arr_worker())
     asyncio.create_task(_update_check_worker())
     asyncio.create_task(_packs_heal())
@@ -12830,6 +12831,65 @@ async def api_course_export(course_id: int):
                     headers={"Content-Disposition": f'attachment; filename="{name}.tgarr-course.json"'})
 
 
+async def _course_report_once() -> str:
+    """Tell the registry which Internet Archive courses this install uses (courses.report):
+    the lists and two numbers each, never who learned what, and nothing of any other kind of
+    course. Returns what happened, for the log."""
+    async with db_pool.acquire() as conn:
+        if (await conn.fetchval("SELECT value FROM config WHERE key = 'share_courses'")) == "0":
+            return "switched off"
+        uuid_ = await conn.fetchval("SELECT value FROM config WHERE key = 'instance_uuid'")
+        if not uuid_:
+            return "this install has no name at the registry yet"
+        rows = [dict(r) for r in await conn.fetch(
+            """SELECT c.id, c.kind, c.slug, c.title, c.lang, c.level, c.subject, c.license, c.parts,
+                      (SELECT count(*) FROM course_items ci WHERE ci.course_id = c.id) AS lessons
+               FROM courses c WHERE c.kind = 'pack' AND c.parts IS NOT NULL""")]
+        for r in rows:
+            r["done"] = [x["n"] for x in await conn.fetch(
+                """SELECT count(*) FILTER (WHERE p.done) AS n FROM course_items ci JOIN progress p ON p.msg_id = ci.msg_id
+                   WHERE ci.course_id = $1 GROUP BY p.who""", r["id"])]
+        lang = (await conn.fetchval("SELECT value FROM config WHERE key = 'ui_lang'")) or ""
+    told = courses.report(rows, _course_packs())
+    body = _json.dumps({"instance_uuid": uuid_, "version": TGARR_VERSION, "lang": lang, "courses": told}).encode()
+
+    def send():
+        req = urllib.request.Request(UPDATE_REGISTRY_URL + "/api/v1/courses/report", data=body, method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": f"tgarr/{TGARR_VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status
+    try:
+        return f"{len(told)} courses told, answer {await asyncio.to_thread(send)}"
+    except Exception as e:
+        return f"not told ({type(e).__name__}: {str(e)[:80]})"
+
+
+async def _course_report_worker():
+    """Once a day, at a time of this install's own (so that installs do not all come at once)."""
+    import random
+    await asyncio.sleep(600 + random.random() * 3000)
+    while True:
+        try:
+            if db_pool is not None:
+                log.info("[courses] the registry: %s", await _course_report_once())
+        except Exception as e:
+            log.info("[courses] the registry was not told: %s: %s", type(e).__name__, str(e)[:120])
+        await asyncio.sleep(86400 + random.random() * 7200)
+
+
+@app.post("/api/kids/share_courses")
+async def api_kids_share_courses(request: Request):
+    """Whether the registry is told which Internet Archive courses this install uses."""
+    try:
+        on = bool((await request.json()).get("on"))
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('share_courses', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", "1" if on else "0")
+    return {"status": "ok", "on": on}
+
+
 @app.post("/api/kids/reward")
 async def api_kids_reward(request: Request):
     """What learning earns (courses.clean_reward)."""
@@ -13761,6 +13821,8 @@ async def page_kids_manage():
     async with db_pool.acquire() as conn:
         my_courses = await _course_list(conn, "owner", False)
     rw = await _reward()
+    async with db_pool.acquire() as conn:
+        share_on = (await conn.fetchval("SELECT value FROM config WHERE key = 'share_courses'")) != "0"
     kind_word = {"pack": "from the Internet Archive", "folder": "a folder", "channel": "a channel", "list": "an imported list"}
     course_rows = "".join(
         f'<div class="km-row"><input type="checkbox" {"checked" if c["allowed"] else ""} title="{_t("shown in the Media Center")}" '
@@ -13800,6 +13862,12 @@ async def page_kids_manage():
         f'<div style="margin-top:14px"><button class="btn" onclick="kcReward()">{_t("Save")}</button> <span id="rwMsg" style="color:var(--muted);margin-left:8px"></span></div>'
         '<p style="color:var(--muted);font-size:13px;margin:12px 0 0">' + _t("Opening hours and breaks hold for lessons as for everything else. Time is counted only for a browser that has not entered your PIN.") + '</p>'
         '</div></div>'
+        + '<div class="km-box"><div class="km-pad">'
+        f'<label><input type="checkbox" id="kcShare" {"checked" if share_on else ""} onchange="kcShare(this)"/> '
+        + _t("Tell tgarr.me which Internet Archive courses this install uses") + '</label>'
+        '<p style="color:var(--muted);font-size:13px;margin:8px 0 0">'
+        + _t("Once a day: the list of each such course, how many people here began it and how far they got in the middle - so that good courses can be found by others. Never who, and nothing about a course made of a channel, a folder or your own files: those are not told of at all.")
+        + '</p></div></div>'
         # add a course
         + f'<h2 class="section">{_t("Add a course")}</h2>'
         + (f'<p class="note">{_t("Lists that come with tgarr. Their material is at the Internet Archive and is fetched to this machine when you ask for it.")}</p>'
@@ -13901,6 +13969,7 @@ function kcImport(){
   const f = G("kcFile").files[0]; if (!f) return;
   f.text().then(t => { let j; try { j = JSON.parse(t); } catch (e) { alert("[[@js:This file is not a course list.]]"); return; } kcAdd({import: j}); });
 }
+function kcShare(el){ kcSend("/api/kids/share_courses", {on: el.checked}).then(j => { if (j.status !== "ok") el.checked = !el.checked; }); }
 function kcReward(){
   kcSend("/api/kids/reward", {on: G("rwOn").checked, per_lesson: +G("rwPer").value, most: +G("rwMost").value, share: +G("rwShare").value,
     book_minutes: +G("rwBook").value, learn_free: G("rwFree").checked})

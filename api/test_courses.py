@@ -75,6 +75,28 @@ files = [(5, "b", "02 two.mp3"), (4, "b", "10 ten.mp3"), (9, "a", "x.pdf"), (6, 
 ok(C.order_lessons([{"ia": "a"}, {"ia": "b"}, {"ia": "c"}], files) == [9, 6, 5, 4], "parts in the list's order, files in the order of their names")
 ok(C.order_lessons([], files) == [], "no parts, no lessons")
 
+# ── what the registry is told ──
+shipped = {"mcguffey-readers": p}
+rows = [
+    {"kind": "pack", "slug": "mcguffey-readers", "title": "McGuffey's Readers", "lang": "en", "level": "5-8", "subject": "reading", "license": "OLD",
+     "parts": json.dumps(p["parts"]), "lessons": 6, "done": [1, 6, 3]},
+    {"kind": "pack", "slug": None, "title": "An imported list", "parts": json.dumps([{"ia": "abc_item"}, {"ia": "def_item"}]), "lessons": 9, "done": []},
+    {"kind": "pack", "slug": "mcguffey-readers", "title": "changed by hand", "parts": json.dumps([{"ia": "only_one"}]), "lessons": 1, "done": [1]},
+    {"kind": "channel", "slug": None, "title": "Anna's piano lessons", "ref": "@a_private_thing", "parts": None, "lessons": 30, "done": [4]},
+    {"kind": "folder", "slug": None, "title": "Home videos of Ben", "ref": "1:family/ben", "parts": None, "lessons": 12, "done": [2]},
+    {"kind": "list", "slug": None, "title": "School", "parts": json.dumps([{"name": "Ben - maths test.pdf"}]), "lessons": 1, "done": [1]},
+    {"kind": "pack", "slug": None, "title": "broken", "parts": "{not json", "lessons": 1, "done": []},
+]
+rep = C.report(rows, shipped)
+ok(len(rep) == 3, "of seven courses the three made of Archive items are told of")
+ok(rep[0] == {"title": "McGuffey's Readers", "lang": "en", "level": "5-8", "subject": "reading", "right": "OLD", "lessons": 6,
+              "learners": 3, "done_median": 3, "slug": "mcguffey-readers"}, "a shipped list by its name, with how many began it and the middle of what they did")
+ok("parts" not in rep[0] and rep[1]["parts"] == ["abc_item", "def_item"] and "slug" not in rep[1], "another by the items it names")
+ok(rep[2].get("parts") == ["only_one"] and "slug" not in rep[2], "a shipped name over other items is not passed off as the shipped list")
+told = json.dumps(rep)
+ok(not any(w in told for w in ("Anna", "Ben", "piano", "a_private_thing", "family", "maths")), "nothing of a channel's, a folder's or a file list's course is in it")
+ok(C.report([], shipped) == [] and C.report([{"kind": "pack", "parts": "[]"}], shipped) == [], "no courses, nothing told")
+
 # ── rewards ──
 r = C.clean_reward({"on": True, "per_lesson": 20, "most": 60, "share": 70, "book_minutes": 20})
 ok(C.clean_reward(None) == C.REWARD_DEFAULT and C.clean_reward({"per_lesson": "x", "share": 5})["share"] == 10, "a rule as typed in is made safe")
