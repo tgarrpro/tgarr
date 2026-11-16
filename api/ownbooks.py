@@ -5,6 +5,8 @@
     .docx  .odt          a zip of XML (Word, LibreOffice)
     .rtf                 text and paragraphs (type faces, pictures and tables are let go)
     .html  .htm          a saved page: its text and structure (pictures kept beside it are not in the file)
+    .pptx                slides: a chapter a slide - its title, its text, its pictures and tables
+    .xlsx                sheets: a table a sheet, as the cells read (numbers, dates, text), no charts
     .chm                 Windows' compiled help: its pages in the order of its contents, its pictures
                          (unpacked by 7-Zip, see unpack.py)
     .mobi  .azw  .prc    Mobipocket, the old Kindle format, when it is not protected
@@ -33,7 +35,8 @@ from xml.etree import ElementTree as ET
 
 import textbook
 
-KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml", "chm")
+KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml", "chm",
+         "pptx", "ppsx", "xlsx", "xlsm")
 XML_MOST = 80 * 1024 * 1024         # one XML part, unpacked
 TEXT_MOST = 120 * 1024 * 1024       # the text of one book
 _CACHE: dict = {}                   # path -> (mtime, Book)
@@ -43,6 +46,8 @@ CSS = (textbook.CSS +
        "p.tb-c,h4.tb-c{text-indent:0;text-align:center}p.tb-r{text-indent:0;text-align:right}"
        "p.tb-v{text-indent:0;margin:.15em 0 .15em 2em}div.tb-verse{margin:1em 0}"
        "p.tb-li{text-indent:0;margin:.3em 0 .3em 1.5em}"
+       "div.tb-wide{overflow-x:auto}table.tb-sheet{font-size:.85em;margin:1em 0}"
+       "table.tb-sheet td{white-space:nowrap;max-width:26em;overflow:hidden;text-overflow:ellipsis}"
        "table{border-collapse:collapse;margin:1em auto}td,th{border:1px solid rgba(120,140,170,.45);"
        "padding:.25em .6em;vertical-align:top}td p,th p{text-indent:0;margin:.2em 0}")
 
@@ -1202,6 +1207,249 @@ def _chm(path: str) -> Book:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── slides and sheets ─────────────────────────────────────────────────────────────────
+_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+SLIDES_MOST = 2000
+SHEET_ROWS_MOST = 3000          # of one sheet; what lies below is said to be left out
+SHEET_COLS_MOST = 60
+SHEET_ROWS_A_PAGE = 120
+
+
+def _rels(zf, names, part: str) -> dict:
+    """What a part of an Office file points at inside the file: id -> (kind, path)."""
+    d, f = part.rsplit("/", 1) if "/" in part else ("", part)
+    rp = (d + "/" if d else "") + "_rels/" + f + ".rels"
+    out = {}
+    if rp not in names:
+        return out
+    for r in _xml(_zip_part(zf, rp)):
+        t = r.get("Target") or ""
+        if (r.get("TargetMode") or "") == "External" or not t:
+            continue
+        path = t.lstrip("/") if t.startswith("/") else os.path.normpath((d + "/" if d else "") + t).replace("\\", "/")
+        out[r.get("Id")] = ((r.get("Type") or "").rsplit("/", 1)[-1], path.lstrip("/"))
+    return out
+
+
+def _core_title(zf, names):
+    if "docProps/core.xml" in names:
+        try:
+            for el in _xml(_zip_part(zf, "docProps/core.xml")):
+                if _local(el.tag) == "title" and (el.text or "").strip():
+                    return el.text.strip()[:200]
+        except NotReadable:
+            pass
+    return None
+
+
+def _a_para(p) -> str:
+    """One paragraph of a slide's text."""
+    out = []
+    for ch in p:
+        tag = _local(ch.tag)
+        if tag in ("r", "fld"):
+            t = ch.find(_A + "t")
+            text = html.escape((t.text if t is not None else "") or "", quote=False)
+            pr = ch.find(_A + "rPr")
+            if text and pr is not None:
+                if pr.get("b") in ("1", "true"):
+                    text = f"<b>{text}</b>"
+                if pr.get("i") in ("1", "true"):
+                    text = f"<i>{text}</i>"
+            out.append(text)
+        elif tag == "br":
+            out.append("<br>")
+    return "".join(out)
+
+
+def _pptx(path: str) -> Book:
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError):
+        raise NotReadable("this is not a presentation of the newer kind (an old .ppt renamed, or a damaged file)")
+    assets, titles, chapters, sample = {}, [], [], []
+    with zf:
+        names = set(zf.namelist())
+        pres = _xml(_zip_part(zf, "ppt/presentation.xml"))
+        rels = _rels(zf, names, "ppt/presentation.xml")
+        order = []
+        for sid in pres.iter(_P + "sldId"):
+            got = rels.get(sid.get(_R_ID + "id"))
+            if got and got[0] == "slide" and got[1] in names:
+                order.append(got[1])
+        if not order:
+            order = sorted((n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                           key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)))
+        if not order:
+            raise NotReadable("this presentation has no slides in it")
+        title = _core_title(zf, names)
+        for num, part in enumerate(order[:SLIDES_MOST], 1):
+            root = _xml(_zip_part(zf, part))
+            srels = _rels(zf, names, part)
+            head, body = "", []
+
+            def shapes(el):
+                nonlocal head
+                for sh in el:
+                    tag = _local(sh.tag)
+                    if tag == "grpSp":
+                        shapes(sh)
+                    elif tag == "sp":
+                        ph = sh.find(f"{_P}nvSpPr/{_P}nvPr/{_P}ph")
+                        kind = ph.get("type") if ph is not None else ""
+                        if kind in ("sldNum", "dt", "ftr", "hdr"):
+                            continue
+                        paras = [x for x in (_a_para(p) for p in sh.iter(_A + "p")) if _plain(x).strip()]
+                        if kind in ("title", "ctrTitle") and not head and paras:
+                            head = re.sub(r"\s+", " ", _plain(" ".join(paras))).strip()[:120]
+                        else:
+                            cls = ' class="tb-c"' if kind == "subTitle" else ' class="tb-li"'
+                            body.extend(f"<p{cls}>{x}</p>" for x in paras)
+                    elif tag == "pic":
+                        for bl in sh.iter(_A + "blip"):
+                            got = srels.get(bl.get(_R_ID + "embed"))
+                            if got and got[1] in names:
+                                name = _safe_name(got[1].rsplit("/", 1)[-1])
+                                assets[name] = ("zip", path, got[1])
+                                body.append(f'<p class="tb-c"><img src="../asset/{name}" alt=""></p>')
+                            break
+                    elif tag == "graphicFrame":
+                        for tbl in sh.iter(_A + "tbl"):
+                            rows = ["<tr>" + "".join(
+                                "<td>" + "<br>".join(x for x in (_a_para(p) for p in tc.iter(_A + "p")) if x) + "</td>"
+                                for tc in tr.findall(_A + "tc")) + "</tr>" for tr in tbl.findall(_A + "tr")]
+                            body.append("<table>" + "".join(rows) + "</table>")
+
+            tree = root.find(f"{_P}cSld/{_P}spTree")
+            if tree is not None:
+                shapes(tree)
+            shown = head or f"Slide {num}"
+            titles.append(f"{num}. {head}" if head else f"Slide {num}")
+            chapters.append(f'<h2 class="tb-h">{html.escape(shown)}</h2>' + "\n".join(body))
+            if len(sample) < 60:
+                sample.append(_plain(shown + " " + " ".join(body))[:1500])
+    return Book(title, titles, chapters, textbook.is_latin(sample), assets)
+
+
+_DATE_FORMATS = set(range(14, 23)) | set(range(27, 37)) | {45, 46, 47} | set(range(50, 59))
+
+
+def _sheet_number(v: str, is_date: bool, epoch_1904: bool) -> str:
+    try:
+        x = float(v)
+    except ValueError:
+        return v
+    if is_date and 0 <= x < 2958466:
+        import datetime
+        base = datetime.datetime(1904, 1, 1) if epoch_1904 else datetime.datetime(1899, 12, 30)
+        t = base + datetime.timedelta(days=x)
+        t = (t + datetime.timedelta(microseconds=500000)).replace(microsecond=0)
+        if x < 1:
+            return t.strftime("%H:%M:%S")
+        return t.strftime("%Y-%m-%d") if (t.hour, t.minute, t.second) == (0, 0, 0) else t.strftime("%Y-%m-%d %H:%M:%S")
+    if x == int(x) and abs(x) < 1e15:
+        return str(int(x))
+    return format(x, ".10g")
+
+
+def _xlsx(path: str) -> Book:
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError):
+        raise NotReadable("this is not a spreadsheet of the newer kind (an old .xls renamed, or a damaged file)")
+    titles, chapters, sample = [], [], []
+    with zf:
+        names = set(zf.namelist())
+        wb = _xml(_zip_part(zf, "xl/workbook.xml"))
+        rels = _rels(zf, names, "xl/workbook.xml")
+        title = _core_title(zf, names)
+        epoch_1904 = any(el.get("date1904") in ("1", "true") for el in wb.iter(_S + "workbookPr"))
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            for si in _xml(_zip_part(zf, "xl/sharedStrings.xml")):
+                bits = []
+                for ch in si:
+                    if ch.tag == _S + "t":
+                        bits.append(ch.text or "")
+                    elif ch.tag == _S + "r":
+                        bits.extend(t.text or "" for t in ch.findall(_S + "t"))
+                shared.append("".join(bits))
+        dates = []                    # for each cell style: does it show a date?
+        if "xl/styles.xml" in names:
+            st = _xml(_zip_part(zf, "xl/styles.xml"))
+            custom = {}
+            for nf in st.iter(_S + "numFmt"):
+                code = re.sub(r"\"[^\"]*\"|\[[^\]]*\]|\\.", "", nf.get("formatCode") or "")
+                custom[nf.get("numFmtId")] = bool(re.search(r"[ymdhs]", code, re.I)) and "general" not in code.lower()
+            xfs = st.find(_S + "cellXfs")
+            for xf in (xfs if xfs is not None else []):
+                fid = xf.get("numFmtId") or "0"
+                dates.append(custom.get(fid, fid.isdigit() and int(fid) in _DATE_FORMATS))
+        sheets = []
+        for sh in wb.iter(_S + "sheet"):
+            got = rels.get(sh.get(_R_ID + "id"))
+            if got and got[1] in names and got[0] == "worksheet":
+                sheets.append((sh.get("name") or f"Sheet {len(sheets) + 1}", got[1]))
+        if not sheets:
+            raise NotReadable("this spreadsheet has no sheets of cells in it")
+        for name, part in sheets[:200]:
+            root = _xml(_zip_part(zf, part))
+            rows, more = [], False
+            for row in root.iter(_S + "row"):
+                if len(rows) >= SHEET_ROWS_MOST:
+                    more = True
+                    break
+                cells = {}
+                for k, c in enumerate(row.findall(_S + "c")):
+                    ref = re.match(r"([A-Z]{1,3})", c.get("r") or "")
+                    col = k
+                    if ref:
+                        col = 0
+                        for letter in ref.group(1):
+                            col = col * 26 + (ord(letter) - 64)
+                        col -= 1
+                    if col >= SHEET_COLS_MOST:
+                        continue
+                    kind = c.get("t") or "n"
+                    v = c.find(_S + "v")
+                    raw = (v.text if v is not None else "") or ""
+                    if kind == "s":
+                        text = shared[int(raw)] if raw.isdigit() and int(raw) < len(shared) else ""
+                    elif kind == "inlineStr":
+                        text = "".join(t.text or "" for t in c.iter(_S + "t"))
+                    elif kind == "b":
+                        text = "TRUE" if raw == "1" else "FALSE"
+                    elif kind in ("str", "e") or not raw:
+                        text = raw
+                    else:
+                        style = c.get("s") or ""
+                        text = _sheet_number(raw, style.isdigit() and int(style) < len(dates) and dates[int(style)], epoch_1904)
+                    if text.strip():
+                        cells[col] = text.strip()[:500]
+                if cells:
+                    rows.append(cells)
+            if not rows:
+                continue
+            width = max(max(r) for r in rows) + 1
+            for at in range(0, len(rows), SHEET_ROWS_A_PAGE):
+                part_rows = rows[at:at + SHEET_ROWS_A_PAGE]
+                body = "".join("<tr>" + "".join(f"<td>{html.escape(r.get(c, ''), quote=False)}</td>" for c in range(width)) + "</tr>"
+                               for r in part_rows)
+                n = at // SHEET_ROWS_A_PAGE
+                titles.append(name if n == 0 else f"{name} ({n + 1})")
+                note = ""
+                if more and at + SHEET_ROWS_A_PAGE >= len(rows):
+                    note = f'<p class="tb-c">This sheet goes on: only its first {SHEET_ROWS_MOST} rows are shown here.</p>'
+                chapters.append(f'<h2 class="tb-h">{html.escape(titles[-1])}</h2><div class="tb-wide"><table class="tb-sheet">{body}</table></div>{note}')
+            if len(sample) < 60:
+                sample.append(" ".join(" ".join(r.values()) for r in rows[:40])[:2000])
+    if not chapters:
+        raise NotReadable("this spreadsheet is empty")
+    return Book(title, titles, chapters, textbook.is_latin(sample), {})
+
+
 # ── one way in ────────────────────────────────────────────────────────────────────────
 def kind_of(name: str) -> str:
     """'fb2' for 'War and Peace.FB2'; '' for what is not read here."""
@@ -1219,6 +1467,10 @@ def build(path: str, kind: str) -> Book:
         return _chm(path)
     if kind == "docx":
         return _docx(path)
+    if kind in ("pptx", "ppsx"):
+        return _pptx(path)
+    if kind in ("xlsx", "xlsm"):
+        return _xlsx(path)
     if kind == "odt":
         return _odt(path)
     if os.path.getsize(path) > XML_MOST * 2:

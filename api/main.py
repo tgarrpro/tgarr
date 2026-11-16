@@ -470,7 +470,7 @@ import usenet_client  # local module
 import usenet_rules  # local module
 import archive_org  # local module
 import updater
-import packs  # what is fetched when first wanted (calibre; the models' runtime)
+import packs  # what is fetched when first wanted (the models' runtime)
 import transcode  # local module
 import usenet_fetch  # local module
 import usenet_judge  # local module
@@ -2856,7 +2856,7 @@ def _ebook_safe_to_convert(src: str, ext: str) -> bool:
     and entry count at 20K. Non-zip formats pass through (calibre has
     its own format-specific limits)."""
     if ext not in ("epub", "cbz", "cbr", "docx", "odt"):
-        return True  # mobi/azw/djvu/etc. not zip-based; trust calibre
+        return True  # djvu and the like are not zips
     import zipfile
     try:
         with zipfile.ZipFile(src) as zf:
@@ -2906,10 +2906,10 @@ def _ebook_lock(msg_id: int):
     return _EBOOK_LOCKS[msg_id]
 
 
-_EBOOK_CONVERTIBLE = ("epub", "mobi", "azw", "azw3", "djvu", "fb2",
-                      "lit", "cbr", "cbz", "rtf", "lrf", "pdb",
-                      # plain documents a household uploads: readable, and read aloud, like a book
-                      "txt", "docx", "odt")
+# What is made into a PDF before it is read: scanned books only. (calibre used to make one of
+# every book that was not an EPUB; the reader opens those by itself now - ownbooks.py.)
+_EBOOK_CONVERTIBLE = ("djvu", "djv")
+_NOT_SHOWN = "this kind of book cannot be shown here - download it to read it with another program"
 
 def _djvu_tool(src: str):
     """The program that turns a scanned .djvu into a PDF by itself (ddjvu, a few megabytes in
@@ -2987,20 +2987,20 @@ async def _ebook_watchdog(proc, src: str) -> str:
 
 
 async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
-    """Run calibre ebook-convert src → pdf. Returns True on success.
+    """A scanned .djvu made into a PDF (ddjvu), kept beside it. Returns True on success.
     Idempotent: skip if pdf already exists and is newer than src.
-    Serialized per msg_id so concurrent /ebook-pdf hits don't fork 2 calibres.
-    """
+    Serialized per msg_id so two requests for one book do not convert it twice.
+    Every other kind of book is opened by the reader itself (ownbooks.py); what neither can
+    show - .lit, .lrf, .pdb, a protected Kindle book - is offered as a download."""
     import asyncio
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return True
     import time as _t
-    # calibre is no longer in the image: it is fetched when a book first needs it (packs.py).
-    # Until then nothing is queued - the page that asked says so and offers to fetch it.
     djvu = _djvu_tool(src)
-    convert = djvu or packs.program("ebook-convert")
-    if not convert:
-        _EBOOK_JOBS[msg_id] = {"state": "needs_converter", "started_at": _t.time()}
+    if not djvu:
+        _EBOOK_JOBS[msg_id] = {"state": "failed", "reason": _NOT_SHOWN, "started_at": _t.time()}
+        try: os.unlink(src + ".queue")           # (a marker an older version left for calibre)
+        except OSError: pass
         return False
     # Mark queued + write disk marker for restart persistence
     if msg_id not in _EBOOK_JOBS or _EBOOK_JOBS[msg_id].get("state") == "failed":
@@ -3017,24 +3017,19 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
             except OSError: pass
             return True
         _EBOOK_JOBS[msg_id] = {"state": "converting", "started_at": _t.time()}
-        env = dict(os.environ)
-        env["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
-        env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
-        env["QT_QPA_PLATFORM"] = "offscreen"          # there is no screen to draw on
         tmp = pdf + ".inprogress.pdf"
         # preexec_fn: RLIMIT_CPU 240s + RLIMIT_FSIZE 200MB; mem bound via container cgroup
         def _set_limits():
-            # (an address-space limit is no use here: Chromium maps a terabyte
-            # and touches little of it - memory is watched by _ebook_watchdog)
+            # (memory and time are watched by _ebook_watchdog)
             try:
                 os.nice(15)          # never compete with playback or the UI
             except OSError:
                 pass
         proc = await asyncio.create_subprocess_exec(
-            *([djvu, "-format=pdf", "-quality=85", src, tmp] if djvu else [convert, src, tmp]),
+            djvu, "-format=pdf", "-quality=85", src, tmp,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            env=env, preexec_fn=_set_limits, start_new_session=True)
+            preexec_fn=_set_limits, start_new_session=True)
         stopped = await _ebook_watchdog(proc, src)
         if stopped:
             for _f in (tmp, src + ".queue"):     # not retried: it would do the same again
@@ -3061,23 +3056,80 @@ async def _ebook_to_pdf(src: str, pdf: str, msg_id: int = 0) -> bool:
         return False
 
 
+def _cover_bytes(src: str):
+    """The cover of a book as the bytes of a picture, or None: an EPUB's or another book's own
+    (ownbooks.py), the first page of a PDF or of a scanned .djvu."""
+    import subprocess
+    import tempfile
+    low = src.lower()
+    kind = ownbooks.kind_of(src)
+    if kind:
+        try:
+            book = ownbooks.load(src, kind)
+        except Exception:
+            return None
+        got = book.asset(book.cover) if book.cover else None
+        return got[0] if got else None
+    if low.endswith(".epub"):
+        try:
+            with _zipfile.ZipFile(src) as zf:
+                pics = [i for i in zf.infolist() if re.search(r"\.(jpe?g|png)$", i.filename, re.I) and i.file_size < 30 * 1024 * 1024]
+                named = sorted((i for i in pics if "cover" in i.filename.lower()), key=lambda i: len(i.filename))
+                pick = (named or pics[:1] or [None])[0]
+                return zf.read(pick) if pick else None
+        except Exception:
+            return None
+    tmp = tempfile.mkdtemp(prefix="cover-")
+    try:
+        if low.endswith(".pdf"):
+            subprocess.run(["pdftoppm", "-f", "1", "-l", "1", "-singlefile", "-jpeg", "-scale-to", "900", src, os.path.join(tmp, "c")],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=40)
+            out = os.path.join(tmp, "c.jpg")
+        elif _djvu_tool(src):
+            out = os.path.join(tmp, "c.ppm")
+            subprocess.run([_djvu_tool(src), "-format=ppm", "-page=1", "-size=900x1200", src, out],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=40)
+        else:
+            return None
+        if not os.path.exists(out) or os.path.getsize(out) > 60 * 1024 * 1024:
+            return None
+        with open(out, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def _ebook_cover(src: str, cover: str) -> bool:
-    import asyncio
+    """The cover of a book kept here, written beside it as a JPEG the first time it is asked
+    for. False when the book has none."""
     if os.path.exists(cover):
         return True
-    meta = packs.program("ebook-meta")
-    if not meta:                                    # (no converter fetched yet: no cover from these formats)
-        return False
-    proc = await asyncio.create_subprocess_exec(
-        meta, src, f"--get-cover={cover}",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL)
+
+    def _make() -> bool:
+        data = _cover_bytes(src)
+        if not data:
+            return False
+        try:
+            import io
+            from PIL import Image
+            im = Image.open(io.BytesIO(data))
+            im.load()
+            im = im.convert("RGB")
+            im.thumbnail((900, 1200))
+            im.save(cover + ".part", "JPEG", quality=85)
+            os.replace(cover + ".part", cover)
+            return True
+        except Exception:
+            try: os.unlink(cover + ".part")
+            except OSError: pass
+            return False
     try:
-        await asyncio.wait_for(proc.communicate(), timeout=30)
-    except asyncio.TimeoutError:
-        proc.kill()
+        return await asyncio.wait_for(asyncio.to_thread(_make), timeout=60)
+    except Exception:
         return False
-    return proc.returncode == 0 and os.path.exists(cover)
 
 
 @app.get("/api/ebook-status/{msg_id}")
@@ -3110,14 +3162,9 @@ async def ebook_status(msg_id: int, request: Request):
     if os.path.exists(pdf) and os.path.getmtime(pdf) >= os.path.getmtime(src):
         return {"state": "ready", "url": f"/ebook-pdf/{msg_id}",
                 "size": os.path.getsize(pdf)}
-    if not packs.program("ebook-convert") and not _djvu_tool(src):
-        st = packs.status("books")
-        return {"state": "needs_converter", "installing": st["installing"], "done": st["done"], "bytes": st["bytes"],
-                "error": st["error"], "possible": st["possible"]}
+    if not _djvu_tool(src):
+        return {"state": "failed", "reason": _NOT_SHOWN}
     job = _EBOOK_JOBS.get(msg_id)
-    if job and job.get("state") == "needs_converter":      # it has arrived since: start over
-        _EBOOK_JOBS.pop(msg_id, None)
-        job = None
     if job and job.get("state") == "converting":
         import time as _t
         return {"state": "converting",
@@ -3175,15 +3222,12 @@ async def ebook_pdf(msg_id: int):
                             headers={"Content-Disposition": "inline",
                                      "Cache-Control": "private, max-age=3600"})
     if ext not in _EBOOK_CONVERTIBLE:
-        return Response(f"format .{ext} not supported by ebook-convert",
-                        status_code=415)
+        return Response(f"a .{ext} is not shown as pages here", status_code=415)
     if not _ebook_safe_to_convert(src, ext):
         return Response("file rejected: zip-bomb or malformed archive", status_code=422)
     ok = await _ebook_to_pdf(src, pdf, msg_id=msg_id)
     if not ok:
-        if not packs.program("ebook-convert"):
-            return Response("the book converter is not installed yet: open the book's page to fetch it", status_code=409)
-        return Response("conversion failed", status_code=500)
+        return Response("this book could not be made into pages", status_code=500)
     return FileResponse(pdf, media_type="application/pdf",
                         headers={"Content-Disposition": "inline",
                                  "Cache-Control": "private, max-age=86400"})
@@ -3199,16 +3243,9 @@ async def _packs_heal():
         if (tts.installed("voice") or vision.installed()) and not packs.installed("runtime"):
             log.info("[packs] a model is installed but what it runs on is no longer in the image: fetching it")
             packs.install("runtime")
-        if not packs.installed("books"):
-            async with db_pool.acquire() as conn:
-                if not await conn.fetchval("SELECT value FROM config WHERE key = 'packs_seeded'"):
-                    n = await conn.fetchval(
-                        r"""SELECT count(*) FROM messages WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'
-                             AND file_name ~* '\.(mobi|azw3?|fb2|djvu|lit|rtf|lrf|pdb|docx|odt)$'""")
-                    await conn.execute("INSERT INTO config (key, value) VALUES ('packs_seeded', '1') ON CONFLICT (key) DO NOTHING")
-                    if n:
-                        log.info("[packs] %d books here need the converter the image no longer carries: fetching it", n)
-                        packs.install("books")
+        freed = await asyncio.to_thread(packs.forget_books)
+        if freed:
+            log.info("[packs] calibre is not used any more: the %d MB an older version fetched are given back", freed // (1024 * 1024))
     except Exception as e:
         log.warning("[packs] looking what is needed: %s", e)
 
@@ -4202,10 +4239,16 @@ async def epub_render(msg_id: int):
             f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
     kind = _own_kind(row)
-    if kind and kind != "txt" and not (await _own_book(path, kind))[0]:
-        # one this reader cannot open after all (packed in a way not read here ...): the old
-        # way, a PDF made of it, still can for some
-        return RedirectResponse(f"/pdf/{msg_id}?conv=1", status_code=307)
+    if kind and kind != "txt":
+        why = (await _own_book(path, kind))[1]
+        if why:
+            # one this reader cannot open after all (protected, packed in a way not read here)
+            return HTMLResponse(
+                '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<title>cannot be shown</title></head><body style="font-family:system-ui,sans-serif;max-width:560px;margin:15vh auto;padding:0 20px;line-height:1.6">'
+                f'<p>{html.escape(why[:1].upper() + why[1:])}.</p>'
+                f'<p>It is kept as it is: <a href="/media/{int(msg_id)}" download>download it</a> to read it with another program.</p>'
+                '<p><a href="/library">&larr; Library</a></p></body></html>', status_code=422)
     title = _re.sub(r"\.[A-Za-z0-9]{2,5}$", "", row["file_name"] or f"book-{msg_id}")
     return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
@@ -5480,7 +5523,7 @@ const MEDIA_FILE_NAME = {_js_str(row["file_name"] or "")};
 const OWN_KINDS = {_json.dumps(list(ownbooks.KINDS))};
 {_WATCH_PLAYER_JS}
 tgFavBtn();
-let started = false, comicTried = false, ownTried = false;
+let started = false, comicTried = false, ownTried = false, ownWhy = "";
 function fmtBytes(b) {{
   if (!b) return "0 B";
   const u = ["B","KB","MB","GB"]; let i = 0; let v = b;
@@ -5515,12 +5558,13 @@ function renderPlayer() {{
     return;
   }}
   if (OWN_KINDS.includes(ext) && !ownTried) {{
-    // also read there as they are; the few that cannot be (packed in a way not read
-    // here) go on to be converted
+    // read in the built-in reader as they are; the few that cannot be (a protected Kindle
+    // book, one packed in a way not read here) say why, further down
     ownTried = true;
-    fetch("/epub/" + MSG_ID + "/toc").then(r => {{
-      if (r.ok) location.replace("/epub/" + MSG_ID);
-      else {{ started = false; renderPlayer(); }}
+    fetch("/epub/" + MSG_ID + "/toc").then(async r => {{
+      if (r.ok) {{ location.replace("/epub/" + MSG_ID); return; }}
+      try {{ ownWhy = (await r.json()).error || ""; }} catch (e) {{}}
+      started = false; renderPlayer();
     }}).catch(() => {{ started = false; renderPlayer(); }});
     return;
   }}
@@ -5534,17 +5578,16 @@ function renderPlayer() {{
     }}).catch(() => {{ started = false; renderPlayer(); }});
     return;
   }}
-  if (["mobi","azw","azw3","djvu","fb2","lit","cbr","cbz"].includes(ext)) {{
-    // Calibre-converted PDF — poll status, swap to iframe on ready.
+  if (["djvu","djv"].includes(ext)) {{
+    // a scanned book: made into a PDF once, then read like one
     const loader = document.createElement("div");
     loader.className = "loader";
     loader.innerHTML =
       '<div class="ico">📚</div>' +
       '<div class="status" id="ebookStatus">checking…</div>' +
       '<div class="progress"><div id="ebookBar"></div></div>' +
-      '<div class="hint">first open of a non-PDF ebook converts to PDF via calibre. ' +
-      'small books (<10MB): ~20s. medium: 1–2 min. big books (50MB+) queue automatically — leave the page, conversion continues in background, come back later (a few minutes to hours for very large books). ' +
-      'subsequent opens are instant.</div>' +
+      '<div class="hint">a scanned book is made into pages the first time it is opened: seconds for most, a few minutes for a very thick one. ' +
+      'You may leave this page; it goes on. After that it opens at once.</div>' +
       '<div class="hint" id="ebookElapsed" style="margin-top:6px"></div>';
     main.innerHTML = "";
     main.appendChild(loader);
@@ -5562,33 +5605,7 @@ function renderPlayer() {{
         }}
         if (j.state === "failed") {{
           document.getElementById("ebookStatus").textContent =
-            "✗ conversion failed: " + (j.reason || "calibre error");
-          return;
-        }}
-        if (j.state === "needs_converter") {{
-          // the converter (calibre) is fetched once, when a book first needs it
-          const st = document.getElementById("ebookStatus"), mb = Math.round((j.bytes || 0) / 1e6);
-          document.getElementById("ebookElapsed").textContent = "";
-          if (j.installing) {{
-            const pc = j.bytes ? Math.min(100, Math.round(j.done * 100 / j.bytes)) : 0;
-            st.textContent = pc < 100 ? "fetching the book converter… " + pc + "%" : "unpacking the book converter…";
-            document.getElementById("ebookBar").style.width = pc + "%";
-          }} else if (!j.possible) {{
-            st.textContent = "✗ this kind of book needs a converter that does not exist for this machine";
-            return;
-          }} else if (!st.querySelector("button")) {{
-            st.innerHTML = 'This kind of book is converted before it is read, and the converter is not part of tgarr: ' +
-              'it is fetched once (' + mb + ' MB, about 1 GB on the disk).' + (j.error ? '<br><span style="color:#fbbf24">Last try: ' +
-              String(j.error).replace(/[&<>]/g, c => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;"}})[c]) + '</span>' : '') +
-              '<br><button id="getConv" style="margin-top:10px;padding:9px 18px;border-radius:8px;border:0;background:#229ED9;color:#fff;font:inherit;font-weight:600;cursor:pointer">Fetch the converter</button>';
-            document.getElementById("getConv").onclick = () => {{
-              st.textContent = "starting…";
-              fetch("/api/packs/install", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{name: "books"}})}})
-                .then(r => r.json()).then(x => {{ if (x.status !== "ok") st.textContent = "✗ " + (x.message || "could not start"); }})
-                .catch(() => {{ st.textContent = "✗ this server did not answer"; }});
-            }};
-          }}
-          setTimeout(tick, 2000);
+            "✗ " + (j.reason || "this book could not be made into pages");
           return;
         }}
         if (j.state === "no_source") {{
@@ -5621,6 +5638,21 @@ function renderPlayer() {{
     }}
     tick();
     return;
+    return;
+  }}
+  if (OWN_KINDS.includes(ext) || ["lit","lrf","pdb","cbr","cbz"].includes(ext)) {{
+    // a book this reader cannot open: said plainly, with the file to take elsewhere
+    const box = document.createElement("div");
+    box.className = "loader";
+    const why = document.createElement("div");
+    why.className = "status";
+    why.textContent = ownWhy || "This kind of book cannot be shown here.";
+    box.innerHTML = '<div class="ico">📚</div>';
+    box.appendChild(why);
+    box.insertAdjacentHTML("beforeend", '<div class="hint">It is kept as it is: download it to read it with another program.</div>' +
+      `<div style="margin-top:12px"><a href="/media/${{MSG_ID}}" download style="color:#5eb6e5">⬇ download</a></div>`);
+    main.innerHTML = "";
+    main.appendChild(box);
     return;
   }}
   // fallback: try iframe but offer download as escape hatch
@@ -6649,7 +6681,7 @@ async def _local_picture(msg_id: int, col: str, folder: str, px: int):
         pic = src + ".cover.jpg"
         if not os.path.exists(pic) and row["media_type"] == "document":
             e = localfiles.ext(src)
-            if e == "pdf" or e in _EBOOK_CONVERTIBLE:
+            if e in ("pdf", "epub") or e in _EBOOK_CONVERTIBLE or ownbooks.kind_of(src):
                 try:
                     await _ebook_cover(src, pic)
                 except Exception:

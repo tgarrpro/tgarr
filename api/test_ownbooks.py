@@ -302,6 +302,84 @@ ok(B.load(os.path.join(tmp, "c.fb2"), "fb2") is b1, "a book is kept for the next
 t = B.load(put("n.txt", "第一章 一\n正文。\n第二章 二\n正文。\n".encode("gb18030")), "txt")
 ok(t.titles == ["第一章 一", "第二章 二"] and "<h2" in t.chapter(0), "a .txt comes through the same door")
 ok(refused(lambda: B.load(put("bad.docx", b"PK\x03\x04broken"), "docx")), "a broken zip is NotReadable, nothing else")
+# ── slides ──
+PN = ('xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"')
+REL = '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+RT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
+
+
+def sp(kind, *paras):
+    ph = f'<p:nvSpPr><p:nvPr><p:ph type="{kind}"/></p:nvPr></p:nvSpPr>' if kind else "<p:nvSpPr><p:nvPr/></p:nvSpPr>"
+    return f"<p:sp>{ph}<p:txBody>" + "".join(f"<a:p>{x}</a:p>" for x in paras) + "</p:txBody></p:sp>"
+
+
+def slide(*shapes):
+    return f'<?xml version="1.0"?><p:sld {PN}><p:cSld><p:spTree>' + "".join(shapes) + "</p:spTree></p:cSld></p:sld>"
+
+
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, "w") as z:
+    z.writestr("ppt/presentation.xml", f'<?xml version="1.0"?><p:presentation {PN}><p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId1"/></p:sldIdLst></p:presentation>')
+    z.writestr("ppt/_rels/presentation.xml.rels", REL + f'<Relationship Id="rId1" Type="{RT}slide" Target="slides/slide1.xml"/>'
+               f'<Relationship Id="rId2" Type="{RT}slide" Target="slides/slide2.xml"/></Relationships>')
+    z.writestr("ppt/slides/slide2.xml", slide(sp("ctrTitle", "<a:r><a:t>季度 汇报</a:t></a:r>"), sp("subTitle", "<a:r><a:t>2026 Q3</a:t></a:r>"),
+                                             sp("sldNum", "<a:fld><a:t>1</a:t></a:fld>")))
+    z.writestr("ppt/slides/slide1.xml", slide(
+        sp("title", "<a:r><a:t>Results</a:t></a:r>"),
+        sp("body", '<a:r><a:rPr b="1"/><a:t>Up</a:t></a:r><a:r><a:t> 12% &lt;net&gt;</a:t></a:r>', "<a:r><a:t>second point</a:t></a:r><a:br/><a:r><a:t>next line</a:t></a:r>"),
+        '<p:grpSp><p:pic><p:blipFill><a:blip r:embed="rId7"/></p:blipFill></p:pic></p:grpSp>',
+        '<p:pic><p:blipFill><a:blip r:embed="rId8"/></p:blipFill></p:pic>',
+        '<p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>A1</a:t></a:r></a:p></a:txBody></a:tc>'
+        '<a:tc><a:txBody><a:p><a:r><a:t>B1</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>'))
+    z.writestr("ppt/slides/_rels/slide1.xml.rels", REL + f'<Relationship Id="rId7" Type="{RT}image" Target="../media/chart.png"/>'
+               f'<Relationship Id="rId8" Type="{RT}image" Target="http://evil/x.png" TargetMode="External"/></Relationships>')
+    z.writestr("ppt/media/chart.png", PNG)
+b = B.build(put("d.pptx", buf.getvalue()), "pptx")
+ok(b.titles == ["1. 季度 汇报", "2. Results"], f"PPTX: slides in the order the presentation gives, named by their titles: {b.titles}")
+ok('<p class="tb-c">2026 Q3</p>' in b.chapter(0) and ">1<" not in b.chapter(0), "PPTX: a subtitle; the slide number is not text")
+ch = b.chapter(1)
+ok("<b>Up</b> 12% &lt;net&gt;" in ch and "second point<br>next line" in ch, f"PPTX: points, bold, a line break: {ch[:300]}")
+ok(ch.count("<img") == 1 and b.asset("chart.png") == (PNG, "image/png"), "PPTX: a picture in a group is shown, one on the internet is not")
+ok("<table><tr><td>A1</td><td>B1</td></tr></table>" in ch, "PPTX: a table")
+ok(refused(lambda: B.build(put("old.pptx", b"\xd0\xcf\x11\xe0"), "pptx"), "presentation"), "an old .ppt under a .pptx name")
+
+# ── sheets ──
+SN = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+
+
+def cell(ref, v, t="", s=""):
+    return f'<c r="{ref}"{f" t={chr(34)}{t}{chr(34)}" if t else ""}{f" s={chr(34)}{s}{chr(34)}" if s else ""}><v>{v}</v></c>'
+
+
+rows = ('<row r="1">' + cell("A1", 0, "s") + cell("B1", 1, "s") + cell("D1", "note", "str") + "</row>"
+        '<row r="2">' + cell("A2", 2, "s") + cell("B2", "1234.5") + cell("C2", "46000", "", "1") + cell("D2", 1, "b") + "</row>"
+        '<row r="3">' + cell("A3", "3.0000000000000004") + cell("B3", "0.75", "", "2") + cell("C3", "46000.5", "", "1")
+        + '<c r="D3" t="inlineStr"><is><t>inline</t></is></c>' + cell("BZ3", "far away") + "</row><row r=\"4\"></row>")
+big = "".join(f'<row r="{i}">' + cell(f"A{i}", i) + "</row>" for i in range(1, 400))
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, "w") as z:
+    z.writestr("xl/workbook.xml", f'<?xml version="1.0"?><workbook {SN}><sheets><sheet name="收入 &amp; 支出" sheetId="1" r:id="rId1"/>'
+               '<sheet name="Long" sheetId="2" r:id="rId2"/><sheet name="Empty" sheetId="3" r:id="rId3"/></sheets></workbook>')
+    z.writestr("xl/_rels/workbook.xml.rels", REL + "".join(f'<Relationship Id="rId{i}" Type="{RT}worksheet" Target="worksheets/sheet{i}.xml"/>' for i in (1, 2, 3)) + "</Relationships>")
+    z.writestr("xl/sharedStrings.xml", f'<?xml version="1.0"?><sst {SN}><si><t>项目</t></si><si><r><t>金</t></r><r><t>额</t></r><rPh><t>kin</t></rPh></si><si><t>&lt;rent&gt;</t></si></sst>')
+    z.writestr("xl/styles.xml", f'<?xml version="1.0"?><styleSheet {SN}><numFmts><numFmt numFmtId="164" formatCode="h:mm:ss"/><numFmt numFmtId="165" formatCode="0.00 &quot;days&quot;"/></numFmts>'
+               '<cellXfs><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/><xf numFmtId="165"/></cellXfs></styleSheet>')
+    z.writestr("xl/worksheets/sheet1.xml", f'<?xml version="1.0"?><worksheet {SN}><sheetData>{rows}</sheetData></worksheet>')
+    z.writestr("xl/worksheets/sheet2.xml", f'<?xml version="1.0"?><worksheet {SN}><sheetData>{big}</sheetData></worksheet>')
+    z.writestr("xl/worksheets/sheet3.xml", f'<?xml version="1.0"?><worksheet {SN}><sheetData/></worksheet>')
+b = B.build(put("s.xlsx", buf.getvalue()), "xlsx")
+ok(b.titles == ["收入 & 支出", "Long", "Long (2)", "Long (3)", "Long (4)"], f"XLSX: a chapter a sheet, a long one in parts, an empty one left out: {b.titles}")
+ch = b.chapter(0)
+ok("<tr><td>项目</td><td>金额</td><td></td><td>note</td></tr>" in ch, f"XLSX: shared text (not its reading aid), an empty cell, plain text: {ch[:400]}")
+ok("<td>&lt;rent&gt;</td><td>1234.5</td><td>2025-12-09</td><td>TRUE</td>" in ch, "XLSX: a number, a date by its style, a truth value")
+ok("<td>3</td><td>18:00:00</td><td>2025-12-09 12:00:00</td><td>inline</td>" in ch, "XLSX: a number tidied, a time, a date with a time, text kept in the cell")
+ok("far away" not in ch, "XLSX: a column far to the right is left out")
+ok(b.chapter(1).count("<tr>") == 120 and b.chapter(4).count("<tr>") == 39, "XLSX: 120 rows a page")
+ok(B._sheet_number("12", False, False) == "12" and B._sheet_number("1e3", False, False) == "1000" and B._sheet_number("x", True, False) == "x"
+   and B._sheet_number("1", True, True) == "1904-01-02", "XLSX: numbers as they read; the calendar that starts in 1904")
+ok(refused(lambda: B.build(put("old.xlsx", b"\xd0\xcf\x11\xe0"), "xlsx"), "spreadsheet"), "an old .xls under an .xlsx name")
+
 # ── compiled help ──
 ok(B.kind_of("Manual.CHM") == "chm", "a .chm is read here")
 ok(refused(lambda: B.load(put("fake.chm", b"<html>not a chm</html>"), "chm")), "what is not a .chm (or no program to open one) is NotReadable")
