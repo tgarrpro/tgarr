@@ -32,6 +32,7 @@ import access  # local module
 import screentime  # local module
 import export  # local module
 import localfiles  # local module
+import textbook  # local module: a .txt read as a book
 import contextvars
 
 
@@ -3406,6 +3407,11 @@ def _epub_row_sql():
     return "SELECT local_path, file_name FROM messages WHERE id=$1"
 
 
+def _is_txt(row) -> bool:
+    """A plain text file: read in the e-book reader, as a book (textbook.py)."""
+    return bool(row) and (row["file_name"] or row["local_path"] or "").lower().endswith(".txt")
+
+
 # ── comics ─────────────────────────────────────────────────────────────────────────────
 # A .cbz (and many a .cbr) is a zip of pictures. Converting one means unpacking every page
 # into memory at once - a 160 MB scan of a newspaper needs gigabytes. Reading one needs a
@@ -3522,6 +3528,12 @@ async def epub_toc(msg_id: int):
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return JSONResponse({"error": "not cached"}, status_code=404)
+    if _is_txt(row):
+        try:
+            book = await asyncio.to_thread(textbook.load, epub_path)
+        except Exception as e:
+            return JSONResponse({"error": f"cannot read this text: {e}"}, status_code=422)
+        return JSONResponse({"title": textbook.book_title(row["file_name"] or ""), "chapters": book["titles"]})
     try:
         idx = await asyncio.to_thread(_epub_index, epub_path)
     except Exception as e:
@@ -3537,6 +3549,23 @@ async def epub_chapter(msg_id: int, n: int):
     epub_path = _epub_locate(msg_id, row)
     if not epub_path:
         return HTMLResponse("not cached", status_code=404)
+    if _is_txt(row):
+        try:
+            book = await asyncio.to_thread(textbook.load, epub_path)
+        except Exception as e:
+            return HTMLResponse(f"<p>cannot show this text: {html.escape(str(e))}</p>",
+                                status_code=500, headers={"Content-Security-Policy": _EPUB_CSP})
+        if not 0 <= n < len(book["chapters"]):
+            return HTMLResponse("no such chapter", status_code=404)
+        await _touch_local(msg_id)
+        return HTMLResponse(
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<style>{_EPUB_CHAPTER_CSS}{textbook.CSS}</style></head>"
+            f"<body class='{'tb-latin' if book['latin'] else 'tb-cjk'}'>"
+            f"{textbook.chapter_html(book['chapters'][n])}</body></html>",
+            headers={"Content-Security-Policy": _EPUB_CSP,
+                     "X-Content-Type-Options": "nosniff",
+                     "Cache-Control": "private, max-age=3600"})
     try:
         idx = await asyncio.to_thread(_epub_index, epub_path)
         if not 0 <= n < len(idx["chapters"]):
@@ -4136,7 +4165,7 @@ async def epub_render(msg_id: int):
         return HTMLResponse(
             f'<p>This book is not downloaded yet. <a href="/watch/{msg_id}">Open it</a>.</p>',
             status_code=404)
-    title = _re.sub(r"\.epub$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
+    title = _re.sub(r"\.(epub|txt)$", "", row["file_name"] or f"book-{msg_id}", flags=_re.IGNORECASE)
     return HTMLResponse(_EPUB_READER_HTML.replace("__SPEECH_JS__", _speech_js()).replace("__ID__", str(int(msg_id)))
                         .replace("__TITLE__", html.escape(title)))
 
@@ -4670,6 +4699,10 @@ async def pdf_reader(msg_id: int):
     """The PDF reader (see the block comment above)."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(_epub_row_sql(), msg_id)
+    if _is_txt(row) and _epub_locate(msg_id, row):
+        # a text file is read as a book, with type that can be set: not as pictures of pages
+        # (links kept from before it was led here)
+        return RedirectResponse(f"/epub/{msg_id}", status_code=307)
     if not _pdf_source(row) and row and _is_local(row["local_path"]):
         # here, but not a PDF yet (a text file, a .docx, a book in another
         # format opened straight from a list): make the PDF now, once
@@ -5414,7 +5447,7 @@ function renderPlayer() {{
     location.replace("/pdf/" + MSG_ID);
     return;
   }}
-  if (ext === "epub") {{
+  if (ext === "epub" || ext === "txt") {{
     // Read in the built-in reader: instant, and no conversion to run.
     location.replace("/epub/" + MSG_ID);
     return;
@@ -6705,7 +6738,7 @@ def _file_href(r) -> str:
     e = localfiles.ext(r["file_name"] or "")
     if r["media_type"] == "video":
         return f'/watch/{r["id"]}'
-    if e == "epub":
+    if e in ("epub", "txt"):
         return f'/epub/{r["id"]}'
     if e == "pdf" or e in _EBOOK_CONVERTIBLE:
         return f'/pdf/{r["id"]}'          # read here (anything else is converted on first opening)
