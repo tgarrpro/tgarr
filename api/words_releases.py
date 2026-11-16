@@ -6,8 +6,6 @@ English: (zh-Hans, zh-Hant, es, fr, de, pt, ru, ja, ko, he, ar) - see i18n.py.
 
 T = {
     # ── Releases ──
-    "episodes": ("剧集", "劇集", "episodios", "épisodes", "Folgen", "episódios", "серии", "エピソード", "에피소드", "פרקים", "حلقات"),
-    "Films": ("电影", "電影", "Películas", "Films", "Filme", "Filmes", "Фильмы", "映画", "영화", "סרטים", "الأفلام"),
     "Episodes": ("剧集", "劇集", "Episodios", "Épisodes", "Folgen", "Episódios", "Серии", "エピソード", "에피소드", "פרקים", "الحلقات"),
     "Films and episodes": ("电影和剧集", "電影和劇集", "Películas y episodios", "Films et épisodes", "Filme und Folgen", "Filmes e episódios", "Фильмы и серии", "映画とエピソード", "영화와 에피소드", "סרטים ופרקים", "الأفلام والحلقات"),
     "Versions of this title": ("此片的所有版本", "此片的所有版本", "Versiones de este título", "Versions de ce titre", "Versionen dieses Titels", "Versões deste título", "Версии этого названия", "このタイトルのバージョン", "이 작품의 버전", "גרסאות של הכותר הזה", "نسخ هذا العنوان"),
@@ -26,10 +24,6 @@ T = {
     "all releases": ("全部影视", "全部影視", "todos los estrenos", "toutes les sorties", "alle Veröffentlichungen", "todos os lançamentos", "все релизы", "すべてのリリース", "전체 릴리스", "כל המהדורות", "كل الإصدارات"),
     "filter…": ("筛选…", "篩選…", "filtrar…", "filtrer…", "filtern…", "filtrar…", "фильтр…", "絞り込み…", "필터…", "סינון…", "تصفية…"),
     # ── Search ──
-    "gone": ("已消失", "已消失", "desaparecido", "disparu", "nicht mehr da", "desapareceu", "исчез", "消滅", "사라짐", "נעלם", "اختفت"),
-    "joined": ("已加入", "已加入", "unido", "rejoint", "beigetreten", "ingressou", "вступили", "参加中", "참여 중", "הצטרפת", "منضم"),
-    "followed": ("已关注", "已追蹤", "seguido", "suivi", "gefolgt", "seguido", "отслеживается", "フォロー中", "팔로우 중", "במעקב", "متابَعة"),
-    "members": ("成员", "成員", "miembros", "membres", "Mitglieder", "membros", "участники", "メンバー", "멤버", "חברים", "أعضاء"),
     "Details": ("详情", "詳細資訊", "Detalles", "Détails", "Details", "Detalhes", "Подробнее", "詳細", "자세히", "פרטים", "التفاصيل"),
     "Nothing found for %1": ("没有找到“%1”的结果", "找不到「%1」的結果", "No se encontró nada para %1", "Aucun résultat pour %1", "Nichts gefunden für %1", "Nada encontrado para %1", "По запросу %1 ничего не найдено", "%1 に一致するものはありません", "%1에 대한 결과가 없습니다", "לא נמצא דבר עבור %1", "لم يُعثر على شيء لـ %1"),
     "Try fewer words, another spelling, or one of the other tabs.": ("试试少用几个词、换一种拼写，或看看其他标签页。", "試試少用幾個詞、換一種拼法，或看看其他分頁。", "Prueba con menos palabras, otra ortografía o alguna de las otras pestañas.", "Essayez avec moins de mots, une autre orthographe ou l'un des autres onglets.", "Versuchen Sie es mit weniger Wörtern, einer anderen Schreibweise oder einem der anderen Tabs.", "Tente menos palavras, outra grafia ou uma das outras abas.", "Попробуйте меньше слов, другое написание или другую вкладку.", "単語を減らす、別の表記にする、または他のタブを試してください。", "단어를 줄이거나 철자를 바꾸거나 다른 탭을 확인해 보세요.", "נסו פחות מילים, איות אחר או אחת מהלשוניות האחרות.", "جرّب كلمات أقل، أو تهجئة أخرى، أو إحدى علامات التبويب الأخرى."),
