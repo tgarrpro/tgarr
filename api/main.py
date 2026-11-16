@@ -12296,6 +12296,15 @@ _MC_KINDS = {
     "book": ("Read", "📖", "#f5a524", _book_sql("m.file_name")),
     "photo": ("Photos", "🖼️", "#8b6cf6", "m.media_type = 'photo'"),
 }
+# The four cards' icons: drawn (one line weight, round ends), so they look the same on every
+# system and take the colour of the card - an emoji is drawn by whatever font the device has.
+_MC_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+_MC_ICONS = {
+    "video": _MC_SVG + '<rect x="3" y="5" width="18" height="14" rx="3.5"/><path d="M10.2 9.2v5.6l4.8-2.8z" fill="currentColor"/></svg>',
+    "audio": _MC_SVG + '<path d="M4.5 14.5v-2.2a7.500 7.500 0 0 1 15 0v2.200"/><rect x="3" y="13.500" width="4.600" height="7" rx="2.200"/><rect x="16.400" y="13.500" width="4.600" height="7" rx="2.200"/></svg>',
+    "book": _MC_SVG + '<path d="M12 6.8C10.200 5.500 7.900 4.900 4.900 5a.9.9 0 0 0-.9.9v11.300c0 .5.400.9.900.9 2.900-.1 5.200.5 7.100 1.800 1.900-1.300 4.200-1.900 7.100-1.800.5 0 .9-.4.9-.9V5.900a.9.9 0 0 0-.9-.9c-3-.1-5.300.5-7.100 1.800z"/><path d="M12 6.800v13.100"/></svg>',
+    "photo": _MC_SVG + '<rect x="3" y="4.500" width="18" height="15" rx="3.500"/><circle cx="8.600" cy="9.700" r="1.700"/><path d="M21 15.300l-4.200-4.200a1.700 1.700 0 0 0-2.400 0L6.600 19.500"/></svg>',
+}
 _UI_LANG = {"at": 0.0, "v": ""}
 
 
@@ -12357,13 +12366,13 @@ async def api_kids_lang(request: Request):
 
 # The looks of the Media Center: key, name, a line about it, and the two colours of its swatch.
 _MC_THEMES = (
-    ("auto", "Day & Night", "light by day, dark where the device is", "#fff8ef", "#191624"),
+    ("auto", "Day & Night", "light by day, dark where the device is", "#f4f5f8", "#0b0d12"),
     ("cinema", "Cinema", "a dark room and the pictures - for a television", "#07080c", "#f5c518"),
     ("playroom", "Playroom", "big, round and coloured - for the youngest", "#bfe6ff", "#ffd166"),
     ("paper", "Paper", "quiet, like a shelf of books", "#f4ecd8", "#8b4a2b"),
     ("aurora", "Aurora", "glass over a night sky", "#1b1b4b", "#5eead4"),
     ("clear", "Clear", "black, white and yellow, large", "#000000", "#ffe600"),
-    ("day", "Always light", "", "#fff8ef", "#ffffff"),
+    ("day", "Always light", "", "#f4f5f8", "#ffffff"),
     ("night", "Always dark", "", "#191624", "#262234"),
 )
 _MC_THEME_KEYS = tuple(t[0] for t in _MC_THEMES)
@@ -12438,13 +12447,13 @@ __PWA__
 })();
 </script>
 <style>
-:root{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--accent:__COLOR__;
-  --shadow:0 6px 18px rgba(64,40,10,.10);--r:22px}
-@media (prefers-color-scheme:dark){:root{--bg:#191624;--card:#262234;--ink:#f3eefc;--soft:#a79fbd;--line:#342f45;
-  --shadow:0 6px 18px rgba(0,0,0,.35)}}
+:root{--bg:#f4f5f8;--card:#ffffff;--ink:#12141a;--soft:#687083;--line:#e2e5eb;--accent:__COLOR__;
+  --shadow:0 8px 24px rgba(18,22,34,.10);--r:14px}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0d12;--card:#161922;--ink:#f2f3f6;--soft:#99a0b0;--line:#252a37;
+  --shadow:0 10px 28px rgba(0,0,0,.55)}}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--ink);
-  font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+  font-family:"Inter","SF Pro Display","Segoe UI","Helvetica Neue","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
 a{color:inherit;text-decoration:none}
 .top{display:flex;align-items:center;gap:14px;padding:18px clamp(16px,4vw,44px) 6px}
 .logo{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
@@ -12457,22 +12466,46 @@ a{color:inherit;text-decoration:none}
 .pill{font-size:13px;color:var(--soft);padding:9px 14px;border-radius:999px;border:1.5px solid var(--line);
   background:var(--card);white-space:nowrap}
 .pill:hover{border-color:var(--accent);color:var(--ink)}
-.cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);
-  padding:14px clamp(16px,4vw,44px) 4px}
-.cat{background:var(--card);border-radius:var(--r);padding:clamp(14px,2.4vw,24px) 10px;text-align:center;
-  box-shadow:var(--shadow);border:3px solid transparent;transition:transform .15s, border-color .15s}
-.cat:hover{transform:translateY(-3px)}
-.cat .ic{font-size:clamp(34px,6vw,56px);line-height:1.1;display:block}
-.cat b{display:block;font-size:clamp(15px,2.2vw,21px);margin-top:6px}
-.cat small{color:var(--soft);font-size:13px}
-.cat.on{border-color:var(--c);background:color-mix(in srgb, var(--c) 12%, var(--card))}
+.cats{display:flex;gap:6px;padding:10px clamp(16px,4vw,44px) 0;overflow-x:auto;scrollbar-width:none}
+.cats::-webkit-scrollbar{display:none}
+.cat{display:flex;align-items:center;gap:10px;padding:10px 18px 10px 12px;border-radius:12px;color:var(--soft);
+  border:2px solid transparent;white-space:nowrap;transition:background .15s, color .15s}
+.cat:hover{color:var(--ink);background:color-mix(in srgb, var(--ink) 6%, transparent)}
+.cat .ic{display:grid;place-items:center;width:34px;height:34px;flex:none;border-radius:10px;
+  color:var(--c);background:color-mix(in srgb, var(--c) 15%, transparent);transition:background .15s, color .15s, box-shadow .15s}
+.cat .ic svg{width:60%;height:60%;display:block}
+.cat b{font-size:clamp(15px,1.5vw,18px);font-weight:700;letter-spacing:-.01em}
+.cat small{color:var(--soft);font-size:12.5px;font-weight:600;opacity:.8}
+.cat.on{color:var(--ink);background:color-mix(in srgb, var(--c) 13%, var(--card));box-shadow:var(--shadow)}
+.cat.on .ic{color:#fff;background:linear-gradient(140deg, color-mix(in srgb, var(--c) 80%, #fff), var(--c));box-shadow:0 8px 18px -8px var(--c)}
+.hic{display:inline-grid;place-items:center;width:1.2em;height:1.2em;margin-inline-end:.15em;color:var(--c)}
+.hic svg{width:100%;height:100%;display:block}
+/* the first thing, wide: its own picture, blurred, behind its name */
+.hero{position:relative;margin:16px clamp(16px,4vw,44px) 0;border-radius:calc(var(--r) + 8px);overflow:hidden;isolation:isolate;
+  min-height:clamp(210px,34vh,400px);display:flex;align-items:flex-end;gap:clamp(16px,2.6vw,34px);padding:clamp(18px,3vw,40px);
+  background:linear-gradient(120deg, color-mix(in srgb, var(--c) 55%, #0b0d12), #0b0d12);color:#fff;box-shadow:var(--shadow)}
+.hero .bk{position:absolute;inset:-40px;z-index:-2;background:var(--img) center/cover no-repeat;filter:blur(34px) saturate(1.25);transform:scale(1.15)}
+.hero::after{content:"";position:absolute;inset:0;z-index:-1;
+  background:linear-gradient(90deg, rgba(8,10,16,.86) 0%, rgba(8,10,16,.55) 48%, rgba(8,10,16,.12) 100%),linear-gradient(0deg, rgba(8,10,16,.55), rgba(8,10,16,0) 55%)}
+.hero .po{flex:none;height:clamp(150px,26vh,300px);border-radius:12px;box-shadow:0 18px 40px rgba(0,0,0,.55);background:rgba(255,255,255,.06);display:block}
+.hero .tx{min-width:0;padding-bottom:4px}
+.hero .ey{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:color-mix(in srgb, var(--c) 55%, #fff)}
+.hero .ey .hic{color:inherit}
+.hero h1{margin:10px 0 18px;font-size:clamp(26px,4.2vw,54px);line-height:1.08;font-weight:800;letter-spacing:-.025em;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;text-shadow:0 2px 18px rgba(0,0,0,.45)}
+.hbtn{display:inline-flex;align-items:center;gap:10px;font-size:17px;font-weight:800;padding:13px 26px;border-radius:999px;background:#fff;color:#0b0d12;
+  transition:transform .15s}
+.hbtn:hover{transform:scale(1.04)}.hbtn:focus-visible{outline:5px solid var(--accent);outline-offset:3px;transform:scale(1.05)}
+.hbtn svg{width:18px;height:18px}
+html[dir=rtl] .hero::after{transform:scaleX(-1)}
+@media (max-width:560px){.hero .po{display:none}.hero{min-height:180px}}
 .find{padding:16px clamp(16px,4vw,44px) 0;display:flex;gap:10px}
-.find input{flex:1;max-width:520px;font:inherit;font-size:18px;padding:13px 20px;border-radius:999px;
-  border:2px solid var(--line);background:var(--card);color:var(--ink);outline:none}
+.find input{flex:1;max-width:440px;font:inherit;font-size:16.500px;padding:12px 18px;border-radius:12px;
+  border:1.500px solid var(--line);background:var(--card);color:var(--ink);outline:none}
 .find input:focus{border-color:var(--accent)}
-.find button{font:inherit;font-size:17px;font-weight:700;padding:0 24px;border-radius:999px;border:0;
+.find button{font:inherit;font-size:16px;font-weight:700;padding:0 22px;border-radius:12px;border:0;
   background:var(--accent);color:#fff;cursor:pointer}
-h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items:center;gap:8px}
+h2{font-size:clamp(20px,2vw,26px);font-weight:800;letter-spacing:-.02em;margin:30px clamp(16px,4vw,44px) 14px;display:flex;align-items:center;gap:8px}
 .row{display:flex;gap:14px;overflow-x:auto;padding:2px clamp(16px,4vw,44px) 10px;scrollbar-width:none}
 .row::-webkit-scrollbar{display:none}
 .row .card{flex:0 0 clamp(170px,22vw,240px)}
@@ -12482,7 +12515,7 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
 .grid.photo{grid-template-columns:repeat(auto-fill,minmax(clamp(110px,14vw,170px),1fr));gap:8px}
 .card{background:var(--card);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow);display:flex;
   flex-direction:column;transition:transform .15s, box-shadow .15s;position:relative}
-.card:hover,.card:focus-visible{transform:translateY(-4px) scale(1.015);box-shadow:0 12px 26px rgba(64,40,10,.18);outline:none}
+.card:hover,.card:focus-visible{transform:translateY(-4px) scale(1.015);box-shadow:0 16px 34px rgba(18,22,34,.20);outline:none}
 /* what the remote control is on: seen from the sofa */
 .card:focus-visible{outline:5px solid var(--accent);outline-offset:3px;transform:translateY(-4px) scale(1.04)}
 .cat:focus-visible,.pill:focus-visible,.more a:focus-visible,.find button:focus-visible,.logo:focus-visible{outline:5px solid var(--accent);outline-offset:3px}
@@ -12490,13 +12523,18 @@ h2{font-size:21px;margin:26px clamp(16px,4vw,44px) 12px;display:flex;align-items
 html.tv .name{font-size:18px}html.tv h2{font-size:25px}
 .pic{aspect-ratio:16/10;background:linear-gradient(135deg,color-mix(in srgb,var(--c) 55%,#fff),var(--c));
   display:flex;align-items:center;justify-content:center;font-size:54px;position:relative;overflow:hidden}
+.pic .ph{width:32%;max-width:76px;color:rgba(255,255,255,.9);display:block}.pic .ph svg{width:100%;height:auto;display:block}
 .pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .book .pic{aspect-ratio:3/4}.photo .pic{aspect-ratio:1/1}.audio .pic{aspect-ratio:1/1}
-.play{position:absolute;right:10px;bottom:10px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.94);
-  display:flex;align-items:center;justify-content:center;font-size:20px;color:var(--c);box-shadow:0 3px 10px rgba(0,0,0,.25)}
-.saved{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.94);color:#157f3d;font-size:11.5px;font-weight:700;
-  padding:3px 9px;border-radius:999px}
-.name{padding:11px 14px 14px;font-size:15.5px;font-weight:700;line-height:1.3;word-break:break-word}
+.play{position:absolute;right:10px;bottom:10px;width:46px;height:46px;border-radius:50%;background:rgba(255,255,255,.96);
+  display:flex;align-items:center;justify-content:center;font-size:18px;padding-left:3px;color:#0b0d12;box-shadow:0 6px 16px rgba(0,0,0,.35);
+  transition:opacity .15s, transform .15s}
+@media (hover:hover){.play{opacity:0;transform:scale(.8)}.card:hover .play,.card:focus-visible .play{opacity:1;transform:none}}
+html.tv .play{opacity:0}html.tv .card:focus-visible .play{opacity:1;transform:none}
+.saved{position:absolute;left:10px;top:10px;display:flex;align-items:center;gap:6px;background:rgba(8,10,16,.62);color:#fff;font-size:11.500px;font-weight:600;
+  padding:4px 9px;border-radius:999px;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.saved::before{content:"";width:7px;height:7px;border-radius:50%;background:#34d399}
+.name{padding:11px 14px 14px;font-size:15px;font-weight:600;line-height:1.3;word-break:break-word}
 .name span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .photo .name{display:none}
 .empty{margin:30px clamp(16px,4vw,44px);padding:46px 20px;text-align:center;background:var(--card);border-radius:var(--r);
@@ -12512,8 +12550,8 @@ html.tv .name{font-size:18px}html.tv h2{font-size:25px}
 /* ── looks ──────────────────────────────────────────────────────────────────────────
    A look is a set of colours and a few shapes, chosen on the page (the 🎨 button) and kept by
    each screen. "auto" is the page as it always was: light by day, dark where the device is. */
-html[data-th=day]{--bg:#fff8ef;--card:#ffffff;--ink:#2b2140;--soft:#7a7191;--line:#f0e4d3;--shadow:0 6px 18px rgba(64,40,10,.10);color-scheme:light}
-html[data-th=night]{--bg:#191624;--card:#262234;--ink:#f3eefc;--soft:#a79fbd;--line:#342f45;--shadow:0 6px 18px rgba(0,0,0,.35);color-scheme:dark}
+html[data-th=day]{--bg:#f4f5f8;--card:#ffffff;--ink:#12141a;--soft:#687083;--line:#e2e5eb;--shadow:0 8px 24px rgba(18,22,34,.10);color-scheme:light}
+html[data-th=night]{--bg:#0b0d12;--card:#161922;--ink:#f2f3f6;--soft:#99a0b0;--line:#252a37;--shadow:0 10px 28px rgba(0,0,0,.55);color-scheme:dark}
 
 /* Cinema: a dark room and the pictures. Made for a television. */
 html[data-th=cinema]{--bg:#07080c;--card:#14161d;--ink:#f2f3f5;--soft:#9aa0ad;--line:#262b38;--accent:#f5c518;
@@ -12524,7 +12562,9 @@ html[data-th=cinema] body{background:radial-gradient(1100px 520px at 18% -12%,#1
 html[data-th=cinema] .cats{display:flex;flex-wrap:wrap;gap:10px}
 html[data-th=cinema] .cat{display:flex;align-items:center;gap:10px;padding:10px 22px;border-radius:999px;box-shadow:none;
   border:2px solid var(--line);background:rgba(255,255,255,.04)}
-html[data-th=cinema] .cat .ic{font-size:22px;display:inline}
+html[data-th=cinema] .cat .ic,html[data-th=cinema] .cat.on .ic{width:24px;height:24px;margin:0;border-radius:0;background:none;box-shadow:none;color:inherit}
+html[data-th=cinema] .cat.on{box-shadow:none}html[data-th=cinema] .hbtn{background:var(--accent)}
+html[data-th=cinema] .cat .ic svg{width:100%;height:100%}
 html[data-th=cinema] .cat b{display:inline;margin:0;font-size:17px}
 html[data-th=cinema] .cat small{display:none}
 html[data-th=cinema] .cat.on{background:var(--accent);border-color:var(--accent);color:#111}
@@ -12545,8 +12585,12 @@ html[data-th=playroom]{--bg:#e8f6ff;--card:#ffffff;--ink:#27314d;--soft:#62739a;
   --shadow:0 8px 0 rgba(39,49,77,.10);--r:30px;color-scheme:light}
 html[data-th=playroom] body{background:linear-gradient(180deg,#bfe6ff 0%,#e8f6ff 34%,#fff4d6 100%);background-attachment:fixed;
   font-family:"Baloo 2","Comic Neue",ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
-html[data-th=playroom] .cat{border:4px solid var(--c)}
-html[data-th=playroom] .cat .ic{font-size:clamp(40px,7vw,66px)}
+html[data-th=playroom] .cats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,2vw,20px);padding-top:14px;overflow:visible}
+html[data-th=playroom] .cat{display:block;text-align:center;padding:clamp(14px,2.4vw,24px) 10px;border:4px solid var(--c);background:var(--card);
+  border-radius:var(--r);box-shadow:var(--shadow);color:var(--ink);white-space:normal}
+html[data-th=playroom] .cat b{display:block;margin-top:10px;font-size:clamp(15px,2.2vw,21px)}
+html[data-th=playroom] .cat .ic{width:clamp(56px,7.6vw,84px);height:clamp(56px,7.6vw,84px);margin:0 auto;border-radius:30%}
+html[data-th=playroom] .cat.on .ic{background:#fff;color:var(--c);box-shadow:none}
 html[data-th=playroom] .cat.on{background:var(--c);color:#fff}
 html[data-th=playroom] .cat.on small{color:#fff}
 html[data-th=playroom] .card{border:4px solid #fff}
@@ -12580,6 +12624,9 @@ html[data-th=clear]{--bg:#000;--card:#000;--ink:#fff;--soft:#e8e8e8;--line:#fff;
 html[data-th=clear] .card,html[data-th=clear] .cat,html[data-th=clear] .pill,html[data-th=clear] .find input{border:3px solid #fff}
 html[data-th=clear] .cat.on{background:#ffe600;border-color:#ffe600;color:#000}
 html[data-th=clear] .cat.on small{color:#000}
+html[data-th=clear] .cat .ic{background:none;color:#fff;box-shadow:none}
+html[data-th=clear] .cat.on .ic{background:none;color:#000;box-shadow:none}
+html[data-th=clear] .hic{color:#fff}
 html[data-th=clear] .name{font-size:19px}
 html[data-th=clear] h2{font-size:26px}
 html[data-th=clear] .cat b{font-size:clamp(18px,2.4vw,24px)}
@@ -12620,7 +12667,7 @@ html.tv .grid.book{grid-template-columns:repeat(auto-fill,minmax(clamp(150px,12v
 html.tv .cat b{font-size:clamp(18px,1.9vw,26px)}
 html.tv .th b{font-size:18px}html.tv .th small{font-size:14px}
 html.tv .thp{width:min(620px,calc(100vw - 24px))}
-@media (max-width:560px){.cats{grid-template-columns:repeat(4,1fr);gap:8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
+@media (max-width:560px){.cats{gap:4px}.cat{padding:8px 12px 8px 8px}.cat small{display:none}.logo .wm{font-size:27px}.logo .mark{width:27px;height:27px}.logo .mc{font-size:16px;padding-left:9px}}
 </style></head>
 <body>
 <div class="top">
@@ -12637,6 +12684,7 @@ html.tv .thp{width:min(620px,calc(100vw - 24px))}
 </form>
 <div class="thp" id="thP" role="dialog" aria-label="[[@Look]]">__THEMEPANEL__</div>
 <div class="thp lgp" id="lgP" role="dialog" aria-label="[[@Language]]">__LANGPANEL__</div>
+__HERO__
 <div id="recent"></div>
 <h2>__HEADING__</h2>
 __GRID__
@@ -12747,7 +12795,7 @@ __MORE__
   // On a television the search box is not among what the arrows go to: the moment it is
   // chosen the on-screen keyboard opens and takes the arrows for itself, and the remote is
   // caught in it. There the way to search is OK on "Find", which opens the keyboard on purpose.
-  var SEL = "a.cat, " + (TV ? "" : ".find input[type=search], ") + ".find button, a.card, .more a, a.pill, button.pill, .top a.logo, button.th";
+  var SEL = "a.cat, " + (TV ? "" : ".find input[type=search], ") + ".find button, a.hbtn, a.card, .more a, a.pill, button.pill, .top a.logo, button.th";
   function all(){
     var open = document.querySelector(".thp.on");      // the list of looks is open: the arrows stay in it
     return Array.prototype.filter.call((open || document).querySelectorAll(open ? "button.th" : SEL), function(e){ var r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
@@ -12836,23 +12884,32 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
     locked = _LOCKED.get()
     cats = "".join(
         f'<a class="cat{" on" if k == kind else ""}" style="--c:{v[2]}" href="/mediacenter?kind={k}">'
-        f'<span class="ic">{v[1]}</span><b>{tr(v[0])}</b><small>{counts[k]:,}</small></a>'
+        f'<span class="ic">{_MC_ICONS[k]}</span><b>{tr(v[0])}</b><small>{counts[k]:,}</small></a>'
         for k, v in _MC_KINDS.items())
     cards = []
+    hero, ph = "", f'<span class="ph">{_MC_ICONS[kind]}</span>'
     for r in rows:
         name = _friendly_name(r["file_name"], r["caption"])
         if kind == "book":
-            pic, href, ic = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", "📖"
+            pic, href, ic = f"/ebook-cover/{r['id']}", f"/watch/{r['id']}", ph
         elif kind == "audio":
-            pic, href, ic = "", f"/watch/{r['id']}", "🎵"
+            pic, href, ic = "", f"/watch/{r['id']}", ph
         elif kind == "photo":
             pic, href, ic = f"/api/thumb/{r['id']}", f"/api/photo-preview/{r['id']}", ""
         else:
-            pic, href, ic = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", "🎬"
+            pic, href, ic = f"/api/thumb/{r['id']}", f"/watch/{r['id']}", ph
+        if not hero and kind != "photo" and not q and not offset:
+            # the first thing gets the wide banner: its picture behind its name, and one button
+            shown = (f'<img class="po" src="{pic}" alt="" onerror="this.remove()"/>' if pic else "")
+            hero = (f'<section class="hero" style="--c:{colour};--img:url({pic or "data:,"})"><div class="bk"></div>{shown}'
+                    f'<div class="tx"><span class="ey"><span class="hic">{_MC_ICONS[kind]}</span>{tr(label)}</span>'
+                    f'<h1>{html.escape(name)}</h1>'
+                    f'<a class="hbtn" href="{href}"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.500v13l11-6.500z"/></svg>'
+                    f'{tr({"video": "Watch", "audio": "Listen", "book": "Read"}[kind])}</a></div></section>')
         img = f'<img loading="lazy" src="{pic}" alt="" onerror="this.remove()"/>' if pic else ""
         cards.append(
             f'<a class="card {kind}" style="--c:{colour}" href="{href}" data-id="{r["id"]}" data-kind="{kind}" '
-            f'data-name="{html.escape(name, quote=True)}" data-pic="{pic}" data-c="{colour}" data-icon="{ic}">'
+            f'data-name="{html.escape(name, quote=True)}" data-pic="{pic}" data-c="{colour}" data-icon="{html.escape(ic, quote=True)}">'
             f'<div class="pic">{ic}{img}'
             + (f'<span class="saved">{tr("ready")}</span>' if r["saved"] and kind != "photo" else "")
             + ('' if kind == "photo" else '<span class="play">▶</span>')
@@ -12879,13 +12936,13 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
              (f'<a class="pill" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else '')
              + f'<a class="pill" href="/mediacenter/manage">⚙ {tr("Choose what is shown")}</a>'
              f'<a class="pill" href="/">← {tr("Back to tgarr")}</a>')
-    heading = f'{icon} {tr(label)}' + (f' · “{html.escape(q)}”' if q else "")
+    heading = f'<span class="hic" style="--c:{colour}">{_MC_ICONS[kind]}</span>{tr(label)}' + (f' · “{html.escape(q)}”' if q else "")
     page = (i18n.fill(lang, _MEDIACENTER_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
             .replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
             .replace("__THEME__", theme).replace("__THEMES__", _json.dumps(list(_MC_THEME_KEYS)))
             .replace("__THEMEPANEL__", _mc_theme_panel(not locked, lang)).replace("__LANGPANEL__", _lang_panel(lang, not locked))
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
-            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
+            .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading).replace("__HERO__", hero)
             .replace("__GRID__", grid).replace("__MORE__", nav))
     return HTMLResponse(page)
 
