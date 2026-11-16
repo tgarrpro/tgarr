@@ -17,12 +17,15 @@ def ok(cond, what):
 
 
 # ── what is kept ──
-ok(P.clean({"key": "tgarr.v.", "val": "125", "frac": 0.25}) == {"key": "tgarr.v.", "val": "125", "frac": 0.25, "done": False}, "seconds into a film")
+ok(P.clean({"key": "tgarr.v.", "val": "125", "frac": 0.25}) == {"key": "tgarr.v.", "val": "125", "frac": 0.25, "done": False, "total": None}, "seconds into a film")
+ok(P.clean({"key": "tgarr.v.", "val": "125", "total": 500})["total"] == 500.0, "and how long the film is")
+for t in (0, -5, "x", True, float("inf"), 9e9):
+    ok(P.clean({"key": "tgarr.v.", "val": "1", "total": t})["total"] is None, f"a length that is none: {t}")
 ok(P.clean({"key": "tgarr.v.", "val": 125})["val"] == "125", "a number is kept as text")
 ok(P.clean({"key": "tgarr.read.", "val": '{"ch":3,"frac":0.5}', "frac": None})["frac"] is None, "no fraction is fine")
 ok(P.clean({"key": "comic-", "val": "7", "frac": 2})["frac"] == 1.0, "a fraction is held within 0..1")
 ok(P.clean({"key": "comic-", "val": "7", "frac": -3})["frac"] == 0.0, "from below as well")
-ok(P.clean({"key": "tgarr.a.", "val": None, "done": True}) == {"key": "tgarr.a.", "val": None, "frac": 1.0, "done": True}, "finished: no place, all of it")
+ok(P.clean({"key": "tgarr.a.", "val": None, "done": True}) == {"key": "tgarr.a.", "val": None, "frac": 1.0, "done": True, "total": None}, "finished: no place, all of it")
 ok(P.clean({"key": "tgarr.v.", "val": "5", "done": "yes"})["done"] is False, "only a real true means finished")
 ok(P.clean({"key": "tgarr.v.", "val": "5", "frac": float("nan")})["frac"] is None, "not-a-number is no fraction")
 ok(P.clean({"key": "tgarr.v.", "val": "5", "frac": True})["frac"] is None, "true is not a fraction")

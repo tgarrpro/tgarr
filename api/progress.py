@@ -49,7 +49,10 @@ def clean(body) -> dict:
         return None                # nothing to remember
     if done:
         frac = 1.0
-    return {"key": key, "val": val, "frac": frac, "done": done}
+    total = body.get("total")
+    if isinstance(total, bool) or not isinstance(total, (int, float)) or total != total or not 0 < total < 400000:
+        total = None
+    return {"key": key, "val": val, "frac": frac, "done": done, "total": None if total is None else float(total)}
 
 
 def seed(row) -> str:
@@ -98,9 +101,14 @@ JS = r"""<script>
       fetch("/api/progress/" + ID, {method: "POST", headers: {"Content-Type": "application/json"}, body: body, keepalive: true}).catch(function(){});
     } catch (e) {}
   }
+  function length(key){
+    try { var m = document.querySelector("video, audio");
+      if (m && m.duration > 0 && isFinite(m.duration) && (key === "tgarr.v." || key === "tgarr.a.")) return m.duration; } catch (e) {}
+    return null;
+  }
   function note(key, val, done){
     var f = done ? 1 : frac(key, val);
-    next = {key: key, val: val, frac: f, done: !!done || (f !== null && f >= 0.985 && key !== "tgarr.read." ? true : false)};
+    next = {key: key, val: val, frac: f, total: length(key), done: !!done || (f !== null && f >= 0.985 && key !== "tgarr.read." ? true : false)};
     if (f !== null && key === "tgarr.read." && f >= 0.995) next.done = true;
     if (wait) return;
     wait = setTimeout(function(){ wait = null; send(false); }, Math.max(300, 8000 - (Date.now() - last)));

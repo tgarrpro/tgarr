@@ -36,6 +36,7 @@ import ownbooks  # local module: books read here without converting (.txt .fb2 .
 import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
 import i18n  # local module: the words on the pages, in the languages of those who read them
 import progress  # local module: where somebody stopped, kept per person
+import courses  # local module: courses - lists, the order of lessons, what a lesson done is worth
 
 # What counts as a book on every shelf, count and export: everything a reader here opens.
 # (This list used to be written out in seven places, each a little different.)
@@ -179,15 +180,18 @@ _LANG = contextvars.ContextVar("tgarr_lang", default="en")      # the language t
 _ACCESS = {"at": 0.0, "pin": None, "secret": None}
 _GUESSES = access.Guesses()
 _KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
-_KID_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
+_KID_COURSE = "m.id IN (SELECT ci.msg_id FROM course_items ci JOIN kids_allow k ON k.kind = 'course' AND k.ref = ci.course_id)"
+_KID_SQL = f"""(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
                AND (m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
-                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')
+                    OR {_KID_COURSE}))"""
 # An older child: everything all-ages from public channels and the folders of this machine -
 # not the owner's private chats, unless ticked - and never a picture found adult.
-_TEEN_SQL = """(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
+_TEEN_SQL = f"""(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
                AND (c.username IS NOT NULL OR c.local_root IS NOT NULL
                     OR m.id IN (SELECT ref FROM kids_allow WHERE kind = 'message')
-                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')))"""
+                    OR m.channel_id IN (SELECT ref FROM kids_allow WHERE kind = 'channel')
+                    OR {_KID_COURSE}))"""
 # The people the owner has added (table profiles): each a PIN of their own and a level,
 # 'kid' (only what is ticked - as a browser with no PIN at all) or 'teen'. Their browsers
 # stay LOCKED; the PIN only says whose it is, so that time is counted per person, on
@@ -323,12 +327,14 @@ async def _locked_block(request: Request):
     if rules["on"]:
         who = _mc_who(request)
         await _mc_device(who, rules)
-        if not _DEVICES.check(who, rules, time.time())["ok"]:
+        if not _DEVICES.check(who, rules, time.time(), await _bonus(who, rules), await _learning_path(path))["ok"]:
             if request.method in ("GET", "HEAD") and "text/html" in (request.headers.get("accept") or ""):
                 return RedirectResponse("/mediacenter/rest", status_code=303)
             return JSONResponse({"status": "rest", "message": "the Media Center is closed for now"}, status_code=403)
     if path in _LOCKED_OPEN:
         return None
+    if request.method == "GET" and path == "/api/courses":
+        return None                                # its own courses, to read (the answer holds only those ticked for it)
     if request.method == "POST" and path.startswith("/api/progress/"):
         # the one thing a locked browser may write: where it stopped, in something it may open
         m = _PRIVATE_ID_RX.match(path)
@@ -373,6 +379,7 @@ async def _signed_out_block(request: Request):
         if path.startswith("/api/") and not path.startswith(
                 ("/api/login", "/api/unlock", "/api/lock", "/api/kids/", "/api/usenet/", "/api/files/", "/api/tts/", "/api/vision/",
                  "/api/progress/",                   # where one stopped: this install's own business
+                 "/api/courses",                     # nor do courses need an account
                  # a public channel is followed and read without an account (the crawler's guest workers)
                  "/api/channel/subscribe", "/api/channel/unsubscribe/",
                  "/api/archive/",                    # the Internet Archive asks nobody for an account
@@ -1092,6 +1099,30 @@ async def _migrate_schema():
               who TEXT NOT NULL, msg_id BIGINT NOT NULL, key TEXT NOT NULL, val TEXT, frac REAL,
               done BOOLEAN NOT NULL DEFAULT FALSE, at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               PRIMARY KEY (who, msg_id)
+            );
+            ALTER TABLE progress ADD COLUMN IF NOT EXISTS total REAL;
+            -- courses (courses.py): what a course is made of. kind: 'pack' (items of the Internet
+            -- Archive, parts = JSON [{ia, title}]), 'folder' (ref = "<channel id>:<path>"),
+            -- 'channel' (ref = "<channel id>"), 'list' (file names, parts = JSON [{name}]: a
+            -- course somebody else made, matched to the files here). Its lessons are worked out
+            -- from the library and kept in course_items.
+            CREATE TABLE IF NOT EXISTS courses (
+              id SERIAL PRIMARY KEY, slug TEXT UNIQUE, title TEXT NOT NULL, about TEXT, lang TEXT, level TEXT,
+              subject TEXT, license TEXT, credit TEXT, kind TEXT NOT NULL, ref TEXT, parts TEXT,
+              built_at TIMESTAMPTZ, added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS course_items (
+              course_id INT NOT NULL, pos INT NOT NULL, msg_id BIGINT NOT NULL, PRIMARY KEY (course_id, pos)
+            );
+            CREATE INDEX IF NOT EXISTS idx_course_items_msg ON course_items (msg_id);
+            -- learning: seconds really spent on a lesson (from the page's "still here" signals),
+            -- and the day a lesson first counted as done for a reward
+            CREATE TABLE IF NOT EXISTS lesson_time (
+              who TEXT NOT NULL, msg_id BIGINT NOT NULL, day INT NOT NULL, seconds INT NOT NULL DEFAULT 0,
+              PRIMARY KEY (who, msg_id, day)
+            );
+            CREATE TABLE IF NOT EXISTS lesson_done (
+              who TEXT NOT NULL, msg_id BIGINT NOT NULL, day INT NOT NULL, PRIMARY KEY (who, msg_id)
             );
             CREATE TABLE IF NOT EXISTS kids_allow (
               kind TEXT NOT NULL,
@@ -2573,10 +2604,12 @@ async def progress_put(msg_id: int, request: Request):
             return JSONResponse({"status": "error", "message": "no such item"}, status_code=404)
         # a thing once finished stays finished when it is opened again; its place is the new one
         await conn.execute(
-            """INSERT INTO progress (who, msg_id, key, val, frac, done) VALUES ($1, $2, $3, $4, $5, $6)
+            """INSERT INTO progress (who, msg_id, key, val, frac, done, total) VALUES ($1, $2, $3, $4, $5, $6, $7)
                ON CONFLICT (who, msg_id) DO UPDATE SET key = $3, val = $4, frac = COALESCE($5, progress.frac),
-                 done = progress.done OR $6, at = NOW()""",
-            who, msg_id, p["key"], p["val"], p["frac"], p["done"])
+                 done = progress.done OR $6, total = COALESCE($7, progress.total), at = NOW()""",
+            who, msg_id, p["key"], p["val"], p["frac"], p["done"], p["total"])
+    if p["done"] and _LOCKED.get():
+        await _lesson_check(who, msg_id)
     return {"status": "ok"}
 
 
@@ -12190,7 +12223,9 @@ _MC_PING_JS = """(function(){
   }
   function ping(){
     if (!busy()) return;
-    fetch("/api/mc/ping", {credentials: "same-origin"}).then(function(r){ return r.json(); })
+    // which file this page shows, when it shows one: a lesson's time is counted apart
+    var m = /^\\/(?:watch|epub|pdf|comic|play)\\/(\\d+)/.exec(location.pathname);
+    fetch("/api/mc/ping" + (m ? "?m=" + m[1] : ""), {credentials: "same-origin"}).then(function(r){ return r.json(); })
       .then(function(j){ if (j && j.ok === false && location.pathname !== "/mediacenter/rest") location.href = "/mediacenter/rest"; })
       .catch(function(){});
   }
@@ -12212,8 +12247,20 @@ async def api_mc_ping(request: Request):
     rules = await _rules_now()
     who, now = _mc_who(request), time.time()
     await _mc_device(who, rules)
-    v = _DEVICES.ping(who, rules, now)
+    # what the page shows: a lesson's time is counted for the lesson, and (unless the parent
+    # said otherwise) not taken from the day
+    try:
+        lesson = int(request.query_params.get("m") or 0)
+    except ValueError:
+        lesson = 0
+    reward = await _reward()
+    if lesson and not await _is_lesson(lesson):
+        lesson = 0
+    v = _DEVICES.ping(who, rules, now, await _bonus(who, rules), bool(lesson) and reward["learn_free"])
     d = _DEVICES.by[who]
+    if lesson and v.get("added"):
+        await _lesson_tick(who, lesson, d["day"], v["added"])
+    v["earned_s"] = await _bonus(who, rules)
     try:
         async with db_pool.acquire() as conn:
             await conn.execute("""INSERT INTO mc_usage (day, who, seconds) VALUES ($1, $2, $3)
@@ -12246,7 +12293,7 @@ async def page_mc_rest(request: Request):
     rules = await _rules_now()
     who = _mc_who(request)
     await _mc_device(who, rules)
-    v = _DEVICES.check(who, rules, time.time())
+    v = _DEVICES.check(who, rules, time.time(), await _bonus(who, rules))
     if v["ok"] or not await _is_locked(request):
         return RedirectResponse("/mediacenter", status_code=303)
     lang = await _lang(request)
@@ -12368,7 +12415,7 @@ async def api_kids_allow(request: Request):
         kind, ref, on = str(body.get("kind")), int(body.get("ref")), bool(body.get("on"))
     except Exception:
         return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
-    if kind not in ("channel", "message"):
+    if kind not in ("channel", "message", "course"):
         return JSONResponse({"status": "error", "message": "bad kind"}, status_code=400)
     async with db_pool.acquire() as conn:
         if on:
@@ -12377,7 +12424,366 @@ async def api_kids_allow(request: Request):
         else:
             await conn.execute("DELETE FROM kids_allow WHERE kind = $1 AND ref = $2", kind, ref)
     _KID_OK.clear()
+    _LESSON.clear()
     return {"status": "ok", "on": on}
+
+
+# ─────────────────────────────────── courses ───────────────────────────────────
+# What a course is, is in courses.py. Here: its lessons worked out of the library, learning
+# time and rewards, and what the pages ask (the pages themselves are further down).
+COURSE_PACKS = {}                   # slug -> a list shipped with tgarr (coursepacks/<language>/*.json)
+_LESSON: dict = {}                  # message id -> (is it a lesson on the children's list, when asked)
+_REWARD = {"at": 0.0, "v": dict(courses.REWARD_DEFAULT)}
+_BONUS: dict = {}                   # who -> (seconds earned today, day, when worked out)
+
+
+def _course_packs() -> dict:
+    if not COURSE_PACKS:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coursepacks")
+        try:
+            for sub_ in sorted(os.listdir(base)):
+                if os.path.isdir(os.path.join(base, sub_)):
+                    for slug, p in courses.load_packs(os.path.join(base, sub_), lambda m: log.info("[courses] %s", m)).items():
+                        COURSE_PACKS.setdefault(slug, p)
+        except OSError:
+            pass
+    return COURSE_PACKS
+
+
+async def _reward() -> dict:
+    now = time.monotonic()
+    if now - _REWARD["at"] > 10 and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                raw = await conn.fetchval("SELECT value FROM config WHERE key = 'mc_reward'")
+            _REWARD["v"] = courses.clean_reward(_json.loads(raw) if raw else None)
+        except Exception:
+            pass
+        _REWARD["at"] = now
+    return _REWARD["v"]
+
+
+async def _is_lesson(msg_id: int) -> bool:
+    """Is this file a lesson of a course on the children's list?"""
+    hit = _LESSON.get(msg_id)
+    if hit and time.monotonic() - hit[1] < 30:
+        return hit[0]
+    ok = False
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            ok = bool(await conn.fetchval(
+                """SELECT 1 FROM course_items ci JOIN kids_allow k ON k.kind = 'course' AND k.ref = ci.course_id
+                   WHERE ci.msg_id = $1 LIMIT 1""", int(msg_id)))
+    if len(_LESSON) > 20000:
+        _LESSON.clear()
+    _LESSON[msg_id] = (ok, time.monotonic())
+    return ok
+
+
+async def _learning_path(path: str) -> bool:
+    """Is what is asked for learning that the day's minutes do not close? The Learn shelf and
+    a course's page, and a lesson itself - when the parent left learning free of the day."""
+    if not (await _reward())["learn_free"]:
+        return False
+    if path.startswith(("/mediacenter/learn", "/mediacenter/course/")):
+        return True
+    m = _PRIVATE_ID_RX.match(path)
+    return bool(m) and await _is_lesson(int(m.group(1)))
+
+
+async def _lesson_tick(who: str, msg_id: int, day: int, seconds: int) -> None:
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO lesson_time (who, msg_id, day, seconds) VALUES ($1, $2, $3, $4)
+                                  ON CONFLICT (who, msg_id, day) DO UPDATE SET seconds = lesson_time.seconds + $4""",
+                               who, int(msg_id), int(day), int(seconds))
+        await _lesson_check(who, msg_id)
+    except Exception:
+        pass
+
+
+async def _lesson_check(who: str, msg_id: int) -> None:
+    """Note the lesson as done - once - when its end was reached and enough of its length was
+    really spent on it (courses.lesson_done)."""
+    if not await _is_lesson(msg_id):
+        return
+    rule = await _reward()
+    async with db_pool.acquire() as conn:
+        if await conn.fetchval("SELECT 1 FROM lesson_done WHERE who = $1 AND msg_id = $2", who, int(msg_id)):
+            return
+        p = await conn.fetchrow("SELECT done, total FROM progress WHERE who = $1 AND msg_id = $2", who, int(msg_id))
+        spent = await conn.fetchval("SELECT COALESCE(sum(seconds), 0) FROM lesson_time WHERE who = $1 AND msg_id = $2", who, int(msg_id))
+        if p and courses.lesson_done(rule, int(spent), p["total"], p["done"]):
+            day = screentime.local(time.time(), (await _rules_now()).get("tz", 0))[0]
+            await conn.execute("INSERT INTO lesson_done (who, msg_id, day) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", who, int(msg_id), day)
+            _BONUS.pop(who, None)
+
+
+async def _bonus(who: str, rules: dict) -> int:
+    """Seconds of entertainment this person earned today by learning."""
+    rule = await _reward()
+    if not rule["on"] or db_pool is None:
+        return 0
+    day = screentime.local(time.time(), rules.get("tz", 0))[0]
+    hit = _BONUS.get(who)
+    if hit and hit[1] == day and time.monotonic() - hit[2] < 20:
+        return hit[0]
+    try:
+        async with db_pool.acquire() as conn:
+            done = await conn.fetchval("SELECT count(*) FROM lesson_done WHERE who = $1 AND day = $2", who, day)
+            # reading has no end to reach: every so many minutes on a book is a lesson's worth
+            read = await conn.fetchval(
+                """SELECT COALESCE(sum(t.seconds), 0) FROM lesson_time t
+                   WHERE t.who = $1 AND t.day = $2
+                     AND NOT EXISTS (SELECT 1 FROM progress p WHERE p.who = t.who AND p.msg_id = t.msg_id AND p.total IS NOT NULL)""", who, day)
+        got = courses.bonus_seconds(rule, int(done), int(read))
+    except Exception:
+        got = 0
+    if len(_BONUS) > 5000:
+        _BONUS.clear()
+    _BONUS[who] = (got, day, time.monotonic())
+    return got
+
+
+async def _course_build(conn, c) -> int:
+    """Work out a course's lessons from what the library holds now. Returns how many."""
+    kind, ids = c["kind"], []
+    playable = f"(m.media_type IN ('video', 'audio') OR {_book_sql('m.file_name')})"
+    live = "COALESCE(m.local_path, '') NOT IN ('__failed__', '__deleted__')"
+    if kind == "pack":
+        parts = _json.loads(c["parts"] or "[]")
+        want = [p["ia"] for p in parts]
+        rows = await conn.fetch(
+            f"""SELECT m.id, m.caption, COALESCE(m.local_path, m.file_name, '') AS name FROM messages m
+                WHERE m.caption LIKE '%archive.org/details/%' AND {live} AND {playable}
+                  AND substring(m.caption FROM 'archive\\.org/details/([A-Za-z0-9][A-Za-z0-9._-]*)') = ANY($1::text[])""", want)
+        ids = courses.order_lessons(parts, [(r["id"], courses.ia_of(r["caption"]), r["name"]) for r in rows])
+    elif kind == "folder":
+        cid, _, path = (c["ref"] or "").partition(":")
+        rows = await conn.fetch(
+            f"""SELECT m.id, COALESCE(m.local_path, m.file_name, '') AS name FROM messages m
+                WHERE m.channel_id = $1 AND {live} AND {playable}
+                  AND ($2 = '' OR m.local_path LIKE $3)""", int(cid or 0), path, path.replace("%", "\\%").replace("_", "\\_") + "/%")
+        ids = [r["id"] for r in sorted(rows, key=lambda r: courses.natural_key(r["name"]))]
+    elif kind == "channel":
+        rows = await conn.fetch(
+            f"""SELECT m.id FROM messages m WHERE m.channel_id = $1 AND {live} AND {playable}
+                ORDER BY m.posted_at NULLS LAST, m.id LIMIT 2000""", int(c["ref"] or 0))
+        ids = [r["id"] for r in rows]
+    elif kind == "list":
+        names = [str(p.get("name") or "") for p in _json.loads(c["parts"] or "[]")]
+        rows = await conn.fetch(
+            f"""SELECT DISTINCT ON (lower(m.file_name)) m.id, lower(m.file_name) AS name FROM messages m
+                WHERE lower(m.file_name) = ANY($1::text[]) AND {live} ORDER BY lower(m.file_name), (m.local_path IS NOT NULL) DESC, m.id""",
+            [n.lower() for n in names])
+        by = {r["name"]: r["id"] for r in rows}
+        ids = [by[n.lower()] for n in names if n.lower() in by]
+    had = [r["msg_id"] for r in await conn.fetch("SELECT msg_id FROM course_items WHERE course_id = $1 ORDER BY pos", c["id"])]
+    if had != ids:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM course_items WHERE course_id = $1", c["id"])
+            if ids:
+                await conn.executemany("INSERT INTO course_items (course_id, pos, msg_id) VALUES ($1, $2, $3)",
+                                       [(c["id"], i, mid) for i, mid in enumerate(ids)])
+        _KID_OK.clear()
+        _LESSON.clear()
+    await conn.execute("UPDATE courses SET built_at = NOW() WHERE id = $1", c["id"])
+    return len(ids)
+
+
+async def _courses_fresh(conn, only=None) -> None:
+    """Lessons follow the library: a course looked at is worked out again when that was a minute ago or more."""
+    rows = await conn.fetch(
+        "SELECT * FROM courses WHERE (built_at IS NULL OR built_at < NOW() - interval '60 seconds')"
+        + (" AND id = $1" if only else ""), *([only] if only else []))
+    for c in rows:
+        try:
+            await _course_build(conn, c)
+        except Exception as e:
+            log.info("[courses] %s: lessons not worked out: %s: %s", c["title"][:60], type(e).__name__, str(e)[:160])
+
+
+async def _course_list(conn, who: str, locked: bool) -> list:
+    """[{id, title, ..., lessons, done, next}] - for a locked browser only the courses ticked for it."""
+    await _courses_fresh(conn)
+    rows = await conn.fetch(
+        f"""SELECT c.*, EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'course' AND k.ref = c.id) AS allowed,
+                   (SELECT count(*) FROM course_items ci WHERE ci.course_id = c.id) AS lessons,
+                   (SELECT count(*) FROM course_items ci JOIN progress p ON p.msg_id = ci.msg_id AND p.who = $1 AND p.done
+                    WHERE ci.course_id = c.id) AS done,
+                   (SELECT ci.msg_id FROM course_items ci LEFT JOIN progress p ON p.msg_id = ci.msg_id AND p.who = $1
+                    WHERE ci.course_id = c.id AND NOT COALESCE(p.done, FALSE) ORDER BY ci.pos LIMIT 1) AS next
+            FROM courses c {"WHERE EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'course' AND k.ref = c.id)" if locked else ""}
+            ORDER BY c.added_at DESC, c.id DESC""", who)
+    return [dict(r) for r in rows]
+
+
+def _course_out(c: dict) -> dict:
+    parts = _json.loads(c.get("parts") or "[]") if c.get("kind") in ("pack", "list") else []
+    return {"id": c["id"], "slug": c["slug"], "title": c["title"], "about": c["about"] or "", "lang": c["lang"] or "",
+            "level": c["level"] or "all", "subject": c["subject"] or "other", "right": c["license"] or "", "credit": c["credit"] or "",
+            "kind": c["kind"], "parts": len(parts), "lessons": c.get("lessons", 0), "done": c.get("done", 0),
+            "next": c.get("next"), "allowed": bool(c.get("allowed"))}
+
+
+@app.get("/api/courses")
+async def api_courses(request: Request):
+    """The courses of this install, and - for the owner - the lists shipped with tgarr that are not added yet."""
+    locked = _LOCKED.get()
+    async with db_pool.acquire() as conn:
+        mine = await _course_list(conn, _progress_who(request), locked)
+    out = {"status": "ok", "courses": [_course_out(c) for c in mine]}
+    if not locked:
+        have = {c["slug"] for c in mine if c["slug"]}
+        out["packs"] = [{k: p[k] for k in ("slug", "title", "about", "lang", "level", "subject", "right", "credit")} | {"parts": len(p["parts"])}
+                        for p in _course_packs().values() if p["slug"] not in have]
+    return out
+
+
+@app.post("/api/courses")
+async def api_course_add(request: Request):
+    """Add a course: {"pack": slug} one of the shipped lists; {"folder": channel id, "path": ...}
+    a folder of one's own files; {"channel": id} a channel; {"import": {...}} a list somebody
+    exported. Title, language, level and subject may be given for the last three."""
+    def no(msg, code=400):
+        return JSONResponse({"status": "error", "message": msg}, status_code=code)
+    try:
+        b = await request.json()
+        assert isinstance(b, dict)
+    except Exception:
+        return no("bad request")
+    meta = {"about": "", "lang": "", "level": "all", "subject": "other", "license": "", "credit": ""}
+    slug = parts = ref = None
+    if b.get("import") is not None:
+        imp = b["import"]
+        if not isinstance(imp, dict) or imp.get("tgarr_course") != 1:
+            return no("this is not a course exported from tgarr")
+        if imp.get("parts") and all(isinstance(p, dict) and p.get("ia") for p in imp["parts"]):
+            try:
+                pk = courses.clean_pack(imp)
+            except ValueError as e:
+                return no(f"this list is not in order: {e}")
+            kind, title, slug, parts = "pack", pk["title"], None, _json.dumps(pk["parts"])
+            meta.update(about=pk["about"], lang=pk["lang"], level=pk["level"], subject=pk["subject"], license=pk["right"], credit=pk["credit"])
+        else:
+            names = [" ".join(str(p.get("name") or "").split())[:300] for p in (imp.get("parts") or []) if isinstance(p, dict)]
+            names = [n for n in names if n][:courses.PARTS_MOST]
+            if not names:
+                return no("this list names no files")
+            kind, title, parts = "list", " ".join(str(imp.get("title") or "").split())[:120] or "A course", _json.dumps([{"name": n} for n in names])
+            meta.update(about=str(imp.get("about") or "")[:600], lang=str(imp.get("lang") or "")[:12],
+                        level=imp.get("level") if imp.get("level") in courses.LEVELS else "all",
+                        subject=imp.get("subject") if imp.get("subject") in courses.SUBJECTS else "other")
+    elif b.get("pack"):
+        pk = _course_packs().get(str(b["pack"]))
+        if not pk:
+            return no("no such list", 404)
+        kind, title, slug, parts = "pack", pk["title"], pk["slug"], _json.dumps(pk["parts"])
+        meta.update(about=pk["about"], lang=pk["lang"], level=pk["level"], subject=pk["subject"], license=pk["right"], credit=pk["credit"])
+    elif b.get("folder") is not None or b.get("channel") is not None:
+        try:
+            cid = int(b.get("folder") if b.get("folder") is not None else b.get("channel"))
+        except (TypeError, ValueError):
+            return no("which one?")
+        path = str(b.get("path") or "").strip("/")
+        if ".." in path.split("/") or len(path) > 500:
+            return no("which folder?")
+        async with db_pool.acquire() as conn:
+            ch = await conn.fetchrow("SELECT id, title FROM channels WHERE id = $1", cid)
+        if not ch:
+            return no("no such channel", 404)
+        kind = "folder" if b.get("folder") is not None else "channel"
+        ref = f"{cid}:{path}" if kind == "folder" else str(cid)
+        title = " ".join(str(b.get("title") or "").split())[:120] or (path.rsplit("/", 1)[-1] if path else ch["title"]) or "A course"
+        meta.update(lang=str(b.get("lang") or "")[:12], level=b.get("level") if b.get("level") in courses.LEVELS else "all",
+                    subject=b.get("subject") if b.get("subject") in courses.SUBJECTS else "other", about=str(b.get("about") or "")[:600])
+    else:
+        return no("what kind of course?")
+    async with db_pool.acquire() as conn:
+        if slug and await conn.fetchval("SELECT 1 FROM courses WHERE slug = $1", slug):
+            return no("this course is added already", 409)
+        if await conn.fetchval("SELECT count(*) FROM courses") >= 500:
+            return no("five hundred courses are here already", 429)
+        c = await conn.fetchrow(
+            """INSERT INTO courses (slug, title, about, lang, level, subject, license, credit, kind, ref, parts)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *""",
+            slug, title, meta["about"], meta["lang"], meta["level"], meta["subject"], meta["license"], meta["credit"], kind, ref, parts)
+        n = await _course_build(conn, c)
+    return {"status": "ok", "id": c["id"], "lessons": n}
+
+
+@app.post("/api/courses/{course_id}/delete")
+async def api_course_delete(course_id: int):
+    """Take a course away. Its files stay: a course is a list, not a folder."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM course_items WHERE course_id = $1", course_id)
+        await conn.execute("DELETE FROM kids_allow WHERE kind = 'course' AND ref = $1", course_id)
+        gone = await conn.fetchval("DELETE FROM courses WHERE id = $1 RETURNING id", course_id)
+    _KID_OK.clear()
+    _LESSON.clear()
+    return {"status": "ok"} if gone else JSONResponse({"status": "error", "message": "no such course"}, status_code=404)
+
+
+@app.post("/api/courses/{course_id}/fetch")
+async def api_course_fetch(course_id: int):
+    """Fetch what a list's course still lacks from the Internet Archive (at most 40 items a time)."""
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow("SELECT * FROM courses WHERE id = $1", course_id)
+        if not c or c["kind"] != "pack":
+            return JSONResponse({"status": "error", "message": "nothing to fetch for this course"}, status_code=400)
+        parts = _json.loads(c["parts"] or "[]")
+        have = {courses.ia_of(r["caption"]) for r in await conn.fetch(
+            "SELECT DISTINCT caption FROM messages WHERE caption LIKE '%archive.org/details/%'")}
+        busy = {r["item_id"] for r in await conn.fetch("SELECT item_id FROM archive_grabs WHERE state IN ('queued', 'working')")}
+        room = max(0, 50 - len(busy))
+        queued = 0
+        for p in parts:
+            if p["ia"] in have or p["ia"] in busy or not _archive_ok(p["title"], p["ia"]):
+                continue
+            if queued >= min(room, 40):
+                break
+            await conn.execute("INSERT INTO archive_grabs (item_id, name, kind) VALUES ($1, $2, NULL)", p["ia"], p["title"] or p["ia"])
+            queued += 1
+        left = sum(1 for p in parts if p["ia"] not in have) - queued
+    return {"status": "ok", "queued": queued, "waiting_already": len(busy), "left": max(0, left)}
+
+
+@app.get("/api/courses/{course_id}/export")
+async def api_course_export(course_id: int):
+    """A course as a small list somebody else can import: its structure and the names of its
+    files - never a file, and nothing about who learned what."""
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow("SELECT * FROM courses WHERE id = $1", course_id)
+        if not c:
+            return JSONResponse({"status": "error", "message": "no such course"}, status_code=404)
+        out = {"tgarr_course": 1, "title": c["title"], "about": c["about"] or "", "lang": c["lang"] or "",
+               "level": c["level"] or "all", "subject": c["subject"] or "other"}
+        if c["kind"] == "pack":
+            out.update(slug=c["slug"] or re.sub(r"[^a-z0-9]+", "-", c["title"].lower()).strip("-")[:60] or "course",
+                       right=c["license"] or "", credit=c["credit"] or "", parts=_json.loads(c["parts"] or "[]"))
+        else:
+            await _course_build(conn, c)
+            rows = await conn.fetch(
+                "SELECT m.file_name FROM course_items ci JOIN messages m ON m.id = ci.msg_id WHERE ci.course_id = $1 ORDER BY ci.pos", course_id)
+            out["parts"] = [{"name": r["file_name"]} for r in rows if r["file_name"]]
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", c["title"]).strip("-")[:60] or "course"
+    return Response(_json.dumps(out, ensure_ascii=False, indent=1), media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.tgarr-course.json"'})
+
+
+@app.post("/api/kids/reward")
+async def api_kids_reward(request: Request):
+    """What learning earns (courses.clean_reward)."""
+    try:
+        rule = courses.clean_reward(await request.json())
+    except Exception:
+        return JSONResponse({"status": "error", "message": "bad request"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('mc_reward', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", _json.dumps(rule))
+    _REWARD.update(at=0.0)
+    _BONUS.clear()
+    return {"status": "ok", "reward": rule}
 
 
 _MC_KINDS = {
