@@ -2289,23 +2289,23 @@ async def _update_banner() -> str:
     st = _update_state(rows, time.time())
     if st["kind"] in ("current", "dismissed", "pending"):
         return ""
-    latest = html.escape(st["latest"])
     hide = ('<form method="POST" action="/api/update/dismiss" style="margin:0">'
-            '<button class="abtn" type="submit" title="hide until the next version">Hide</button></form>')
+            f'<button class="abtn" type="submit" title="{_t("hide until the next version")}">{_t("Hide")}</button></form>')
     box = ('<div style="background:{bg};border:1px solid {bd};border-radius:12px;padding:14px 18px;'
            'margin-bottom:16px;line-height:1.6;display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">'
            '<div style="flex:1;min-width:240px">{body}</div>{hide}</div>')
     if st["kind"] == "pinned":
-        body = (f'<b>tgarr {latest} is available.</b> This install stays on {html.escape(TGARR_VERSION)} '
-                f'because <code>TGARR_TAG={html.escape(st["tag"])}</code> is set in <code>.env</code>. '
-                f'Remove that line and run <code>docker compose up -d</code> to follow new versions.')
+        body = (f'<b>{_t("tgarr {latest} is available.", latest=st["latest"])}</b> '
+                + _t("This install stays on {cur} because %1 is set in %2. Remove that line and run %3 to follow new versions.", cur=TGARR_VERSION)
+                .replace("%1", f'<code>TGARR_TAG={html.escape(st["tag"])}</code>')
+                .replace("%2", '<code>.env</code>').replace("%3", '<code>docker compose up -d</code>'))
         return box.format(bg="#eff6ff", bd="#bfdbfe", body=body, hide=hide)
-    body = (f'<b>tgarr {latest} is available, and this install is still on {html.escape(TGARR_VERSION)}.</b> '
-            f'It has not updated itself in {st["hours"]} hours, so its updater is probably missing or not running. '
-            f'To update now, in the folder that holds <code>docker-compose.yml</code>:'
-            f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
-            f'<a class="btn" href="/settings/update" style="margin-right:10px">Update now</a>'
-            f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">How to make updates automatic again</a>')
+    body = (f'<b>{_t("tgarr {latest} is available, and this install is still on {cur}.", latest=st["latest"], cur=TGARR_VERSION)}</b> '
+            + _t("It has not updated itself in {h} hours, so its updater is probably missing or not running.", h=st["hours"]) + ' '
+            + _t("To update now, in the folder that holds %1:").replace("%1", '<code>docker-compose.yml</code>')
+            + f'<div style="margin:6px 0"><code>docker compose pull &amp;&amp; docker compose up -d</code></div>'
+            f'<a class="btn" href="/settings/update" style="margin-right:10px">{_t("Update now")}</a>'
+            f'<a href="{UPDATE_HELP_URL}" target="_blank" rel="noopener">{_t("How to make updates automatic again")}</a>')
     return box.format(bg="#fffbeb", bd="#fde68a", body=body, hide=hide)
 
 
@@ -8796,24 +8796,24 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         return (f'<a class="st-card" href="{href}">{inner}</a>' if href
                 else f'<div class="st-card">{inner}</div>')
     if not authed:
-        tg = _status("bad", "Telegram", "not signed in — sign in to index and play", "/login")
+        tg = _status("bad", "Telegram", _t("not signed in — sign in to index and play"), "/login")
     elif flood:
         tg = _status("warn", "Telegram",
-                     f'asked us to slow down — resumes in about {max(1, flood["seconds_left"] // 60)} min')
+                     _t("asked us to slow down — resumes in about {n} min", n=max(1, flood["seconds_left"] // 60)))
     else:
         who = user.get("username") or user.get("first_name") or ""
-        tg = _status("ok", "Telegram", f'signed in{(" as @" + html.escape(str(who))) if who else ""}', "/settings")
+        tg = _status("ok", "Telegram", _t("signed in as @{who}", who=str(who)) if who else _t("signed in"), "/settings")
     if hb:
         age = (_dt.datetime.now(_dt.timezone.utc) - hb).total_seconds()
-        cr = (_status("ok", "Indexer", f"running · last activity {_ago(hb)}", "/system") if age < 900
-              else _status("bad", "Indexer", f"no activity since {_ago(hb)}", "/system"))
+        cr = (_status("ok", _t("Indexer"), _t("running · last activity %1").replace("%1", _ago(hb)), "/system") if age < 900
+              else _status("bad", _t("Indexer"), _t("no activity since %1").replace("%1", _ago(hb)), "/system"))
     else:
-        cr = _status("off", "Indexer", "has not reported yet", "/system")
+        cr = _status("off", _t("Indexer"), _t("has not reported yet"), "/system")
     if shared and shared["last"]:
-        sh = _status("ok" if shared["d1"] else "off", "Shared with tgarr.me",
-                     f'{_fmt_count(shared["d1"])} files today · last {_ago(shared["last"])}')
+        sh = _status("ok" if shared["d1"] else "off", _t("Shared with tgarr.me"),
+                     _t("{n} files today · last %1", n=_fmt_count(shared["d1"])).replace("%1", _ago(shared["last"])))
     else:
-        sh = _status("off", "Shared with tgarr.me", "nothing shared yet")
+        sh = _status("off", _t("Shared with tgarr.me"), _t("nothing shared yet"))
     used = sum(r["bytes"] for r in usage)
     try:
         import shutil as _sh
@@ -8821,31 +8821,33 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         _sto_lvl = _disk_level(_du.free, _du.total)
     except OSError:
         _sto_lvl = "off"
-    sto = _status(_sto_lvl, "Storage",
-                  f'{_fmt_size(used) or "0 MB"} saved · {free_gb:.0f} GB free', "/downloads")
+    sto = _status(_sto_lvl, _t("Storage"),
+                  _t("{used} saved · {free} GB free", used=_fmt_size(used) or "0 MB", free=f"{free_gb:.0f}"), "/downloads")
     welcome_html = "" if authed else (
         '<div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:18px">'
-        + ('<h2 style="margin:0 0 6px;font-size:19px">Signed out of Telegram</h2>'
-           '<p style="margin:0 0 12px;color:var(--muted)">What was indexed from public channels is still here to browse. Playing a file from Telegram, '
-           'or indexing more, needs the account again.</p>' if (revoked or browsable) else
-           '<h2 style="margin:0 0 6px;font-size:19px">Welcome to tgarr</h2>'
-           '<p style="margin:0 0 12px;color:var(--muted)">Nothing is indexed yet. There are three ways to fill this library - start with any of them, '
-           'the others can follow later:</p>')
+        + (f'<h2 style="margin:0 0 6px;font-size:19px">{_t("Signed out of Telegram")}</h2>'
+           '<p style="margin:0 0 12px;color:var(--muted)">'
+           + _t("What was indexed from public channels is still here to browse. Playing a file from Telegram, or indexing more, needs the account again.")
+           + '</p>' if (revoked or browsable) else
+           f'<h2 style="margin:0 0 6px;font-size:19px">{_t("Welcome to tgarr")}</h2>'
+           '<p style="margin:0 0 12px;color:var(--muted)">'
+           + _t("Nothing is indexed yet. There are three ways to fill this library - start with any of them, the others can follow later:")
+           + '</p>')
         + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">'
         + "".join(
             f'<a href="{href}" style="display:block;border:1px solid var(--border);border-radius:10px;padding:12px 14px;text-decoration:none;color:inherit">'
             f'<b>{title}</b><div style="color:var(--muted);font-size:13px;margin-top:4px;line-height:1.45">{text}</div></a>'
             for href, title, text in (
-                ("/login", "📨 Telegram", "Sign in with your account: tgarr indexes the films, music and books of the channels you follow. "
-                           "The first time, Telegram asks for a free app id - it takes a minute and tgarr shows how."),
-                ("/settings/usenet", "📰 Usenet", "Have a Usenet provider? Enter it and tgarr indexes newsgroups: films through your downloader, "
-                                     "books, comics, music and pictures directly. No Telegram account needed."),
-                ("/files", "📁 Your own files", "Add folders of films, music, books or photos you already have. They play here and in the "
-                           "Media Center. No account needed."),
-                ("/archive", "🏛 Internet Archive", "Old films, radio plays, audiobooks, books and magazines that anybody may download. "
-                             "Search, press Get, and it is in your library. No account needed."),
-                ("/discover", "🔭 Public channels", "Look through the public Telegram channels tgarr knows and follow some: what they hold is "
-                              "listed right away, without an account. Playing a file is when Telegram wants one.")))
+                ("/login", "📨 Telegram",
+                 _t("Sign in with your account: tgarr indexes the films, music and books of the channels you follow. The first time, Telegram asks for a free app id - it takes a minute and tgarr shows how.")),
+                ("/settings/usenet", "📰 Usenet",
+                 _t("Have a Usenet provider? Enter it and tgarr indexes newsgroups: films through your downloader, books, comics, music and pictures directly. No Telegram account needed.")),
+                ("/files", "📁 " + _t("Your own files"),
+                 _t("Add folders of films, music, books or photos you already have. They play here and in the Media Center. No account needed.")),
+                ("/archive", "🏛 " + _t("Internet Archive"),
+                 _t("Old films, radio plays, audiobooks, books and magazines that anybody may download. Search, press Get, and it is in your library. No account needed.")),
+                ("/discover", "🔭 " + _t("Public channels"),
+                 _t("Look through the public Telegram channels tgarr knows and follow some: what they hold is listed right away, without an account. Playing a file is when Telegram wants one."))))
         + '</div></div>')
     status_html = f'{welcome_html}<div class="st-row">{tg}{cr}{sh}{sto}</div>'
     status_html = await _update_banner() + status_html
@@ -8855,17 +8857,16 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         status_html = (
             '<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;'
             'padding:16px 18px;margin-bottom:16px;line-height:1.6">'
-            '<b>You are signed in. Nothing is indexed yet.</b><br>'
-            'tgarr is reading the channels your Telegram account follows; they appear here '
-            'within a few minutes, and their files over the next hours. If the account follows '
-            'no channels with files, pick some on <a href="/discover">Discover</a>.'
-            '</div>' + status_html)
+            f'<b>{_t("You are signed in. Nothing is indexed yet.")}</b><br>'
+            + _t("tgarr is reading the channels your Telegram account follows; they appear here within a few minutes, and their files over the next hours. If the account follows no channels with files, pick some on %1.")
+            .replace("%1", f'<a href="/discover">{_t("Discover")}</a>')
+            + '</div>' + status_html)
 
     # ── library ──
     def _tile(href, icon, n, label, plus=0):
         return (f'<a class="tile" href="{href}"><div class="ti">{icon}</div>'
                 f'<div class="tn">{n:,}</div><div class="tl">{label}</div>'
-                + (f'<div class="tp">+{_fmt_count(plus)} today</div>' if plus else '<div class="tp">&nbsp;</div>')
+                + (f'<div class="tp">{_t("+{n} today", n=_fmt_count(plus))}</div>' if plus else '<div class="tp">&nbsp;</div>')
                 + '</a>')
     _tn = lib.get("tile") or {}
 
@@ -8874,30 +8875,30 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
     # ("+N today" counts everything that arrived; it is left off where the page lists a
     # selection of it, so that a tile never says "10" with "+2.3K today" under it)
     tiles = (
-        _tile("/releases?cat=movie", "🎬", _shown("movie", lib["films"]), "films", 0)
-        + _tile("/releases?cat=tv", "📺", _shown("tv", lib["episodes"]), "episodes", 0)
-        + _tile("/videos", "▶", _shown("video", st["videos"]), "videos", 0 if "video" in _tn else new_today.get("video", 0))
-        + _tile("/music", "🎵", st["audio"], "songs", new_today.get("audio", 0))
-        + _tile("/library", "📚", st["books"], "books", 0)
-        + _tile("/gallery", "🖼", _shown("photo", st["photos"]), "photos", 0 if "photo" in _tn else new_today.get("photo", 0))
-        + _tile("/channels", "📡", st["channels"], "channels", 0))
+        _tile("/releases?cat=movie", "🎬", _shown("movie", lib["films"]), _t("films"), 0)
+        + _tile("/releases?cat=tv", "📺", _shown("tv", lib["episodes"]), _t("episodes"), 0)
+        + _tile("/videos", "▶", _shown("video", st["videos"]), _t("videos"), 0 if "video" in _tn else new_today.get("video", 0))
+        + _tile("/music", "🎵", st["audio"], _t("songs"), new_today.get("audio", 0))
+        + _tile("/library", "📚", st["books"], _t("books"), 0)
+        + _tile("/gallery", "🖼", _shown("photo", st["photos"]), _t("photos"), 0 if "photo" in _tn else new_today.get("photo", 0))
+        + _tile("/channels", "📡", st["channels"], _t("channels"), 0))
 
     # ── now ──
     now_bits = []
     # out of the box anyone on the same network opens this page as the owner
     if _signed_in() and not _ACCESS["pin"] and not _UI_PASSWORD:
-        now_bits.append('<a class="now-pill" href="/mediacenter/manage" title="with a PIN, other browsers get only '
-                        'the Media Center and what you allow there">🔓 No PIN yet: anyone on your network '
-                        'opens this page as you — set one</a>')
+        now_bits.append('<a class="now-pill" href="/mediacenter/manage" title="'
+                        + _t("with a PIN, other browsers get only the Media Center and what you allow there") + '">🔓 '
+                        + _t("No PIN yet: anyone on your network opens this page as you — set one") + '</a>')
     arriving = [f for f in fetches if f["state"] in ("queued", "fetching")]
     if arriving:
-        now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {len(arriving)} arriving for a player</a>')
+        now_bits.append(f'<a class="now-pill" href="/downloads">⬇ {_t("{n} arriving for a player", n=len(arriving))}</a>')
     if st["pending"] or st["downloading"]:
-        now_bits.append(f'<a class="now-pill" href="/downloads?tab=grabs">⬇ {st["pending"] + st["downloading"]} '
-                        f'grab(s) in the queue</a>')
+        now_bits.append(f'<a class="now-pill" href="/downloads?tab=grabs">⬇ '
+                        f'{_t("{n} grab(s) in the queue", n=st["pending"] + st["downloading"])}</a>')
     if lib["rel_new"]:
-        now_bits.append(f'<a class="now-pill" href="/releases">✨ {lib["rel_new"]:,} films and episodes '
-                        f'recognised in the last day</a>')
+        now_bits.append(f'<a class="now-pill" href="/releases">✨ '
+                        f'{_t("{n} films and episodes recognised in the last day", n=format(lib["rel_new"], ","))}</a>')
     now_html = f'<div class="now-row">{"".join(now_bits)}</div>' if now_bits else ""
 
     # ── recently added ──
@@ -8915,7 +8916,7 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 + f'</div><div class="pt">{html.escape(r["t"] or "")}</div>'
                 f'<div class="ps">{html.escape(sub)}</div></a>')
         latest_html = (
-            '<h2 class="section">Recently added <span class="extra"><a href="/releases">all releases →</a></span></h2>'
+            f'<h2 class="section">{_t("Recently added")} <span class="extra"><a href="/releases">{_t("all releases →")}</a></span></h2>'
             f'<div class="strip">{"".join(cards)}</div>')
     else:
         latest_html = ""
@@ -8935,27 +8936,28 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
         bars.append(
             f'<g><rect x="{x + bw * 0.16:.1f}" y="{H - PAD - h:.1f}" width="{bw * 0.68:.1f}" '
             f'height="{max(h, 1.5):.1f}" rx="3" fill="{"var(--accent)" if d == today else "rgba(94,182,229,.55)"}">'
-            f'<title>{d.strftime("%b %d")}: {n:,} added</title></rect>'
+            f'<title>{_t("{d}: {n} added", d=d.strftime("%b %d"), n=format(n, ","))}</title></rect>'
             + (f'<text x="{x + bw / 2:.1f}" y="{H - 6}" text-anchor="middle" font-size="10" '
                f'fill="var(--muted)">{d.strftime("%m-%d")}</text>' if i % 2 == 1 else '')
             + '</g>')
     total14 = sum(n for _, n in series)
     growth_html = (
-        '<div class="panel"><div class="ph"><span>Added per day</span>'
-        f'<span class="pn">{total14:,} in two weeks · peak {peak:,}</span></div>'
+        f'<div class="panel"><div class="ph"><span>{_t("Added per day")}</span>'
+        f'<span class="pn">{_t("{total} in two weeks · peak {peak}", total=format(total14, ","), peak=format(peak, ","))}</span></div>'
         f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block">'
         f'<line x1="0" y1="{H - PAD}" x2="{W}" y2="{H - PAD}" stroke="var(--border)"/>'
         f'{"".join(bars)}</svg></div>')
-    mix = [("photos", st["photos"], "#5eb6e5"), ("videos", st["videos"], "#94d2bd"),
-           ("songs", st["audio"], "#f4a261"), ("books", st["books"], "#e9c46a")]
+    mix = [(_t("photos"), st["photos"], "#5eb6e5"), (_t("videos"), st["videos"], "#94d2bd"),
+           (_t("songs"), st["audio"], "#f4a261"), (_t("books"), st["books"], "#e9c46a")]
     other = max(0, st["messages"] - sum(v for _, v, _ in mix))
     if other:
-        mix.append(("other files", other, "#cbd5e1"))
+        mix.append((_t("other files"), other, "#cbd5e1"))
     tot = sum(v for _, v, _ in mix) or 1
     mix_html = (
-        '<div class="panel"><div class="ph"><span title="Every file in the index. The tiles above count what each page '
-        'lists when opened: no 18+ channels, no clips, one card per film - so they are smaller.">Everything in the index</span>'
-        f'<span class="pn">{st["messages"]:,} items</span></div>'
+        '<div class="panel"><div class="ph"><span title="'
+        + _t("Every file in the index. The tiles above count what each page lists when opened: no 18+ channels, no clips, one card per film - so they are smaller.")
+        + f'">{_t("Everything in the index")}</span>'
+        f'<span class="pn">{_t("{n} items", n=format(st["messages"], ","))}</span></div>'
         '<div class="mixbar">'
         + "".join(f'<div style="width:{v * 100 / tot:.2f}%;background:{c}" title="{k}: {v:,}"></div>'
                   for k, v, c in mix if v)
@@ -8975,10 +8977,10 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
             items.append(
                 f'<div class="ls-row"><div style="width:26px;text-align:center">{icon}</div>'
                 f'<div class="ls-main"><div class="ls-title">{html.escape(d["name"])}</div>'
-                f'<div class="ls-sub"><span class="tag {cls}">{d["status"]}</span>'
+                f'<div class="ls-sub"><span class="tag {cls}">{_t(d["status"])}</span>'
                 f'<span>{_fmt_size(d["size_bytes"])}</span><span>{_ago(d["requested_at"])}</span></div></div></div>')
         grabs_html = (
-            '<h2 class="section">Recent grabs <span class="extra"><a href="/downloads?tab=grabs">all →</a></span></h2>'
+            f'<h2 class="section">{_t("Recent grabs")} <span class="extra"><a href="/downloads?tab=grabs">{_t("all →")}</a></span></h2>'
             f'<div class="ls">{"".join(items)}</div>')
     else:
         grabs_html = ""
@@ -8990,14 +8992,14 @@ async def root(request: Request, accept: Optional[str] = Header(None)):
                 f'<div class="ls-main"><div class="ls-title">{name}</div><div class="ls-sub">{where}</div></div>'
                 f'<code class="wv">{value}</code>'
                 f'<button class="abtn" style="min-width:74px" onclick="tgCopy(this)" '
-                f'data-v="{value}">Copy</button></div>')
+                f'data-v="{value}">{_t("Copy")}</button></div>')
     wiring_html = (
-        '<h2 class="section">Connect Sonarr / Radarr</h2><div class="ls">'
-        + _wire("🔌", "Newznab indexer", "Settings → Indexers → + → Newznab → URL", f"{base_url}/newznab/")
-        + _wire("⬇", "SABnzbd download client",
-                "Settings → Download Clients → + → SABnzbd → same host and port, URL Base", "/sabnzbd")
+        f'<h2 class="section">{_t("Connect Sonarr / Radarr")}</h2><div class="ls">'
+        + _wire("🔌", _t("Newznab indexer"), "Settings → Indexers → + → Newznab → URL", f"{base_url}/newznab/")
+        + _wire("⬇", _t("SABnzbd download client"),
+                _t("Settings → Download Clients → + → SABnzbd → same host and port, URL Base"), "/sabnzbd")
         + '</div><script>function tgCopy(b){const v=b.dataset.v;const done=()=>{const o=b.textContent;'
-          'b.textContent="Copied";setTimeout(()=>b.textContent=o,1400)};'
+          'b.textContent="' + _tj("Copied") + '";setTimeout(()=>b.textContent=o,1400)};'
           'if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(v).then(done);'
           'else{const t=document.createElement("textarea");t.value=v;document.body.appendChild(t);t.select();'
           'try{document.execCommand("copy");done()}catch(e){}t.remove()}}</script>')
