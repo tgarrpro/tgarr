@@ -30,7 +30,9 @@ import subprocess
 
 # what no browser plays / what some play and some do not / everything else plays as it is
 ALWAYS = frozenset("iso vob avi wmv flv mpg mpeg rmvb rm 3gp ts m2ts mts divx asf ogv".split())
-MAYBE = frozenset("mkv mov".split())
+# (mp4 and webm are here since AV1 and HEVC came to live in them: a new phone plays those, an
+#  older one or a television may not - then the player falls back to converting, as for mkv)
+MAYBE = frozenset("mkv mov mp4 m4v webm".split())
 HEIGHTS = (480, 720, 1080)             # what the player offers; 0 is "as it is"
 FFMPEG, FFPROBE = "ffmpeg", "ffprobe"
 

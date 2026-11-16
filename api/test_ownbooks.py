@@ -419,6 +419,89 @@ ok(B._sheet_number("12", False, False) == "12" and B._sheet_number("1e3", False,
    and B._sheet_number("1", True, True) == "1904-01-02", "XLSX: numbers as they read; the calendar that starts in 1904")
 ok(refused(lambda: B.build(put("old.xlsx", b"\xd0\xcf\x11\xe0"), "xlsx"), "spreadsheet"), "an old .xls under an .xlsx name")
 
+# ── Markdown ──
+MD = """---
+title: Field Notes
+tags: [a, b]
+---
+# 第一部分 Setup
+
+Some *emphasis*, **strong**, `code <b>` and ~~gone~~. A [link](https://example.com/a_(b) "t") and <script>alert(1)</script>.
+Second line of the same paragraph.
+中文第一行
+中文第二行
+
+[![Build](https://img/x.svg)](https://ci) ![logo](logo.png)
+
+- one
+- two
+  - nested **item**
+- [x] done
+- [ ] to do
+
+1. first
+2. second
+
+> quoted *text*
+> goes on
+
+```python
+def f(x):
+    return x < 1 and "<b>"
+```
+
+| Name | Value |
+|------|------:|
+| a_b  | 1 \\| 2 |
+| c    | `x`   |
+
+Setext Heading
+==============
+
+After it.
+
+---
+
+## Sub heading
+
+snake_case_word and 2*3*4 stay as they are.
+"""
+b = B.build(put("n.md", MD.encode("utf-8")), "md")
+ok(b.title == "Field Notes" and b.titles == ["第一部分 Setup", "Setext Heading"], f"MD: title from the notes at the top, chapters from the top headings: {b.title} {b.titles}")
+c0 = b.chapter(0)
+ok("<i>emphasis</i>" in c0 and "<b>strong</b>" in c0 and "<code>code &lt;b&gt;</code>" in c0 and "<s>gone</s>" in c0, "MD: emphasis, strong, code, struck out")
+ok("A link and &lt;script&gt;alert(1)&lt;/script&gt;." in c0 and "example.com" not in c0, "MD: a link keeps its words; HTML inside is shown as text, never run")
+ok("Second line of the same paragraph." in c0 and "中文第一行中文第二行" in c0, "MD: the lines of a paragraph are one paragraph; Chinese without a space")
+ok("<i>[Build]</i> <i>[logo]</i>" in c0 and "img/x.svg" not in c0, f"MD: a picture is its caption, a badge too: {c0[c0.find('Build') - 20:c0.find('Build') + 60]}")
+ok("<ul><li>one</li><li>two<ul><li>nested <b>item</b></li></ul></li><li>☑ done</li><li>☐ to do</li></ul>" in c0, f"MD: a list, a list inside it, boxes: {c0[c0.find('<ul>'):c0.find('<ol>')]}")
+ok("<ol><li>first</li><li>second</li></ol>" in c0, "MD: a numbered list")
+ok("<blockquote><p>quoted <i>text</i> goes on</p></blockquote>" in c0, "MD: a quote")
+ok('<pre><code>def f(x):\n    return x &lt; 1 and "&lt;b&gt;"</code></pre>' in c0, "MD: code kept as typed")
+ok("<tr><th>Name</th><th>Value</th></tr><tr><td>a_b</td><td>1 | 2</td></tr><tr><td>c</td><td><code>x</code></td></tr>" in c0, "MD: a table, a bar inside a cell")
+c1 = b.chapter(1)
+ok("After it." in c1 and "tb-rule" in c1 and "<h3>Sub heading</h3>" in c1, "MD: a heading underlined with =, a rule, a lower heading inside its chapter")
+ok("snake_case_word and 2*3*4 stay as they are." in c1, "MD: underscores and stars inside words are not emphasis")
+ok(not any(mark in c0 + c1 for mark in ("**", "~~", "](", "```", "|--")), "MD: none of the marks is left on the page")
+ok(B.kind_of("NOTES.MD") == "md" and B.kind_of("a.markdown") == "markdown", "Markdown is read here")
+deep = B.build(put("deep.md", ("> " * 40 + "deep\n" + "- x\n" * 5).encode()), "md")
+ok("deep" in deep.chapter(0), "MD: quotes inside quotes without end do not hang or raise")
+plain = B.build(put("p.md", "just one line, no marks".encode()), "md")
+ok(plain.titles == [""] and "just one line" in plain.chapter(0), "MD: a note with no marks at all")
+
+# ── a table kept as text ──
+b = B.build(put("t.csv", "name,amount,note\n王小明,12.5,\"a, b\"\n<x>,3,\n\n".encode("gb18030")), "csv")
+ok(b.titles == [""] and "<tr><th>name</th><th>amount</th><th>note</th></tr>" in b.chapter(0), f"CSV: a table: {b.chapter(0)[:200]}")
+ok("<td>王小明</td><td>12.5</td><td>a, b</td>" in b.chapter(0) and "&lt;x&gt;" in b.chapter(0), "CSV: its characters worked out, a comma inside quotes, text escaped")
+b = B.build(put("t.tsv", ("a\tb\n" + "".join(f"{i}\t{i * 2}\n" for i in range(300))).encode()), "tsv")
+ok(len(b) == 3 and b.titles[0] == "Rows 1-120" and "<td>299</td><td>598</td>" in b.chapter(2), f"TSV: tabs, 120 rows a page: {b.titles}")
+b = B.build(put("s.csv", b"a;b;c\n1;2;3\n"), "csv")
+ok("<td>2</td>" in b.chapter(0), "CSV with semicolons, as spreadsheets in Europe save it")
+ok(refused(lambda: B.build(put("e.csv", b"\n\n"), "csv"), "empty"), "an empty table")
+
+# ── AVIF ──
+ok(B.picture_type(b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00") == "image/avif" and B.picture_type(b"\x00\x00\x00\x1cftypisom") is None,
+   "an AVIF picture by its first bytes; an MP4 film is not a picture")
+
 # ── compiled help ──
 ok(B.kind_of("Manual.CHM") == "chm", "a .chm is read here")
 ok(refused(lambda: B.load(put("fake.chm", b"<html>not a chm</html>"), "chm")), "what is not a .chm (or no program to open one) is NotReadable")

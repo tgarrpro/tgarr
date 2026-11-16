@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 
 TAKEN = {"ebook": "epub mobi azw azw3 prc pdf djvu fb2 cbz cbr chm docx rtf".split(),
          "audio": "mp3 flac m4a m4b ogg opus aac wav ape wv".split(),
-         "photo": "jpg jpeg png gif webp".split()}
+         "photo": "jpg jpeg png gif webp avif".split()}
 _KIND = {e: k for k, v in TAKEN.items() for e in v}
 MB = 1024 * 1024
 MOST = {"ebook": 400 * MB, "audio": 600 * MB, "photo": 60 * MB}      # one file

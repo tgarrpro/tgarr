@@ -17,7 +17,9 @@ def ok(cond, what):
 for name in ("Film.iso", "a.VOB", "old.avi", "x.wmv", "clip.flv", "tv.mpg", "b.mpeg", "c.rmvb", "cam.3gp", "rec.ts", "bd.m2ts", "d.divx"):
     ok(T.needs(name) == "always", f"{name}: no browser plays it")
 ok(T.needs("film.mkv") == "maybe" and T.needs("clip.MOV") == "maybe", "mkv and mov: some browsers do, with some sound")
-ok(T.needs("film.mp4") == "" and T.needs("a.webm") == "" and T.needs("b.m4v") == "" and T.needs("noext") == "" and T.needs("") == "" and T.needs(None) == "",
+ok(T.needs("film.mp4") == "maybe" and T.needs("a.webm") == "maybe" and T.needs("b.m4v") == "maybe",
+   "mp4 and webm too, since AV1 and HEVC live in them: played as they are, converted if this device cannot")
+ok(T.needs("song.mp3") == "" and T.needs("noext") == "" and T.needs("") == "" and T.needs(None) == "",
    "what plays as it is; and what is no file name")
 
 # ---- how a file is opened -------------------------------------------------------------------------

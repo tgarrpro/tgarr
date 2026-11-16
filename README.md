@@ -17,8 +17,8 @@
 | Opens in the reader | |
 |---|---|
 | Books | `.epub` `.mobi` `.azw` `.azw3` `.prc` `.fb2` `.txt` `.chm` |
-| Documents | `.pdf` `.docx` `.odt` `.rtf` `.html` |
-| Slides and sheets | `.pptx` `.xlsx` (text, pictures and tables - not the layout, not charts) |
+| Documents | `.pdf` `.docx` `.odt` `.rtf` `.html` `.md` (Markdown, laid out: headings, lists, code, tables) |
+| Slides and sheets | `.pptx` `.xlsx` `.csv` (text, pictures and tables - not the layout, not charts) |
 | Scanned books | `.djvu` (made into pages the first time it is opened) |
 | Comics | `.cbz` `.cbr` (page by page, a real RAR too) |
 

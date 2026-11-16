@@ -22,8 +22,8 @@ MINE = "mine"
 _KINDS = {
     "video": "mp4 mkv avi mov m4v webm wmv flv ts m2ts mpg mpeg 3gp rmvb vob divx iso",     # (iso: a DVD or Blu-ray image)
     "audio": "mp3 flac m4a m4b aac ogg opus wav wma ape alac aiff dsf wv",
-    "photo": "jpg jpeg png webp gif bmp heic heif tif tiff",
-    "document": "pdf epub mobi azw azw3 prc djvu djv fb2 cbz cbr chm txt rtf doc docx odt xls xlsx xlsm ppt pptx ppsx "
+    "photo": "jpg jpeg png webp avif gif bmp heic heif tif tiff",
+    "document": "pdf epub mobi azw azw3 prc djvu djv fb2 cbz cbr chm txt md markdown rtf doc docx odt xls xlsx xlsm csv tsv ppt pptx ppsx "
                 "html htm xhtml zip rar 7z srt ass",
 }
 _EXT = {e: k for k, v in _KINDS.items() for e in v.split()}
@@ -31,7 +31,7 @@ _MIME = {"mp4": "video/mp4", "mkv": "video/x-matroska", "webm": "video/webm", "m
          "avi": "video/x-msvideo", "m4v": "video/mp4", "ts": "video/mp2t",
          "mp3": "audio/mpeg", "flac": "audio/flac", "m4a": "audio/mp4", "m4b": "audio/mp4", "ogg": "audio/ogg",
          "opus": "audio/ogg", "wav": "audio/wav", "aac": "audio/aac",
-         "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp",
+         "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp", "avif": "image/avif",
          "gif": "image/gif", "pdf": "application/pdf", "epub": "application/epub+zip",
          "zip": "application/zip", "txt": "text/plain"}
 _JUNK = re.compile(r"^(\.|~\$|thumbs\.db$|desktop\.ini$)|\.(part|tmp|crdownload|partial|!qb)$", re.I)

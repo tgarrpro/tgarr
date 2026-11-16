@@ -2847,7 +2847,7 @@ import re as _re
 
 _EPUB_MIME = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-    "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp",
+    "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp", "avif": "image/avif",
     "css": "text/css", "html": "text/html", "xhtml": "application/xhtml+xml",
     "js": "application/javascript", "ttf": "font/ttf", "otf": "font/otf",
     "woff": "font/woff", "woff2": "font/woff2",
@@ -3101,7 +3101,7 @@ def _cover_bytes(src: str):
     if low.endswith(".epub"):
         try:
             with _zipfile.ZipFile(src) as zf:
-                pics = [i for i in zf.infolist() if re.search(r"\.(jpe?g|png)$", i.filename, re.I) and i.file_size < 30 * 1024 * 1024]
+                pics = [i for i in zf.infolist() if re.search(r"\.(jpe?g|png|webp|avif)$", i.filename, re.I) and i.file_size < 30 * 1024 * 1024]
                 named = sorted((i for i in pics if "cover" in i.filename.lower()), key=lambda i: len(i.filename))
                 pick = (named or pics[:1] or [None])[0]
                 return zf.read(pick) if pick else None
@@ -3557,8 +3557,8 @@ async def _own_book(path: str, kind: str):
 # A .cbz (and many a .cbr) is a zip of pictures. Converting one means unpacking every page
 # into memory at once - a 160 MB scan of a newspaper needs gigabytes. Reading one needs a
 # page at a time, so that is what is done: the pages are served as they lie in the zip.
-_COMIC_PAGE_RX = re.compile(r"\.(jpe?g|png|gif|webp)$", re.I)
-_COMIC_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+_COMIC_PAGE_RX = re.compile(r"\.(jpe?g|png|gif|webp|avif)$", re.I)
+_COMIC_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 _COMIC_PAGE_MOST = 80 * 1024 * 1024
 _COMIC_CACHE: dict = {}           # path -> (mtime, [names in reading order])
 
@@ -5631,7 +5631,12 @@ function renderPlayer() {{
     tgVideo(main);
     if (CONVERT === "maybe") {{
       const vv = main.querySelector("video");
-      if (vv) vv.addEventListener("error", () => location.replace("/play/" + MSG_ID), {{once: true}});
+      // only when this device cannot decode it (3) or does not know the kind at all (4) -
+      // a connection that dropped (2) is not a reason to convert a film
+      if (vv) vv.addEventListener("error", () => {{
+        const c = vv.error ? vv.error.code : 4;
+        if (c === 3 || c === 4) location.replace("/play/" + MSG_ID);
+      }});
     }}
     return;
   }}
@@ -5645,7 +5650,7 @@ function renderPlayer() {{
     location.replace("/pdf/" + MSG_ID);
     return;
   }}
-  if (ext === "epub" || ext === "txt") {{
+  if (ext === "epub" || ext === "txt" || ext === "md" || ext === "csv") {{
     // Read in the built-in reader: instant, and no conversion to run.
     location.replace("/epub/" + MSG_ID);
     return;
@@ -13846,7 +13851,8 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
     def _ico(ext):
         return {"PDF": "📄", "EPUB": "📘", "MOBI": "📕", "AZW3": "📕", "AZW": "📕", "PRC": "📕",
                 "DJVU": "📃", "DJV": "📃", "CBR": "📚", "CBZ": "📚", "FB2": "📖", "CHM": "📖",
-                "TXT": "📝", "RTF": "📝", "DOCX": "📝", "ODT": "📝", "HTML": "🌐", "HTM": "🌐",
+                "TXT": "📝", "MD": "📝", "MARKDOWN": "📝", "RTF": "📝", "DOCX": "📝", "ODT": "📝", "HTML": "🌐", "HTM": "🌐",
+                "CSV": "📈", "TSV": "📈",
                 "PPTX": "📊", "PPSX": "📊", "XLSX": "📈", "XLSM": "📈"}.get(ext, "📄")
 
     if not rows:

@@ -1,6 +1,8 @@
 """Books this reader opens by itself, without converting them to a PDF first.
 
     .txt                 textbook.py
+    .md                  Markdown: laid out, not shown as marks - headings (the chapters), lists, code, tables
+    .csv  .tsv           a table kept as text, shown as a table
     .fb2                 FictionBook: one XML file, pictures inside it
     .docx  .odt          a zip of XML (Word, LibreOffice)
     .rtf                 text and paragraphs (type faces, pictures and tables are let go)
@@ -37,8 +39,8 @@ from xml.etree import ElementTree as ET
 
 import textbook
 
-KINDS = ("txt", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml", "chm",
-         "pptx", "ppsx", "xlsx", "xlsm")
+KINDS = ("txt", "md", "markdown", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml", "chm",
+         "pptx", "ppsx", "xlsx", "xlsm", "csv", "tsv")
 XML_MOST = 80 * 1024 * 1024         # one XML part, unpacked
 TEXT_MOST = 120 * 1024 * 1024       # the text of one book
 _CACHE: dict = {}                   # path -> (mtime, Book)
@@ -48,6 +50,11 @@ CSS = (textbook.CSS +
        "p.tb-c,h4.tb-c{text-indent:0;text-align:center}p.tb-r{text-indent:0;text-align:right}"
        "p.tb-v{text-indent:0;margin:.15em 0 .15em 2em}div.tb-verse{margin:1em 0}"
        "p.tb-li{text-indent:0;margin:.3em 0 .3em 1.5em}"
+       "code{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:.9em;background:rgba(127,127,127,.16);"
+       "padding:.05em .3em;border-radius:3px}pre{background:rgba(127,127,127,.12);padding:.8em 1em;border-radius:6px;"
+       "text-indent:0;line-height:1.5;font-size:.88em;overflow-x:auto}pre code{background:none;padding:0;font-size:1em}"
+       "ul,ol{margin:.6em 0 .6em 1.6em;padding:0}li{text-indent:0;margin:.25em 0}li p{text-indent:0}"
+       "blockquote p{text-indent:0}th{font-weight:600;background:rgba(127,127,127,.12)}"
        "div.tb-wide{overflow-x:auto}table.tb-sheet{font-size:.85em;margin:1em 0}"
        "table.tb-sheet td{white-space:nowrap;max-width:26em;overflow:hidden;text-overflow:ellipsis}"
        "table{border-collapse:collapse;margin:1em auto}td,th{border:1px solid rgba(120,140,170,.45);"
@@ -122,6 +129,8 @@ def picture_type(data: bytes):
         return "image/webp"
     if data[:2] == b"BM" and len(data) > 26:
         return "image/bmp"
+    if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+        return "image/avif"
     return None
 
 
@@ -1117,7 +1126,7 @@ def _html(data: bytes) -> Book:
 # ── Windows' compiled help ────────────────────────────────────────────────────────────
 _CHM_MOST = 400 * 1024 * 1024
 _CHM_PAGE = re.compile(r"\.(html?|xhtml)$", re.I)
-_CHM_PICTURE = re.compile(r"\.(jpe?g|png|gif|bmp|webp)$", re.I)
+_CHM_PICTURE = re.compile(r"\.(jpe?g|png|gif|bmp|webp|avif)$", re.I)
 
 
 _PAGE_CODECS = {"utf-8": "utf-8", "utf8": "utf-8", "gb2312": "gb18030", "gbk": "gb18030", "gb18030": "gb18030", "big5": "big5",
@@ -1501,6 +1510,256 @@ def _xlsx(path: str) -> Book:
     return Book(title, titles, chapters, textbook.is_latin(sample), {})
 
 
+# ── Markdown ──────────────────────────────────────────────────────────────────────────
+# Notes, manuals and what an AI assistant writes are Markdown more and more. Read as plain
+# text it is a page of # and ** and | ; here it is laid out: headings (which make the
+# chapters), emphasis, lists, quotes, code, tables. Raw HTML inside it is shown as text, a
+# link keeps its words, a picture its caption - nothing in a note can load or run anything.
+_MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_MD_ATX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*#*[ \t]*$")
+_MD_RULE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_MD_ITEM = re.compile(r"^([ \t]*)([-*+]|\d{1,9}[.)])[ \t]+(.*)$")
+_MD_TABLE_SEP = re.compile(r"^[ \t]*\|?[ \t]*:?-{1,}:?[ \t]*(?:\|[ \t]*:?-{1,}:?[ \t]*)*\|?[ \t]*$")
+_MD_DEPTH = 6
+
+
+def _md_inline(s: str) -> str:
+    """One run of Markdown text as HTML."""
+    codes = []
+
+    def keep(m):
+        codes.append(m.group(2))
+        return f"\x00{len(codes) - 1}\x00"
+    s = re.sub(r"(`+)(.+?)\1", keep, s)
+    s = html.escape(s, quote=False)
+    s = re.sub(r"\[!\[([^\]]*)\]\([^)]*\)\]\([^)]*\)", r"![\1](x)", s)
+    s = re.sub(r"!\[([^\]]*)\]\([^)]*\)", lambda m: f"<i>[{m.group(1)}]</i>" if m.group(1).strip() else "", s)
+    s = re.sub(r"\[([^\]]+)\]\((?:[^()\s]|\([^()\s]*\))*(?:[ \t]+\"[^\"]*\")?\)", r"\1", s)
+    s = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", s)
+    s = re.sub(r"&lt;((?:https?://|mailto:)[^&\s]+)&gt;", r"\1", s)
+    s = re.sub(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*", r"<b><i>\1</i></b>", s)
+    s = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"(?<![\w_])__(?=\S)(.+?)(?<=\S)__(?![\w_])", r"<b>\1</b>", s)
+    s = re.sub(r"(?<![\w*])\*(?=[^\s*])([^*]+?)(?<=[^\s*])\*(?![\w*])", r"<i>\1</i>", s)
+    s = re.sub(r"(?<![\w_])_(?=[^\s_])([^_]+?)(?<=[^\s_])_(?![\w_])", r"<i>\1</i>", s)
+    s = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<s>\1</s>", s)
+    s = re.sub(r"\\([\\`*_{}\[\]()#+\-.!|>~])", r"\1", s)
+    return re.sub("\x00(\\d+)\x00", lambda m: "<code>" + html.escape(codes[int(m.group(1))].strip(), quote=False) + "</code>", s)
+
+
+def _md_join(lines: list) -> str:
+    """The lines of one paragraph as one run: a line ending in two spaces or a backslash
+    breaks there; Chinese lines are joined without a space."""
+    out = []
+    for i, ln in enumerate(lines):
+        hard = ln.endswith("  ") or ln.endswith("\\")
+        ln = ln.rstrip().rstrip("\\").strip()
+        if not ln:
+            continue
+        if out and not out[-1].endswith("<br>"):
+            a, b = out[-1][-1:], ln[:1]
+            out.append("" if (a and b and textbook._wide(a) and textbook._wide(b)) else " ")
+        out.append(_md_inline(ln) + ("<br>" if hard and i + 1 < len(lines) else ""))
+    return "".join(out)
+
+
+def _md_table_row(line: str) -> list:
+    line = line.strip()
+    line = line[1:] if line.startswith("|") else line
+    line = line[:-1] if line.endswith("|") and not line.endswith("\\|") else line
+    return [c.replace("\\|", "|").strip() for c in re.split(r"(?<!\\)\|", line)]
+
+
+def _md_blocks(lines: list, depth: int = 0) -> list:
+    """Markdown lines as blocks: (heading level or 0, html, plain text)."""
+    out, para, i, n = [], [], 0, len(lines)
+
+    def flush():
+        if para:
+            h = _md_join(para)
+            if h:
+                out.append((0, f"<p>{h}</p>", _plain(h)))
+            para.clear()
+
+    while i < n:
+        line = lines[i].rstrip("\n")
+        bare = line.strip()
+        m = _MD_FENCE.match(line)
+        if m:                                                   # ``` code ```
+            flush()
+            mark, j, code = m.group(1), i + 1, []
+            while j < n and not re.match(r"^ {0,3}" + re.escape(mark[0]) + "{" + str(len(mark)) + r",}[ \t]*$", lines[j]):
+                code.append(lines[j])
+                j += 1
+            text = "\n".join(code)
+            out.append((0, f"<pre><code>{html.escape(text, quote=False)}</code></pre>", text[:2000]))
+            i = j + 1
+            continue
+        if not bare:
+            flush()
+            i += 1
+            continue
+        m = _MD_ATX.match(line)
+        if m and (m.group(2) or "").strip():                     # # Heading
+            flush()
+            lv = len(m.group(1))
+            h = _md_inline(m.group(2).strip())
+            out.append((lv, f'<h{min(lv + 1, 5)}{" class=" + chr(34) + "tb-h" + chr(34) if lv == 1 else ""}>{h}</h{min(lv + 1, 5)}>', _plain(h)))
+            i += 1
+            continue
+        if para and re.match(r"^ {0,3}(=+|-+)[ \t]*$", line) and len(bare) >= 2:      # Heading\n=====
+            lv = 1 if bare[0] == "=" else 2
+            h = _md_join(para)
+            para.clear()
+            out.append((lv, f'<h{lv + 1}{" class=" + chr(34) + "tb-h" + chr(34) if lv == 1 else ""}>{h}</h{lv + 1}>', _plain(h)))
+            i += 1
+            continue
+        if _MD_RULE.match(line):                                 # ---
+            flush()
+            out.append((0, '<p class="tb-rule">＊＊＊</p>', ""))
+            i += 1
+            continue
+        if bare.startswith(">") and depth < _MD_DEPTH:           # > quote
+            flush()
+            inner = []
+            while i < n and lines[i].strip() and (lines[i].lstrip().startswith(">") or inner):
+                ln = lines[i].lstrip()
+                if not ln.startswith(">") and (_MD_ITEM.match(lines[i]) or _MD_ATX.match(lines[i]) or _MD_FENCE.match(lines[i])):
+                    break
+                inner.append(re.sub(r"^> ?", "", ln))
+                i += 1
+            got = _md_blocks(inner, depth + 1)
+            out.append((0, "<blockquote>" + "".join(h for _, h, _ in got) + "</blockquote>", " ".join(t for _, _, t in got)))
+            continue
+        if "|" in line and i + 1 < n and "-" in lines[i + 1] and _MD_TABLE_SEP.match(lines[i + 1]) and not para:      # | a | b |
+            head = _md_table_row(line)
+            rows, j = [], i + 2
+            while j < n and lines[j].strip() and "|" in lines[j] and len(rows) < 3000:
+                rows.append(_md_table_row(lines[j]))
+                j += 1
+            cols = min(max([len(head)] + [len(r) for r in rows]), 40)
+            body = "<tr>" + "".join(f"<th>{_md_inline(c)}</th>" for c in (head + [""] * cols)[:cols]) + "</tr>"
+            body += "".join("<tr>" + "".join(f"<td>{_md_inline(c)}</td>" for c in (r + [""] * cols)[:cols]) + "</tr>" for r in rows)
+            out.append((0, f'<div class="tb-wide"><table>{body}</table></div>', " ".join(" ".join(r) for r in [head] + rows[:50])))
+            i = j
+            continue
+        m = _MD_ITEM.match(line)
+        if m and (not para or len(m.group(1).expandtabs(4)) < 4):   # - item / 1. item
+            flush()
+            items = []                                           # (indent, ordered, [lines])
+            while i < n:
+                m = _MD_ITEM.match(lines[i])
+                if m:
+                    items.append([len(m.group(1).expandtabs(4)), m.group(2)[0].isdigit(), [m.group(3)]])
+                elif not lines[i].strip():
+                    if i + 1 < n and (_MD_ITEM.match(lines[i + 1]) or lines[i + 1][:1] in " \t") and lines[i + 1].strip():
+                        i += 1
+                        continue
+                    break
+                elif lines[i][:1] in " \t" or not (_MD_ATX.match(lines[i]) or _MD_FENCE.match(lines[i]) or _MD_RULE.match(lines[i])
+                                                    or lines[i].lstrip().startswith(">")):
+                    items[-1][2].append(lines[i].strip())           # the item goes on
+                else:
+                    break
+                i += 1
+            html_, stack, texts = [], [], []
+            for indent, ordered, ls in items:
+                while stack and indent < stack[-1][0] and len(stack) > 1:
+                    html_.append(f"</li></{stack.pop()[1]}>")
+                if not stack or (indent >= stack[-1][0] + 2 and len(stack) < _MD_DEPTH):
+                    tag = "ol" if ordered else "ul"
+                    html_.append(f"<{tag}>")
+                    stack.append((indent, tag))
+                elif (stack[-1][1] == "ol") != ordered:
+                    # numbers after bullets (or the other way round) at one depth: another list
+                    old = stack.pop()
+                    tag = "ol" if ordered else "ul"
+                    html_.append(f"</li></{old[1]}><{tag}>")
+                    stack.append((old[0], tag))
+                else:
+                    html_.append("</li>")
+                text = _md_join(ls)
+                text = re.sub(r"^\[ \]\s*", "☐ ", text)
+                text = re.sub(r"^\[[xX]\]\s*", "☑ ", text)
+                html_.append(f"<li>{text}")
+                texts.append(_plain(text))
+            while stack:
+                html_.append(f"</li></{stack.pop()[1]}>")
+            out.append((0, "".join(html_), " ".join(texts)))
+            continue
+        if not para and (line.startswith("    ") or line.startswith("\t")):          # indented code
+            code = []
+            while i < n and (lines[i].startswith("    ") or lines[i].startswith("\t") or not lines[i].strip()):
+                code.append(lines[i][4:] if lines[i].startswith("    ") else lines[i][1:])
+                i += 1
+            text = "\n".join(code).rstrip()
+            if text.strip():
+                out.append((0, f"<pre><code>{html.escape(text, quote=False)}</code></pre>", text[:2000]))
+            continue
+        para.append(line)
+        i += 1
+    flush()
+    return out
+
+
+def _markdown(data: bytes, name: str = "") -> Book:
+    text = textbook.decode(data)[0].replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    lines = text.split("\n")
+    title = None
+    if lines and lines[0].strip() == "---":                       # the notes a tool keeps at the top of a file
+        for j in range(1, min(len(lines), 80)):
+            if lines[j].strip() in ("---", "..."):
+                for ln in lines[1:j]:
+                    m = re.match(r"^title:\s*[\"']?(.+?)[\"']?\s*$", ln, re.I)
+                    if m:
+                        title = m.group(1)[:200]
+                lines = lines[j + 1:]
+                break
+    blocks = _md_blocks(lines)
+    if title is None:
+        title = next((t[:200] for lv, _, t in blocks if lv == 1), None)
+    titles, chapters = _from_blocks(blocks)
+    return Book(title, titles, chapters, _latin(blocks))
+
+
+# ── a table kept as text ──────────────────────────────────────────────────────────────
+def _csv(data: bytes, kind: str) -> Book:
+    import csv
+    import io
+    text = textbook.decode(data)[0].replace("\x00", "")
+    sample = text[:20000]
+    delim = "\t" if kind == "tsv" else None
+    if delim is None:
+        first = sample.split("\n", 1)[0]
+        delim = max(",;\t|", key=lambda c: first.count(c)) if any(first.count(c) for c in ",;\t|") else ","
+    rows, more = [], False
+    try:
+        for r in csv.reader(io.StringIO(text), delimiter=delim):
+            if len(rows) >= SHEET_ROWS_MOST:
+                more = True
+                break
+            if any(c.strip() for c in r):
+                rows.append([c.strip()[:500] for c in r[:SHEET_COLS_MOST]])
+    except csv.Error:
+        pass
+    if not rows:
+        raise NotReadable("this table is empty")
+    width = max(len(r) for r in rows)
+    titles, chapters = [], []
+    for at in range(0, len(rows), SHEET_ROWS_A_PAGE):
+        part = rows[at:at + SHEET_ROWS_A_PAGE]
+        cell = "th" if at == 0 else "td"
+        body = "".join("<tr>" + "".join(f"<{cell if k == 0 else 'td'}>{html.escape(c, quote=False)}</{cell if k == 0 else 'td'}>"
+                                        for c in (r + [""] * width)[:width]) + "</tr>" for k, r in enumerate(part))
+        n = at // SHEET_ROWS_A_PAGE
+        titles.append(f"Rows {at + 1}-{at + len(part)}" if len(rows) > SHEET_ROWS_A_PAGE else "")
+        note = ""
+        if more and at + SHEET_ROWS_A_PAGE >= len(rows):
+            note = f'<p class="tb-c">This table goes on: only its first {SHEET_ROWS_MOST} rows are shown here.</p>'
+        chapters.append(f'<div class="tb-wide"><table class="tb-sheet">{body}</table></div>{note}')
+    return Book(None, titles, chapters, textbook.is_latin([" ".join(r) for r in rows[:60]]), {})
+
+
 # ── one way in ────────────────────────────────────────────────────────────────────────
 def kind_of(name: str) -> str:
     """'fb2' for 'War and Peace.FB2'; '' for what is not read here."""
@@ -1532,6 +1791,10 @@ def build(path: str, kind: str) -> Book:
         return _fb2(data)
     if kind == "rtf":
         return _rtf(data)
+    if kind in ("md", "markdown"):
+        return _markdown(data)
+    if kind in ("csv", "tsv"):
+        return _csv(data, kind)
     if kind in ("html", "htm", "xhtml"):
         return _html(data)
     raise NotReadable("not a kind of book read here")
