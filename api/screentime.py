@@ -8,6 +8,11 @@ Rules (all optional, set by the owner):
 Time is counted per device (by its address on the network), from small "still here" signals
 the pages send while they are open and visible. A browser that has entered the PIN is never
 limited.
+
+Learning (a lesson of a course on the child's list, see courses.py) can be set apart from that:
+time spent on it is then not taken from the day's minutes, a lesson can still be opened when
+those are used up, and lessons done add minutes to the day ("bonus"). Opening hours and breaks
+hold for learning as for everything else.
 """
 import re
 
@@ -53,21 +58,24 @@ def local(now: float, tz_minutes: int):
     return day, (t % 86400) // 60, (day + 3) % 7 >= 5          # day 0 was a Thursday
 
 
-def verdict(rules: dict, now: float, used_today_s: int, session_s: int, rest_until: float) -> dict:
+def verdict(rules: dict, now: float, used_today_s: int, session_s: int, rest_until: float,
+            bonus_s: int = 0, free: bool = False) -> dict:
     """May this device use the Media Center right now?
     {'ok': bool, 'why': '' | 'hours' | 'day' | 'rest', 'until': local 'HH:MM' it opens again or '',
-     'left_s': seconds left today (None = no daily limit)}"""
+     'left_s': seconds left today (None = no daily limit)}
+    bonus_s: seconds earned today on top of the day's minutes. free: what is asked for is
+    learning that is not counted - the day's minutes being used up does not close it."""
     if not rules.get("on"):
         return {"ok": True, "why": "", "until": "", "left_s": None}
     _day, minute, weekend = local(now, rules["tz"])
     r = rules["we" if weekend else "wd"]
     start, end = _minutes(r["from"], 0), _minutes(r["to"], 1440)
-    left = None if not r["limit"] else max(0, r["limit"] * 60 - used_today_s)
+    left = None if not r["limit"] else max(0, r["limit"] * 60 + max(0, int(bonus_s)) - used_today_s)
     hhmm = lambda m: f"{(m // 60) % 24:02d}:{m % 60:02d}"          # noqa: E731
     inside = (start <= minute < end) if start <= end else (minute >= start or minute < end)
     if not inside:
         return {"ok": False, "why": "hours", "until": r["from"], "left_s": left}
-    if left is not None and left <= 0:
+    if left is not None and left <= 0 and not free:
         return {"ok": False, "why": "day", "until": "", "left_s": 0}
     if rest_until > now:
         return {"ok": False, "why": "rest", "until": hhmm(minute + int((rest_until - now + 59) // 60)), "left_s": left}
@@ -87,29 +95,34 @@ class Devices:
                                 "session": 0, "last": 0.0, "rest_until": d["rest_until"] if d else 0.0}
         return d
 
-    def ping(self, who: str, rules: dict, now: float) -> dict:
+    def ping(self, who: str, rules: dict, now: float, bonus_s: int = 0, free: bool = False) -> dict:
         """A page says "still here". Counts the time since the last signal (when
         that was recent), starts a break when one sitting has been long enough,
-        and answers with the verdict."""
+        and answers with the verdict. free: the page is a lesson whose time is not taken
+        from the day (it still counts towards the break). The seconds this signal stood for
+        are in the answer as 'added' - what a lesson's own count is fed with."""
         day, _m, _w = local(now, rules.get("tz", 0))
         d = self.get(who, day)
         gap = now - d["last"] if d["last"] else None
         rest_s = max(1, rules.get("rest", 0)) * 60
         if gap is not None and gap >= rest_s:
             d["session"] = 0                      # away long enough: that was the break
-        v = verdict(rules, now, d["used"], d["session"], d["rest_until"])
+        v = verdict(rules, now, d["used"], d["session"], d["rest_until"], bonus_s, free)
+        add = 0
         if v["ok"] and gap is not None and gap <= PING_SECONDS * 3:
             add = int(min(gap, PING_SECONDS * 1.5))
-            d["used"] += add
+            if not free:
+                d["used"] += add
             d["session"] += add
             if rules.get("on") and rules.get("session") and d["session"] >= rules["session"] * 60 and rules.get("rest"):
                 d["rest_until"], d["session"] = now + rules["rest"] * 60, 0
-            v = verdict(rules, now, d["used"], d["session"], d["rest_until"])
+            v = verdict(rules, now, d["used"], d["session"], d["rest_until"], bonus_s, free)
         d["last"] = now
+        v["added"] = add
         return v
 
-    def check(self, who: str, rules: dict, now: float) -> dict:
+    def check(self, who: str, rules: dict, now: float, bonus_s: int = 0, free: bool = False) -> dict:
         """The verdict without counting anything (for every request the server answers)."""
         day, _m, _w = local(now, rules.get("tz", 0))
         d = self.get(who, day)
-        return verdict(rules, now, d["used"], d["session"], d["rest_until"])
+        return verdict(rules, now, d["used"], d["session"], d["rest_until"], bonus_s, free)
