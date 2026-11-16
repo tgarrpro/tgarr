@@ -34,6 +34,7 @@ import export  # local module
 import localfiles  # local module
 import ownbooks  # local module: books read here without converting (.txt .fb2 .docx .odt .rtf .mobi .html)
 import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
+import i18n  # local module: the words on the pages, in the languages of those who read them
 
 # What counts as a book on every shelf, count and export: everything a reader here opens.
 # (This list used to be written out in seven places, each a little different.)
@@ -11865,7 +11866,7 @@ function unSave(){{
 # ════════════════════════════════════════════════════════════════════
 # Kids' pages, the PIN, the kids' list
 # ════════════════════════════════════════════════════════════════════
-_UNLOCK_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+_UNLOCK_HTML = """<!DOCTYPE html><html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr - PIN</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f1f5f9;color:#0f172a;
@@ -11881,12 +11882,12 @@ button{margin-top:12px;width:100%;padding:12px;font:inherit;font-size:15px;font-
   border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.6}
 #err{color:#b91c1c;font-size:14px;min-height:20px;margin-top:10px}a{color:#0284c7;font-size:13px}
 </style></head><body><div class="card">
-<h1>Enter the PIN</h1><p>Enter the PIN to open all of tgarr.</p>
+<h1>[[@Enter the PIN]]</h1><p>[[@Enter the PIN to open all of tgarr.]]</p>
 <form id="f" autocomplete="off">
 <input type="password" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="12" autofocus aria-label="PIN"/>
-<label><input type="checkbox" id="rem"/> keep this browser unlocked for 30 days</label>
-<button id="b" type="submit">Unlock</button><div id="err"></div></form>
-<a href="/mediacenter">&larr; back to the Media Center</a></div>
+<label><input type="checkbox" id="rem"/> [[@keep this browser unlocked for 30 days]]</label>
+<button id="b" type="submit">[[@Unlock]]</button><div id="err"></div></form>
+<a href="/mediacenter">&larr; [[@back to the Media Center]]</a></div>
 <script>
 document.getElementById("f").addEventListener("submit", async function (e) {
   e.preventDefault();
@@ -11897,8 +11898,8 @@ document.getElementById("f").addEventListener("submit", async function (e) {
       body: JSON.stringify({pin: document.getElementById("pin").value, remember: document.getElementById("rem").checked})});
     const j = await r.json();
     if (j.status === "ok") { location.href = "/"; return; }
-    err.textContent = j.message || "That is not the PIN.";
-  } catch (x) { err.textContent = "Could not reach tgarr."; }
+    err.textContent = (j.message && j.message !== "That is not the PIN.") ? j.message : "[[@js:That is not the PIN.]]";
+  } catch (x) { err.textContent = "[[@js:Could not reach tgarr.]]"; }
   document.getElementById("pin").value = ""; b.disabled = false; document.getElementById("pin").focus();
 });
 </script></body></html>"""
@@ -11908,7 +11909,8 @@ document.getElementById("f").addEventListener("submit", async function (e) {
 async def page_unlock(request: Request):
     if not await _is_locked(request):
         return RedirectResponse("/")
-    return HTMLResponse(_UNLOCK_HTML)
+    lang = await _lang(request)
+    return HTMLResponse(i18n.fill(lang, _UNLOCK_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang)))
 
 
 def _unlock_cookie(resp, secret: str, remember: bool):
@@ -12011,8 +12013,8 @@ async def api_mc_ping(request: Request):
     return v
 
 
-_MC_REST_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr Media Center</title>
+_MC_REST_HTML = """<!DOCTYPE html><html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/><title>tgarr · [[@Media Center]]</title>
 <style>
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;
   background:#fff8ef;color:#2b2140;font-family:ui-rounded,"SF Pro Rounded","Nunito","Segoe UI","PingFang SC",system-ui,sans-serif;text-align:center}
@@ -12020,7 +12022,7 @@ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:c
 .big{font-size:96px;line-height:1}h1{font-size:34px;margin:18px 0 8px}p{font-size:19px;opacity:.75;margin:6px 0}
 a{display:inline-block;margin-top:34px;font-size:13px;color:inherit;opacity:.55}
 </style></head><body><div><div class="big">__ICON__</div><h1>__TITLE__</h1><p>__TEXT__</p>
-<a href="/unlock">🔒 Enter PIN</a></div>
+<a href="/unlock">🔒 [[@Enter PIN]]</a></div>
 <script>
 // look again every half minute: when it is time, go back in
 setInterval(function(){ fetch("/api/mc/ping").then(function(r){ return r.json(); })
@@ -12036,12 +12038,17 @@ async def page_mc_rest(request: Request):
     v = _DEVICES.check(who, rules, time.time())
     if v["ok"] or not await _is_locked(request):
         return RedirectResponse("/mediacenter", status_code=303)
+    lang = await _lang(request)
+
+    def tr(text: str, **values) -> str:
+        return html.escape(i18n.t(lang, text, **values))
     icon, title, text = {
-        "hours": ("🌙", "The Media Center is closed now", f"It opens again at {v['until']}."),
-        "day": ("🌟", "That is all for today", "Well done. See you tomorrow!"),
-        "rest": ("🤸", "Time for a break", f"Stretch, drink some water, look far away. Back at {v['until']}."),
-    }.get(v["why"], ("🌙", "The Media Center is closed now", ""))
-    return HTMLResponse(_MC_REST_HTML.replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
+        "hours": ("🌙", tr("The Media Center is closed now"), tr("It opens again at {t}.", t=v["until"])),
+        "day": ("🌟", tr("That is all for today"), tr("Well done. See you tomorrow!")),
+        "rest": ("🤸", tr("Time for a break"), tr("Stretch, drink some water, look far away. Back at {t}.", t=v["until"])),
+    }.get(v["why"], ("🌙", tr("The Media Center is closed now"), ""))
+    return HTMLResponse(i18n.fill(lang, _MC_REST_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
+                        .replace("__ICON__", icon).replace("__TITLE__", title).replace("__TEXT__", text))
 
 
 @app.post("/api/kids/rules")
@@ -12169,6 +12176,47 @@ _MC_KINDS = {
     "book": ("Read", "📖", "#f5a524", _book_sql("m.file_name")),
     "photo": ("Photos", "🖼️", "#8b6cf6", "m.media_type = 'photo'"),
 }
+_UI_LANG = {"at": 0.0, "v": ""}
+
+
+async def _lang(request: Request) -> str:
+    """The language this request is answered in: this screen's own choice (a cookie), else
+    the household's (config `ui_lang`), else what the browser asks for, else English."""
+    now = time.monotonic()
+    if now - _UI_LANG["at"] > 10 and db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                _UI_LANG["v"] = (await conn.fetchval("SELECT value FROM config WHERE key = 'ui_lang'")) or ""
+        except Exception:
+            pass
+        _UI_LANG["at"] = now
+    return i18n.pick(request.cookies.get(i18n.COOKIE) or "", request.headers.get("accept-language") or "", _UI_LANG["v"])
+
+
+def _lang_panel(lang: str, may_set_default: bool) -> str:
+    out = [f'<button type="button" class="th lg{" on" if code == lang else ""}" data-lang="{code}" lang="{code}"><span><b>{html.escape(name)}</b></span></button>'
+           for code, name in i18n.LANGS]
+    if may_set_default:
+        out.append(f'<button type="button" class="th all" id="lgAll">{html.escape(i18n.t(lang, "Make this the language every screen starts with"))}</button>')
+    return "".join(out)
+
+
+@app.post("/api/kids/lang")
+async def api_kids_lang(request: Request):
+    """The language a screen starts in when it has not chosen one. '' = whatever its browser asks for."""
+    try:
+        lang = str((await request.json()).get("lang") or "")
+    except Exception:
+        lang = ""
+    if lang and lang not in i18n.CODES:
+        return JSONResponse({"status": "error", "message": "no such language"}, status_code=400)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO config (key, value) VALUES ('ui_lang', $1)
+                              ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", lang)
+    _UI_LANG.update(at=0.0)
+    return {"status": "ok", "lang": lang}
+
+
 # The looks of the Media Center: key, name, a line about it, and the two colours of its swatch.
 _MC_THEMES = (
     ("auto", "Day & Night", "light by day, dark where the device is", "#fff8ef", "#191624"),
@@ -12183,13 +12231,13 @@ _MC_THEMES = (
 _MC_THEME_KEYS = tuple(t[0] for t in _MC_THEMES)
 
 
-def _mc_theme_panel(may_set_default: bool) -> str:
+def _mc_theme_panel(may_set_default: bool, lang: str = "en") -> str:
     out = []
     for key, name, about, a, b in _MC_THEMES:
         out.append(f'<button type="button" class="th" data-th="{key}"><i style="background:linear-gradient(135deg,{a} 0 55%,{b} 55% 100%)"></i>'
-                   f'<span><b>{html.escape(name)}</b><small>{html.escape(about)}</small></span></button>')
+                   f'<span><b>{html.escape(i18n.t(lang, name))}</b><small>{html.escape(i18n.t(lang, about) if about else "")}</small></span></button>')
     if may_set_default:
-        out.append('<button type="button" class="th all" id="thAll">Make this the look every screen starts with</button>')
+        out.append(f'<button type="button" class="th all" id="thAll">{html.escape(i18n.t(lang, "Make this the look every screen starts with"))}</button>')
     return "".join(out)
 
 
@@ -12236,9 +12284,9 @@ def _friendly_name(file_name, caption) -> str:
 
 
 _MEDIACENTER_HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/>
+<html lang="__LANG__" dir="__DIR__"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
-<title>tgarr Media Center</title>
+<title>tgarr · [[@Media Center]]</title>
 <link rel="icon" href="/favicon.svg"/>
 __PWA__
 <script>
@@ -12406,6 +12454,8 @@ html[data-th=clear] .card:focus-visible,html[data-th=clear] .cat:focus-visible,h
 html[data-th=aurora] .pic{background:linear-gradient(135deg,color-mix(in srgb,var(--c) 34%,#1b1b4b),color-mix(in srgb,var(--c) 50%,#0b1026))}
 html[data-th=night] .pic,html[data-th=clear] .pic{background:linear-gradient(135deg,color-mix(in srgb,var(--c) 30%,#262234),color-mix(in srgb,var(--c) 50%,#000))}
 html[data-th=paper] .pic{background:linear-gradient(135deg,#efe2c4,color-mix(in srgb,var(--c) 30%,#e2d2ad))}
+/* a short page still fills the screen with its background */
+body{min-height:100vh}
 /* room for the ring around what the remote is on */
 .grid{padding-top:8px;padding-bottom:8px}
 /* the list of looks */
@@ -12420,6 +12470,8 @@ html[data-th=aurora] .thp{background:#1b1b4b}
 .th b{display:block;font-size:15px}.th small{display:block;color:var(--soft);font-size:12px;line-height:1.25}
 .th.on{border-color:var(--accent)}
 .th:focus-visible{outline:5px solid var(--accent);outline-offset:2px}
+.thp.lgp{grid-template-columns:repeat(3,minmax(0,1fr))}.th.lg{justify-content:center;text-align:center}
+[dir=rtl] .th{text-align:right}[dir=rtl] .logo .mc{padding-left:0;margin-left:0;border-left:0;padding-right:12px;margin-right:4px;border-right:2px solid var(--line)}
 .thp .all{grid-column:1/-1;font-size:13px;color:var(--soft);text-align:center;border-style:dashed;justify-content:center}
 button.pill{font-family:inherit;cursor:pointer}
 /* on a television: seen from three metres */
@@ -12436,16 +12488,17 @@ html.tv .thp{width:min(620px,calc(100vw - 24px))}
 <div class="top">
   <a class="logo" href="/mediacenter" aria-label="tgarr Media Center">
     <svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-    <span class="wm">tg<b>arr</b></span><span class="mc">Media Center</span></a>
+    <span class="wm">tg<b>arr</b></span><span class="mc">[[@Media Center]]</span></a>
   __TOPRIGHT__
 </div>
 <nav class="cats">__CATS__</nav>
 <form class="find" method="GET" action="/mediacenter">
   <input type="hidden" name="kind" value="__KIND__"/>
-  <input type="search" name="q" value="__Q__" placeholder="What are you looking for?" aria-label="search"/>
-  <button type="submit">Find</button>
+  <input type="search" name="q" value="__Q__" placeholder="[[@What are you looking for?]]" aria-label="[[@Find]]"/>
+  <button type="submit">[[@Find]]</button>
 </form>
-<div class="thp" id="thP" role="dialog" aria-label="how this page looks">__THEMEPANEL__</div>
+<div class="thp" id="thP" role="dialog" aria-label="[[@Look]]">__THEMEPANEL__</div>
+<div class="thp lgp" id="lgP" role="dialog" aria-label="[[@Language]]">__LANGPANEL__</div>
 <div id="recent"></div>
 <h2>__HEADING__</h2>
 __GRID__
@@ -12469,7 +12522,7 @@ __MORE__
   });
   var rec = load();
   if (rec.length && !"__Q__" && !__OFFSET__) {
-    var h = '<h2>⭐ Carry on</h2><div class="row">';
+    var h = '<h2>⭐ [[@js:Carry on]]</h2><div class="row">';
     rec.forEach(function(x){
       var name = document.createElement("div"); name.textContent = x.name;
       h += '<a class="card ' + x.kind + '" style="--c:' + x.c + '" href="' + x.href + '"><div class="pic">' + (x.icon || "") +
@@ -12515,8 +12568,33 @@ __MORE__
       fetch("/api/kids/theme", {method: "POST", headers: {"Content-Type": "application/json"},
                                 body: JSON.stringify({theme: root.getAttribute("data-th")})})
         .then(function(r){ return r.json(); })
-        .then(function(j){ b.textContent = j.status === "ok" ? "✓ every screen now starts with this look" : "✗ " + (j.message || "not saved"); })
-        .catch(function(){ b.textContent = "✗ not saved"; });
+        .then(function(j){ b.textContent = j.status === "ok" ? "✓ [[@js:every screen now starts with this look]]" : "✗ [[@js:not saved]]"; })
+        .catch(function(){ b.textContent = "✗ [[@js:not saved]]"; });
+    }
+  });
+  document.addEventListener("keydown", function(ev){ if (ev.key === "Escape" && panel.classList.contains("on")) { ev.stopPropagation(); open(false); } });
+  document.addEventListener("click", function(ev){ if (panel.classList.contains("on") && !panel.contains(ev.target) && ev.target !== btn) panel.classList.remove("on"); });
+})();
+</script>
+<script>
+(function(){
+  // The language of the page: chosen here, kept by this screen (a cookie, so the page comes in it).
+  var panel = document.getElementById("lgP"), btn = document.getElementById("lgB");
+  if (!panel || !btn) return;
+  function open(on){ panel.classList.toggle("on", on); if (on) { var f = panel.querySelector("button.th.on") || panel.querySelector("button.th"); if (f) f.focus(); } else btn.focus(); }
+  btn.addEventListener("click", function(){ document.getElementById("thP").classList.remove("on"); open(!panel.classList.contains("on")); });
+  panel.addEventListener("click", function(ev){
+    var b = ev.target.closest("button.th");
+    if (!b) return;
+    if (b.dataset.lang) {
+      document.cookie = "tgarr_lang=" + b.dataset.lang + "; path=/; max-age=31536000; SameSite=Lax";
+      location.reload();
+    } else if (b.id === "lgAll") {
+      fetch("/api/kids/lang", {method: "POST", headers: {"Content-Type": "application/json"},
+                               body: JSON.stringify({lang: document.documentElement.lang})})
+        .then(function(r){ return r.json(); })
+        .then(function(j){ b.textContent = j.status === "ok" ? "✓ [[@js:every screen now starts in this language]]" : "✗ [[@js:not saved]]"; })
+        .catch(function(){ b.textContent = "✗ [[@js:not saved]]"; });
     }
   });
   document.addEventListener("keydown", function(ev){ if (ev.key === "Escape" && panel.classList.contains("on")) { ev.stopPropagation(); open(false); } });
@@ -12593,6 +12671,10 @@ async def page_kids_old():
 async def page_mediacenter(request: Request, kind: str = "video", q: Optional[str] = None, offset: int = 0):
     """What a locked browser gets: the items on the Media Center list, as a
     page of its own - large pictures, four big choices, nothing to configure."""
+    lang = await _lang(request)
+
+    def tr(text: str, **values) -> str:
+        return html.escape(i18n.t(lang, text, **values))
     kind = kind if kind in _MC_KINDS else "video"
     offset, per = max(0, int(offset)), 48
     label, icon, colour, cond = _MC_KINDS[kind]
@@ -12616,7 +12698,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
     locked = _LOCKED.get()
     cats = "".join(
         f'<a class="cat{" on" if k == kind else ""}" style="--c:{v[2]}" href="/mediacenter?kind={k}">'
-        f'<span class="ic">{v[1]}</span><b>{v[0]}</b><small>{counts[k]:,}</small></a>'
+        f'<span class="ic">{v[1]}</span><b>{tr(v[0])}</b><small>{counts[k]:,}</small></a>'
         for k, v in _MC_KINDS.items())
     cards = []
     for r in rows:
@@ -12634,34 +12716,36 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
             f'<a class="card {kind}" style="--c:{colour}" href="{href}" data-id="{r["id"]}" data-kind="{kind}" '
             f'data-name="{html.escape(name, quote=True)}" data-pic="{pic}" data-c="{colour}" data-icon="{ic}">'
             f'<div class="pic">{ic}{img}'
-            + ('<span class="saved">ready</span>' if r["saved"] and kind != "photo" else "")
+            + (f'<span class="saved">{tr("ready")}</span>' if r["saved"] and kind != "photo" else "")
             + ('' if kind == "photo" else '<span class="play">▶</span>')
             + f'</div><div class="name"><span>{html.escape(name)}</span></div></a>')
     if cards:
         grid = f'<div class="grid {kind}">{"".join(cards)}</div>'
     elif q:
-        grid = '<div class="empty"><i>🔎</i>Nothing found. Try another word?</div>'
+        grid = f'<div class="empty"><i>🔎</i>{tr("Nothing found. Try another word?")}</div>'
     else:
-        grid = ('<div class="empty"><i>🌱</i>Nothing here yet.<br/>Things show up here once they are added to the Media Center.</div>')
+        grid = (f'<div class="empty"><i>🌱</i>{tr("Nothing here yet.")}<br/>{tr("Things show up here once they are added to the Media Center.")}</div>')
     qs = f"kind={kind}" + (f"&q={_q(q)}" if q else "")
     nav = ""
     if offset or more:
         nav = ('<div class="more">'
-               + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← Back</a>' if offset else "")
-               + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">More →</a>' if more else "")
+               + (f'<a href="/mediacenter?{qs}&offset={max(0, offset - per)}">← {tr("Back")}</a>' if offset else "")
+               + (f'<a class="go" href="/mediacenter?{qs}&offset={offset + per}">{tr("More")} →</a>' if more else "")
                + "</div>")
     prof = _PROFILE.get()
     whose = (f'<span class="pill">👤 {html.escape(prof["name"])}</span>'
-             '<a class="pill" href="/lock" title="this is not me">Leave</a>') if prof else ""
-    look = '<button type="button" class="pill" id="thB" title="how this page looks" aria-haspopup="dialog">🎨 Look</button>'
-    top_right = look + (whose + '<a class="pill" href="/unlock" title="your own PIN, or the one that opens all of tgarr">🔒 Enter PIN</a>' if locked else
-             ('<a class="pill" href="/lock" title="lock this browser again">🔒 Lock</a>' if _ACCESS["pin"] else '')
-             + '<a class="pill" href="/mediacenter/manage">⚙ Choose what is shown</a>'
-             '<a class="pill" href="/">← Back to tgarr</a>')
-    heading = f'{icon} {html.escape(label)}' + (f' · “{html.escape(q)}”' if q else "")
-    page = (_MEDIACENTER_HTML.replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
+             f'<a class="pill" href="/lock" title="{tr("this is not me")}">{tr("Leave")}</a>') if prof else ""
+    look = (f'<button type="button" class="pill" id="thB" aria-haspopup="dialog">🎨 {tr("Look")}</button>'
+            f'<button type="button" class="pill" id="lgB" aria-haspopup="dialog" title="{tr("Language")}">🌐 {html.escape(dict(i18n.LANGS)[lang])}</button>')
+    top_right = look + (whose + f'<a class="pill" href="/unlock">🔒 {tr("Enter PIN")}</a>' if locked else
+             (f'<a class="pill" href="/lock">🔒 {tr("Lock")}</a>' if _ACCESS["pin"] else '')
+             + f'<a class="pill" href="/mediacenter/manage">⚙ {tr("Choose what is shown")}</a>'
+             f'<a class="pill" href="/">← {tr("Back to tgarr")}</a>')
+    heading = f'{icon} {tr(label)}' + (f' · “{html.escape(q)}”' if q else "")
+    page = (i18n.fill(lang, _MEDIACENTER_HTML).replace("__LANG__", lang).replace("__DIR__", i18n.direction(lang))
+            .replace("__PWA__", _pwa_head(True)).replace("__COLOR__", colour).replace("__TOPRIGHT__", top_right).replace("__CATS__", cats)
             .replace("__THEME__", theme).replace("__THEMES__", _json.dumps(list(_MC_THEME_KEYS)))
-            .replace("__THEMEPANEL__", _mc_theme_panel(not locked))
+            .replace("__THEMEPANEL__", _mc_theme_panel(not locked, lang)).replace("__LANGPANEL__", _lang_panel(lang, not locked))
             .replace("__KIND__", kind).replace("__Q__", html.escape(q or "", quote=True))
             .replace("__OFFSET__", str(offset)).replace("__HEADING__", heading)
             .replace("__GRID__", grid).replace("__MORE__", nav))
