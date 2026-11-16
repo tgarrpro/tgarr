@@ -43,6 +43,16 @@ ok(bad(dict(good, parts=[]), "no parts") and bad(dict(good, parts=[{"ia": "../et
 ok(bad(dict(good, parts=[{"ia": "a1"}, {"ia": "a1"}]), "twice") and bad(dict(good, parts=["x"]), "object"), "each once, each an object")
 ok(bad(dict(good, parts=[{"ia": f"i{i}"} for i in range(C.PARTS_MOST + 1)]), "more than"), "not endless")
 ok(bad([], "object") and bad(None, "object"), "a list is an object")
+ok(p["channel"] == "" and p["tag"] == "", "a list of Archive items names no channel")
+ch = C.clean_pack({"slug": "zh-pinyin", "title": "拼音入门", "lang": "zh-Hans", "level": "5-8", "subject": "reading", "right": "CC BY-SA",
+                   "channel": "@tgarr_courses", "tag": "#拼音"})
+ok(ch["channel"] == "tgarr_courses" and ch["tag"] == "#拼音" and ch["parts"] == [], "a list may be a public channel, or the posts of it under one tag")
+chan = {"slug": "x-y", "title": "t", "right": "CC BY", "channel": "tgarr_courses"}
+ok(C.clean_pack(chan)["tag"] == "", "the tag is optional: then it is all of the channel")
+ok(bad(dict(chan, channel="ab"), "channel") and bad(dict(chan, channel="has space"), "channel"), "the channel is an @name")
+ok(bad(dict(chan, tag="two words"), "tag") and bad(dict(chan, tag="notag"), "tag") and bad(dict(chan, tag="#a%b"), "tag"), "the tag is one #tag")
+ok(bad(dict(chan, parts=[{"ia": "abc"}]), "not both"), "parts or a channel, not both")
+ok(bad(dict(chan, right=""), "right"), "a channel's list names its right as well")
 d = tempfile.mkdtemp()
 json.dump(good, open(os.path.join(d, "a.json"), "w"))
 json.dump(dict(good, title="Another"), open(os.path.join(d, "b.json"), "w"))       # the same slug again
@@ -74,4 +84,17 @@ ok(C.credits(r, 2, 0) == 2 and C.credits(r, 0, 45 * 60) == 2 and C.credits(r, 1,
 ok(C.bonus_seconds(r, 2, 0) == 40 * 60, "two lessons: forty minutes")
 ok(C.bonus_seconds(r, 9, 0) == 60 * 60, "never more than the day's most")
 ok(C.bonus_seconds(dict(r, on=False), 9, 9999) == 0, "nothing when rewards are off")
-print(f"test_courses: {n} checks passed")
+# ── the lists shipped with tgarr are all in order, and the template is ──
+base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coursepacks")
+tpl = json.load(open(os.path.join(base, "template.json.example"), encoding="utf-8"))
+ok(C.clean_pack(tpl)["channel"] == "your_public_channel", "the template is a list in order")
+slugs = {}
+for lang in sorted(d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))):
+    said = []
+    got = C.load_packs(os.path.join(base, lang), said.append)
+    ok(not said, f"coursepacks/{lang}: every list is in order: {said}")
+    for slug, pk in got.items():
+        ok(slug not in slugs, f"{slug}: a slug used by two lists ({lang} and {slugs.get(slug)})")
+        slugs[slug] = lang
+        ok(pk["lang"].split("-")[0] == lang.split("-")[0], f"{slug}: its language ({pk['lang']}) is its folder's ({lang})")
+print(f"test_courses: {n} checks passed ({len(slugs)} lists shipped)")

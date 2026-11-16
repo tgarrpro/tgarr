@@ -12579,9 +12579,11 @@ async def _course_build(conn, c) -> int:
                   AND ($2 = '' OR m.local_path LIKE $3)""", int(cid or 0), path, path.replace("%", "\\%").replace("_", "\\_") + "/%")
         ids = [r["id"] for r in sorted(rows, key=lambda r: courses.natural_key(r["name"]))]
     elif kind == "channel":
+        cid, _, tag = (c["ref"] or "").partition(" ")
         rows = await conn.fetch(
             f"""SELECT m.id FROM messages m WHERE m.channel_id = $1 AND {live} AND {playable}
-                ORDER BY m.posted_at NULLS LAST, m.id LIMIT 2000""", int(c["ref"] or 0))
+                  AND ($2 = '' OR position(lower($2) IN lower(COALESCE(m.caption, ''))) > 0)
+                ORDER BY m.posted_at NULLS LAST, m.id LIMIT 2000""", int(cid or 0), tag)
         ids = [r["id"] for r in rows]
     elif kind == "list":
         names = [str(p.get("name") or "") for p in _json.loads(c["parts"] or "[]")]
@@ -12693,6 +12695,17 @@ async def api_course_add(request: Request):
             return no("no such list", 404)
         kind, title, slug, parts = "pack", pk["title"], pk["slug"], _json.dumps(pk["parts"])
         meta.update(about=pk["about"], lang=pk["lang"], level=pk["level"], subject=pk["subject"], license=pk["right"], credit=pk["credit"])
+        if pk["channel"]:
+            # a list that is a public channel: the channel is followed (read without joining), and
+            # the course is that channel's posts - under the list's tag, when it names one
+            r = await api_channel_subscribe(pk["channel"])
+            cid = r.get("channel_id") if isinstance(r, dict) else None
+            if not cid:
+                async with db_pool.acquire() as conn:
+                    cid = await conn.fetchval("SELECT id FROM channels WHERE username ILIKE $1", pk["channel"])
+            if not cid:
+                return no("the channel of this list could not be followed - try again in a moment", 503)
+            kind, parts, ref = "channel", None, f"{cid}" + (f" {pk['tag']}" if pk["tag"] else "")
     elif b.get("folder") is not None or b.get("channel") is not None:
         try:
             cid = int(b.get("folder") if b.get("folder") is not None else b.get("channel"))

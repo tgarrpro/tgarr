@@ -1,0 +1,13 @@
+{
+  "slug": "my-first-course",
+  "title": "The name of the course, in the language of its material",
+  "about": "One or two sentences: what it teaches and for whom.",
+  "lang": "en",
+  "level": "8-12",
+  "subject": "reading",
+  "right": "CC BY-SA",
+  "credit": "Who made the material",
+
+  "channel": "your_public_channel",
+  "tag": "#course1"
+}

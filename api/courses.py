@@ -1,7 +1,9 @@
 """Courses - the part with no web framework and no database in it.
 
-A course is a list of sources in an order: items of the Internet Archive (a "pack", one of the
-lists in the folder courses/ of this repository), a folder of one's own files, or a channel.
+A course is a list of sources in an order: a "pack" - one of the lists shipped with tgarr
+(coursepacks/<language>/*.json), which names either items of the Internet Archive or a public
+Telegram channel (all of it, or the posts that carry one tag) - a folder of one's own files, or
+a channel one follows.
 It keeps no lessons of its own: its lessons are the files those sources hold, in their order
 (main.py reads them out of the library and keeps the list in the table course_items).
 
@@ -16,6 +18,8 @@ import re
 
 SLUG_RX = re.compile(r"^[a-z0-9][a-z0-9-]{1,60}$")
 IA_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+TG_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")          # a public channel's @name, without the @
+TAG_RX = re.compile(r"^#[^\s#%_]{1,40}$")                    # one tag: the posts of a channel that belong to this course
 LEVELS = ("all", "5-8", "8-12", "12-16", "16+")
 SUBJECTS = ("reading", "language", "math", "science", "history", "arts", "music", "computing", "life", "other")
 RIGHTS = ("PD", "CC BY", "CC BY-SA", "CC BY-NC", "CC BY-NC-SA", "CC BY-ND", "CC BY-NC-ND", "OLD", "USGOV", "NOCR")
@@ -48,6 +52,18 @@ def clean_pack(raw) -> dict:
         raise ValueError(f"subject: one of {SUBJECTS}")
     if right not in RIGHTS:
         raise ValueError(f"right: one of {RIGHTS} (a list names the right its material is under)")
+    channel, tag = str(raw.get("channel") or "").lstrip("@"), str(raw.get("tag") or "")
+    if channel:
+        # the lessons are the files posted in a public channel, in the order posted
+        if raw.get("parts"):
+            raise ValueError("a list names parts or a channel, not both")
+        if not TG_RX.match(channel):
+            raise ValueError("channel: the @name of a public channel")
+        if tag and not TAG_RX.match(tag):
+            raise ValueError("tag: one #tag without spaces")
+        return {"slug": slug, "title": title, "about": " ".join(str(raw.get("about") or "").split())[:600],
+                "lang": str(raw.get("lang") or "en")[:12], "level": level, "subject": subject, "right": right,
+                "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": [], "channel": channel, "tag": tag}
     parts, seen = [], set()
     for p in raw.get("parts") or []:
         if not isinstance(p, dict):
@@ -65,7 +81,7 @@ def clean_pack(raw) -> dict:
         raise ValueError(f"more than {PARTS_MOST} parts")
     return {"slug": slug, "title": title, "about": " ".join(str(raw.get("about") or "").split())[:600],
             "lang": str(raw.get("lang") or "en")[:12], "level": level, "subject": subject, "right": right,
-            "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": parts}
+            "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": parts, "channel": "", "tag": ""}
 
 
 def load_packs(folder: str, log=None) -> dict:
