@@ -13295,6 +13295,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
         return "?" + "&".join(bits) if bits else ""
 
+    _tip = html.unescape              # _chip_link escapes its tooltip itself: hand it the plain word
     picked = None
     for r in all_channels:
         if (ch and r["id"] == ch) or (channel and r["username"] == channel):
@@ -13303,27 +13304,27 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     priv = [r for r in all_channels if r["private"]]
 
     def _name(r):
-        return r["title"] or (("@" + r["username"]) if r["username"] else "private chat")
+        return r["title"] or (("@" + r["username"]) if r["username"] else html.unescape(_t("private chat")))
     opts = "".join(
         f'<a class="gp-opt" href="/gallery{_gqs(ch=r["id"], channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None)}" '
         f'data-k="{html.escape((_name(r) + " " + (r["username"] or "")).lower(), quote=True)}">'
         f'{_avatar(_name(r), 30)}<span class="gp-n">{html.escape(_name(r))}'
         + (f'<small>@{html.escape(r["username"])}</small>' if r["username"]
-           else '<small>🔒 private</small>' if r["private"]
-           else '<small>📰 from the newsgroups</small>' if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT)
-           else '<small>🏛 from the Internet Archive</small>' if r["local_root"] == ARCHIVE_ROOT
-           else '<small>📁 files of this server</small>' if r["local_root"]
-           else '<small>group · no public name</small>')
+           else f'<small>🔒 {_t("private")}</small>' if r["private"]
+           else f'<small>📰 {_t("from the newsgroups")}</small>' if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT)
+           else f'<small>🏛 {_t("from the Internet Archive")}</small>' if r["local_root"] == ARCHIVE_ROOT
+           else f'<small>📁 {_t("files of this server")}</small>' if r["local_root"]
+           else f'<small>{_t("group · no public name")}</small>')
         + f'</span><span class="gp-c">{r["n"]:,}</span></a>'
         for r in all_channels)
     picker = (
         '<div class="gp" id="gp">'
         f'<button type="button" class="btn ghost gp-btn{" on" if picked else ""}" id="gpBtn">'
         + (f'📡 {html.escape(_name(picked)[:28])} <span style="opacity:.6">{picked["n"]:,}</span>'
-           if picked else f'📡 Choose a channel… <span style="opacity:.6">{len(all_channels):,}</span>')
+           if picked else f'📡 {_t("Choose a channel…")} <span style="opacity:.6">{len(all_channels):,}</span>')
         + ' ▾</button>'
         '<div class="gp-pop" id="gpPop">'
-        '<input type="text" id="gpQ" placeholder="type to find a channel or chat…" autocomplete="off"/>'
+        f'<input type="text" id="gpQ" placeholder="{_t("type to find a channel or chat…")}" autocomplete="off"/>'
         f'<div class="gp-list" id="gpList">{opts}</div></div></div>')
     ch_chips_html = (
         '<style>'
@@ -13347,20 +13348,20 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '.gp-c{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}'
         '</style>'
         '<div class="bar-tools" style="margin-bottom:16px">'
-        + _chip_link("All photos", "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None),
+        + _chip_link(_t("All photos"), "/gallery" + _gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=None, offset=None),
                      not (picked or private or usenet or archive))
-        + (_chip_link(f'🔒 My private chats <span style="opacity:.6">{priv_n:,}</span>',
+        + (_chip_link(f'🔒 {_t("My private chats")} <span style="opacity:.6">{priv_n:,}</span>',
                       "/gallery" + _gqs(ch=None, channel=None, private=1, usenet=None, grp=None, archive=None, item=None, offset=None), bool(private),
-                      "photos from chats and groups that have no public @username - yours alone")
+                      _tip(_t("photos from chats and groups that have no public @username - yours alone")))
            if priv else "")
         # Usenet opens into its newsgroups, as "Choose a channel" opens into the chats
         + (('<details class="gp gu"><summary class="btn ghost gp-btn' + (" on" if usenet else "") + '" '
-            'title="pictures fetched from the newsgroups">📰 '
+            f'title="{_t("pictures fetched from the newsgroups")}">📰 '
             + (html.escape(grp[:34]) if grp else "Usenet")
             + f' <span style="opacity:.6">{(next((r["n"] for r in usenet_groups if r["g"] == grp), 0) if grp else usenet_n):,}</span> ▾</summary>'
             '<div class="gp-pop"><div class="gp-list">'
             f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=1, grp=None, archive=None, item=None, offset=None)}">'
-            f'<span class="gp-n">All of Usenet</span><span class="gp-c">{usenet_n:,}</span></a>'
+            f'<span class="gp-n">{_t("All of Usenet")}</span><span class="gp-c">{usenet_n:,}</span></a>'
             + "".join(
                 f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=r["g"], archive=None, item=None, offset=None)}">'
                 f'<span class="gp-n">{html.escape(r["g"])}</span><span class="gp-c">{r["n"]:,}</span></a>' for r in usenet_groups)
@@ -13368,12 +13369,12 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
            if usenet_n else "")
         # and the Internet Archive into the items that were fetched from it
         + (('<details class="gp gu"><summary class="btn ghost gp-btn' + (" on" if archive else "") + '" '
-            'title="pictures fetched from the Internet Archive">🏛 '
-            + (html.escape(item[:34]) if item else "Internet Archive")
+            f'title="{_t("pictures fetched from the Internet Archive")}">🏛 '
+            + (html.escape(item[:34]) if item else _t("Internet Archive"))
             + f' <span style="opacity:.6">{(next((r["n"] for r in archive_items if r["g"] == item), 0) if item else archive_n):,}</span> ▾</summary>'
             '<div class="gp-pop"><div class="gp-list">'
             f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=1, item=None, offset=None)}">'
-            f'<span class="gp-n">All from the Archive</span><span class="gp-c">{archive_n:,}</span></a>'
+            f'<span class="gp-n">{_t("All from the Archive")}</span><span class="gp-c">{archive_n:,}</span></a>'
             + "".join(
                 f'<a class="gp-opt" href="/gallery{_gqs(ch=None, channel=None, private=None, usenet=None, grp=None, archive=None, item=r["g"], offset=None)}">'
                 f'<span class="gp-n">{html.escape(r["g"])}</span><span class="gp-c">{r["n"]:,}</span></a>' for r in archive_items)
@@ -13381,35 +13382,34 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
            if archive_n else "")
         + picker
         + (_export_btn({"scope": "chat", "ch": picked["id"], "kind": "photo"},
-                       "⬇ Download all " + format(picked["n"], ",")) if (picked and _in)
-           else _export_btn({"scope": "private", "kind": "photo"}, "⬇ Download all") if (private and _in)
+                       "⬇ " + _t("Download all {n}", n=format(picked["n"], ","))) if (picked and _in)
+           else _export_btn({"scope": "private", "kind": "photo"}, "⬇ " + _t("Download all")) if (private and _in)
            else ('<button class="btn ghost" style="padding:5px 12px;font-size:12px" '
                  f'onclick="ugForget({{grp:{html.escape(_json.dumps(grp), quote=True)}}},&quot;everything fetched from this newsgroup&quot;,this)">'
-                 '🗑 Delete this newsgroup</button>' + _UN_FORGET_JS) if grp
-           else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 Manage…</a>' if usenet
-           else '<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/archive?kind=have">🗑 Manage…</a>' if archive
+                 f'🗑 {_t("Delete this newsgroup")}</button>' + _UN_FORGET_JS) if grp
+           else f'<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 {_t("Manage…")}</a>' if usenet
+           else f'<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/archive?kind=have">🗑 {_t("Manage…")}</a>' if archive
            else "")
         + (('<span class="sep"></span>'
-            + _chip_link("all", "/gallery" + _gqs(rate=None if _rate0 == "all" else "all", offset=None), rate == "all")
+            + _chip_link(_t("all"), "/gallery" + _gqs(rate=None if _rate0 == "all" else "all", offset=None), rate == "all")
             + _chip_link("SFW", "/gallery" + _gqs(rate=None if _rate0 == "sfw" else "sfw", offset=None), rate == "sfw",
-                         "only pictures that are neither from an 18+ channel nor found to be adult")
+                         _tip(_t("only pictures that are neither from an 18+ channel nor found to be adult")))
             + _chip_link("18+", "/gallery" + _gqs(rate=None if _rate0 == "adult" else "adult", offset=None), rate == "adult",
-                         "only pictures from an 18+ channel, or found to be adult")) if _nsfw_on else "")
+                         _tip(_t("only pictures from an 18+ channel, or found to be adult")))) if _nsfw_on else "")
         + (('<span class="sep"></span>'
-            + _chip_link("all", "/gallery" + _gqs(art=None, offset=None), not art)
-            + _chip_link("Photos", "/gallery" + _gqs(art="photo", offset=None), art == "photo",
-                         "only photographs - of the pictures that have been looked at")
-            + _chip_link("Drawings", "/gallery" + _gqs(art="drawn", offset=None), art == "drawn",
-                         "only drawings, comics and paintings - of the pictures that have been looked at")) if (_looked or art) else "")
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _chip_link("newest", "/gallery" + _gqs(sort=None, offset=None), sort != "old")
-        + _chip_link("oldest", "/gallery" + _gqs(sort="old", offset=None), sort == "old")
+            + _chip_link(_t("all"), "/gallery" + _gqs(art=None, offset=None), not art)
+            + _chip_link(_t("Photos"), "/gallery" + _gqs(art="photo", offset=None), art == "photo",
+                         _tip(_t("only photographs - of the pictures that have been looked at")))
+            + _chip_link(_t("Drawings"), "/gallery" + _gqs(art="drawn", offset=None), art == "drawn",
+                         _tip(_t("only drawings, comics and paintings - of the pictures that have been looked at")))) if (_looked or art) else "")
+        + f'<span class="sep"></span><span class="lbl">{_t("Sort:")}</span>'
+        + _chip_link(_t("newest"), "/gallery" + _gqs(sort=None, offset=None), sort != "old")
+        + _chip_link(_t("oldest"), "/gallery" + _gqs(sort="old", offset=None), sort == "old")
         + (('<span class="sep"></span>'
-            + _chip_link(f"only my data center (DC {my_dc})",
+            + _chip_link(_t("only my data center (DC {dc})", dc=my_dc),
                          "/gallery" + _gqs(dc=None if same_dc_only else "mine", offset=None),
                          same_dc_only,
-                         "photos stored on your own Telegram data center load fastest; "
-                         "the others work too")) if my_dc else "")
+                         _tip(_t("photos stored on your own Telegram data center load fastest; the others work too")))) if my_dc else "")
         + '</div>'
         '<script>(function(){const gp=document.getElementById("gp"),q=document.getElementById("gpQ");'
         'document.getElementById("gpBtn").onclick=e=>{e.stopPropagation();gp.classList.toggle("open");'
@@ -13420,20 +13420,23 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         'q.addEventListener("keydown",e=>{if(e.key==="Escape")gp.classList.remove("open");'
         'if(e.key==="Enter"){const f=[...document.querySelectorAll("#gpList .gp-opt")].find(o=>o.style.display!=="none");'
         'if(f)location.href=f.href}})})()</script>')
-    _where_txt = (f'in {html.escape(_name(picked))}' if picked else
-                  'in my private chats' if private else f'from {html.escape(grp)}' if grp else 'fetched from Usenet' if usenet
-                  else f'from {html.escape(item)}' if item else 'fetched from the Internet Archive' if archive else '')
+    # which photos these are, said as whole phrases (each one a sentence of its own in every language)
+    _where_txt = (_t("photos in {name}", name=_name(picked)) if picked else
+                  _t("photos in my private chats") if private else _t("photos from {name}", name=grp) if grp
+                  else _t("photos fetched from Usenet") if usenet
+                  else _t("photos from {name}", name=item) if item
+                  else _t("photos fetched from the Internet Archive") if archive else _t("photos"))
 
     if not rows:
         body = (
-            f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">0</span></h2>'
+            f'{_LIST_CSS}<h2 class="section">{_t("Gallery")} <span class="count">0</span></h2>'
             f'{ch_chips_html}'
             '<div class="empty-state">'
             '<div class="icon">🖼</div>'
-            + ('<div>No photo matches.</div>' if (picked or private or usenet or archive or q or same_dc_only or page_offset or rate) else
-               '<div>No photos yet.</div>'
-               f'<div style="margin-top:8px;font-size:13px">{pending:,} photos are indexed; their '
-               'thumbnails are fetched as pages are opened.</div>')
+            + (f'<div>{_t("No photo matches.")}</div>' if (picked or private or usenet or archive or q or same_dc_only or page_offset or rate) else
+               f'<div>{_t("No photos yet.")}</div>'
+               f'<div style="margin-top:8px;font-size:13px">'
+               f'{_t("{n} photos are indexed; their thumbnails are fetched as pages are opened.", n=format(pending, ","))}</div>')
             + '</div>'
         )
         return HTMLResponse(_layout("Gallery", "/gallery", body))
@@ -13458,7 +13461,7 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         f'data-cap="{html.escape(_said(r)[1][:300])}" '
         f'data-ch="{html.escape(_said(r)[0])}">'
         f'<img src="/api/thumb/{r["id"]}" loading="lazy" data-mid="{r["id"]}" class="lazy-thumb" />'
-        + (f'<div class="dup-badge" title="shared across {r["dup_count"]} channels">×{r["dup_count"]}</div>'
+        + (f'<div class="dup-badge" title="{_t("shared across {n} channels", n=r["dup_count"])}">×{r["dup_count"]}</div>'
            if r.get("dup_count") and r["dup_count"] > 1 else '')
         + f'<figcaption class="meta">'
         f'<div class="ch">{html.escape(_said(r)[0] if r["local_root"] in (USENET_ROOT, USENET_ROOT_ADULT, ARCHIVE_ROOT) else (r["ch_title"] or ""))}</div>'
@@ -13469,24 +13472,24 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
     )
 
     body = (
-        f'{_LIST_CSS}<h2 class="section">Gallery <span class="count">{matched:,}</span>'
+        f'{_LIST_CSS}<h2 class="section">{_t("Gallery")} <span class="count">{matched:,}</span>'
         '<span class="extra" style="color:var(--muted);font-size:12px;font-weight:400;text-transform:none;'
-        f'letter-spacing:0;margin-left:10px">photos {_where_txt}'
-        + (f' matching “{html.escape(q)}”' if q else '')
-        + ' · the same picture posted in several places is shown once · click one for the slideshow</span></h2>'
+        f'letter-spacing:0;margin-left:10px">{_where_txt}'
+        + (' · ' + _t("matching “{q}”", q=q) if q else '')
+        + f' · {_t("the same picture posted in several places is shown once")} · {_t("click one for the slideshow")}</span></h2>'
         f'{ch_chips_html}'
         f'<div class="gallery">{items}</div>'
         + _page_nav("/gallery", _gqs, page_offset, page_size, len(rows), matched or 0) +
         '<div class="lightbox">'
         '  <div class="lb-progress"><div class="lb-progress-bar" id="lbProgress"></div></div>'
         '  <button class="lb-close" id="lbClose">×</button>'
-        '  <button class="lb-prev" id="lbPrev" title="previous"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>'
-        '  <button class="lb-next" id="lbNext" title="next"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></button>'
+        f'  <button class="lb-prev" id="lbPrev" title="{_t("previous")}">' '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button>'
+        f'  <button class="lb-next" id="lbNext" title="{_t("next")}">' '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg></button>'
         '  <img id="lbImg" alt="" />'
         '  <div class="lb-controls">'
-        '    <button id="lbPlay" title="play / pause (Space)">▶</button>'
+        f'    <button id="lbPlay" title="{_t("play / pause (Space)")}">▶</button>'
         '    <span class="lb-count" id="lbCount">– / –</span>'
-        '    <button id="lbDel" title="delete (Del) — will not be redownloaded">🗑</button>'
+        f'    <button id="lbDel" title="{_t("delete (Del) — will not be redownloaded")}">🗑</button>'
         '  </div>'
         '  <div class="lb-meta"><div class="ch" id="lbCh"></div><div id="lbCap"></div></div>'
         '</div>'
@@ -13646,14 +13649,14 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
         '  function pause() { playing = false; playBtn.textContent = "▶"; clearTimeout(timer); prog.style.transition = "none"; prog.style.width = "0"; }'
         '  async function del() {'
         '    const p = photos[cur];'
-        '    if (!confirm("Delete this photo? Will not be redownloaded.")) return;'
+        '    if (!confirm("' + _tj("Delete this photo? Will not be redownloaded.") + '")) return;'
         '    try {'
         '      const r = await fetch("/api/photo/" + p.id + "/delete", {method:"POST"});'
         '      if (!r.ok) throw new Error("HTTP " + r.status);'
         '      p.el.remove(); photos.splice(cur, 1);'
         '      if (!photos.length) { close(); return; }'
         '      show(cur);'
-        '    } catch (e) { alert("Delete failed: " + e.message); }'
+        '    } catch (e) { alert("' + _tj("Delete failed: %1") + '".replace("%1", e.message)); }'
         '  }'
         '  function open(id) {'
         '    const idx = photos.findIndex(p => p.id === id);'
@@ -14484,32 +14487,34 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
     _nsfw_on = await _is_nsfw_enabled()
 
     def _vc(label, href, on, tip=""):
-        return _chip_link(label, "/videos" + href, on, tip)
+        # (_chip_link escapes its tooltip itself: it is handed the plain word)
+        return _chip_link(label, "/videos" + href, on, html.unescape(tip))
     toolbar = (
         '<div class="bar-tools" style="margin-bottom:18px">'
         + ((_vc("SFW", _qs(aud=None if _aud0 == "sfw" else "sfw", offset=None), aud == "sfw")
             + _vc("18+", _qs(aud=None if _aud0 == "nsfw" else "nsfw", offset=None), aud == "nsfw")
-            + _vc("both", _qs(aud=None if _aud0 == "any" else "any", offset=None), aud == "any")
+            + _vc(_t("both"), _qs(aud=None if _aud0 == "any" else "any", offset=None), aud == "any")
             + '<span class="sep"></span>') if _nsfw_on else '')
-        + '<span class="lbl">Size:</span>'
-        + _vc("any", _qs(min_mb=0, offset=None), min_mb <= 0)
-        + _vc("50 MB+", _qs(min_mb=None, offset=None), min_mb == 50, "leaves out clips")
-        + _vc("300 MB+", _qs(min_mb=300, offset=None), min_mb == 300, "film-sized")
-        + '<span class="sep"></span><span class="lbl">Sort:</span>'
-        + _vc("newest", _qs(sort=None, offset=None), sort != "size")
-        + _vc("largest", _qs(sort="size", offset=None), sort == "size")
+        + f'<span class="lbl">{_t("Size:")}</span>'
+        + _vc(_t("any"), _qs(min_mb=0, offset=None), min_mb <= 0)
+        + _vc("50 MB+", _qs(min_mb=None, offset=None), min_mb == 50, _t("leaves out clips"))
+        + _vc("300 MB+", _qs(min_mb=300, offset=None), min_mb == 300, _t("film-sized"))
+        + f'<span class="sep"></span><span class="lbl">{_t("Sort:")}</span>'
+        + _vc(_t("newest"), _qs(sort=None, offset=None), sort != "size")
+        + _vc(_t("largest"), _qs(sort="size", offset=None), sort == "size")
         + '<span class="sep"></span>'
         + _src_chips("/videos", _qs, src, src_n) + _saved_chip("/videos", _qs, local)
         + f'<a class="btn ghost" href="/videos{_qs(fav=None if fav else 1, offset=None)}" '
           f'style="{"background:rgba(244,63,94,0.12);color:#e11d48;border-color:#fb7185;" if fav else ""}'
-          f'padding:5px 12px;font-size:12px" title="only my favourites">♥ favourites</a>'
+          f'padding:5px 12px;font-size:12px" title="{_t("only my favourites")}">♥ {_t("favourites")}</a>'
         + '</div>' + _FAV_CARD_JS + _THUMB_RETRY_JS)
 
     def _card(r):
+        # (the card escapes its title: it is handed the plain words)
         title = (r["canonical_title"] or r["movie_title"] or r["series_title"]
-                 or r["file_name"] or (r["caption"] or "")[:80] or f"video {r['id']}")
+                 or r["file_name"] or (r["caption"] or "")[:80] or html.unescape(_t("video {n}", n=r["id"])))
         if r["rel_part"]:
-            title += f" — part {r['rel_part']}"
+            title = html.unescape(_t("{title} — part {n}", title=title, n=r["rel_part"]))
         ch = r["ch_title"] or r["ch_user"] or ""
         date = _fmt_time(r["posted_at"])[:10] if r["posted_at"] else ""
         return _media_card(
@@ -14524,13 +14529,13 @@ async def page_videos(q: Optional[str] = None, limit: int = 120,
         grid_html = '<div class="mc-grid wide">' + ''.join(_card(r) for r in rows) + '</div>'
     else:
         grid_html = ('<div class="empty-state"><div class="icon">🎬</div>'
-                     '<div>No video matches.</div></div>')
+                     f'<div>{_t("No video matches.")}</div></div>')
     _note = []
     if q:
-        _note.append(f'matching “{html.escape(q)}”')
+        _note.append(_t("matching “{q}”", q=q))
     body = (
         f'{_LIST_CSS}'
-        f'<h2 class="section">Videos <span class="count">{total:,}</span>'
+        f'<h2 class="section">{_t("Videos")} <span class="count">{total:,}</span>'
         f'<span class="extra" style="color:var(--muted, #64748b);font-size:12px;font-weight:400;'
         f'text-transform:none;letter-spacing:0;margin-left:10px">{" · ".join(_note)}</span></h2>'
         f'{toolbar}{grid_html}'
@@ -14593,8 +14598,8 @@ def _dc_mark(file_dc, my_dc) -> str:
     if not file_dc:
         return ""
     same = bool(my_dc and file_dc == my_dc)
-    tip = ("on your Telegram data center: the fast path" if same else
-           "on another Telegram data center: it works, a little slower to start")
+    tip = (_t("on your Telegram data center: the fast path") if same else
+           _t("on another Telegram data center: it works, a little slower to start"))
     return f'<span class="dc{" same" if same else ""}" title="{tip}">DC{file_dc}</span>'
 
 
@@ -14602,7 +14607,8 @@ def _fmt_dur_short(sec) -> str:
     if not sec:
         return ""
     sec = int(sec)
-    return f"{sec // 3600}h {sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60} min"
+    return (_t("{h}h {m}m", h=sec // 3600, m=f"{sec % 3600 // 60:02d}") if sec >= 3600
+            else _t("{n} min", n=sec // 60))
 
 
 def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=None,
@@ -14616,26 +14622,31 @@ def _media_card(*, msg_id, title, img, sub="", size=None, file_dc=None, my_dc=No
     if quality:
         badges += f'<span class="bq">{html.escape(quality)}</span>'
     if saved:
-        badges += '<span class="bs" title="already downloaded: opens instantly">● saved</span>'
+        badges += f'<span class="bs" title="{_t("already downloaded: opens instantly")}">● {_t("saved")}</span>'
     if part:
-        badges += f'<span class="bp" title="this film was posted in several parts">part {int(part)}</span>'
+        badges += (f'<span class="bp" title="{_t("this film was posted in several parts")}">'
+                   f'{_t("part {n}", n=int(part))}</span>')
     more = ""
     if work and versions and versions > 1:
         more = (f'<a class="bv" href="/releases?work={_q(work)}" '
-                f'title="other copies of this title: other resolutions or uploads">{versions} versions</a>')
+                f'title="{_t("other copies of this title: other resolutions or uploads")}">'
+                f'{_t("{n} versions", n=versions)}</a>')
     meta = [x for x in (_fmt_size(size), _fmt_dur_short(duration)) if x]
-    acts = f'<a class="b pri" href="{watch}">▶ Play</a>'
+    acts = f'<a class="b pri" href="{watch}">▶ {_t("Play")}</a>'
     if not _signed_in():
         fav = None                        # favourites and grabs belong to the account
     if guid and _signed_in():
         acts += (f'<button class="b grab-btn" data-guid="{guid}" onclick="tgGrab(this)" '
-                 f'title="save it to the download folder (the one Sonarr/Radarr read)">⬇ Grab</button>')
+                 f'title="{_t("save it to the download folder (the one Sonarr/Radarr read)")}">⬇ {_t("Grab")}</button>')
     elif _signed_in() or saved:
         # signed out, only a file that is already on this machine can be handed over
-        acts += (f'<a class="b sq" href="/media/{msg_id}" download title="download to this device">⬇</a>')
+        acts += (f'<a class="b sq" href="/media/{msg_id}" download title="{_t("download to this device")}">⬇</a>')
     if fav is not None:
+        # (both tooltips ride on the button: the script that flips the heart is one text for
+        #  every language, and takes its words from here)
+        _on, _off = _t("in your favourites"), _t("add to favourites")
         acts += (f'<button class="b sq{" on" if fav else ""}" onclick="tgFavCard(this,{msg_id})" '
-                 f'title="{"in your favourites" if fav else "add to favourites"}">♥</button>')
+                 f'data-on="{_on}" data-off="{_off}" title="{_on if fav else _off}">♥</button>')
     return (
         f'<div class="mc{" wide" if wide else ""}">'
         f'<a class="mc-img" href="{watch}"><span class="fb">{fallback}</span>{img_html}'
@@ -14666,7 +14677,7 @@ _THUMB_RETRY_JS = (
 
 _FAV_CARD_JS = ('<script>function tgFavCard(b,id){fetch("/api/fav/"+id,{method:"POST"}).then(r=>r.json())'
                 '.then(j=>{if(j.fav===undefined)return;b.classList.toggle("on",j.fav);'
-                'b.title=j.fav?"in your favourites":"add to favourites"})}</script>')
+                'b.title=j.fav?(b.dataset.on||"in your favourites"):(b.dataset.off||"add to favourites")})}</script>')
 
 
 def _release_card(r, my_dc=None) -> str:
@@ -14678,7 +14689,7 @@ def _release_card(r, my_dc=None) -> str:
     if _rk(r, "movie_year"):
         bits.append(str(r["movie_year"]))
     if not bits and r["posted_at"]:
-        bits.append("posted " + _fmt_time(r["posted_at"])[:10])
+        bits.append(html.unescape(_t("posted {date}", date=_fmt_time(r["posted_at"])[:10])))   # (the card escapes it)
     pmid = r["primary_msg_id"]
     return _media_card(
         msg_id=pmid, title=title, sub=" · ".join(bits),
