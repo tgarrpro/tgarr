@@ -3,6 +3,8 @@
     .txt                 textbook.py
     .md                  Markdown: laid out, not shown as marks - headings (the chapters), lists, code, tables
     .csv  .tsv           a table kept as text, shown as a table
+    .ipynb               a Jupyter notebook: notes, code, and what the code printed or drew
+    .json .yaml .toml    data kept as text: set as code, keys picked out, JSON laid out anew
     .fb2                 FictionBook: one XML file, pictures inside it
     .docx  .odt          a zip of XML (Word, LibreOffice)
     .rtf                 text and paragraphs (type faces, pictures and tables are let go)
@@ -40,7 +42,10 @@ from xml.etree import ElementTree as ET
 import textbook
 
 KINDS = ("txt", "md", "markdown", "fb2", "docx", "odt", "rtf", "mobi", "azw", "azw3", "prc", "html", "htm", "xhtml", "chm",
-         "pptx", "ppsx", "xlsx", "xlsm", "csv", "tsv")
+         "pptx", "ppsx", "xlsx", "xlsm", "ipynb", "csv", "tsv", "json", "yaml", "yml", "toml")
+# Readable here, but not what anybody means by a book: they open in the reader and stay off
+# the Library's shelves and out of the count of books.
+DATA_KINDS = ("csv", "tsv", "json", "yaml", "yml", "toml")
 XML_MOST = 80 * 1024 * 1024         # one XML part, unpacked
 TEXT_MOST = 120 * 1024 * 1024       # the text of one book
 _CACHE: dict = {}                   # path -> (mtime, Book)
@@ -53,6 +58,7 @@ CSS = (textbook.CSS +
        "code{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:.9em;background:rgba(127,127,127,.16);"
        "padding:.05em .3em;border-radius:3px}pre{background:rgba(127,127,127,.12);padding:.8em 1em;border-radius:6px;"
        "text-indent:0;line-height:1.5;font-size:.88em;overflow-x:auto}pre code{background:none;padding:0;font-size:1em}"
+       "pre.tb-out{background:none;border-left:3px solid rgba(127,127,127,.45);border-radius:0;margin-top:-.4em}"
        "ul,ol{margin:.6em 0 .6em 1.6em;padding:0}li{text-indent:0;margin:.25em 0}li p{text-indent:0}"
        "blockquote p{text-indent:0}th{font-weight:600;background:rgba(127,127,127,.12)}"
        "div.tb-wide{overflow-x:auto}table.tb-sheet{font-size:.85em;margin:1em 0}"
@@ -1760,6 +1766,115 @@ def _csv(data: bytes, kind: str) -> Book:
     return Book(None, titles, chapters, textbook.is_latin([" ".join(r) for r in rows[:60]]), {})
 
 
+# ── notebooks, and data kept as text ──────────────────────────────────────────────────
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+CODE_LINES_A_PAGE = 300
+JSON_MOST = 24 * 1024 * 1024        # larger than this is shown as it is, not laid out anew
+
+
+def _joined(v) -> str:
+    return "".join(str(x) for x in v) if isinstance(v, list) else (v if isinstance(v, str) else "")
+
+
+def _ipynb(data: bytes) -> Book:
+    """A Jupyter notebook: its notes laid out as Markdown, its code as code, and under each
+    piece of code what it printed - text, a table as text, a chart as the picture it was."""
+    import json
+    try:
+        nb = json.loads(textbook.decode(data)[0])
+    except (ValueError, RecursionError):
+        raise NotReadable("this notebook is damaged (it is not the JSON a notebook is kept as)")
+    if not isinstance(nb, dict):
+        raise NotReadable("this is not a notebook")
+    cells = nb.get("cells")
+    if cells is None:                                             # the format of 2013: cells inside worksheets
+        cells = [c for w in (nb.get("worksheets") or []) if isinstance(w, dict) for c in (w.get("cells") or [])]
+    if not isinstance(cells, list):
+        raise NotReadable("this is not a notebook")
+    blocks, assets, held = [], {}, 0
+    for c in cells[:20000]:
+        if not isinstance(c, dict):
+            continue
+        kind = c.get("cell_type")
+        src = _joined(c.get("source") if c.get("source") is not None else c.get("input"))
+        if kind == "markdown":
+            blocks.extend(_md_blocks(src.replace("\r\n", "\n").split("\n")))
+        elif kind == "heading":
+            lv = c.get("level") if isinstance(c.get("level"), int) and 1 <= c.get("level") <= 6 else 1
+            h = _md_inline(src.strip())
+            blocks.append((lv, f'<h{min(lv + 1, 5)}{" class=" + chr(34) + "tb-h" + chr(34) if lv == 1 else ""}>{h}</h{min(lv + 1, 5)}>', _plain(h)))
+        elif kind in ("code", "raw"):
+            if src.strip():
+                blocks.append((0, f'<pre class="tb-in"><code>{html.escape(src.rstrip(), quote=False)}</code></pre>', src[:2000]))
+            for o in (c.get("outputs") or [])[:200] if kind == "code" else []:
+                if not isinstance(o, dict):
+                    continue
+                ot, text = o.get("output_type"), ""
+                if ot == "stream":
+                    text = _joined(o.get("text"))
+                elif ot in ("error", "pyerr"):
+                    text = "\n".join(str(x) for x in (o.get("traceback") or [])) or f'{o.get("ename", "")}: {o.get("evalue", "")}'
+                elif ot in ("execute_result", "display_data", "pyout"):
+                    d = o.get("data") if isinstance(o.get("data"), dict) else o
+                    shown = False
+                    for key in ("image/png", "image/jpeg", "png", "jpeg"):
+                        raw = _joined(d.get(key))
+                        if raw and held < 120 * 1024 * 1024:
+                            try:
+                                pic = base64.b64decode(raw, validate=False)
+                            except Exception:
+                                continue
+                            if picture_type(pic):
+                                held += len(pic)
+                                name = f"out{len(assets) + 1}"
+                                assets[name] = ("bytes", pic)
+                                blocks.append((0, f'<p class="tb-c"><img src="../asset/{name}" alt=""></p>', ""))
+                                shown = True
+                                break
+                    if not shown:
+                        text = _joined(d.get("text/plain") if d.get("text/plain") is not None else d.get("text"))
+                text = _ANSI.sub("", text).rstrip()
+                if text:
+                    cut = text[:30000] + ("\n…" if len(text) > 30000 else "")
+                    blocks.append((0, f'<pre class="tb-out">{html.escape(cut, quote=False)}</pre>', cut[:1000]))
+    if not blocks:
+        raise NotReadable("this notebook is empty")
+    meta = nb.get("metadata") if isinstance(nb.get("metadata"), dict) else {}
+    title = (meta.get("title") if isinstance(meta.get("title"), str) else None) or next((t[:200] for lv, _, t in blocks if lv == 1), None)
+    titles, chapters = _from_blocks(blocks)
+    return Book(title, titles, chapters, _latin(blocks), assets)
+
+
+_JSON_KEY = re.compile(r'^(\s*)("(?:[^"\\]|\\.)*")(\s*:)', re.M)
+_YAML_KEY = re.compile(r"^(\s*(?:- )?)([A-Za-z0-9_.\-\"' /]{1,80}?)(\s*[:=](?:\s|$))", re.M)
+
+
+def _data(data: bytes, kind: str) -> Book:
+    """JSON, YAML, TOML: kept as it is, set in a fixed-width face with its keys picked out.
+    JSON saved on one line is laid out anew, an entry a line."""
+    text = textbook.decode(data)[0].replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    if kind == "json" and len(data) <= JSON_MOST:
+        import json
+        try:
+            text = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+        except (ValueError, RecursionError):
+            pass                                                   # not quite JSON: shown as it was written
+    lines = text.split("\n")
+    if not text.strip():
+        raise NotReadable("this file is empty")
+    key = _JSON_KEY if kind == "json" else _YAML_KEY
+    titles, chapters = [], []
+    for at in range(0, len(lines), CODE_LINES_A_PAGE):
+        part = "\n".join(x if len(x) <= 4000 else x[:4000] + " …" for x in lines[at:at + CODE_LINES_A_PAGE])
+        shown = key.sub(lambda m: f"{m.group(1)}\x01{m.group(2)}\x02{m.group(3)}", part)
+        shown = html.escape(shown, quote=False).replace("\x01", "<b>").replace("\x02", "</b>")
+        titles.append(f"Lines {at + 1}-{min(at + CODE_LINES_A_PAGE, len(lines))}" if len(lines) > CODE_LINES_A_PAGE else "")
+        chapters.append(f"<pre><code>{shown}</code></pre>")
+        if len(chapters) >= 4000:
+            break
+    return Book(None, titles, chapters, True)
+
+
 # ── one way in ────────────────────────────────────────────────────────────────────────
 def kind_of(name: str) -> str:
     """'fb2' for 'War and Peace.FB2'; '' for what is not read here."""
@@ -1795,6 +1910,10 @@ def build(path: str, kind: str) -> Book:
         return _markdown(data)
     if kind in ("csv", "tsv"):
         return _csv(data, kind)
+    if kind == "ipynb":
+        return _ipynb(data)
+    if kind in ("json", "yaml", "yml", "toml"):
+        return _data(data, kind)
     if kind in ("html", "htm", "xhtml"):
         return _html(data)
     raise NotReadable("not a kind of book read here")

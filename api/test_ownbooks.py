@@ -498,6 +498,47 @@ b = B.build(put("s.csv", b"a;b;c\n1;2;3\n"), "csv")
 ok("<td>2</td>" in b.chapter(0), "CSV with semicolons, as spreadsheets in Europe save it")
 ok(refused(lambda: B.build(put("e.csv", b"\n\n"), "csv"), "empty"), "an empty table")
 
+# ── a notebook ──
+import json as _json  # noqa: E402
+NB = {"nbformat": 4, "metadata": {"kernelspec": {"language": "python"}}, "cells": [
+    {"cell_type": "markdown", "source": ["# Sales 分析\n", "\n", "Some **notes** first.\n"]},
+    {"cell_type": "code", "execution_count": 1, "source": "import pandas as pd\nprint(1 < 2)", "outputs": [
+        {"output_type": "stream", "name": "stdout", "text": ["True\n"]},
+        {"output_type": "execute_result", "data": {"text/plain": ["   a  b\n", "0  1  <2>"], "text/html": "<table><script>x()</script></table>"}},
+        {"output_type": "display_data", "data": {"image/png": base64.b64encode(PNG).decode(), "text/plain": "<Figure>"}},
+        {"output_type": "display_data", "data": {"image/png": base64.b64encode(b"<svg onload=x>").decode(), "text/plain": "not a picture"}},
+        {"output_type": "error", "ename": "ValueError", "evalue": "bad", "traceback": ["\x1b[0;31mValueError\x1b[0m: bad <b>"]}]},
+    {"cell_type": "markdown", "source": "# Second part\n\n- a\n- b"},
+    {"cell_type": "code", "source": [], "outputs": []},
+    {"cell_type": "raw", "source": "raw text"},
+    "not a cell", {"cell_type": "code", "source": 5, "outputs": "x"}]}
+b = B.build(put("a.ipynb", _json.dumps(NB).encode("utf-8")), "ipynb")
+ok(b.title == "Sales 分析" and b.titles == ["Sales 分析", "Second part"], f"IPYNB: chapters from the headings in its notes: {b.title} {b.titles}")
+c0 = b.chapter(0)
+ok("Some <b>notes</b> first." in c0 and '<pre class="tb-in"><code>import pandas as pd\nprint(1 &lt; 2)</code></pre>' in c0, "IPYNB: notes laid out, code as code")
+ok('<pre class="tb-out">True</pre>' in c0 and "0  1  &lt;2&gt;" in c0 and "script" not in c0 and "<table" not in c0, "IPYNB: what it printed, as text - never its HTML")
+ok(c0.count("<img") == 1 and b.asset("out1") == (PNG, "image/png") and "not a picture" in c0, "IPYNB: a chart as the picture it was; what is not a picture falls back to its text")
+ok("ValueError: bad &lt;b&gt;" in c0 and "\x1b" not in c0, "IPYNB: an error, without the colour codes")
+ok("<ul><li>a</li><li>b</li></ul>" in b.chapter(1) and "raw text" in b.chapter(1), "IPYNB: the second part")
+old_nb = {"worksheets": [{"cells": [{"cell_type": "heading", "level": 1, "source": "Old"}, {"cell_type": "code", "input": ["x = 1"], "outputs": [
+    {"output_type": "pyout", "text": ["1"]}]}]}]}
+b = B.build(put("old.ipynb", _json.dumps(old_nb).encode()), "ipynb")
+ok(b.titles == ["Old"] and "x = 1" in b.chapter(0) and '<pre class="tb-out">1</pre>' in b.chapter(0), "IPYNB of 2013 (cells inside worksheets)")
+ok(refused(lambda: B.build(put("bad.ipynb", b"{not json"), "ipynb"), "damaged") and refused(lambda: B.build(put("e.ipynb", b'{"cells": []}'), "ipynb"), "empty")
+   and refused(lambda: B.build(put("l.ipynb", b"[1,2]"), "ipynb"), "not a notebook"), "IPYNB: damaged, empty, not one")
+
+# ── data kept as text ──
+b = B.build(put("d.json", '{"name":"王小明","tags":["a","<b>"],"n":{"x":1}}'.encode("utf-8")), "json")
+ok('<b>"name"</b>: "王小明"' in b.chapter(0) and '  <b>"tags"</b>: [\n    "a",\n    "&lt;b&gt;"' in b.chapter(0), f"JSON on one line is laid out, its keys picked out: {b.chapter(0)[:160]}")
+b = B.build(put("broken.json", b'{"a": 1,, }'), "json")
+ok('{"a": 1,, }' in b.chapter(0), "JSON that is not quite JSON is shown as it was written")
+b = B.build(put("c.yaml", b"# comment\nname: demo\nlist:\n  - one: 1\n    two: <x>\nurl: http://a/b\n"), "yaml")
+ok("<b>name</b>: demo" in b.chapter(0) and "- <b>one</b>: 1" in b.chapter(0) and "&lt;x&gt;" in b.chapter(0) and "# comment" in b.chapter(0), f"YAML: keys picked out: {b.chapter(0)[:200]}")
+b = B.build(put("big.json", _json.dumps(list(range(2000))).encode()), "json")
+ok(len(b) == 7 and b.titles[0] == "Lines 1-300", f"a long file is 300 lines a page: {len(b)} {b.titles[:2]}")
+ok(refused(lambda: B.build(put("e.toml", b"  \n"), "toml"), "empty"), "an empty file")
+ok(set(B.DATA_KINDS) <= set(B.KINDS) and "md" not in B.DATA_KINDS and "ipynb" not in B.DATA_KINDS, "data is read here, and is not a book")
+
 # ── AVIF ──
 ok(B.picture_type(b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00") == "image/avif" and B.picture_type(b"\x00\x00\x00\x1cftypisom") is None,
    "an AVIF picture by its first bytes; an MP4 film is not a picture")

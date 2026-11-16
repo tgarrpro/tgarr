@@ -1079,7 +1079,7 @@ SAFE_NAME = re.compile(r"[^\w\-._]+")
 # containers share no code). A book is small, is wanted years after it was posted, and never
 # becomes a "release" - three things the rules below for films would otherwise hold against it.
 BOOK_KINDS = ("pdf", "epub", "djvu", "djv", "cbz", "cbr", "txt", "md", "markdown", "fb2", "docx", "odt", "rtf", "mobi", "azw",
-              "azw3", "prc", "html", "htm", "xhtml", "chm", "pptx", "ppsx", "xlsx", "xlsm", "csv", "tsv")
+              "azw3", "prc", "html", "htm", "xhtml", "chm", "pptx", "ppsx", "xlsx", "xlsm", "ipynb")
 BOOK_RX = re.compile(r"\.(" + "|".join(BOOK_KINDS) + r")$", re.I)
 BOOK_SQL = "file_name ~* '\\.(" + "|".join(BOOK_KINDS) + ")$'"
 BOOK_MIN_BYTES = 1000             # a text of a page; under that it is a note, not a book

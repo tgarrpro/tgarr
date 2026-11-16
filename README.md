@@ -19,6 +19,8 @@
 | Books | `.epub` `.mobi` `.azw` `.azw3` `.prc` `.fb2` `.txt` `.chm` |
 | Documents | `.pdf` `.docx` `.odt` `.rtf` `.html` `.md` (Markdown, laid out: headings, lists, code, tables) |
 | Slides and sheets | `.pptx` `.xlsx` `.csv` (text, pictures and tables - not the layout, not charts) |
+| Notebooks and data | `.ipynb` (notes, code, and what the code printed or drew) `.json` `.yaml` `.toml` |
+| Pictures | JPEG, PNG, GIF, WebP, AVIF as they are; a phone's HEIC and JPEG XL shown as a JPEG made of them |
 | Scanned books | `.djvu` (made into pages the first time it is opened) |
 | Comics | `.cbz` `.cbr` (page by page, a real RAR too) |
 

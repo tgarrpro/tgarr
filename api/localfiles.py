@@ -22,8 +22,9 @@ MINE = "mine"
 _KINDS = {
     "video": "mp4 mkv avi mov m4v webm wmv flv ts m2ts mpg mpeg 3gp rmvb vob divx iso",     # (iso: a DVD or Blu-ray image)
     "audio": "mp3 flac m4a m4b aac ogg opus wav wma ape alac aiff dsf wv",
-    "photo": "jpg jpeg png webp avif gif bmp heic heif tif tiff",
+    "photo": "jpg jpeg png webp avif jxl gif bmp heic heif tif tiff",
     "document": "pdf epub mobi azw azw3 prc djvu djv fb2 cbz cbr chm txt md markdown rtf doc docx odt xls xlsx xlsm csv tsv ppt pptx ppsx "
+                "ipynb json yaml yml toml "
                 "html htm xhtml zip rar 7z srt ass",
 }
 _EXT = {e: k for k, v in _KINDS.items() for e in v.split()}

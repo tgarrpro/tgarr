@@ -37,7 +37,7 @@ import unpack  # local module: RAR and .chm, through bsdtar and 7-Zip
 
 # What counts as a book on every shelf, count and export: everything a reader here opens.
 # (This list used to be written out in seven places, each a little different.)
-BOOK_KINDS = tuple(dict.fromkeys(("pdf", "epub", "djvu", "djv", "cbz", "cbr") + ownbooks.KINDS))
+BOOK_KINDS = tuple(dict.fromkeys(("pdf", "epub", "djvu", "djv", "cbz", "cbr") + tuple(k for k in ownbooks.KINDS if k not in ownbooks.DATA_KINDS)))
 _BOOK_RX = "\\.(" + "|".join(BOOK_KINDS) + ")$"          # for PostgreSQL's ~*
 
 
@@ -6752,11 +6752,32 @@ async def _local_forget(conn, ch: int, paths: list) -> None:
 
 
 def _local_picture_make(src: str, dst: str, px: int) -> None:
+    """A JPEG no wider or taller than `px`, of any picture this machine can read: what Pillow
+    opens (JPEG, PNG, WebP, AVIF, TIFF ...), and what only ffmpeg does - a phone's HEIC, JPEG XL."""
+    import shutil
+    import subprocess
     from PIL import Image, ImageOps
-    with Image.open(src) as im:
-        im = ImageOps.exif_transpose(im)
-        im.thumbnail((px, px))
-        im.convert("RGB").save(dst, "JPEG", quality=82)
+    try:
+        with Image.open(src) as im:
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((px, px))
+            im.convert("RGB").save(dst, "JPEG", quality=82)
+        return
+    except Exception:
+        if not shutil.which("ffmpeg"):
+            raise
+    tmp = dst + ".part.jpg"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src, "-frames:v", "1",
+             "-vf", f"scale='min({int(px)},iw)':'min({int(px)},ih)':force_original_aspect_ratio=decrease", "-q:v", "3", tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=60)
+        if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            raise ValueError("not a picture this machine can read")
+        os.replace(tmp, dst)
+    finally:
+        try: os.unlink(tmp)
+        except OSError: pass
 
 
 async def _local_picture(msg_id: int, col: str, folder: str, px: int):
@@ -13852,7 +13873,7 @@ async def page_library(limit: int = 100, q: Optional[str] = None,
         return {"PDF": "📄", "EPUB": "📘", "MOBI": "📕", "AZW3": "📕", "AZW": "📕", "PRC": "📕",
                 "DJVU": "📃", "DJV": "📃", "CBR": "📚", "CBZ": "📚", "FB2": "📖", "CHM": "📖",
                 "TXT": "📝", "MD": "📝", "MARKDOWN": "📝", "RTF": "📝", "DOCX": "📝", "ODT": "📝", "HTML": "🌐", "HTM": "🌐",
-                "CSV": "📈", "TSV": "📈",
+                "CSV": "📈", "TSV": "📈", "IPYNB": "📓",
                 "PPTX": "📊", "PPSX": "📊", "XLSX": "📈", "XLSM": "📈"}.get(ext, "📄")
 
     if not rows:

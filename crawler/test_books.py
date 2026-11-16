@@ -40,8 +40,10 @@ ok(stored_name("../../etc/passwd", 1) == ".._.._etc_passwd" and "/" not in store
 api = open(os.path.join(here, "..", "api", "main.py"), encoding="utf-8").read()
 own = open(os.path.join(here, "..", "api", "ownbooks.py"), encoding="utf-8").read()
 kinds = re.search(r"^KINDS = \(([^)]*)\)", own, re.M | re.S).group(1)
-api_kinds = set(re.findall(r'"(\w+)"', kinds)) | {"pdf", "epub", "djvu", "djv", "cbz", "cbr"}
-ok('("pdf", "epub", "djvu", "djv", "cbz", "cbr") + ownbooks.KINDS' in api, "the api builds its list from these six and what ownbooks reads")
+data = set(re.findall(r'"(\w+)"', re.search(r"^DATA_KINDS = \(([^)]*)\)", own, re.M | re.S).group(1)))
+api_kinds = (set(re.findall(r'"(\w+)"', kinds)) - data) | {"pdf", "epub", "djvu", "djv", "cbz", "cbr"}
+ok('("pdf", "epub", "djvu", "djv", "cbz", "cbr") + tuple(k for k in ownbooks.KINDS if k not in ownbooks.DATA_KINDS)' in api,
+   "the api builds its list from these six and what ownbooks reads, without the kinds that are data")
 ok(set(ns["BOOK_KINDS"]) == api_kinds, f"crawler and api agree on what a book is: {sorted(set(ns['BOOK_KINDS']) ^ api_kinds)}")
 ok(ns["BOOK_RX"].search("War and Peace.FB2") and not ns["BOOK_RX"].search("setup.exe") and not ns["BOOK_RX"].search("fb2"), "by the end of the name")
 ok(ns["BOOK_SQL"] == "file_name ~* '\\.(" + "|".join(ns["BOOK_KINDS"]) + ")$'", "the same list for PostgreSQL")
