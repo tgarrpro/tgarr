@@ -69,4 +69,7 @@ T = {
     "Other": ("其他", "其他", "Otros", "Autre", "Sonstiges", "Outros", "Другое", "その他", "기타", "אחר", "أخرى"),
     # (the word "History" alone is taken: it is the record of what was downloaded)
     "History and society": ("历史与社会", "歷史與社會", "Historia y sociedad", "Histoire et société", "Geschichte und Gesellschaft", "História e sociedade", "История и общество", "歴史・社会", "역사와 사회", "היסטוריה וחברה", "التاريخ والمجتمع"),
+    # on a lesson's own page, when it has been done
+    "done": ("已完成", "已完成", "hecho", "terminé", "fertig", "concluída", "готово", "完了", "완료", "הושלם", "تم"),
+    "Next lesson": ("下一课", "下一課", "Siguiente lección", "Leçon suivante", "Nächste Lektion", "Próxima aula", "Следующий урок", "次のレッスン", "다음 수업", "השיעור הבא", "الدرس التالي"),
 }

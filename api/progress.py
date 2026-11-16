@@ -63,11 +63,51 @@ def seed(row) -> str:
     return json.dumps({"keys": keys, "val": row["val"], "at": int(row["at"])}).replace("</", "<\\/")
 
 
-# The script. __ID__ = the file, __SEED__ = seed() of what is stored. It must run before the
-# page's own script, which reads its place as soon as it starts.
+def nav(course) -> str:
+    """What the page is told when the file is a lesson of a course: where in the course it
+    stands and what comes before and after ({"n", "total", "prev", "next", "back", "title",
+    "word_next", "word_done"}), as JSON for the script - or "null"."""
+    if not course:
+        return "null"
+    return json.dumps(course, ensure_ascii=False).replace("</", "<\\/")
+
+
+# The script. __ID__ = the file, __SEED__ = seed() of what is stored, __NAV__ = nav() of the
+# course it is a lesson of. It must run before the page's own script, which reads its place
+# as soon as it starts.
 JS = r"""<script>
 (function(){
-  var ID = __ID__, SEED = __SEED__, ls;
+  var ID = __ID__, SEED = __SEED__, NAV = __NAV__, ls;
+  // a lesson of a course: a small chip says which one it is and leads to the next; when the
+  // lesson is done the chip grows into the way on
+  var chip = null;
+  function lessonChip(done){
+    if (!NAV) return;
+    if (!chip) {
+      chip = document.createElement("div");
+      chip.style.cssText = "position:fixed;z-index:2147483000;right:12px;top:64px;display:flex;align-items:center;gap:8px;padding:6px 8px 6px 12px;" +
+        "border-radius:999px;background:rgba(8,10,16,.72);color:#fff;font:600 13px/1.2 system-ui,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;" +
+        "box-shadow:0 6px 18px rgba(0,0,0,.35);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);max-width:calc(100vw - 24px)";
+      var where = document.createElement("a");
+      where.href = NAV.back; where.textContent = NAV.n + " / " + NAV.total; where.title = NAV.title;
+      where.style.cssText = "color:#fff;text-decoration:none;opacity:.85;white-space:nowrap";
+      chip.appendChild(where);
+      if (NAV.next) {
+        var go = document.createElement("a");
+        go.href = "/watch/" + NAV.next; go.textContent = NAV.word_next + " \u203a"; go.id = "tgNextLesson";
+        go.style.cssText = "color:#0b0d12;background:#fff;text-decoration:none;padding:6px 12px;border-radius:999px;white-space:nowrap";
+        chip.appendChild(go);
+      }
+      (document.body || document.documentElement).appendChild(chip);
+    }
+    if (done) {
+      var g = document.getElementById("tgNextLesson");
+      chip.style.background = "#16a34a"; chip.style.fontSize = "15px"; chip.style.padding = "9px 10px 9px 16px";
+      chip.firstChild.textContent = "\u2713 " + NAV.word_done + " \u00b7 " + NAV.n + " / " + NAV.total;
+      if (g) { g.style.padding = "9px 16px"; g.style.fontWeight = "800"; }
+    }
+  }
+  if (NAV) { if (document.body) lessonChip(false); else document.addEventListener("DOMContentLoaded", function(){ lessonChip(false); }); }
   try { ls = window.localStorage; if (!ls) return; } catch (e) { return; }
   var RX = /^(tgarr\.(?:v|play|read|pdf|a)\.|comic-)(\d+)$/;
   var set = Storage.prototype.setItem, del = Storage.prototype.removeItem;
@@ -110,6 +150,7 @@ JS = r"""<script>
     var f = done ? 1 : frac(key, val);
     next = {key: key, val: val, frac: f, total: length(key), done: !!done || (f !== null && f >= 0.985 && key !== "tgarr.read." ? true : false)};
     if (f !== null && key === "tgarr.read." && f >= 0.995) next.done = true;
+    if (next.done) lessonChip(true);
     if (wait) return;
     wait = setTimeout(function(){ wait = null; send(false); }, Math.max(300, 8000 - (Date.now() - last)));
   }
@@ -129,5 +170,5 @@ JS = r"""<script>
 """
 
 
-def script(msg_id: int, row) -> str:
-    return JS.replace("__ID__", str(int(msg_id))).replace("__SEED__", seed(row))
+def script(msg_id: int, row, course=None) -> str:
+    return JS.replace("__ID__", str(int(msg_id))).replace("__NAV__", nav(course)).replace("__SEED__", seed(row))

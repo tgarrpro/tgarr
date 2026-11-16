@@ -2577,9 +2577,34 @@ async def _progress_row(request: Request, msg_id: int):
         return None
 
 
+async def _lesson_nav(request: Request, msg_id: int):
+    """When the file is a lesson of a course this browser may see: its place in the course, and
+    the lessons before and after it."""
+    if db_pool is None:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            r = await conn.fetchrow(
+                f"""SELECT ci.course_id, ci.pos, c.title,
+                           (SELECT count(*) FROM course_items x WHERE x.course_id = ci.course_id) AS total,
+                           (SELECT x.msg_id FROM course_items x WHERE x.course_id = ci.course_id AND x.pos < ci.pos ORDER BY x.pos DESC LIMIT 1) AS prev,
+                           (SELECT x.msg_id FROM course_items x WHERE x.course_id = ci.course_id AND x.pos > ci.pos ORDER BY x.pos LIMIT 1) AS next
+                    FROM course_items ci JOIN courses c ON c.id = ci.course_id
+                    WHERE ci.msg_id = $1 {"AND EXISTS (SELECT 1 FROM kids_allow k WHERE k.kind = 'course' AND k.ref = c.id)" if _LOCKED.get() else ""}
+                    ORDER BY c.added_at DESC LIMIT 1""", int(msg_id))
+    except Exception:
+        return None
+    if not r:
+        return None
+    lang = _LANG.get()
+    return {"n": r["pos"] + 1, "total": r["total"], "prev": r["prev"], "next": r["next"], "title": r["title"],
+            "back": f"/mediacenter?kind=learn&course={r['course_id']}",
+            "word_next": i18n.t(lang, "Next lesson"), "word_done": i18n.t(lang, "done")}
+
+
 async def _progress_js(request: Request, msg_id: int) -> str:
     """The script a player page carries before its own (progress.py)."""
-    return progress.script(msg_id, await _progress_row(request, msg_id))
+    return progress.script(msg_id, await _progress_row(request, msg_id), await _lesson_nav(request, msg_id))
 
 
 @app.get("/api/progress/{msg_id}")

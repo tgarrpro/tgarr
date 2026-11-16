@@ -1,5 +1,7 @@
 # Course lists
 
+(中文: [README.zh.md](README.zh.md))
+
 Every `*.json` in the folders here is a course that tgarr offers under *Media Center & PIN → Courses → Add a
 course*. One folder for each language (`en/`, `de/`, `zh/`, ...): the language the material is in, not a country.
 
@@ -40,7 +42,8 @@ an item with several files gives several lessons, in the order of their names.
 The lessons are the files posted in the channel, in the order they were posted - with `tag`, only the posts whose
 caption carries it, so that one channel can hold many courses in many languages (begin a tag with the language:
 `#zh_pinyin1`, `#de_lesen1`, `#es_lectura2`). Post the lessons in the order they are to be taken; a file's name is
-the lesson's name.
+the lesson's name. The channel has to be public and must **not** have "Restrict saving content" switched on: with
+it on, nobody can read the channel at all.
 
 `upto` is the number of the last post that was read when the list was checked (the number at the end of a post's
 link, `t.me/your_channel/120`). The course takes the channel's posts **up to that one and no further**: whoever

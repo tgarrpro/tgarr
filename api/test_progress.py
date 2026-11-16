@@ -48,6 +48,10 @@ ok("</script" not in evil and json.loads(evil)["val"].startswith("</script>"), "
 page = P.script(42, {"key": "tgarr.a.", "val": "30", "at": 7})
 ok("var ID = 42," in page and '"val": "30"' in page and "__ID__" not in page and "__SEED__" not in page, "the script is filled in")
 ok(P.script(42, None).count("SEED = null") == 1, "and says null when there is nothing")
+ok(P.script(42, None).count("NAV = null") == 1 and "__NAV__" not in page, "a file that is no lesson has no course to show")
+lesson = P.script(42, None, {"n": 3, "total": 20, "prev": 41, "next": 43, "back": "/mediacenter?kind=learn&course=7",
+                             "title": "A </script> course", "word_next": "Next", "word_done": "done"})
+ok('"next": 43' in lesson and "</script> course" not in lesson and lesson.count("</script>") == 1, "a lesson is told its place; a course's title cannot close the script")
 ok(page.strip().startswith("<script>") and page.strip().endswith("</script>") and page.count("<script>") == 1, "one script, closed")
 # the keys the script watches are the keys clean() accepts
 rx = re.search(r"var RX = /\^\((.+?)\)\(\\d\+\)\$/;", P.JS).group(1)
