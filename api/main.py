@@ -10714,10 +10714,10 @@ async def api_usenet_grabs():
 async def page_usenet(q: Optional[str] = None, kind: str = ""):
     cfg = await _usenet_cfg()
     if not (cfg.get("enabled") and cfg.get("host")):
-        body = (_KIDS_CSS + '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">Usenet is not set up</h3>'
-                '<p style="color:var(--muted);margin:0 0 12px">With a Usenet account tgarr reads the newsgroups as well: films and series '
-                'for Sonarr and Radarr, and books, songs and pictures it can fetch itself, straight into the Library, Music and the Gallery.</p>'
-                '<a class="btn" href="/settings/usenet">Set up</a></div></div>')
+        body = (_KIDS_CSS + '<div class="km-box"><div class="km-pad"><h3 style="margin:0 0 6px">' + _t("Usenet is not set up") + '</h3>'
+                '<p style="color:var(--muted);margin:0 0 12px">'
+                + _t("With a Usenet account tgarr reads the newsgroups as well: films and series for Sonarr and Radarr, and books, songs and pictures it can fetch itself, straight into the Library, Music and the Gallery.")
+                + '</p><a class="btn" href="/settings/usenet">' + _t("Set up") + '</a></div></div>')
         return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=""))
     if kind == "have":
         return await _usenet_have_page()
@@ -10754,42 +10754,42 @@ async def page_usenet(q: Optional[str] = None, kind: str = ""):
     qs = f"&q={_q(q)}" if q else ""
     chips = "".join(
         f'<a class="btn ghost km-chip{" on" if k == kind else ""}" href="/usenet?kind={k}{qs}">{lbl} <span style="opacity:.6">{n:,}</span></a>'
-        for k, lbl, n in [("", "All", sum(counts.values()))] + [(s[0], f"{s[1]} {s[2]}", counts.get(s[0], 0)) for s in _UN_SHELVES])
+        for k, lbl, n in [("", _t("All"), sum(counts.values()))] + [(s[0], f"{s[1]} {_t(s[2])}", counts.get(s[0], 0)) for s in _UN_SHELVES])
     chips += ('<a class="btn ghost km-chip" href="/usenet?kind=have" style="margin-left:auto" '
-              f'title="what you fetched, and the room it takes">📥 Fetched <span style="opacity:.6">{_fmt_size(have_bytes) or "0"}</span></a>')
+              f'title="{_t("what you fetched, and the room it takes")}">📥 {_t("Fetched")} <span style="opacity:.6">{_fmt_size(have_bytes) or "0"}</span></a>')
     items = "".join(
         f'<div class="km-row"><span class="n">{ico.get(r["shelf"], "")} {html.escape(r["name"])}'
         + (' <small>· 18+</small>' if r["audience"] == "nsfw" else "")
         # a card from a sparse reading saw only some of a release: one file is measured,
         # several are an estimate, and the count is of those seen
-        + f'<br/><small>{"about " if r["sketch"] and (r["files"] or 0) > 1 else ""}{_fmt_size(r["size"]) or "?"}'
-        + (f' · {r["files"]}{"+" if r["sketch"] else ""} files' if (r["files"] or 0) > 1 else "")
+        + '<br/><small>' + (_t("about {size}", size=_fmt_size(r["size"]) or "?") if r["sketch"] and (r["files"] or 0) > 1 else (_fmt_size(r["size"]) or "?"))
+        + (' · ' + _t("{n} files", n=f'{r["files"]}{"+" if r["sketch"] else ""}') if (r["files"] or 0) > 1 else "")
         + f' · {html.escape(r["grp"])} · {time.strftime("%Y-%m-%d", time.gmtime(r["posted_from"] or 0))}</small></span>'
-        f'<span id="ug-{r["id"]}" style="white-space:nowrap"><button class="btn" onclick="ugGet(&quot;{r["id"]}&quot;,this)">Get</button></span></div>'
+        f'<span id="ug-{r["id"]}" style="white-space:nowrap"><button class="btn" onclick="ugGet(&quot;{r["id"]}&quot;,this)">{_t("Get")}</button></span></div>'
         for r in rows)
     body = (
         _KIDS_CSS
-        + '<p style="color:var(--muted);margin:0 0 14px">Books, songs and pictures found in the newsgroups. <b>Get</b> fetches one through your '
-          'Usenet account and puts it in the Library, Music or the Gallery. Only what was posted whole and can be opened as it is: nothing '
-          'packed, never a program, never video - films and series go to Sonarr and Radarr.</p>'
+        + '<p style="color:var(--muted);margin:0 0 14px">'
+        + _t("Books, songs and pictures found in the newsgroups. %1 fetches one through your Usenet account and puts it in the Library, Music or the Gallery. Only what was posted whole and can be opened as it is: nothing packed, never a program, never video - films and series go to Sonarr and Radarr.").replace("%1", "<b>" + _t("Get") + "</b>")
+        + '</p>'
         + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}</div>'
         + (f'<div class="km-box">{items}</div>' if items else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
-           + ("Nothing found for these words." if q else "Nothing yet. Cards appear here as the newsgroups are read; searching also asks the shared index.")
+           + (_t("Nothing found for these words.") if q else _t("Nothing yet. Cards appear here as the newsgroups are read; searching also asks the shared index."))
            + '</div></div>')
-        + """<script>
+        + _grab_note_js() + _fill("""<script>
 const ugEsc = t => String(t || "").replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
 function ugShow(g){
   const e = document.getElementById("ug-" + g.card_id);
   if (!e) return false;
-  const again = '<button class="btn ghost" onclick="ugGet(&quot;' + g.card_id + '&quot;,this)">Try again</button>';
-  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">Open</a>' : "";
-  if (g.state === "queued") e.innerHTML = '<small>waiting</small>';
-  else if (g.state === "working") e.innerHTML = '<small>fetching' + (g.percent != null ? " " + g.percent + "%" : "") + '</small>';
-  else if (g.state === "done") e.innerHTML = '<small>fetched</small> ' + open;
-  else if (g.state === "partial") e.innerHTML = '<small>' + ugEsc(g.note) + '</small> ' + open;
+  const again = '<button class="btn ghost" onclick="ugGet(&quot;' + g.card_id + '&quot;,this)">' + "[[@js:Try again]]" + '</button>';
+  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">' + "[[@js:Open]]" + '</a>' : "";
+  if (g.state === "queued") e.innerHTML = '<small>' + "[[@js:waiting]]" + '</small>';
+  else if (g.state === "working") e.innerHTML = '<small>' + (g.percent != null ? "[[@js:fetching %1%]]".replace("%1", g.percent) : "[[@js:fetching]]") + '</small>';
+  else if (g.state === "done") e.innerHTML = '<small>' + "[[@js:fetched]]" + '</small> ' + open;
+  else if (g.state === "partial") e.innerHTML = '<small>' + ugEsc(grabNote(g.note)) + '</small> ' + open;
   // "try again" only where trying again can help: not for what is refused for what it is
-  else e.innerHTML = '<small style="color:#b45309">' + ugEsc(g.note || "that did not work") + '</small> '
+  else e.innerHTML = '<small style="color:#b45309">' + ugEsc(grabNote(g.note) || "[[@js:that did not work]]") + '</small> '
     + (!g.note || /try again|room left/.test(g.note) ? again : "");
   return g.state === "queued" || g.state === "working";
 }
@@ -10803,14 +10803,14 @@ function ugPoll(){
 function ugGet(id, b){
   b.disabled = true;
   fetch("/api/usenet/grab", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: id})})
-    .then(r => r.json()).then(j => { if (j.status === "ok") ugPoll(); else { b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") ugPoll(); else { b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { b.disabled = false; });
 }
 ugPoll();
-</script>""")
+</script>"""))
     top = ('<form action="/usenet" method="GET" style="margin-left:auto">'
            + (f'<input type="hidden" name="kind" value="{kind}"/>' if kind else "")
-           + f'<input type="text" name="q" class="search" placeholder="Search books, songs, pictures on Usenet…" value="{html.escape(q, quote=True)}"/></form>')
+           + f'<input type="text" name="q" class="search" placeholder="{_t("Search books, songs, pictures on Usenet…")}" value="{html.escape(q, quote=True)}"/></form>')
     return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Usenet", top_actions_html=top))
 
 
@@ -11216,13 +11216,13 @@ const agEsc = t => String(t || "").replace(/[&<>]/g, c => ({"&": "&amp;", "<": "
 function agShow(g){
   const e = document.querySelector('[data-ag="' + CSS.escape(g.item_id) + '"]');
   if (!e) return false;
-  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">Open</a>' : "";
-  if (g.state === "queued") e.innerHTML = '<small>waiting</small>';
-  else if (g.state === "working") e.innerHTML = '<small>fetching' + (g.percent != null ? " " + g.percent + "%" : "") + '</small>';
-  else if (g.state === "done") e.innerHTML = '<small>fetched</small> ' + open;
-  else if (g.state === "partial") e.innerHTML = '<small>' + agEsc(g.note) + '</small> ' + open;
-  else e.innerHTML = '<small style="color:#b45309">' + agEsc(g.note || "that did not work") + '</small> '
-    + (!g.note || /try again|room left/.test(g.note) ? '<button class="btn ghost" data-again="1">Try again</button>' : "");
+  const open = g.msg_id ? '<a class="btn ghost" href="/watch/' + g.msg_id + '">' + "[[@js:Open]]" + '</a>' : "";
+  if (g.state === "queued") e.innerHTML = '<small>' + "[[@js:waiting]]" + '</small>';
+  else if (g.state === "working") e.innerHTML = '<small>' + (g.percent != null ? "[[@js:fetching %1%]]".replace("%1", g.percent) : "[[@js:fetching]]") + '</small>';
+  else if (g.state === "done") e.innerHTML = '<small>' + "[[@js:fetched]]" + '</small> ' + open;
+  else if (g.state === "partial") e.innerHTML = '<small>' + agEsc(grabNote(g.note)) + '</small> ' + open;
+  else e.innerHTML = '<small style="color:#b45309">' + agEsc(grabNote(g.note) || "[[@js:that did not work]]") + '</small> '
+    + (!g.note || /try again|room left/.test(g.note) ? '<button class="btn ghost" data-again="1">' + "[[@js:Try again]]" + '</button>' : "");
   const again = e.querySelector("[data-again]");
   if (again) again.onclick = () => agGet(e, again);
   return g.state === "queued" || g.state === "working";
@@ -11238,14 +11238,14 @@ function agGet(e, b){
   b.disabled = true;
   fetch("/api/archive/grab", {method: "POST", headers: {"Content-Type": "application/json"},
                               body: JSON.stringify({id: e.dataset.ag, name: e.dataset.name, shelf: e.dataset.shelf})})
-    .then(r => r.json()).then(j => { if (j.status === "ok") agPoll(); else { b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") agPoll(); else { b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { b.disabled = false; });
 }
 function agForget(body, what, b){
-  if (!confirm("Remove " + what + " from this server? The files are deleted; they can be fetched again from the Internet Archive.")) return;
+  if (!confirm(what)) return;
   if (b) b.disabled = true;
   fetch("/api/archive/forget", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
-    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { if (b) b.disabled = false; });
 }
 document.querySelectorAll("[data-ag] button").forEach(b => { b.onclick = () => agGet(b.parentElement, b); });
@@ -11274,27 +11274,32 @@ async def page_archive(q: Optional[str] = None, shelf: str = "film", page: int =
         cur.update(over)
         bits = [f"{k}={_q(str(v))}" for k, v in cur.items() if v not in (None, "", 0)]
         return "/archive" + ("?" + "&".join(bits) if bits else "")
-    chips = ("".join(_chip_link(f"{s[1]} {s[2]}", link(shelf=s[0] if s[0] != "film" else None), kind != "have" and shelf == s[0])
+    shelf_word = {"film": _t("Films"), "audiobook": _t("Audiobooks"), "audio": _t("Music and radio"),
+                  "book": _t("Books and magazines"), "picture": _t("Pictures")}
+    chips = ("".join(_chip_link(f"{s[1]} {shelf_word.get(s[0], s[2])}", link(shelf=s[0] if s[0] != "film" else None), kind != "have" and shelf == s[0])
                      for s in archive_org.SHELVES)
-             + (_chip_link(f"📥 Fetched {_fmt_size(have_bytes) or ''}".strip(), link(kind="have", q=None, shelf=None), kind == "have",
-                           "what you fetched from the Internet Archive, and the way to remove it") if have else ""))
+             + (_chip_link(("📥 " + _t("Fetched") + f" {_fmt_size(have_bytes) or ''}").strip(), link(kind="have", q=None, shelf=None), kind == "have",
+                           html.unescape(_t("what you fetched from the Internet Archive, and the way to remove it"))) if have else ""))
     if kind == "have":
+        ar_one = html.escape(_tj("Remove this item from this server? The files are deleted; they can be fetched again from the Internet Archive."), quote=True)
+        ar_all = html.escape(_tj("Remove everything fetched from the Internet Archive from this server? The files are deleted; they can be fetched again from the Internet Archive."), quote=True)
         items = "".join(
             f'<div class="km-row"><span class="n">{html.escape((r["cap"] or "").split(" · ")[0])}'
-            f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {r["files"]} file{"s" if r["files"] != 1 else ""} · fetched {_ago(r["fetched"])}</small></span>'
+            f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {_t("files: {n}", n=r["files"])} · {_t("fetched %1").replace("%1", _ago(r["fetched"]))}</small></span>'
             '<span style="white-space:nowrap">'
-            f'<a class="btn ghost" href="/watch/{r["first"]}">Open</a> '
-            f'<button class="btn ghost" onclick="agForget({{release:&quot;{r["key"]}&quot;}},&quot;this item&quot;,this)">Delete</button></span></div>'
+            f'<a class="btn ghost" href="/watch/{r["first"]}">{_t("Open")}</a> '
+            f'<button class="btn ghost" onclick="agForget({{release:&quot;{r["key"]}&quot;}},&quot;{ar_one}&quot;,this)">{_t("Delete")}</button></span></div>'
             for r in have)
         body = (_KIDS_CSS
-                + f'<p style="color:var(--muted);margin:0 0 14px">What you fetched from the Internet Archive: <b>{len(have):,}</b> item{"s" if len(have) != 1 else ""}, '
-                  f'<b>{_fmt_size(have_bytes) or "0 MB"}</b>. You asked for each of these, so tgarr never removes one by itself.</p>'
+                + '<p style="color:var(--muted);margin:0 0 14px">'
+                + _t("Items fetched from the Internet Archive: %1, taking %2. You asked for each of these, so tgarr never removes one by itself.")
+                  .replace("%1", f"<b>{len(have):,}</b>").replace("%2", f'<b>{_fmt_size(have_bytes) or "0 MB"}</b>') + '</p>'
                 + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}'
-                + ('<button class="btn ghost" style="margin-left:auto" onclick="agForget({all:true},&quot;everything fetched from the Internet Archive&quot;,this)">'
-                   f'🗑 Delete all ({_fmt_size(have_bytes) or "0"})</button>' if have else "")
+                + ('<button class="btn ghost" style="margin-left:auto" onclick="agForget({all:true},&quot;' + ar_all + '&quot;,this)">'
+                   f'🗑 {_t("Delete all ({size})", size=_fmt_size(have_bytes) or "0")}</button>' if have else "")
                 + '</div>'
-                + (f'<div class="km-box">{items}</div>' if items else '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing fetched yet.</div></div>')
-                + _AR_JS)
+                + (f'<div class="km-box">{items}</div>' if items else '<div class="km-box"><div class="km-pad" style="color:var(--muted)">' + _t("Nothing fetched yet.") + '</div></div>')
+                + _grab_note_js() + _fill(_AR_JS))
         return HTMLResponse(_layout("Archive", "/archive", body, page_title="Fetched from the Internet Archive", top_actions_html=""))
     total, found, trouble = await _archive_search(q, shelf, page)
     sign = archive_org.SHELF[shelf][1]
@@ -11303,35 +11308,35 @@ async def page_archive(q: Optional[str] = None, shelf: str = "film", page: int =
         + (f' <small>({html.escape(i["year"])})</small>' if i["year"] else "")
         + '<br/><small>'
         + " · ".join(x for x in ((html.escape(i["creator"]) if i["creator"] else ""),
-                                 (f'up to {_fmt_size(i["size"])}' if i["size"] else ""),
-                                 f'{i["downloads"]:,} downloads',
+                                 (_t("up to {size}", size=_fmt_size(i["size"])) if i["size"] else ""),
+                                 _t("{n} downloads", n=format(i["downloads"], ",")),
                                  f'<a href="https://archive.org/details/{html.escape(i["id"], quote=True)}" target="_blank" rel="noopener noreferrer">archive.org ↗</a>') if x)
         + '</small></span>'
         f'<span data-ag="{html.escape(i["id"], quote=True)}" data-name="{html.escape(i["title"], quote=True)}" data-shelf="{shelf}" style="white-space:nowrap">'
-        '<button class="btn">Get</button></span></div>'
+        '<button class="btn">' + _t("Get") + '</button></span></div>'
         for i in found)
     pages = ""
     if total > archive_org.ROWS or page > 1:
         last = min(250, (total + archive_org.ROWS - 1) // archive_org.ROWS)
         pages = ('<div style="display:flex;gap:8px;align-items:center;margin-top:14px">'
-                 + (f'<a class="btn ghost" href="{html.escape(link(page=page - 1 if page > 2 else None), quote=True)}">← Earlier</a>' if page > 1 else "")
-                 + f'<span style="color:var(--muted);font-size:13px">page {page} of {max(last, 1):,} · {total:,} found</span>'
-                 + (f'<a class="btn ghost" href="{html.escape(link(page=page + 1), quote=True)}">More →</a>' if page < last else "")
+                 + (f'<a class="btn ghost" href="{html.escape(link(page=page - 1 if page > 2 else None), quote=True)}">← {_t("Earlier")}</a>' if page > 1 else "")
+                 + f'<span style="color:var(--muted);font-size:13px">{_t("page {page} of {last} · {total} found", page=page, last=format(max(last, 1), ","), total=format(total, ","))}</span>'
+                 + (f'<a class="btn ghost" href="{html.escape(link(page=page + 1), quote=True)}">{_t("More")} →</a>' if page < last else "")
                  + '</div>')
     body = (
         _KIDS_CSS
-        + '<p style="color:var(--muted);margin:0 0 14px">The <a href="https://archive.org" target="_blank" rel="noopener noreferrer">Internet Archive</a> keeps '
-          'films, radio plays, audiobooks, books, magazines and recordings that anybody may download - no account, no provider. '
-          '<b>Get</b> fetches an item to this server and puts it in Videos, Music or the Library: one playable copy of it, never a program. '
-          'Without words, a shelf shows what is downloaded most.</p>'
+        + '<p style="color:var(--muted);margin:0 0 14px">'
+        + _t("The %1 keeps films, radio plays, audiobooks, books, magazines and recordings that anybody may download - no account, no provider. %2 fetches an item to this server and puts it in Videos, Music or the Library: one playable copy of it, never a program. Without words, a shelf shows what is downloaded most.")
+          .replace("%1", '<a href="https://archive.org" target="_blank" rel="noopener noreferrer">' + _t("Internet Archive") + '</a>').replace("%2", "<b>" + _t("Get") + "</b>")
+        + '</p>'
         + f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">{chips}</div>'
         + (f'<div class="km-box">{items}</div>' if items else
            '<div class="km-box"><div class="km-pad" style="color:var(--muted)">'
-           + (html.escape(trouble) if trouble else "Nothing found for these words on this shelf.") + '</div></div>')
-        + pages + _AR_JS)
+           + (_t(trouble) if trouble else _t("Nothing found for these words on this shelf.")) + '</div></div>')
+        + pages + _grab_note_js() + _fill(_AR_JS))
     top = ('<form action="/archive" method="GET" style="margin-left:auto">'
            + (f'<input type="hidden" name="shelf" value="{shelf}"/>' if shelf != "film" else "")
-           + f'<input type="text" name="q" class="search" placeholder="Search the Internet Archive…" value="{html.escape(q, quote=True)}"/></form>')
+           + f'<input type="text" name="q" class="search" placeholder="{_t("Search the Internet Archive…")}" value="{html.escape(q, quote=True)}"/></form>')
     return HTMLResponse(_layout("Archive", "/archive", body, page_title="Internet Archive", top_actions_html=top))
 
 
@@ -11363,12 +11368,44 @@ async def api_usenet_forget(request: Request):
     return {"status": "ok", "removed": len(paths), "freed": _fmt_size(sum(r["sz"] for r in rows)) or "0 MB"}
 
 
+# What a fetch says when it did not go well (usenet_grabs.note, archive_grabs.note) is kept in
+# English; a page shows it in the language of its reader. The same sentences as in
+# _usenet_grab_one, _archive_grab_one, usenet_fetch and archive_org.plan.
+_GRAB_NOTES = (
+    "it is no longer in the index", "it is no longer on the news server", "it is no longer whole on the news server",
+    "never fetched: the block list", "nothing in it that can be opened as it is", "not enough room left on the disk",
+    "the news server did not answer - try again later", "video is not fetched by tgarr - give it to Sonarr or Radarr",
+    "packed in an archive: it needs a real downloader to repair and unpack", "too large to fetch here",
+    "archive.org did not answer (asked three times) - try again later", "it did not arrive from archive.org - try again later",
+    "that did not work - try again later", "the Internet Archive no longer shows this item",
+    "this one can only be borrowed at archive.org, not downloaded", "not a film, a recording, a book or a picture",
+    "nothing in it that can be played or read as it is",
+)
+_GRAB_NOTE_JS = """<script>
+const grabNotes = __NOTES__;
+function grabNote(n){
+  return String(n || "").split("; ").map(p => {
+    let m = /^([0-9]+) of ([0-9]+) files arrived whole$/.exec(p);
+    if (m) return "[[@js:%1 of %2 files arrived whole]]".replace("%1", m[1]).replace("%2", m[2]);
+    m = /^the first ([0-9]+) of ([0-9]+) files: the rest is over what one fetch may be$/.exec(p);
+    if (m) return "[[@js:the first %1 of %2 files: the rest is over what one fetch may be]]".replace("%1", m[1]).replace("%2", m[2]);
+    return grabNotes[p] || p;
+  }).join("; ");
+}
+</script>"""
+
+
+def _grab_note_js() -> str:
+    words = _json.dumps({n: i18n.t(_LANG.get(), n) for n in _GRAB_NOTES}, ensure_ascii=False).replace("</", "<" + chr(92) + "/")
+    return _fill(_GRAB_NOTE_JS).replace("__NOTES__", words)
+
+
 _UN_FORGET_JS = """<script>
 function ugForget(body, what, b){
-  if (!confirm("Remove " + what + " from this server? The files are deleted; they can be fetched again only while the post is still on Usenet.")) return;
+  if (!confirm(what)) return;
   if (b) b.disabled = true;
   fetch("/api/usenet/forget", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
-    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "that did not work"); } })
+    .then(r => r.json()).then(j => { if (j.status === "ok") location.reload(); else { if (b) b.disabled = false; alert(j.message || "[[@js:that did not work]]"); } })
     .catch(() => { if (b) b.disabled = false; });
 }
 </script>"""
@@ -11387,29 +11424,32 @@ async def _usenet_have_page() -> HTMLResponse:
                 WHERE {_FROM_USENET} AND m.local_path IS NOT NULL AND left(m.local_path, 2) <> '__'
                 GROUP BY 1 ORDER BY max(m.id) DESC LIMIT 500""")
     total = sum(r["bytes"] for r in rows)
+    un_one = html.escape(_tj("Remove this release from this server? The files are deleted; they can be fetched again only while the post is still on Usenet."), quote=True)
+    un_all = html.escape(_tj("Remove everything fetched from Usenet from this server? The files are deleted; they can be fetched again only while the post is still on Usenet."), quote=True)
     items = "".join(
         f'<div class="km-row"><span class="n">{html.escape((r["cap"] or "").split(" · ")[0] or os.path.basename(r["path"]))}'
-        + (' <small>· ♥ kept</small>' if r["fav"] else "")
-        + f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {r["files"]} file{"s" if r["files"] != 1 else ""}'
+        + (f' <small>· ♥ {_t("kept")}</small>' if r["fav"] else "")
+        + f'<br/><small>{_fmt_size(r["bytes"]) or "0"} · {_t("files: {n}", n=r["files"])}'
         + (f' · {html.escape(r["grp"])}' if r["grp"] else "")
-        + f' · fetched {_ago(r["fetched"])}' + (f' · opened {_ago(r["used"])}' if r["used"] else ' · not opened yet')
+        + ' · ' + _t("fetched %1").replace("%1", _ago(r["fetched"]))
+        + ' · ' + (_t("opened %1").replace("%1", _ago(r["used"])) if r["used"] else _t("not opened yet"))
         + '</small></span><span style="white-space:nowrap">'
-        f'<a class="btn ghost" href="/watch/{r["first"]}">Open</a> '
-        f'<button class="btn ghost" onclick="ugForget({{release:&quot;{r["key"]}&quot;}},&quot;this release&quot;,this)">Delete</button></span></div>'
+        f'<a class="btn ghost" href="/watch/{r["first"]}">{_t("Open")}</a> '
+        f'<button class="btn ghost" onclick="ugForget({{release:&quot;{r["key"]}&quot;}},&quot;{un_one}&quot;,this)">{_t("Delete")}</button></span></div>'
         for r in rows)
     body = (
         _KIDS_CSS
-        + f'<p style="color:var(--muted);margin:0 0 14px">What you fetched from Usenet: <b>{len(rows):,}</b> release{"s" if len(rows) != 1 else ""}, '
-          f'<b>{_fmt_size(total) or "0 MB"}</b>. '
-        + 'You asked for each of these, so tgarr never removes one by itself: they stay until you delete them here.</p>'
-        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
-        '<a class="btn ghost km-chip" href="/usenet">← Find more</a>'
-        + ('<button class="btn ghost" style="margin-left:auto" onclick="ugForget({all:true},&quot;everything fetched from Usenet&quot;,this)">'
-           f'🗑 Delete all ({_fmt_size(total) or "0"})</button>' if rows else "")
+        + '<p style="color:var(--muted);margin:0 0 14px">'
+        + _t("Releases fetched from Usenet: %1, taking %2. You asked for each of these, so tgarr never removes one by itself: they stay until you delete them here.")
+          .replace("%1", f"<b>{len(rows):,}</b>").replace("%2", f'<b>{_fmt_size(total) or "0 MB"}</b>')
+        + '</p><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+        '<a class="btn ghost km-chip" href="/usenet">← ' + _t("Find more") + '</a>'
+        + ('<button class="btn ghost" style="margin-left:auto" onclick="ugForget({all:true},&quot;' + un_all + '&quot;,this)">'
+           f'🗑 {_t("Delete all ({size})", size=_fmt_size(total) or "0")}</button>' if rows else "")
         + '</div>'
         + (f'<div class="km-box">{items}</div>' if items else
-           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">Nothing fetched yet.</div></div>')
-        + _UN_FORGET_JS)
+           '<div class="km-box"><div class="km-pad" style="color:var(--muted)">' + _t("Nothing fetched yet.") + '</div></div>')
+        + _fill(_UN_FORGET_JS))
     return HTMLResponse(_layout("Usenet", "/usenet", body, page_title="Fetched from Usenet", top_actions_html=""))
 
 
@@ -11875,9 +11915,9 @@ poll();
 async def page_settings_usenet(request: Request):
     cfg = await _usenet_cfg(fresh=True)
     ready = await _usenet_ready() if cfg.get("enabled") and cfg.get("host") else False
-    state = ('<span class="pill ok">working</span>' if ready else
-             '<span class="pill muted">switched off</span>' if not cfg.get("enabled") else
-             f'<span class="pill bad">not working</span> <span style="color:var(--muted)">{html.escape(_USENET["msg"])}</span>')
+    state = (f'<span class="pill ok">{_t("working")}</span>' if ready else
+             f'<span class="pill muted">{_t("switched off")}</span>' if not cfg.get("enabled") else
+             f'<span class="pill bad">{_t("not working")}</span> <span style="color:var(--muted)">{html.escape(_USENET["msg"])}</span>')
     base = _base_url(request)
     body = f"""<style>.un-box{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:22px}}
 .un-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0}}
@@ -11893,30 +11933,24 @@ async def page_settings_usenet(request: Request):
 </style>
 <div class="un-box"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px">
 <h3 style="margin:0;flex:1">Usenet {state}</h3>
-<label class="un-sw" title="switch Usenet on or off"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""} onchange="unToggle(this)"/><span></span><b>{"On" if cfg.get("enabled") else "Off"}</b></label></div>
-<p style="color:var(--muted);margin:0 0 4px">With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small
-card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram.
-Films and series are never downloaded by tgarr itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet). Small things posted whole - a book, a song, a picture - tgarr fetches itself, on the <a href="/usenet">Usenet</a> page.</p>
-<p style="color:var(--muted);margin:6px 0 4px">Newsgroups hold fifteen years of posts, far more than one account reads in a lifetime, so the
-reading is shared, as it is for Telegram: tgarr.me hands every install a different stretch of a group, takes back the cards found
-there - a name, who posted it, where it lies - and a search here also finds what the others found. No file, no NZB and nothing
-about your account or your provider's name is sent. Reading the index uses one connection, so that your downloader keeps the rest.</p>
+<label class="un-sw" title="{_t("switch Usenet on or off")}"><input type="checkbox" id="unOn" {"checked" if cfg.get("enabled") else ""} onchange="unToggle(this)"/><span></span><b>{_t("On") if cfg.get("enabled") else _t("Off")}</b></label></div>
+<p style="color:var(--muted);margin:0 0 4px">{_t("With a Usenet account, tgarr reads newsgroup headers a little at a time, keeps a small card for every named film, episode, album and book it finds, and offers them to Sonarr and Radarr beside what it finds on Telegram. Films and series are never downloaded by tgarr itself: Sonarr hands the NZB to your Usenet downloader (SABnzbd, NZBGet). Small things posted whole - a book, a song, a picture - tgarr fetches itself, on the %1 page.").replace("%1", '<a href="/usenet">Usenet</a>')}</p>
+<p style="color:var(--muted);margin:6px 0 4px">{_t("Newsgroups hold fifteen years of posts, far more than one account reads in a lifetime, so the reading is shared, as it is for Telegram: tgarr.me hands every install a different stretch of a group, takes back the cards found there - a name, who posted it, where it lies - and a search here also finds what the others found. No file, no NZB and nothing about your account or your provider's name is sent. Reading the index uses one connection, so that your downloader keeps the rest.")}</p>
 <div class="un-grid">
-<label>News server<input id="unHost" value="{html.escape(cfg.get("host") or "", quote=True)}" placeholder="news.example.com"/></label>
-<label>Port<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
-<label>User name<input id="unUser" value="{html.escape(cfg.get("user") or "", quote=True)}" autocomplete="off"/></label>
-<label>Password<input id="unPass" type="password" placeholder="{"kept - leave empty to keep it" if cfg.get("pass") else ""}" autocomplete="new-password"/></label>
-<label>Data it may use per day, in MB<input id="unDay" type="number" step="100" min="0" value="{round(cfg.get("per_day", 2000000) * 350 / 1e6)}"/></label>
+<label>{_t("News server")}<input id="unHost" value="{html.escape(cfg.get("host") or "", quote=True)}" placeholder="news.example.com"/></label>
+<label>{_t("Port")}<input id="unPort" type="number" value="{cfg.get("port") or 563}"/></label>
+<label>{_t("User name")}<input id="unUser" value="{html.escape(cfg.get("user") or "", quote=True)}" autocomplete="off"/></label>
+<label>{_t("Password")}<input id="unPass" type="password" placeholder="{_t("kept - leave empty to keep it") if cfg.get("pass") else ""}" autocomplete="new-password"/></label>
+<label>{_t("Data it may use per day, in MB")}<input id="unDay" type="number" step="100" min="0" value="{round(cfg.get("per_day", 2000000) * 350 / 1e6)}"/></label>
 </div>
-<label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> use TLS (port 563)</label>
+<label style="display:flex;gap:8px;align-items:center;margin:6px 0"><input type="checkbox" id="unSsl" {"checked" if cfg.get("ssl", True) else ""}/> {_t("use TLS (port 563)")}</label>
 <div style="height:8px"></div>
-<button class="btn" onclick="unSave()">Save and test</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span>
-<p style="color:var(--muted);margin:14px 0 0;font-size:14px">No Usenet account yet, or thinking of a second one? What to look for, and which
-providers are the same network under another name: <a href="https://tgarr.me/usenet/" target="_blank" rel="noopener">tgarr.me/usenet</a>.</p></div>
-<h2 class="section">In Sonarr and Radarr</h2>
-<div class="un-box"><p style="margin:0 0 8px">Add a second indexer (Newznab), beside the existing "tgarr" one, and give it your Usenet downloader:</p>
-<p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · API path <code>/api</code> · API key: the same as for "tgarr"<br/>
-Download client: <b>SABnzbd</b> (or NZBGet) - not "tgarr". An indexer goes to one download client, which is why Usenet needs its own entry.</p></div>
+<button class="btn" onclick="unSave()">{_t("Save and test")}</button> <span id="unMsg" style="color:var(--muted);margin-left:10px"></span>
+<p style="color:var(--muted);margin:14px 0 0;font-size:14px">{_t("No Usenet account yet, or thinking of a second one? What to look for, and which providers are the same network under another name: %1.").replace("%1", '<a href="https://tgarr.me/usenet/" target="_blank" rel="noopener">tgarr.me/usenet</a>')}</p></div>
+<h2 class="section">{_t("In Sonarr and Radarr")}</h2>
+<div class="un-box"><p style="margin:0 0 8px">{_t("Add a second indexer (Newznab), beside the existing “tgarr” one, and give it your Usenet downloader:")}</p>
+<p style="margin:0;line-height:1.9">URL <code>{html.escape(base)}/newznab/usenet</code> · {_t("API path")} <code>/api</code> · {_t("API key: the same as for “tgarr”")}<br/>
+{_t("Download client: %1 (or NZBGet) - not “tgarr”. An indexer goes to one download client, which is why Usenet needs its own entry.").replace("%1", "<b>SABnzbd</b>")}</p></div>
 <script>
 function unToggle(el){{
   // the switch works at once, without touching the account fields
@@ -11925,14 +11959,14 @@ function unToggle(el){{
     .catch(() => {{ el.checked = !el.checked; }});
 }}
 function unSave(){{
-  const m = document.getElementById("unMsg"); m.textContent = "testing…";
+  const m = document.getElementById("unMsg"); m.textContent = "{_tj("testing…")}";
   fetch("/api/usenet/settings", {{method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{
     enabled: document.getElementById("unOn").checked, host: document.getElementById("unHost").value,
     port: +document.getElementById("unPort").value, ssl: document.getElementById("unSsl").checked,
     user: document.getElementById("unUser").value, password: document.getElementById("unPass").value,
     per_day: Math.round(+document.getElementById("unDay").value * 1e6 / 350)}})}}).then(r => r.json())
-    .then(j => {{ m.textContent = j.working ? "saved - the server answers" : "saved - " + (j.message || "not working"); setTimeout(() => location.reload(), 1200); }})
-    .catch(() => {{ m.textContent = "could not save"; }});
+    .then(j => {{ m.textContent = j.working ? "{_tj("saved - the server answers")}" : "{_tj("saved - %1")}".replace("%1", j.message || "{_tj("not working")}"); setTimeout(() => location.reload(), 1200); }})
+    .catch(() => {{ m.textContent = "{_tj("could not save")}"; }});
 }}
 </script>"""
     return HTMLResponse(_layout("Usenet", "/settings", body, page_title="Usenet", top_actions_html=""))
@@ -13398,8 +13432,8 @@ async def page_gallery(channel: Optional[str] = None, limit: int = 240,
                        "⬇ " + _t("Download all {n}", n=format(picked["n"], ","))) if (picked and _in)
            else _export_btn({"scope": "private", "kind": "photo"}, "⬇ " + _t("Download all")) if (private and _in)
            else ('<button class="btn ghost" style="padding:5px 12px;font-size:12px" '
-                 f'onclick="ugForget({{grp:{html.escape(_json.dumps(grp), quote=True)}}},&quot;everything fetched from this newsgroup&quot;,this)">'
-                 f'🗑 {_t("Delete this newsgroup")}</button>' + _UN_FORGET_JS) if grp
+                 f'onclick="ugForget({{grp:{html.escape(_json.dumps(grp), quote=True)}}},&quot;{html.escape(_tj("Remove everything fetched from this newsgroup from this server? The files are deleted; they can be fetched again only while the post is still on Usenet."), quote=True)}&quot;,this)">'
+                 f'🗑 {_t("Delete this newsgroup")}</button>' + _fill(_UN_FORGET_JS)) if grp
            else f'<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/usenet?kind=have">🗑 {_t("Manage…")}</a>' if usenet
            else f'<a class="btn ghost" style="padding:5px 12px;font-size:12px" href="/archive?kind=have">🗑 {_t("Manage…")}</a>' if archive
            else "")
