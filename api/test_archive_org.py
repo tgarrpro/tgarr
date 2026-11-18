@@ -118,6 +118,8 @@ ok(not A.is_the_film("Night of the living dead Trailer", "", "night of the livin
    and A.is_the_film("The Making of a Murderer", "", "the making of a murderer", ""), "its trailer, its music: not the film - unless the word is part of what was asked")
 ok(not A.is_the_film("Day of the Dead", "1985", "night of the living dead", "") and not A.is_the_film("Anything", "", "", ""), "another film; nothing asked")
 ok(A.release_name("Night of the Living Dead", "1968", 1080) == "Night.of.the.Living.Dead.1968.1080p.WEB-archive.org", "a name Radarr reads")
+ok(A.release_name("tweakers.6325 Tears of Steel", "2012", 480, "tears of steel") == "Tears.of.Steel.2012.480p.WEB-archive.org",
+   "an uploader's prefix before the asked title is left out (Radarr refused it)")
 ok(A.release_name("Duck & Cover!", "1951", 480) == "Duck.Cover.1951.480p.WEB-archive.org" and A.release_name("X", "", 0) == "X.SD.WEB-archive.org"
    and A.release_name("Y", "1999", 720).endswith(".720p.WEB-archive.org"), "quality from the picture's height; no height: SD")
 p = A.plan(item("movies", [F("a.mp4", 500, height="480"), F("b.mp4", 900, height="1080")]))

@@ -274,9 +274,18 @@ def parse_registry(body) -> list:
     return out
 
 
-def release_name(title: str, year: str, height: int) -> str:
+def release_name(title: str, year: str, height: int, asked: str = "") -> str:
+    """Title.Year.Quality.WEB-archive.org. With the title that was asked for, the name starts where that
+    title starts in the item's: "tweakers.6325 Tears of Steel" -> Tears.of.Steel (an uploader's prefix in front
+    made Radarr refuse it, QA 2026-11-17 #18)."""
     quality = "1080p" if height >= 1000 else "720p" if height >= 700 else "480p" if height else "SD"
-    name = ".".join(re.findall(r"[^\W_]+", title or "", re.UNICODE))[:150] or "Untitled"
+    words = re.findall(r"[^\W_]+", title or "", re.UNICODE)
+    want = [w.lower() for w in re.findall(r"[^\W_]+", asked or "", re.UNICODE)]
+    if want:
+        low = [w.lower() for w in words]
+        at = next((k for k in range(len(low) - len(want) + 1) if low[k:k + len(want)] == want), 0)
+        words = words[at:]
+    name = ".".join(words)[:150] or "Untitled"
     return f"{name}{'.' + year if year else ''}.{quality}.WEB-archive.org"
 
 

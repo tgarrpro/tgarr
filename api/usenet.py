@@ -357,14 +357,39 @@ class Assembler:
         return list(self.rel.values())
 
 
+# a scene release name: Title.S02E01.Episode.DVDRip.XviD-GROUP, Title.2012.720p.WEB-DL.x264-GROUP
+RX_SCENE = re.compile(r"(?<![\w.])[A-Za-z0-9][\w'&+()]*(?:\.[\w'&+()]+)*?\.(?:S\d{1,2}E\d{1,3}|S\d{1,2}|\d{4})(?:\.[\w+()]+)+-[A-Za-z0-9]+(?![\w.-])")
+
+
+def clean_release_name(t: str) -> str:
+    """A release's name as Sonarr and Radarr read it, out of a posting subject (QA 2026-11-17 #22):
+    "12916]-[FULL]-[#a.b.teevee@EFNet]-[ Lexx.S02E01.Mantrid.DVDRip.XviD-BE ]-[01/50] - yEnc" ->
+    "Lexx.S02E01.Mantrid.DVDRip.XviD-BE". A scene name anywhere in it wins; otherwise the posting
+    header blocks, counters and yEnc tails are taken off and the words are left."""
+    t = t or ""
+    scene = [m.group(0) for m in RX_SCENE.finditer(t)]
+    if scene:
+        return max(scene, key=len)
+    t = re.sub(r"^\s*\[?\s*\d+\s*\]\s*-?", " ", t)                                   # 12916]-  [12916]-
+    t = re.sub(r"\[\s*#?[\w.@-]+@\w+\s*\]|#[\w.]+@\w+", " ", t)                  # [#a.b.teevee@EFNet]
+    t = re.sub(r"\[\s*(FULL|REQ|REPOST|PART|\d{3,})\s*\]|\bREQ\s*\d+\b", " ", t, flags=re.I)
+    t = re.sub(r"[\[(]\s*\d+\s*/\s*\d+\s*[\])]", " ", t)                                 # [01/50] (1/23)
+    t = re.sub(r"\byEnc\b.*$", " ", t, flags=re.I)
+    t = re.sub(r"\.(?:par2|vol\d+\+\d+\.par2|part\d+\.rar|r\d\d|nzb|nfo|sfv)\b", " ", t, flags=re.I)
+    t = re.sub(r"[\[\]<>{}\"]", " ", t)
+    return re.sub(r"\s+", " ", t).strip(" -–—:|>*=#.")
+
+
 def display_name(r: dict) -> str:
     """The name to show and to search: the words of the subject when they say
     something, otherwise the largest file's name."""
-    t = r["title"]
-    t = re.sub(r"\[\s*#?[\w.@-]+@\w+\s*\]|#[\w.]+@\w+", " ", t)          # [#a.b.teevee@EFNet]
-    t = re.sub(r"\[\s*(FULL|REQ|REPOST|\d{3,})\s*\]|\bREQ\s*\d+\b", " ", t, flags=re.I)
-    t = re.sub(r"[\[\]<>{}]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip(" -–—:|>*=#.")
+    t = clean_release_name(r["title"])
+    if not RX_SCENE.fullmatch(t):
+        for f in sorted(r["files"], key=lambda f: -r["files"][f]["bytes"]):     # a file named like a release
+            m = RX_SCENE.search(re.sub(r"\.(mkv|mp4|avi|rar|zip|7z|nzb|nfo)$", "", f or "", flags=re.I))
+            if m:
+                t = m.group(0)
+                break
     if is_random(t) or len(re.sub(r"\W", "", t)) < 6:
         big = max(r["files"].items(), key=lambda kv: kv[1]["bytes"])[0] if r["files"] else ""
         t = base_name(big)
