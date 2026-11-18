@@ -91,4 +91,30 @@ ok("COALESCE(m.local_path, '') <> '__deleted__'" in src, "the export picker take
 ok("stalled.append(r[\"id\"])        # its file is gone" in src, "an export file missing from disk is fetched again")
 ok("rss = not q and season is None and ep is None" in src, "RSS order for tvsearch/movie without a query too")
 
+# --- 0.5.18: Usenet NZBs on any provider (QA #23/#24/#25/#27/#30) -----------------------------------------------
+ok("ADD COLUMN IF NOT EXISTS art_server TEXT" in src and "ADD COLUMN IF NOT EXISTS nzb_gz BYTEA" in src, "a card knows whose numbers it holds, and keeps its NZB")
+cn = src[src.index("def _usenet_card_nzb("):src.index("async def _usenet_card_keep(")]
+ok("usenet_scan.relocate(" in cn and 'return "", "gone", got, None' in cn and '"not_located"' in cn,
+   "another server's numbers: found again by message-id; gone and not-found-yet are told apart")
+ok('c["art_server"] == host' in cn, "the stored numbers are tried only on the server they came from")
+gt = src[src.index('@app.get("/newznab/usenet/api"'):src.index("    where, params = [\"alive >= 0.5\"], []")]
+ok('could not be found on this news server just now; try again later", 503)' in gt and 'no longer on the news server", 404)' in gt,
+   "t=get: 404 only when really gone, 503 (try again) when not found yet")
+ok(src.count("_usenet_card_nzb, ") == 2, "Sonarr's NZB and tgarr's own grab use the same way")
+ok("WHEN EXCLUDED.art_server IS NOT NULL THEN EXCLUDED.art_lo ELSE usenet_cards.art_lo END" in src,
+   "numbers of two servers are never mixed")
+sb = src[src.index("def _usenet_scan_block("):src.index("async def _usenet_count(")]
+ok('mode == "back"' in sb and "newest = max(first, last - count + 1)" in sb and "USENET_START" not in sb, "the scan reads newest first, then backwards")
+ok('mode = "back" if (turns[grp] % 3 == 2 and back_at) else "live"' in src, "two live blocks to one backward block")
+ok("budget, sorted(own))" in src, "the lease asks for the operator's groups and within its budget")
+
+# --- 0.5.18 review ------------------------------------------------------------------------------------------
+st = src[src.index("async def _usenet_store("):src.index("def _nzb_sample_alive(")] if "def _nzb_sample_alive(" in src[src.index("async def _usenet_store("):] else src[src.index("async def _usenet_store("):src.index("async def _usenet_store(") + 3000]
+ok("LEAST(usenet_cards.art_lo, EXCLUDED.art_lo) ELSE EXCLUDED.art_lo END" in st, "the own scan never mixes another server's numbers")
+ok('backs[grp] = cursor if cursor > first else 0' in src and 'and back_at) else "live"' in src, "a finished backward scan stays finished after a restart")
+ok("(resume if mode != \"back\" else cursors.get(grp, live_at))" in src, "live reading restarts where releases still settling begin")
+ok("began > live_at" in src, "a live jump leaves the skipped stretch to the backward reader")
+ok('mode == "back" and r["art_lo"] < start + USENET_SETTLE and start > first' in src, "a release at a backward block's edge is carried over")
+ok("html.unescape(m) for m in re.findall" in src, "kept NZB message-ids are unescaped before STAT")
+
 print(f"ok - {n} checks")

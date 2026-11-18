@@ -520,7 +520,7 @@ import vision  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.17"
+TGARR_VERSION = "0.5.18"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -1068,6 +1068,11 @@ async def _migrate_schema():
             ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS detail SMALLINT NOT NULL DEFAULT 1;
             -- 'nsfw' for adult material (usenet_rules): left out of the feed unless adult content is switched on
             ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'sfw';
+            -- whose article numbers art_lo/art_hi are (numbers are per server; a shared-index card's are another
+            -- provider's), and the NZB once it has been built whole: message-ids are the same on every server, so
+            -- the next grab needs no header reading at all (QA #23, #30)
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS art_server TEXT;
+            ALTER TABLE usenet_cards ADD COLUMN IF NOT EXISTS nzb_gz BYTEA;
             -- small things fetched from Usenet by tgarr itself (usenet_fetch.py): one row per asking
             CREATE TABLE IF NOT EXISTS usenet_grabs (
               id SERIAL PRIMARY KEY, card_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT,
@@ -1097,6 +1102,9 @@ async def _migrate_schema():
               headers BIGINT NOT NULL DEFAULT 0, cards BIGINT NOT NULL DEFAULT 0, bytes BIGINT NOT NULL DEFAULT 0,
               enabled BOOLEAN NOT NULL DEFAULT TRUE, note TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            -- newest first (QA #25): live_next reads what is posted now, back_next works back from where it began
+            ALTER TABLE usenet_progress ADD COLUMN IF NOT EXISTS live_next BIGINT;
+            ALTER TABLE usenet_progress ADD COLUMN IF NOT EXISTS back_next BIGINT;
             -- Media Center: seconds used per device per day (day = days since
             -- 1970 in the owner's time zone), and which items were opened.
             CREATE TABLE IF NOT EXISTS profiles (
@@ -10166,26 +10174,37 @@ async def _usenet_ready(recheck: bool = False) -> bool:
     return bool(_USENET["ok"])
 
 
-def _usenet_scan_block(cfg: dict, grp: str, start, asm, count: int):
-    """Read `count` headers of a group from article `start` (None: from
-    USENET_START), feed them to the group's assembler, and return the cards of
-    the releases that are finished. Runs in a thread."""
-    import calendar
+def _usenet_scan_block(cfg: dict, grp: str, start, asm, count: int, mode: str = "live"):
+    """Read `count` headers of a group, feed them to the assembler, and return the cards of the releases that are
+    finished. Runs in a thread. Newest first (QA #25: reading forward from 2009 at a couple of million headers a
+    day never reached anything posted in the last years):
+      live  from `start` (where the last live block ended), or from the newest `count` articles when that is
+            further back than one block - what is posted now comes first;
+      back  the `count` articles before `start`, working back from where live reading began; every release in
+            the block is handed in when the block is read (nothing arrives behind a backward reader)."""
     import random
     nn = _usenet_connect(cfg)
     try:
         _n, first, last = nn.group(grp)
-        if start is None or start < first:
-            start = usenet.article_at(nn, first, last, calendar.timegm(time.strptime(USENET_START, "%Y-%m-%d")))
-        b0, lo, end = nn.bytes_in, start, min(last, start + count - 1)
+        if mode == "back":
+            hi = min(last, (start or last + 1) - 1)
+            start = max(first, hi - count + 1)
+            end = hi
+        else:
+            newest = max(first, last - count + 1)
+            start = newest if (start is None or start < newest or start > last + 1) else start
+            end = min(last, start + count - 1)
+        b0, lo = nn.bytes_in, start
         while lo <= end:
             for row in nn.over(lo, min(end, lo + 19999)):
                 asm.add(*row)
             lo += 20000
         cursor, cards = end + 1, []
         for k, r in list(asm.rel.items()):
-            if r["art_hi"] >= cursor - USENET_SETTLE and cursor <= last:
+            if mode != "back" and r["art_hi"] >= cursor - USENET_SETTLE and cursor <= last:
                 continue                              # may still be arriving
+            if mode == "back" and r["art_lo"] < start + USENET_SETTLE and start > first:
+                continue                              # its earlier parts are in the next (older) block
             del asm.rel[k]
             c = usenet.card(r)
             if not c:
@@ -10195,7 +10214,9 @@ def _usenet_scan_block(cfg: dict, grp: str, start, asm, count: int):
             c["alive"] = round(sum(1 for m in sample if nn.stat(m)) / max(1, len(sample)), 2)
             cards.append(c)
         resume = min([r["art_lo"] for r in asm.rel.values()] + [cursor])
-        return cards, cursor, max(resume, cursor - USENET_BLOCK), end - start + 1, nn.bytes_in - b0, first, last
+        if mode == "back":
+            return cards, start, start, max(0, end - start + 1), nn.bytes_in - b0, first, last
+        return cards, cursor, max(resume, cursor - USENET_BLOCK), max(0, end - start + 1), nn.bytes_in - b0, first, last
     finally:
         nn.quit()
 
@@ -10217,7 +10238,8 @@ async def _usenet_scan_worker():
     each). Only while Usenet is switched on and the server answers."""
     await asyncio.sleep(90)
     logu = logging.getLogger("tgarr.usenet")
-    asms, cursors, turn = {}, {}, 0
+    import collections as _co
+    asms, backasms, cursors, backs, turn, turns = {}, {}, {}, {}, 0, _co.Counter()
     while True:
         try:
             if not await _usenet_ready():
@@ -10227,7 +10249,7 @@ async def _usenet_scan_worker():
             day = time.strftime("%Y-%m-%d", time.gmtime())
             async with db_pool.acquire() as conn:
                 used = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_today'") or ""
-                rows = await conn.fetch("SELECT grp, next_article, enabled FROM usenet_progress")
+                rows = await conn.fetch("SELECT grp, next_article, live_next, back_next, enabled FROM usenet_progress")
             used_n = int(used.split(":")[1]) if used.startswith(day + ":") else 0
             room = cfg["per_day"] - used_n
             if room < 20000:
@@ -10240,11 +10262,17 @@ async def _usenet_scan_worker():
                 continue
             grp = groups[turn % len(groups)]
             turn += 1
-            start = cursors.get(grp, known[grp]["next_article"] if grp in known else None)
-            asm = asms.setdefault(grp, usenet.Assembler(grp))
+            k = known.get(grp)
+            live_at = cursors.get(grp, k["live_next"] if k else None)
+            back_at = backs.get(grp, k["back_next"] if k else None)
+            # two live blocks to one backward block; backward only once live reading has begun somewhere
+            # back_next: None = not begun, 0 = read back to the oldest article the provider keeps (done)
+            mode = "back" if (turns[grp] % 3 == 2 and back_at) else "live"
+            turns[grp] += 1
+            asm = (backasms if mode == "back" else asms).setdefault(grp, usenet.Assembler(grp))
             try:
                 cards, cursor, resume, n, nbytes, first, last = await asyncio.to_thread(
-                    _usenet_scan_block, cfg, grp, start, asm, min(USENET_BLOCK, room))
+                    _usenet_scan_block, cfg, grp, back_at if mode == "back" else live_at, asm, min(USENET_BLOCK, room), mode)
             except Exception as e:
                 logu.warning("[usenet] %s: %s", grp, str(e)[:120])
                 async with db_pool.acquire() as conn:
@@ -10253,16 +10281,26 @@ async def _usenet_scan_worker():
                            ON CONFLICT (grp) DO UPDATE SET note = $2, updated_at = NOW()""", grp, str(e)[:200])
                 await asyncio.sleep(120)
                 continue
-            cursors[grp] = cursor
+            if mode == "back":
+                backs[grp] = cursor if cursor > first else 0        # back at the oldest article kept: done
+            else:
+                began = cursor - n
+                if (back_at is None and grp not in backs) or (live_at is not None and began > live_at):
+                    # where live reading began - or jumped ahead to, past articles it never read: the backward
+                    # reader goes on from there, so the most recent unread stretch is read first (QA #25 review)
+                    backs[grp] = began
+                cursors[grp] = cursor
             async with db_pool.acquire() as conn:
-                await _usenet_store(conn, cards)
+                await _usenet_store(conn, cards, cfg.get("host"))
                 await conn.execute(
-                    """INSERT INTO usenet_progress (grp, first_article, last_article, next_article, headers, cards, bytes, note)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
-                       ON CONFLICT (grp) DO UPDATE SET first_article = $2, last_article = $3, next_article = $4,
-                           headers = usenet_progress.headers + $5, cards = usenet_progress.cards + $6,
-                           bytes = usenet_progress.bytes + $7, note = NULL, updated_at = NOW()""",
-                    grp, first, last, resume, n, len(cards), nbytes)
+                    """INSERT INTO usenet_progress (grp, first_article, last_article, live_next, back_next, headers, cards, bytes, note)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
+                       ON CONFLICT (grp) DO UPDATE SET first_article = $2, last_article = $3, live_next = $4, back_next = $5,
+                           headers = usenet_progress.headers + $6, cards = usenet_progress.cards + $7,
+                           bytes = usenet_progress.bytes + $8, note = NULL, updated_at = NOW()""",
+                    # live: kept where the releases still settling begin, so a restart reads them whole again
+                    grp, first, last, (resume if mode != "back" else cursors.get(grp, live_at)),
+                    backs.get(grp, back_at), n, len(cards), nbytes)
                 await _usenet_count(conn, "usenet_today", day, n)
             logu.info("[usenet] %s: %s headers, %s cards, %.0f MB", grp, f"{n:,}", len(cards), nbytes / 1e6)
             await asyncio.sleep(20 if cursor <= last else 600)
@@ -10275,19 +10313,28 @@ _USENET_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "p
                 "segments", "segments_expected", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive")
 
 
-async def _usenet_store(conn, cards: list) -> None:
+async def _usenet_store(conn, cards: list, server=None) -> None:
+    """Cards of this install's own scan: their numbers are this server's. A card that held another server's numbers
+    (from the registry) takes these instead; they are never mixed (QA #23 review)."""
+    srv = (server or "").lower() or None
+    cols = _USENET_COLS + ("art_server",)
     for c in cards:
         row = dict(c)
         row["grp"] = row.pop("group", row.get("grp"))
+        row["art_server"] = srv
         await conn.execute(
-            f"""INSERT INTO usenet_cards ({", ".join(_USENET_COLS)})
-                VALUES ({", ".join(f"${i + 1}" for i in range(len(_USENET_COLS)))})
+            f"""INSERT INTO usenet_cards ({", ".join(cols)})
+                VALUES ({", ".join(f"${i + 1}" for i in range(len(cols)))})
                 ON CONFLICT (id) DO UPDATE SET size = EXCLUDED.size, files = EXCLUDED.files,
                     segments = EXCLUDED.segments, segments_expected = EXCLUDED.segments_expected,
-                    complete = EXCLUDED.complete, art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo),
-                    art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi), alive = EXCLUDED.alive,
+                    complete = EXCLUDED.complete,
+                    art_lo = CASE WHEN usenet_cards.art_server IS NOT DISTINCT FROM EXCLUDED.art_server
+                                  THEN LEAST(usenet_cards.art_lo, EXCLUDED.art_lo) ELSE EXCLUDED.art_lo END,
+                    art_hi = CASE WHEN usenet_cards.art_server IS NOT DISTINCT FROM EXCLUDED.art_server
+                                  THEN GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi) ELSE EXCLUDED.art_hi END,
+                    art_server = EXCLUDED.art_server, alive = EXCLUDED.alive,
                     posted_to = EXCLUDED.posted_to""",
-            *[bool(row.get(k)) if k == "complete" else row.get(k) for k in _USENET_COLS])
+            *[bool(row.get(k)) if k == "complete" else row.get(k) for k in cols])
 
 
 def _usenet_nzb(cfg: dict, c) -> str:
@@ -10308,6 +10355,76 @@ def _usenet_nzb(cfg: dict, c) -> str:
         return usenet.build_nzb(rels[0]) if rels else ""
     finally:
         nn.quit()
+
+
+NZB_KEEP_MAX = 8 * 1024 * 1024        # a built NZB is kept (gzipped) up to this size
+
+
+def _nzb_sample_alive(cfg: dict, text: str) -> bool:
+    """A kept NZB is served after a look at three of its articles: still there, or not (retention)."""
+    import random
+    ids = [html.unescape(m) for m in re.findall(r">([^<>\s]+@[^<>\s]+)</segment>", text)]
+    if not ids:
+        return False
+    nn = _usenet_connect(cfg)
+    try:
+        sample = random.sample(ids, min(3, len(ids)))
+        return sum(1 for m in sample if nn.stat(f"<{m}>")) >= max(1, len(sample) - 1)
+    finally:
+        nn.quit()
+
+
+def _usenet_card_nzb(cfg: dict, c, asked: int) -> tuple:
+    """The NZB of a card, whatever server this is. Runs in a thread. Returns (text, state, got, store):
+    state "ok"; "gone" (the server does not have its first article: really no longer there); "not_located" (the
+    server has it but the release could not be put together here - worth trying again, not a dead release).
+    store: what to write back to the card (numbers on this server, the kept NZB), or None.
+    QA #23: a shared-index card's numbers are another provider's; QA #24: one error used to cover every case."""
+    import gzip
+    host = (cfg.get("host") or "").lower()
+    if c["nzb_gz"]:
+        try:
+            text = gzip.decompress(bytes(c["nzb_gz"])).decode("utf-8")
+            if _nzb_sample_alive(cfg, text):
+                return text, "ok", {"kept": True}, None
+        except Exception:
+            pass
+    pad = 6000 if c["detail"] == 0 else 2000
+    got = {"nzb": ""}
+    # the stored numbers, when they are this server's (a card from this install's own scan, or one already found here)
+    if c["art_server"] == host or (not c["sketch"] and c["art_server"] is None):
+        if c["sketch"]:
+            got = usenet_scan.rebuild(cfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"], pad, c["name"], asked)
+        else:
+            got = {"nzb": _usenet_nzb(cfg, c)}
+    if not got["nzb"] and c["first_message_id"]:
+        got = usenet_scan.relocate(cfg, c["grp"], c["poster"], c["key"], c["first_message_id"], c["name"], asked)
+        if got.get("gone"):
+            return "", "gone", got, None
+    if not got["nzb"]:
+        return "", "not_located", got, None
+    store = None
+    if got.get("segments") is not None and not got.get("unread"):
+        gz = gzip.compress(got["nzb"].encode("utf-8"))
+        store = {"art_lo": got.get("art_lo"), "art_hi": got.get("art_hi"), "server": host, "size": got.get("size"),
+                 "files": got.get("files"), "segments": got.get("segments"), "complete": bool(got.get("complete")),
+                 "nzb_gz": gz if got.get("complete") and len(gz) <= NZB_KEEP_MAX else None}
+    return got["nzb"], "ok", got, store
+
+
+async def _usenet_card_keep(card_id: str, store) -> None:
+    """What building a card's NZB taught: its numbers on this server, exact figures, and the NZB itself."""
+    if not store:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE usenet_cards SET size = COALESCE($2, size), files = COALESCE($3, files),
+                      segments = COALESCE($4, segments), complete = $5,
+                      art_lo = COALESCE($6, art_lo), art_hi = COALESCE($7, art_hi), art_server = $8, detail = 1,
+                      nzb_gz = COALESCE($9, nzb_gz)
+               WHERE id = $1""",
+            card_id, store["size"], store["files"], store["segments"], store["complete"],
+            store["art_lo"], store["art_hi"], store["server"], store["nzb_gz"])
 
 
 _USENET_EP_RX = re.compile(r"S(\d{1,2})E(\d{1,3})", re.I)
@@ -10362,44 +10479,39 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
         if not c or usenet_rules.forbidden({"name": c["name"], "groups": [c["grp"]], "audience": c["audience"]}):
             return _newznab_error(300, "No such item", 404)
         try:
-            if c["sketch"]:
-                _ucfg = await _usenet_cfg()
-                # as many connections as the provider gives: somebody is waiting for this.
-                # The number finds its own level (usenet_scan.next_connections) and is kept.
-                async with db_pool.acquire() as conn:
-                    _asked = usenet_scan.next_connections(
-                        await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_nzb_conns'"), {})
-                _UN_INDEX["nzb"] += 1                        # the index reading stands aside meanwhile
-                try:
-                    got = await asyncio.to_thread(
-                        usenet_scan.rebuild, _ucfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
-                        6000 if c["detail"] == 0 else 2000, c["name"], _asked)
-                finally:
-                    _UN_INDEX["nzb"] -= 1
+            _ucfg = await _usenet_cfg()
+            # as many connections as the provider gives: somebody is waiting for this.
+            # The number finds its own level (usenet_scan.next_connections) and is kept.
+            async with db_pool.acquire() as conn:
+                _asked = usenet_scan.next_connections(
+                    await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_nzb_conns'"), {})
+            _UN_INDEX["nzb"] += 1                        # the index reading stands aside meanwhile
+            try:
+                text, state, got, store = await asyncio.to_thread(_usenet_card_nzb, _ucfg, c, _asked)
+            finally:
+                _UN_INDEX["nzb"] -= 1
+            if got.get("connections"):
                 _next = usenet_scan.next_connections(_asked, got)
                 if _next != _asked:
                     async with db_pool.acquire() as conn:
                         await conn.execute("""INSERT INTO config (key, value) VALUES ('usenet_nzb_conns', $1)
                                               ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", str(_next))
-                text = got["nzb"]
-                logging.getLogger("tgarr").info(
-                    "[usenet] NZB for %s: %s parts of %s file(s) in %.1fs over %s connection(s) of %s asked, %s request(s)%s%s",
-                    c["id"], f"{got['segments']:,}", got["files"], got.get("seconds", 0), got.get("connections", 1), _asked,
-                    got.get("requests", 0), f", {got['unread']} stretch(es) the server did not give" if got.get("unread") else "",
-                    f"; {_next} next time" if _next != _asked else "")
-                if text and not got.get("unread"):           # now it has been read in full: keep the exact figures
-                    async with db_pool.acquire() as conn:
-                        await conn.execute(
-                            """UPDATE usenet_cards SET size = $2, files = $3, segments = $4, complete = $5,
-                                      art_lo = $6, art_hi = $7, detail = 1 WHERE id = $1""",
-                            c["id"], got["size"], got["files"], got["segments"], got["complete"], got["art_lo"], got["art_hi"])
-            else:
-                text = await asyncio.to_thread(_usenet_nzb, await _usenet_cfg(), c)
+            logging.getLogger("tgarr").info(
+                "[usenet] NZB for %s: %s%s%s", c["id"], state,
+                " (kept NZB)" if got.get("kept") else f": {got.get('segments') or 0:,} parts of {got.get('files') or 0} file(s)"
+                + (f" in {got.get('seconds', 0)}s over {got.get('connections', 1)} connection(s)" if got.get("connections") else ""),
+                f", found here by {got['anchor_by']} at {got['anchor']:,}" if got.get("anchor") else "")
+            await _usenet_card_keep(c["id"], store)
         except Exception as e:
             _USENET.update(ok=None)                          # look at the server again before the next answer
             return _newznab_error(300, f"The news server did not give the headers: {str(e)[:80]}", 503)
-        if not text:
+        if state == "gone":
+            # the server does not have its first article: this one is really gone from this provider
             return _newznab_error(300, "This release is no longer on the news server", 404)
+        if not text:
+            # the server has it, but it could not be put together here: a passing answer, so that Sonarr and
+            # Radarr try again later instead of blocking a release that exists (QA #24)
+            return _newznab_error(300, "This release could not be found on this news server just now; try again later", 503)
         safe = "".join(ch if ord(ch) < 128 and ch not in '"\\' else "_" for ch in c["name"])[:150]
         return Response(text, media_type="application/x-nzb",
                         headers={"Content-Disposition": f'attachment; filename="{safe}.nzb"'})
@@ -10456,7 +10568,8 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
 # ════════════════════════════════════════════════════════════════════
 _UN_INDEX = {"state": "off", "window": None, "at": 0.0, "last": None, "asked": {}, "nzb": 0}
 _UN_SKETCH_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "posted_to", "files", "files_expected",
-                   "segments", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive", "sketch", "detail", "audience")
+                   "segments", "complete", "first_message_id", "key", "art_lo", "art_hi", "alive", "sketch", "detail", "audience",
+                   "art_server")
 
 
 async def _usenet_tidy() -> dict:
@@ -10492,8 +10605,9 @@ def _usenet_card_id(poster: str, key: str) -> str:
     return hashlib.sha1(f"{poster}|{key}".encode("utf-8", "replace")).hexdigest()[:20]      # as the registry counts them
 
 
-async def _usenet_keep(cards: list) -> int:
-    """Sketched cards into this install's own table, in one go."""
+async def _usenet_keep(cards: list, server=None) -> int:
+    """Sketched cards into this install's own table, in one go. server: whose article numbers these are (this
+    install's provider when it read them itself; None when they came from the registry - another provider's)."""
     rows = []
     for c in cards:
         grp = c.get("grp") or c["groups"][0]
@@ -10506,7 +10620,8 @@ async def _usenet_keep(cards: list) -> int:
                      c["poster"], c.get("posted_from"), c.get("posted_to"), c.get("files"), c.get("files_expected"),
                      c.get("segments"), c.get("complete"), c["first_message_id"], c["key"], c["art_lo"], c["art_hi"], 1.0, True,
                      0 if c.get("detail") == 0 else 1,
-                     "nsfw" if (c.get("audience") == "nsfw" or usenet_rules.adult(judged)) else "sfw"))
+                     "nsfw" if (c.get("audience") == "nsfw" or usenet_rules.adult(judged)) else "sfw",
+                     (server or "").lower() or None))
     if not rows:
         return 0
     cols = ", ".join(_UN_SKETCH_COLS)
@@ -10517,7 +10632,15 @@ async def _usenet_keep(cards: list) -> int:
             await conn.execute(
                 f"""INSERT INTO usenet_cards ({cols}) SELECT DISTINCT ON (id) {cols} FROM _uk
                     ON CONFLICT (id) DO UPDATE SET
-                      art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo), art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi),
+                      -- numbers of two servers are never mixed: the same server's widen the range, this server's
+                      -- replace another's, another's never touch this server's (QA #23)
+                      art_lo = CASE WHEN usenet_cards.art_server IS NOT DISTINCT FROM EXCLUDED.art_server
+                                    THEN LEAST(usenet_cards.art_lo, EXCLUDED.art_lo)
+                                    WHEN EXCLUDED.art_server IS NOT NULL THEN EXCLUDED.art_lo ELSE usenet_cards.art_lo END,
+                      art_hi = CASE WHEN usenet_cards.art_server IS NOT DISTINCT FROM EXCLUDED.art_server
+                                    THEN GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi)
+                                    WHEN EXCLUDED.art_server IS NOT NULL THEN EXCLUDED.art_hi ELSE usenet_cards.art_hi END,
+                      art_server = COALESCE(EXCLUDED.art_server, usenet_cards.art_server),
                       -- what was read in full is not put back to an estimate
                       size = CASE WHEN usenet_cards.detail > EXCLUDED.detail THEN usenet_cards.size ELSE EXCLUDED.size END,
                       detail = GREATEST(usenet_cards.detail, EXCLUDED.detail), alive = 1.0, sketch = TRUE,
@@ -10625,10 +10748,11 @@ async def _usenet_index_worker():
                 await asyncio.sleep(1800)
                 continue
             uuid_ = await _instance_uuid()
-            wins = await asyncio.to_thread(usenet_client.lease, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], None, budget)
             # only the groups this install reads for itself (QA #27: windows came in groups the operator never
-            # chose, adult ones among them, on the operator's account)
+            # chose, adult ones among them, on the operator's account) - asked for, and checked again
             own = {g for g in USENET_GROUPS if mine.get(g, True)}
+            wins = await asyncio.to_thread(usenet_client.lease, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], None,
+                                           budget, sorted(own))
             wins = [x for x in wins if x.get("grp") in own]
             # A window that could not be read is left alone for six hours. The registry gives
             # back what an install still holds, so without this one bad window was handed out
@@ -10659,7 +10783,7 @@ async def _usenet_index_worker():
             async with db_pool.acquire() as conn:
                 for key in ("usenet_today", "usenet_index_today"):
                     await _usenet_count(conn, key, day, n_read)
-            kept = await _usenet_keep(res["cards"])
+            kept = await _usenet_keep(res["cards"], cfg.get("host"))      # read here: this server's numbers
             out = await asyncio.to_thread(
                 usenet_client.report, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], w["id"], res["stats"],
                 res["posters"], [{k: v for k, v in c.items() if k != "grp"} for c in res["cards"]], res["empty"])
@@ -10824,15 +10948,12 @@ async def _usenet_grab_one(job) -> tuple:
     base = None
     _UN_INDEX["nzb"] += 1                          # the index reading stands aside meanwhile
     try:
-        if c["sketch"]:
-            got = await asyncio.to_thread(
-                usenet_scan.rebuild, cfg, c["grp"], c["poster"], c["key"], c["art_lo"], c["art_hi"],
-                6000 if c["detail"] == 0 else 2000, c["name"], 4)
-            text = got["nzb"]
-        else:
-            text = await asyncio.to_thread(_usenet_nzb, cfg, c)
-        if not text:
+        text, state, _got, store = await asyncio.to_thread(_usenet_card_nzb, cfg, c, 4)
+        await _usenet_card_keep(c["id"], store)
+        if state == "gone":
             return "failed", "it is no longer on the news server", 0, 0, None
+        if not text:
+            return "failed", "it could not be found on this news server just now", 0, 0, None
         inside = usenet_fetch.parse_nzb(text)
         adult = c["audience"] == "nsfw"
         # the guard, on everything the release holds - also what would not be taken: one
@@ -11732,6 +11853,7 @@ async def api_usenet_forget(request: Request):
 # _usenet_grab_one, _archive_grab_one, usenet_fetch and archive_org.plan.
 _GRAB_NOTES = (
     "it is no longer in the index", "it is no longer on the news server", "it is no longer whole on the news server",
+    "it could not be found on this news server just now",
     "never fetched: the block list", "nothing in it that can be opened as it is", "not enough room left on the disk",
     "the news server did not answer - try again later", "video is not fetched by tgarr - give it to Sonarr or Radarr",
     "packed in an archive: it needs a real downloader to repair and unpack", "too large to fetch here",

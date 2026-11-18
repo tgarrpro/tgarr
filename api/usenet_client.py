@@ -42,10 +42,12 @@ def _call(base: str, path: str, body=None, query=None, timeout: int = 60) -> dic
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
-def lease(base: str, instance_uuid: str, version: str, host: str, oldest=None, budget_articles: int = 0) -> list:
+def lease(base: str, instance_uuid: str, version: str, host: str, oldest=None, budget_articles: int = 0, groups=None) -> list:
+    """Windows to read for the shared index: within budget_articles headers, in `groups` only (the ones this
+    install reads for itself) - a registry from before 0.5.18 ignores both, and the install filters again."""
     out = _call(base, "/api/v1/usenet/lease", {"instance_uuid": instance_uuid, "tgarr_version": version,
                                                "provider_key": provider_key(host), "oldest": oldest,
-                                               "budget_articles": budget_articles})
+                                               "budget_articles": budget_articles, "groups": list(groups or [])})
     return out.get("windows") or []
 
 

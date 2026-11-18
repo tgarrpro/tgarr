@@ -123,6 +123,28 @@ class NNTP:
             raise NNTPError(f"BODY {code}")
         return self._multiline()
 
+    def head(self, message_id):
+        """(code, {lower-case header: value}) of one article, by message-id: 221 and its headers, or the
+        server's refusal (430 = it does not have it) and {}. Article numbers are per server; a message-id is
+        the same on every one (QA #23)."""
+        mid = str(message_id).strip().strip("<>")
+        if not mid or any(c.isspace() or c in "<>" for c in mid):
+            return 501, {}                  # a malformed id says nothing about the article: not "gone"
+        code, _text = self.cmd(f"HEAD <{mid}>")
+        if code != 221:
+            return code, {}
+        out, last = {}, None
+        for ln in self._multiline():
+            s = ln.decode("utf-8", "replace")
+            if s[:1] in (" ", "\t") and last:           # a folded header goes on from the line before
+                out[last] += " " + s.strip()
+                continue
+            k, sep, v = s.partition(":")
+            if sep:
+                last = k.strip().lower()
+                out[last] = v.strip()
+        return code, out
+
     def stat(self, message_id) -> bool:
         """Does the server still hold this article? Nothing is downloaded."""
         code, _ = self.cmd(f"STAT {message_id}")
