@@ -445,8 +445,11 @@ async def _request_guard(request: Request, call_next):
             return Response("authentication required", status_code=401,
                             headers={"WWW-Authenticate": 'Basic realm="tgarr"'})
     # Sonarr, Radarr and the like come with their own key (checked above) and
-    # carry no browser cookie: the PIN is not for them
-    locked = (not _is_arr_path(path)) and await _is_locked(request)
+    # carry no browser cookie: the PIN is not for them. Nor is a script or tool that brings TGARR_API_KEY in the
+    # X-Api-Key header: the PIN keeps a child's browser to the Media Center - it is not the lock on settings and
+    # downloading for the one who runs tgarr (QA 2026-11-17 #9). Header only, so the key is not left in URLs and logs.
+    admin = bool(_API_KEY) and _ct_equal(request.headers.get("x-api-key") or "", _API_KEY)
+    locked = (not _is_arr_path(path)) and not admin and await _is_locked(request)
     _LOCKED.set(locked)
     _PROFILE.set(await _profile_of(request) if locked else None)
     if locked:
