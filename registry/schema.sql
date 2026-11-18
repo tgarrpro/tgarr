@@ -140,3 +140,7 @@ CREATE TABLE IF NOT EXISTS registry_metrics (
 
 -- A day's additions to the dedup summary are read by first_seen_at.
 CREATE INDEX IF NOT EXISTS idx_rsrc_first_seen ON registry_resources (first_seen_at);
+
+-- Consensus counts addresses, not install ids (QA #38: an install id is whatever the client sends, so two made-up
+-- ids from one machine verified any channel). Rows from before this have no address: each counts as its own.
+ALTER TABLE registry_contributor_seen ADD COLUMN IF NOT EXISTS ip_hash TEXT;

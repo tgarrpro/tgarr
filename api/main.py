@@ -179,6 +179,15 @@ _LOCKED = contextvars.ContextVar("tgarr_locked", default=False)
 _LANG = contextvars.ContextVar("tgarr_lang", default="en")      # the language this request is answered in
 _ACCESS = {"at": 0.0, "pin": None, "secret": None}
 _GUESSES = access.Guesses()
+_PIN_SEM = None                     # PBKDF2 off the event loop, two at a time (QA #33)
+
+
+async def _pin_check(pin: str, stored) -> bool:
+    global _PIN_SEM
+    if _PIN_SEM is None:
+        _PIN_SEM = asyncio.Semaphore(2)
+    async with _PIN_SEM:
+        return await asyncio.to_thread(access.check_pin, pin, stored)
 _KID_OK: dict = {}                     # message id / thumb file -> (allowed, checked at)
 _KID_COURSE = "m.id IN (SELECT ci.msg_id FROM course_items ci JOIN kids_allow k ON k.kind = 'course' AND k.ref = ci.course_id)"
 _KID_SQL = f"""(COALESCE(c.audience, 'sfw') = 'sfw' AND COALESCE(m.ai_adult, 0) < 0.9
@@ -511,7 +520,7 @@ import vision  # local module
 DB_DSN = os.environ["DB_DSN"]
 MEILI_URL = os.environ.get("MEILI_URL", "http://meili:7700")
 MEILI_KEY = os.environ.get("MEILI_MASTER_KEY", "")
-TGARR_VERSION = "0.5.16"
+TGARR_VERSION = "0.5.17"
 
 # /app/session/.revoked marker — written by crawler on AuthKeyUnregistered /
 # SessionRevoked / UserDeactivated, deleted by QR re-login success. While
@@ -912,6 +921,7 @@ async def _migrate_schema():
             -- category the *arr asked for on add (tv / movies / …); echoed back
             -- in queue + history so each app only sees its own jobs.
             ALTER TABLE downloads ADD COLUMN IF NOT EXISTS sab_cat TEXT;
+            ALTER TABLE downloads ADD COLUMN IF NOT EXISTS sab_hidden BOOLEAN NOT NULL DEFAULT FALSE;
             -- running time + frame size as reported by Telegram for videos
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS duration_sec INTEGER;
             ALTER TABLE messages ADD COLUMN IF NOT EXISTS width INTEGER;
@@ -1935,7 +1945,7 @@ async def serve_media(msg_id: int, request: Request):
 #     item again simply fetches it again.
 # Only these three folders are touched - never what Sonarr/Radarr grabbed.
 # ════════════════════════════════════════════════════════════════════
-_CACHE_PREFIXES = ("video/", "audio/", "library/")
+_CACHE_PREFIXES = ("video/", "audio/", "library/", "photo/")
 # What was fetched from Usenet is not held to the two rules: a person asked for each of those
 # by hand, and there is no index entry to bring one back (the card on the Usenet page is the
 # way, for as long as the post lasts). They are removed by hand (/usenet?kind=have), and only
@@ -2058,6 +2068,30 @@ def _cache_unlink(lp: str) -> None:
             pass
 
 
+_LOST_LAST: set = set()          # paths found missing by the previous sweep (QA #32: a path is forgotten only when missing twice)
+
+
+def _top_ok(lp: str) -> bool:
+    """The disk the path lives on is there: /downloads and the path's top folder exist and are not empty. A share
+    not mounted yet (CIFS, USB, NAS at boot) looks like every file gone - that must never forget anything."""
+    try:
+        top = os.path.join("/downloads", lp.split("/", 1)[0])
+        return bool(os.listdir("/downloads")) and os.path.isdir(top)
+    except OSError:
+        return False
+
+
+def _lost_to_forget(lost: list, seen: int, previous: set, tops_ok: dict) -> list:
+    """Which missing paths may be forgotten (QA #32). Not when the path's disk looks absent; not on a first miss
+    (an SMB hiccup); not at all when more than a fifth of the paths are missing at once (a mount problem)."""
+    if not lost:
+        return []
+    if len(lost) > 20 and len(lost) > seen // 5:
+        log.warning("[cache] %d of %d saved files look missing at once - the disk is probably not mounted; nothing forgotten", len(lost), seen)
+        return []
+    return [lp for lp in lost if tops_ok.get(lp.split("/", 1)[0]) and lp in previous]
+
+
 async def _cache_sweep(clear_all: bool = False) -> tuple:
     """Apply the rules (or remove everything). Returns (files removed, bytes freed)."""
     import time as _time
@@ -2112,6 +2146,12 @@ async def _cache_sweep(clear_all: bool = False) -> tuple:
                 total -= it[1]
                 doomed.append(it)
     doomed += partial
+    global _LOST_LAST
+    tops = {lp.split("/", 1)[0] for lp in lost}
+    tops_ok = {t: await asyncio.to_thread(_top_ok, t + "/") for t in tops}
+    really = _lost_to_forget(lost, len(rows), _LOST_LAST, tops_ok)
+    _LOST_LAST = set(lost) - set(really)
+    lost = really
     freed = 0
     for used, size, lp in doomed:
         await asyncio.to_thread(_cache_unlink, lp)
@@ -2900,9 +2940,12 @@ async def fetch_remove_many(request: Request):
                FROM (SELECT id, local_path FROM messages WHERE id = ANY($1::bigint[])) o
                WHERE m.id = o.id AND m.tg_chat_id > $2 RETURNING o.local_path""", ids, localfiles.LOCAL_CHAT_MAX)
     n = 0
+    async with db_pool.acquire() as conn:
+        shared = {r["local_path"] for r in await conn.fetch(          # another post of the same file still uses it (QA #59)
+            "SELECT DISTINCT local_path FROM messages WHERE local_path = ANY($1::text[])", [r["local_path"] for r in rows if r["local_path"]])}
     for r in rows:
         lp = r["local_path"]
-        if _is_local(lp) and lp.startswith(_CACHE_PREFIXES) and ".." not in lp:
+        if _is_local(lp) and lp.startswith(_CACHE_PREFIXES) and ".." not in lp and lp not in shared:
             await asyncio.to_thread(_cache_unlink, lp)
             n += 1
     return {"removed": n}
@@ -2946,7 +2989,8 @@ async def fetch_cancel(msg_id: int):
         await conn.execute(
             "UPDATE messages SET local_path = NULL, local_accessed_at = NULL "
             "WHERE id = $1 AND local_path = $2", msg_id, lp)
-    if _is_local(lp) and lp.startswith(_CACHE_PREFIXES) and ".." not in lp:
+        shared = await conn.fetchval("SELECT 1 FROM messages WHERE local_path = $1 LIMIT 1", lp)   # QA #59
+    if _is_local(lp) and lp.startswith(_CACHE_PREFIXES) and ".." not in lp and not shared:
         await asyncio.to_thread(_cache_unlink, lp)
     return {"ok": True}
 
@@ -6681,7 +6725,7 @@ def _export_btn(what: dict, label: str) -> str:
 
 async def _export_pick(scope: str, ch, kind: str) -> list:
     cond = [_EXPORT_KIND_SQL[kind],
-            "COALESCE(m.local_path, '') NOT IN ('__failed__', '__deleted__')",
+            "COALESCE(m.local_path, '') <> '__deleted__'",          # __failed__ is tried again (QA #31)
             "COALESCE(c.audience, 'sfw') <> 'blocked_csam'"]
     params = []
     one = "COALESCE(m.file_unique_id, m.id::text)"       # the same file posted twice is taken once
@@ -6733,23 +6777,62 @@ async def api_export(request: Request):
     else:
         title = "Saved files" + ("" if kind == "all" else f" - {what}")
     async with db_pool.acquire() as conn:
+        # a file that failed before is tried again for a new export (QA #31: __failed__ was never retried)
+        await conn.execute("UPDATE messages SET local_path = NULL WHERE id = ANY($1::bigint[]) AND local_path = '__failed__'",
+                           [r["id"] for r in rows])
         jid = await conn.fetchval(
             """INSERT INTO exports (title, owner, msg_ids, status, done_at)
                VALUES ($1, $2, $3::bigint[], $4, CASE WHEN $4 = 'ready' THEN NOW() END) RETURNING id""",
-            title[:200], _me_id(), [r["id"] for r in rows], "fetching" if fetch else "ready")
-    return {"status": "ok", "id": jid, "ready": not fetch}
+            title[:200], _me_id(), [r["id"] for r in rows], "fetching")     # the worker says when it is whole (QA #42)
+    return {"status": "ok", "id": jid, "ready": False}
+
+
+_WHOLE: dict = {}                   # msg id -> path known complete on disk (the exports page and worker stat less)
+
+
+def _whole_on_disk(rows) -> tuple:
+    """In a thread: which saved rows are complete on the disk (a path is written before the fetch, and a paused
+    fetch leaves part of the file under it), and which partial ones have not grown for 10 minutes (stalled)."""
+    import time as _t
+    whole, stalled = [], []
+    for r in rows:
+        if _WHOLE.get(r["id"]) == r["local_path"]:
+            whole.append(r["id"])
+            continue
+        try:
+            st = os.stat(os.path.join("/downloads", r["local_path"]))
+        except OSError:
+            stalled.append(r["id"])        # its file is gone: fetched again, never waited for for ever
+            continue
+        if st.st_size >= (r["file_size"] or 1):
+            whole.append(r["id"])
+            if len(_WHOLE) > 200_000:
+                _WHOLE.clear()
+            _WHOLE[r["id"]] = r["local_path"]
+        elif _t.time() - st.st_mtime > 600:
+            stalled.append(r["id"])
+    return whole, stalled
 
 
 async def _export_state(conn, ids: list) -> dict:
+    """ready = complete on disk (QA #42: a row with a path used to count, while its file was still arriving or
+    had been paused half-way, and the zip silently left it out); partial = has a path, not complete yet."""
+    rows = await conn.fetch(
+        """SELECT id, local_path, file_size FROM messages
+           WHERE id = ANY($1::bigint[]) AND local_path IS NOT NULL AND left(local_path, 2) <> '__'""", ids)
+    whole, stalled = await asyncio.to_thread(_whole_on_disk, rows)
+    whole = set(whole)
     r = await conn.fetchrow(
-        """SELECT count(*) FILTER (WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__') AS ready,
-                  count(*) FILTER (WHERE local_path = '__user_queued__') AS queued,
-                  count(*) FILTER (WHERE local_path IS NULL) AS waiting,
-                  COALESCE(sum(file_size) FILTER (WHERE local_path IS NOT NULL AND left(local_path, 2) <> '__'), 0) AS bytes
+        """SELECT count(*) FILTER (WHERE local_path = '__user_queued__') AS queued,
+                  count(*) FILTER (WHERE local_path IS NULL) AS waiting
            FROM messages WHERE id = ANY($1::bigint[])""", ids)
     d = dict(r)
+    d["ready"] = len(whole)
+    d["partial"] = [x["id"] for x in rows if x["id"] not in whole]
+    d["stalled"] = stalled
+    d["bytes"] = sum((x["file_size"] or 0) for x in rows if x["id"] in whole)
     d["total"] = len(ids)
-    d["missed"] = d["total"] - d["ready"] - d["queued"] - d["waiting"]
+    d["missed"] = d["total"] - d["ready"] - len(d["partial"]) - d["queued"] - d["waiting"]
     return d
 
 
@@ -6765,9 +6848,18 @@ async def _export_worker():
                         "SELECT id, msg_ids FROM exports WHERE status = 'fetching' ORDER BY id LIMIT 5")
                     for j in jobs:
                         st = await _export_state(conn, j["msg_ids"])
-                        if st["waiting"] == 0 and st["queued"] == 0:
+                        if st["stalled"]:
+                            # a fetch paused or stopped half-way, untouched for 10 minutes, is fetched on (QA #42: it
+                            # used to stay half-done); one still growing is left to the fetch that is writing it
                             await conn.execute(
-                                "UPDATE exports SET status = 'ready', done_at = NOW() WHERE id = $1", j["id"])
+                                """UPDATE messages SET local_path = '__user_queued__',
+                                          fetch_wanted_at = NOW() + INTERVAL '6 hours'
+                                   WHERE id = ANY($1::bigint[]) AND left(local_path, 2) <> '__'""", st["stalled"])
+                        if st["waiting"] == 0 and st["queued"] == 0 and not st["partial"]:
+                            # nothing at all arrived: say so, not "ready" with an empty zip (QA #31)
+                            await conn.execute(
+                                "UPDATE exports SET status = $2, done_at = NOW() WHERE id = $1", j["id"],
+                                "failed" if st["ready"] == 0 and st["missed"] else "ready")
                             continue
                         room = EXPORT_SLOTS - st["queued"]
                         if room > 0 and st["waiting"]:
@@ -6777,10 +6869,12 @@ async def _export_worker():
                                    WHERE id IN (SELECT id FROM messages WHERE id = ANY($1::bigint[])
                                                 AND local_path IS NULL ORDER BY id LIMIT $2)""",
                                 j["msg_ids"], room)
-                        # a large file is only fetched to the end while someone wants it
+                        # a large file is only fetched to the end while someone wants it - also once its
+                        # fetch has begun and the row holds its path (QA #42: those were left to pause)
                         await conn.execute(
                             """UPDATE messages SET fetch_wanted_at = NOW() + INTERVAL '6 hours'
-                               WHERE id = ANY($1::bigint[]) AND local_path = '__user_queued__'
+                               WHERE id = ANY($1::bigint[]) AND local_path IS NOT NULL
+                                 AND (local_path = '__user_queued__' OR left(local_path, 2) <> '__')
                                  AND (fetch_wanted_at IS NULL OR (fetch_wanted_at > 'epoch'
                                       AND fetch_wanted_at < NOW() + INTERVAL '1 hour'))""", j["msg_ids"])
                         break                      # one export at a time
@@ -8738,6 +8832,9 @@ async function loadWorkers() {
     <th>[[@Last error]]</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 async function loadDeepBackfill() {
+  // a channel's title is written by whoever owns the channel: always escaped (QA #34)
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const r = await fetch("/api/deep-backfill-progress");
   const j = await r.json();
   const fmtPct = (v) => v == null ? "—" : (v >= 100 ? "100%" : v + "%");
@@ -8760,9 +8857,9 @@ async function loadDeepBackfill() {
       ? `${(c.local_media||0).toLocaleString()} / ${c.remote_media.toLocaleString()}`
       : (c.local_media||0).toLocaleString();
     return `
-    <tr><td>${c.done?"✅":"🔄"} <b>@${c.username || "—"}</b></td>
+    <tr><td>${c.done?"✅":"🔄"} <b>@${esc(c.username) || "—"}</b></td>
         <td>${modeBadge(c.mode)}</td>
-        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(c.title || "").substring(0, 40)}</td>
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((c.title || "").substring(0, 40))}</td>
         <td style="text-align:right;font-size:13px">${totalCell}</td>
         <td>${bar(c.pct_media)}</td>
         <td style="text-align:right;font-size:11px;color:#475569">P ${fmtPct(c.pct_photos)}</td>
@@ -9364,7 +9461,8 @@ async def api_set_audience(tg_chat_id: int, value: str = Form(...)):
                           status_code=400)
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE channels SET audience=$1, audience_manual=TRUE WHERE tg_chat_id=$2",
+            "UPDATE channels SET audience=$1, audience_manual=TRUE WHERE tg_chat_id=$2"
+            " AND audience IS DISTINCT FROM 'blocked_csam'",              # a hard ban is never undone from here (QA #64)
             None if value == "unknown" else value, tg_chat_id)
     return {"status": "ok", "audience": value}
 
@@ -10102,6 +10200,17 @@ def _usenet_scan_block(cfg: dict, grp: str, start, asm, count: int):
         nn.quit()
 
 
+async def _usenet_count(conn, key: str, day: str, n: int) -> None:
+    """Add n headers to today's count under `key` ("day:count"), in one statement: the scanner and the shared index
+    both add to it, and a read-then-write lost one side's headers (QA #26 review)."""
+    await conn.execute(
+        """INSERT INTO config (key, value) VALUES ($1, $2 || ':' || $3::bigint)
+           ON CONFLICT (key) DO UPDATE SET updated_at = NOW(), value =
+             CASE WHEN split_part(config.value, ':', 1) = $2
+                  THEN $2 || ':' || (COALESCE(NULLIF(split_part(config.value, ':', 2), ''), '0')::bigint + $3::bigint)
+                  ELSE $2 || ':' || $3::bigint END""", key, day, n)
+
+
 async def _usenet_scan_worker():
     """Reads a block of one group, then the next group, staying under the
     day's allowance of headers (their download is the cost: about 350 bytes
@@ -10154,9 +10263,7 @@ async def _usenet_scan_worker():
                            headers = usenet_progress.headers + $5, cards = usenet_progress.cards + $6,
                            bytes = usenet_progress.bytes + $7, note = NULL, updated_at = NOW()""",
                     grp, first, last, resume, n, len(cards), nbytes)
-                await conn.execute(
-                    """INSERT INTO config (key, value) VALUES ('usenet_today', $1)
-                       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""", f"{day}:{used_n + n}")
+                await _usenet_count(conn, "usenet_today", day, n)
             logu.info("[usenet] %s: %s headers, %s cards, %.0f MB", grp, f"{n:,}", len(cards), nbytes / 1e6)
             await asyncio.sleep(20 if cursor <= last else 600)
         except Exception as e:
@@ -10418,8 +10525,9 @@ async def _usenet_keep(cards: list) -> int:
     return len(rows)
 
 
-def _usenet_index_window(cfg: dict, w: dict) -> dict:
-    """Read one leased window. Runs in a thread (it takes minutes)."""
+def _usenet_index_window(cfg: dict, w: dict, budget: int = 0) -> dict:
+    """Read one leased window. Runs in a thread (it takes minutes). budget: headers it may read; a window that
+    would read more is not read at all (QA #26: windows used to ignore the operator's daily allowance)."""
     import calendar as _cal
     nn = usenet_scan.connect(cfg, packed=False)
     try:
@@ -10438,6 +10546,12 @@ def _usenet_index_window(cfg: dict, w: dict) -> dict:
                     "oldest": time.strftime("%Y-%m-%d", time.gmtime(oldest)) if oldest else None}
         lo = usenet.article_at(nn, first, last, w["t_from"])
         hi = usenet.article_at(nn, first, last, w["t_to"])
+        span = max(0, hi - lo)
+        if w.get("read"):
+            m, every = w["read"][0], max(1, w["read"][1])
+            span = span * m // every
+        if budget and span > budget:
+            return {"skip": True, "need": span}
     finally:
         try:
             nn.sock.close()
@@ -10496,8 +10610,26 @@ async def _usenet_index_worker():
                 _UN_INDEX["state"] = "the news server is not answering"
                 await asyncio.sleep(300)
                 continue
+            # one daily allowance for everything that reads headers from the operator's provider; the shared index
+            # gets at most half of it, so the operator's own scan is never starved (QA #26)
+            day = time.strftime("%Y-%m-%d", time.gmtime())
+            async with db_pool.acquire() as conn:
+                used = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_today'") or ""
+                iused = await conn.fetchval("SELECT value FROM config WHERE key = 'usenet_index_today'") or ""
+                mine = {r["grp"]: r["enabled"] for r in await conn.fetch("SELECT grp, enabled FROM usenet_progress")}
+            used_n = int(used.split(":")[1]) if used.startswith(day + ":") else 0
+            iused_n = int(iused.split(":")[1]) if iused.startswith(day + ":") else 0
+            budget = min(cfg["per_day"] - used_n, cfg["per_day"] // 2 - iused_n)
+            if budget < 100_000:
+                _UN_INDEX["state"] = "today's share of the header allowance is used"
+                await asyncio.sleep(1800)
+                continue
             uuid_ = await _instance_uuid()
-            wins = await asyncio.to_thread(usenet_client.lease, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], None, 0)
+            wins = await asyncio.to_thread(usenet_client.lease, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], None, budget)
+            # only the groups this install reads for itself (QA #27: windows came in groups the operator never
+            # chose, adult ones among them, on the operator's account)
+            own = {g for g in USENET_GROUPS if mine.get(g, True)}
+            wins = [x for x in wins if x.get("grp") in own]
             # A window that could not be read is left alone for six hours. The registry gives
             # back what an install still holds, so without this one bad window was handed out
             # again every ten minutes and nothing else was ever read.
@@ -10516,7 +10648,17 @@ async def _usenet_index_worker():
             _UN_INDEX.update(state="reading", window=w, at=time.time())
             logu.info("[usenet-index] window %s: %s %s, %s", w["id"], w["grp"],
                       time.strftime("%Y-%m-%d", time.gmtime(w["t_from"])), w["mode"])
-            res = await asyncio.to_thread(_usenet_index_window, cfg, w)
+            res = await asyncio.to_thread(_usenet_index_window, cfg, w, budget)
+            if res.get("skip"):
+                # more than today's share: not read (the lease runs out and the window goes to someone else)
+                _UN_INDEX["state"] = f"a window of {res['need']:,} headers is more than today's share ({budget:,})"
+                failed[w["id"]] = time.time()
+                await asyncio.sleep(600)
+                continue
+            n_read = int(res["stats"].get("headers") or 0)
+            async with db_pool.acquire() as conn:
+                for key in ("usenet_today", "usenet_index_today"):
+                    await _usenet_count(conn, key, day, n_read)
             kept = await _usenet_keep(res["cards"])
             out = await asyncio.to_thread(
                 usenet_client.report, UPDATE_REGISTRY_URL, uuid_, TGARR_VERSION, cfg["host"], w["id"], res["stats"],
@@ -12255,22 +12397,24 @@ async def api_unlock(request: Request):
     if wait:
         return JSONResponse({"status": "wait", "message": f"Too many wrong tries. Try again in {max(1, wait // 60)} min."},
                             status_code=429)
+    # counted as a wrong guess before anything is awaited, so a burst of requests cannot all slip past the
+    # count (QA #33); taken back below when it turns out right
+    earned = _GUESSES.wrong(who)
     try:
         body = await request.json()
     except Exception:
         body = {}
     pin = str(body.get("pin") or "")
-    if not access.check_pin(pin, cfg["pin"]):
+    if not await _pin_check(pin, cfg["pin"]):
         # not the owner's: one of the people's? Their browser stays locked, it is now known whose it is.
         for p in (await _profiles(fresh=True)).values():
-            if access.check_pin(pin, p["pin"]):
-                _GUESSES.right(who)
+            if await _pin_check(pin, p["pin"]):
+                _GUESSES.undo(who)
                 seconds = access.REMEMBER_SECONDS if body.get("remember") else access.UNLOCK_SECONDS
                 resp = JSONResponse({"status": "ok", "profile": p["name"]})
                 resp.set_cookie(access.COOKIE, access.make_token(cfg["secret"], seconds, who=f"p{p['id']}"), max_age=seconds,
                                 httponly=True, samesite="lax", path="/")
                 return resp
-        earned = _GUESSES.wrong(who)
         return JSONResponse({"status": "wrong", "message": "That is not the PIN." + (
             f" Too many wrong tries - wait {earned // 60} min." if earned else "")}, status_code=403)
     _GUESSES.right(who)
@@ -12422,16 +12566,29 @@ async def api_kids_pin(request: Request):
         body = {}
     new, cur = str(body.get("pin") or ""), str(body.get("current") or "")
     cfg = await _access_cfg(fresh=True)
-    if cfg["pin"] and not access.check_pin(cur, cfg["pin"]):
-        return JSONResponse({"status": "error", "message": "The current PIN is not right."}, status_code=403)
+    who = request.client.host if request.client else "?"
+    if cfg["pin"]:
+        wait = _GUESSES.wait(who)
+        if wait:
+            return JSONResponse({"status": "error", "message": f"Too many wrong tries. Try again in {max(1, wait // 60)} min."}, status_code=429)
+        _GUESSES.wrong(who)
+        if not await _pin_check(cur, cfg["pin"]):
+            return JSONResponse({"status": "error", "message": "The current PIN is not right."}, status_code=403)
+        _GUESSES.right(who)
+    if new:
+        # the owner's PIN must not be one of the people's: that person would then unlock everything (QA #44)
+        for p in (await _profiles(fresh=True)).values():
+            if await _pin_check(new, p["pin"]):
+                return JSONResponse({"status": "error", "message": "That PIN belongs to one of the people. Choose another."}, status_code=400)
     async with db_pool.acquire() as conn:
         if not new:
-            await conn.execute("DELETE FROM config WHERE key = 'access_pin'")
+            # a new secret when the PIN goes: "remember this browser" cookies made under the old PIN end (QA #43)
+            await conn.execute("DELETE FROM config WHERE key IN ('access_pin', 'access_secret')")
             await _access_cfg(fresh=True)
             return {"status": "ok", "pin": False}
         if not access.valid_pin(new):
             return JSONResponse({"status": "error", "message": "A PIN is 4 to 12 digits."}, status_code=400)
-        secret = cfg["secret"] or access.new_secret()
+        secret = access.new_secret()          # a changed PIN ends every cookie made under the old one (QA #43)
         for k, v in (("access_pin", access.hash_pin(new)), ("access_secret", secret)):
             await conn.execute(
                 """INSERT INTO config (key, value) VALUES ($1, $2)
@@ -12475,7 +12632,7 @@ async def api_kids_profile(request: Request):
     if pin:
         if not access.valid_pin(pin):
             return no("A PIN is 4 to 12 digits.")
-        if access.check_pin(pin, cfg["pin"]) or any(access.check_pin(pin, p["pin"]) for i, p in profs.items() if i != pid):
+        if await _pin_check(pin, cfg["pin"]) or any([await _pin_check(pin, p["pin"]) for i, p in profs.items() if i != pid]):
             return no("That PIN is taken. Each person needs one of their own, different from yours.")
     async with db_pool.acquire() as conn:
         if pid is not None and body.get("delete"):
@@ -17366,10 +17523,12 @@ def _offered_season(r) -> int:
     """The season a release is offered to an *arr under: its own; else the one
     in the name it is given on the way out (an alias can name a season, and a
     release without one goes out as season 1); else 1."""
-    if r["season"] is not None:
-        return int(r["season"])
+    # the name it goes out under decides (an alias's season wins over the parsed one there), so the season it is
+    # filtered by is the season the *arr reads (QA #57: the two used to disagree)
     m = _OFFERED_SE_RX.search(_rewrite_release_title_sync(r))
-    return int(m.group(1)) if m else 1
+    if m:
+        return int(m.group(1))
+    return int(r["season"]) if r["season"] is not None else 1
 
 
 def _rewrite_release_title_sync(r, my_dc=None) -> str:
@@ -17691,8 +17850,7 @@ async def newznab_api(
             # Chinese series) is offered as season 1, or as the season its
             # alias names; it must be findable under that season too. Sonarr
             # always asks with a season, so "r.season = N" alone hid them all.
-            params.append(season)
-            where_parts.append(f"(r.season = ${len(params)} OR r.season IS NULL)")
+            pass               # filtered below by the season the release is offered under, over every match (QA #57)
         if ep is not None:
             params.append(ep)
             where_parts.append(f"r.episode = ${len(params)}")
@@ -17723,6 +17881,8 @@ async def newznab_api(
         where_parts.append(f"r.name !~* ${len(params)}")
 
     limit_val = max(1, min(limit, 200))
+    by_season = t == "tvsearch" and season is not None
+    rss = not q and season is None and ep is None        # RSS sync: t=search, tvsearch or movie with no query
     _release_my_dc = await _get_my_dc()
     # JOIN messages to get file_dc; same-DC releases ranked higher so Sonarr's
     # release picker prefers fast downloads. Same content uploaded to multiple
@@ -17734,17 +17894,23 @@ async def newznab_api(
           f"FROM releases r LEFT JOIN messages m ON m.id = r.primary_msg_id "
           f"LEFT JOIN channels c ON c.id = m.channel_id "
           f"WHERE {' AND '.join(where_parts)} "
-          f"ORDER BY (CASE WHEN m.file_dc = ${len(params)+1} THEN 0 ELSE 1 END), "
-          f"  r.posted_at DESC NULLS LAST "
-          f"LIMIT {limit_val} OFFSET {max(0, offset)}")
-    params.append(_release_my_dc or -1)
+          # RSS sync (no query) is newest first and nothing else: ranking same-DC releases first kept new
+          # releases from other DCs off the first page, so Sonarr never saw them (QA #55). r.id breaks ties so
+          # pages do not repeat (#77).
+          + ("ORDER BY " if rss else f"ORDER BY (CASE WHEN m.file_dc = ${len(params)+1} THEN 0 ELSE 1 END), ")
+          + "r.posted_at DESC NULLS LAST, r.id DESC "
+          # a season search filters in Python after the query: it reads every match, then pages (QA #57)
+          + ("LIMIT 2000" if by_season else f"LIMIT {limit_val} OFFSET {max(0, offset)}"))
+    if not rss:
+        params.append(_release_my_dc or -1)
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
 
     total = rows[0]["_total"] if rows else 0
-    if t == "tvsearch" and season is not None:
+    if by_season:
         rows = [r for r in rows if _offered_season(r) == season]
-        total = max(0, offset) + len(rows)
+        total = len(rows)
+        rows = rows[max(0, offset):max(0, offset) + limit_val]
     items = "\n".join(_item_xml(r, base_url, apikey or "tgarr",
                                  my_dc=_release_my_dc) for r in rows)
     if q and max(0, offset) == 0 and (t == "movie" or (t == "search" and (_cats_to_filter(cat) or (True, True, False))[0])):
@@ -17773,13 +17939,10 @@ async def _handle_grab(guid: Optional[str]) -> Response:
             "SELECT id, name FROM releases WHERE guid = $1", guid) or await _archive_release(conn, guid)
         if not rel:
             return _newznab_error(300, "No such item", 404)
-        await conn.execute(
-            """INSERT INTO downloads (release_id, status)
-               SELECT $1, 'pending'
-               WHERE NOT EXISTS (
-                 SELECT 1 FROM downloads
-                 WHERE release_id = $1 AND status IN ('pending','downloading','completed')
-               )""", rel["id"])
+        # Fetching the NZB starts nothing: the download client's addfile/addurl does, with the *arr's category.
+        # It used to start here first, so addfile found the row and its category was never stored, and the item
+        # never showed in a custom-category *arr queue; the UI's NZB icon and a Prowlarr proxy fetch also started
+        # downloads (QA #41).
     stub = (
         f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         f"<!DOCTYPE nzb PUBLIC \"-//newzBin//DTD NZB 1.1//EN\" "
@@ -17866,6 +18029,14 @@ async def sab_api(
                            {"name": "tv", "dir": "tv"},
                            {"name": "movies", "dir": "movies"}],
         }}
+    if mode in ("queue", "history") and name == "delete":
+        # what Sonarr/Radarr send to remove an item: mode=queue|history&name=delete&value=<nzo_id>[,<nzo_id>…]
+        # (QA #40: this used to return the queue, so a removed download carried on and was imported anyway)
+        for nzo in (value or "").split(","):
+            nzo = nzo.strip()
+            if nzo:
+                await (_sab_delete(nzo) if mode == "queue" else _sab_history_delete(nzo))
+        return {"status": True}
     if mode == "queue":
         return await _sab_queue()
     if mode == "history":
@@ -17952,7 +18123,10 @@ async def _sab_history():
                         COALESCE(d.sab_cat,
                                  CASE r.category WHEN 'movie' THEN 'movies' ELSE 'tv' END) AS sab_cat
                  FROM downloads d JOIN releases r ON r.id = d.release_id
-                 WHERE d.status IN ('completed','failed')
+                 WHERE d.status IN ('completed','failed') AND NOT d.sab_hidden
+                   -- a release grabbed again is in the queue, not in the history as well (QA #56)
+                   AND NOT EXISTS (SELECT 1 FROM downloads a WHERE a.release_id = d.release_id
+                                   AND a.status IN ('pending','downloading'))
                  ORDER BY d.release_id,
                           CASE d.status WHEN 'completed' THEN 0 ELSE 1 END,
                           d.id DESC NULLS LAST
@@ -18005,15 +18179,33 @@ async def _sab_addurl(url: str, nzbname: Optional[str], cat: Optional[str]):
         rel = await conn.fetchrow("SELECT id FROM releases WHERE guid = $1", guid) or await _archive_release(conn, guid)
         if not rel:
             return {"status": False, "error": "release not found"}
-        await conn.execute(
-            """INSERT INTO downloads (release_id, status, sab_cat)
-               SELECT $1, 'pending', $2
-               WHERE NOT EXISTS (
-                 SELECT 1 FROM downloads
-                 WHERE release_id = $1
-                   AND status IN ('pending','downloading','completed')
-               )""", rel["id"], sab_cat)
+        # already being fetched: it now carries this *arr's category (QA #41)
+        if await conn.fetchval(
+                """UPDATE downloads SET sab_cat = COALESCE($2, sab_cat) WHERE release_id = $1
+                   AND status IN ('pending','downloading') RETURNING id""", rel["id"], sab_cat):
+            return {"status": True, "nzo_ids": [f"tgarr-{guid}"]}
+        # done before: only again when the file is gone (QA #56: a re-grab used to do nothing and say it worked)
+        done = await conn.fetch("SELECT id, local_path FROM downloads WHERE release_id = $1 AND status = 'completed'", rel["id"])
+        here = [d for d in done if d["local_path"] and await asyncio.to_thread(os.path.exists, d["local_path"])]
+        if here:
+            await conn.execute("UPDATE downloads SET sab_hidden = FALSE, sab_cat = COALESCE($2, sab_cat) WHERE id = $1",
+                               here[0]["id"], sab_cat)
+            return {"status": True, "nzo_ids": [f"tgarr-{guid}"]}
+        await conn.execute("INSERT INTO downloads (release_id, status, sab_cat) VALUES ($1, 'pending', $2)",
+                           rel["id"], sab_cat)
     return {"status": True, "nzo_ids": [f"tgarr-{guid}"]}
+
+
+async def _sab_history_delete(nzo_id: str):
+    """Sonarr/Radarr clearing an item from the history: it is no longer listed. The file and the download row stay."""
+    if not nzo_id.startswith("tgarr-") or not _GUID_RX.fullmatch(nzo_id[6:]):
+        return {"status": False, "error": "bad nzo_id"}
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE downloads SET sab_hidden = TRUE
+               WHERE release_id = (SELECT id FROM releases WHERE guid = $1)
+                 AND status IN ('completed','failed')""", nzo_id[6:])
+    return {"status": True}
 
 
 async def _sab_delete(nzo_id: str):

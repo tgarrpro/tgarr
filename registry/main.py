@@ -580,8 +580,14 @@ async def contribute(request: Request):
             if audience not in ("sfw", "nsfw"):
                 audience = "sfw"
 
-            members = c.get("members_count")
-            media = c.get("media_count")
+            def _count(v, most):           # a count from a client: a whole number in a sane range, or none (QA #60)
+                try:
+                    v = int(v)
+                except (TypeError, ValueError):
+                    return None
+                return v if 0 <= v <= most else None
+            members = _count(c.get("members_count"), 50_000_000)
+            media = _count(c.get("media_count"), 10_000_000)
             lang = (c.get("language") or "")[:8] or None
             cat = (c.get("category") or "")[:24] or None
 
@@ -611,17 +617,21 @@ async def contribute(request: Request):
 
             # Distinct-contributor accounting
             inserted = await conn.fetchval(
-                """INSERT INTO registry_contributor_seen (instance_hash, username)
-                   VALUES ($1, $2)
+                """INSERT INTO registry_contributor_seen (instance_hash, username, ip_hash)
+                   VALUES ($1, $2, $3)
                    ON CONFLICT (instance_hash, username) DO UPDATE SET last_at = NOW()
                    RETURNING (xmax = 0)""",
-                inst_hash, username)
+                inst_hash, username, ip_hash)
             if inserted:
+                # counted, not incremented (the column started at 1, so the first contributor made it 2), and
+                # verified only by three different addresses, not three install ids (QA #38)
                 await conn.execute(
-                    """UPDATE registry_channels
-                       SET distinct_contributors = distinct_contributors + 1,
-                           verified = (distinct_contributors + 1) >= 3
-                       WHERE username = $1""",
+                    """UPDATE registry_channels rc
+                       SET distinct_contributors = s.n, verified = s.addrs >= 3
+                       FROM (SELECT count(*) AS n,
+                                    count(DISTINCT COALESCE(ip_hash, 'legacy:' || instance_hash)) AS addrs
+                             FROM registry_contributor_seen WHERE username = $1) s
+                       WHERE rc.username = $1""",
                     username)
             accepted += 1
 
@@ -779,7 +789,8 @@ async def contribute_resources(request: Request):
     # 3 round-trips total regardless of row count: UPSERT resources,
     # UPSERT contributor_seen, UPDATE distinct_contributors. Handles 50K+
     # rows in seconds vs old per-row loop's hours.
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    _TG_START = _dt(2013, 8, 1, tzinfo=_tz.utc)                    # no Telegram post is older than Telegram
     rows_valid = []  # list of column-aligned tuples
     accepted = rejected = csam_flagged = new_resource_count = 0
     anomaly_format = 0
@@ -799,6 +810,8 @@ async def contribute_resources(request: Request):
         if isinstance(posted_at, str):
             try:
                 posted_at = _dt.fromisoformat(posted_at.replace("Z","+00:00"))
+                if posted_at.tzinfo is None:
+                    posted_at = posted_at.replace(tzinfo=_tz.utc)        # compared with aware times below
             except Exception:
                 posted_at = None
         else:
@@ -819,8 +832,8 @@ async def contribute_resources(request: Request):
             rj,
             (r.get("access_kind") or "")[:20] or None,
             channel,
-            _int(r.get("msg_id")),
-            posted_at,
+            _int(r.get("msg_id"), 1, 2**31 - 1),                       # a Telegram message id (QA #39)
+            posted_at if posted_at and _TG_START <= posted_at <= _dt.now(posted_at.tzinfo) + _td(days=1) else None,
         ))
         accepted += 1
 
@@ -926,8 +939,9 @@ async def contribute_resources(request: Request):
                   (file_unique_id, channel_username, msg_id, posted_at)
                 SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[], $4::timestamptz[])
                 ON CONFLICT (file_unique_id, channel_username) DO UPDATE SET
-                  msg_id    = COALESCE(EXCLUDED.msg_id, registry_resource_channels.msg_id),
-                  posted_at = COALESCE(EXCLUDED.posted_at, registry_resource_channels.posted_at)
+                  -- the first report of where a file sits stands; a later one only fills a gap (QA #39)
+                  msg_id    = COALESCE(registry_resource_channels.msg_id, EXCLUDED.msg_id),
+                  posted_at = COALESCE(registry_resource_channels.posted_at, EXCLUDED.posted_at)
                 RETURNING file_unique_id, (xmax = 0) AS was_new
             """, cf, cn, cm, cp)
             new_chan_fuids = [r["file_unique_id"] for r in new_chan_rows if r["was_new"]]
@@ -1091,13 +1105,20 @@ async def _channel_file_list(channel: str, limit: int, after: int = 0) -> dict:
                 "AND (blocked OR audience = 'blocked_csam')", channel):
             rows = []
         else:
+            # A file only one install reported, numbered far beyond anything two installs agree on, is not
+            # trusted: made-up rows with huge message ids would otherwise push the channel's real files out of
+            # the newest-first list for everybody (QA #39).
             rows = await conn.fetch("""
+                WITH ok AS (SELECT max(rc.msg_id) AS top FROM registry_resource_channels rc
+                            JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
+                            WHERE rc.channel_username = $1 AND r.distinct_contributors >= 2)
                 SELECT rc.file_unique_id, rc.msg_id, rc.posted_at,
                        r.file_name, r.file_size, r.mime_type, r.media_type
                 FROM registry_resource_channels rc
-                JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id
+                JOIN registry_resources r ON r.file_unique_id = rc.file_unique_id, ok
                 WHERE rc.channel_username = $1 AND rc.msg_id IS NOT NULL AND NOT r.blocked
                   AND rc.msg_id > $3
+                  AND (ok.top IS NULL OR r.distinct_contributors >= 2 OR rc.msg_id <= ok.top + 200000)
                 ORDER BY rc.msg_id DESC
                 LIMIT $2
             """, channel, limit, after)
