@@ -451,4 +451,64 @@ _cc = _sk.cards(detail=0)
 ok(len(_cc) == 1 and _cc[0]["files"] == 3 and _cc[0]["files_expected"] == 280 and _cc[0]["name"] == "Criminal.Minds.S01.DVDRip",
    f"three files of one release seen: one card, not three ({[(c['name'], c['files']) for c in _cc]})")
 
+# ---- a card whose numbers are another server's (QA #23): found again by message-id --------------------
+import calendar as _cal
+
+
+class _AnchorNN:
+    """What anchor() asks of a connection: GROUP, HEAD by message-id, OVER (for the date search), QUIT."""
+
+    def __init__(self, arts, xref=True, have=True):
+        self.arts, self.xref, self.have = arts, xref, have
+        self.by_mid = {v[3]: n for n, v in arts.items()}
+        self.heads = 0
+
+    def group(self, grp):
+        return len(self.arts), min(self.arts), max(self.arts)
+
+    def head(self, mid):
+        self.heads += 1
+        n = self.by_mid.get(mid if mid.startswith("<") else f"<{mid}>")
+        if n is None or not self.have:
+            return 430, {}
+        subj, frm, date, m, size = self.arts[n]
+        h = {"subject": subj, "from": frm, "date": date, "message-id": m}
+        if self.xref:
+            h["xref"] = f"news.example alt.binaries.test:{n} alt.binaries.other:{n + 7}"
+        return 221, h
+
+    def over(self, lo, hi):
+        return [(k, self.arts[k][0], self.arts[k][1], self.arts[k][2], self.arts[k][3], self.arts[k][4])
+                for k in range(lo, hi + 1) if k in self.arts]
+
+    def quit(self):
+        pass
+
+
+FIRST_MID = ARTS[30_000][3]
+far = S.rebuild({}, "alt.binaries.test", PH, KEY, 9_000_000, 9_000_010, 6000, "Some Film", connections=4,
+                opener=FakeServer(ARTS).opener, pull=FakeServer(ARTS).pull)
+ok(far["nzb"] == "", "with another server's numbers the old way finds nothing (the field report's empty NZB)")
+
+srv = FakeServer(ARTS)
+nnx = _AnchorNN(ARTS, xref=True)
+r = S.relocate({}, "alt.binaries.test", PH, KEY, FIRST_MID, "Some Film", connections=6,
+               opener=srv.opener, pull=srv.pull, anchor_opener=lambda cfg: nnx)
+ok(r["located"] and r["anchor_by"] == "xref" and r["anchor"] == 30_000, f"found by its Xref number: {r.get('anchor')}")
+ok(r["nzb"] == one["nzb"] and r["complete"] and r["segments"] == 120_000, "and the NZB is the whole release, the same as read in place")
+
+srv = FakeServer(ARTS)
+nnd = _AnchorNN(ARTS, xref=False)           # a provider that sends no Xref and says "223 0" to STAT
+r = S.relocate({}, "alt.binaries.test", PH, KEY, FIRST_MID, "Some Film", connections=6,
+               opener=srv.opener, pull=srv.pull, anchor_opener=lambda cfg: nnd)
+ok(r["located"] and r["anchor_by"] == "date" and abs(r["anchor"] - 30_000) <= 2_000, f"found by its date: {r.get('anchor')}")
+ok(r["nzb"] == one["nzb"] and r["complete"], "the same whole NZB by the date search")
+
+r = S.relocate({}, "alt.binaries.test", PH, KEY, "<not-here@test>", "Some Film", connections=2,
+               opener=FakeServer(ARTS).opener, pull=FakeServer(ARTS).pull, anchor_opener=lambda cfg: _AnchorNN(ARTS))
+ok(r["gone"] and r["nzb"] == "", "a first article the server does not have: really gone")
+r = S.relocate({}, "alt.binaries.test", PH, "another release", FIRST_MID, "x", connections=2,
+               opener=FakeServer(ARTS).opener, pull=FakeServer(ARTS).pull, anchor_opener=lambda cfg: _AnchorNN(ARTS))
+ok(not r["gone"] and not r["located"] and r["nzb"] == "", "there, but not put together: not called gone")
+
 print(f"ok - {n} checks")

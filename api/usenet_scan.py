@@ -632,6 +632,58 @@ def _rebuild(cfg, grp, key, art_lo, art_hi, pad, name, connections, take, files,
             "files": len(payload) or len(files), "segments": seen, "art_lo": span[0], "art_hi": span[1], **cost}
 
 
+# ───────────────────────── a card whose numbers are another server's ─────────────────────────
+#
+# Article numbers belong to one server: a card from the shared index carries the numbers of whichever provider
+# indexed it, and on any other provider they point at somebody else's posts (QA #23: every Lexx episode came out
+# as an empty NZB on Newshosting while every article was there). A message-id is the same everywhere. So: ask this
+# server for the card's first article by message-id; it has it or it does not (gone, for real). Its Xref header
+# gives its number here when the server sends one; otherwise its Date is looked up in the group (article numbers
+# rise with time: some thirty small requests). The release is then read around that number as usual.
+
+def anchor(cfg: dict, grp: str, message_id: str, opener=None) -> dict:
+    """Where the article `message_id` is on this server: {"number": n} when found, {"gone": True} when the server
+    does not have it, {"number": None} when it has it but its place in the group could not be told."""
+    nn = (opener or (lambda c: connect(c, packed=False)))(cfg)
+    try:
+        _count, first, last = nn.group(grp)
+        code, hdr = nn.head(message_id)
+        if code in (430, 423, 420):
+            return {"gone": True}
+        if code != 221:
+            raise U.NNTPError(f"HEAD {code}")
+        for part in (hdr.get("xref") or "").split()[1:]:            # "Xref: server grp:12345 other.grp:678"
+            g, _sep, num = part.partition(":")
+            if g == grp and num.isdigit() and first <= int(num) <= last:
+                return {"number": int(num), "by": "xref"}
+        ts = U.when(hdr.get("date") or "")
+        if not ts:
+            return {"number": None}
+        return {"number": U.article_at(nn, first, last, ts), "by": "date"}
+    finally:
+        try:
+            nn.quit()
+        except Exception:
+            pass
+
+
+RELOCATE_PAD = 20_000                  # read around the place found by date: it is found to within a couple of thousand
+
+
+def relocate(cfg: dict, grp: str, poster: str, key: str, message_id: str, name: str = "", connections: int = 1,
+             opener=None, pull=None, anchor_opener=None) -> dict:
+    """The NZB of a card found by its first article's message-id, on whatever server this is. The same answer as
+    rebuild(), plus "gone" (the server does not have the article: really no longer there) and "located"."""
+    a = anchor(cfg, grp, message_id, opener=anchor_opener)
+    if a.get("gone"):
+        return {"nzb": "", "gone": True, "located": False, "segments": 0, "files": 0, "complete": False}
+    if a.get("number") is None:
+        return {"nzb": "", "gone": False, "located": False, "segments": 0, "files": 0, "complete": False}
+    got = rebuild(cfg, grp, poster, key, a["number"], a["number"], RELOCATE_PAD, name, connections, opener=opener, pull=pull)
+    got.update(gone=False, located=bool(got["nzb"]), anchor=a["number"], anchor_by=a.get("by"))
+    return got
+
+
 NZB_CONNECTIONS = 16                   # to begin with
 NZB_CONNECTIONS_STEP = 6
 NZB_CONNECTIONS_MOST = 50
