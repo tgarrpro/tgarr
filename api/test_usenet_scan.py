@@ -346,9 +346,9 @@ sk.add_rows([(k,) + v + ((),) for k, v in SMALL.items()])
 cards = sk.cards(detail=1)
 ok(len(cards) == 1 and cards[0]["kind"] == "ebook", f"one card for the post: {[(c['name'], c['kind']) for c in cards]}")
 its = cards[0].get("items") or []
-ok([(i["name"], len(i["message_ids"])) for i in its] == [("Author A - First Book.epub", 2), ("Author B - Second Book.pdf", 5), ("Author C - Third.epub", 1)],
-   f"its three books listed, each with the Message-IDs of its parts: {[(i['name'], len(i['message_ids'])) for i in its]}")
-ok(its[1]["message_ids"] == [f"<b1-{p}@test>" for p in range(1, 6)], "in the order of the parts")
+ok([i["name"] for i in its] == ["Author A - First Book.epub", "Author B - Second Book.pdf", "Author C - Third.epub"],
+   f"its three books listed by name: {[i['name'] for i in its]}")
+ok(all(set(i) == {"name", "size"} for i in its), "by name and size only: no Message-IDs go to the registry (it only indexes)")
 half = S.Sketch("alt.binaries.e-book", items=True)
 half.add_rows([(k,) + v + ((),) for k, v in SMALL.items() if k != 4])                      # one part of the second book missing
 ok([i["name"] for i in half.cards(detail=1)[0]["items"]] == ["Author A - First Book.epub", "Author C - Third.epub"], "a book with a part missing is not listed")
