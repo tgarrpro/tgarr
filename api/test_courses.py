@@ -136,4 +136,29 @@ for lang in sorted(d for d in os.listdir(base) if os.path.isdir(os.path.join(bas
         ok(slug not in slugs, f"{slug}: a slug used by two lists ({lang} and {slugs.get(slug)})")
         slugs[slug] = lang
         ok(pk["lang"].split("-")[0] == lang.split("-")[0], f"{slug}: its language ({pk['lang']}) is its folder's ({lang})")
+# ── index entries: free material kept by its publisher, only pointed to ──
+_e = {"slug": "zh-jinan-zhongwen", "title": "《中文》", "lang": "zh-Hans", "level": "5-8", "subject": "language", "right": "PUB",
+      "credit": "中国华文教育网", "terms": "版权所有，未经授权禁止复制和建立镜像", "terms_url": "https://www.hwjyw.com/hwjc.html",
+      "links": [{"url": "https://www.hwjyw.com/hwjc.html", "title": "教材"}, {"url": "https://oss.hwjyw.com/a.pdf", "title": "第一册", "file": True}]}
+_p = C.clean_catalogue_pack(_e)
+ok(_p["links"][1]["file"] and _p["parts"] == [] and not _p["channel"] and _p["terms_url"].startswith("https://"),
+   "an index entry keeps its links, its publisher's terms and where they are written - and holds no parts and no channel")
+
+
+def _refused(raw):
+    try:
+        C.clean_catalogue_pack(raw)
+    except ValueError:
+        return True
+    return False
+
+
+ok(_refused(dict(_e, right="CC BY-SA")), "an index entry is under the publisher's terms (PUB), not a licence of ours")
+ok(_refused(dict(_e, terms="")) and _refused(dict(_e, terms_url="")), "without the publisher's own terms it is not taken")
+ok(_refused(dict(_e, links=[{"url": "http://www.hwjyw.com/x.pdf"}])) and _refused(dict(_e, links=[{"url": "javascript:alert(1)"}])),
+   "links are https addresses only")
+ok(_refused(dict(_e, channel="tgarr0", tag="#x", upto=1)), "an index entry is not also a channel's list")
+ok(all(C.clean_catalogue_pack({"slug": "t-" + c.replace("_", "-"), "title": "t", "right": "CC BY-SA", "channel": c, "tag": "#t", "upto": 1})["channel"] == c
+       for c in ("tgarr0", "tgarr_vi", "tgarr_ko", "tgarr_tl", "tgarr_fa")),
+   "tgarr's own channels, one a language, may carry the catalogue's lists")
 print(f"test_courses: {n} checks passed ({len(slugs)} lists shipped)")

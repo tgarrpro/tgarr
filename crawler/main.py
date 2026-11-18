@@ -1184,7 +1184,7 @@ PRIVATE_CHAT_SQL = "username IS NULL AND COALESCE(members_count, 0) < 200"
 # Channels where volunteers publish courses (the api's courses.CATALOGUE_CHANNELS). A lesson is
 # often a film of two minutes and three megabytes: what the size floors below take for an
 # advert or a teaser. In these channels the floors do not apply (the advert words still do).
-COURSE_CHANNELS = frozenset({"tgarr0"})
+COURSE_CHANNELS = frozenset({"tgarr0", "tgarr_vi", "tgarr_ko", "tgarr_tl", "tgarr_fa"})
 
 
 def _quality_check(file_name: str | None, file_size: int | None,

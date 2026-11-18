@@ -86,4 +86,10 @@ T = {
     "every subject": ("所有科目", "所有科目", "todas las materias", "toutes les matières", "alle Fächer", "todas as matérias", "все предметы", "すべての教科", "모든 과목", "כל המקצועות", "كل المواد"),
     "listed": ("项", "項", "listados", "affichés", "angezeigt", "listados", "в списке", "件", "개", "מוצגים", "معروض"),
     "search": ("搜索", "搜尋", "buscar", "rechercher", "suchen", "buscar", "поиск", "検索", "검색", "חיפוש", "بحث"),
+    # ── index entries: kept by their publisher, only pointed to (0.5.16) ──
+    'Official page': ('官方页面', '官方頁面', 'Página oficial', 'Page officielle', 'Offizielle Seite', 'Página oficial', 'Официальная страница', '公式ページ', '공식 페이지', 'הדף הרשמי', 'الصفحة الرسمية'),
+    'kept by its publisher': ('由出版方提供', '由出版方提供', 'lo ofrece su editor', 'proposé par son éditeur', 'beim Herausgeber', 'oferecido pela editora', 'у издателя', '発行元が公開', '발행처 제공', 'אצל המוציא לאור', 'لدى الناشر'),
+    'read them': ('查看', '查看', 'leerlos', 'les lire', 'lesen', 'ler', 'прочитать', '読む', '보기', 'לקרוא', 'قراءتها'),
+    'terms of the publisher': ('出版方的使用条款', '出版方的使用條款', 'condiciones del editor', "conditions de l'éditeur", 'Bedingungen des Herausgebers', 'termos da editora', 'условия издателя', '発行元の利用条件', '발행처 이용 조건', 'תנאי המוציא לאור', 'شروط الناشر'),
+    '{n} files on the site of the publisher': ('出版方网站上的 {n} 个文件', '出版方網站上的 {n} 個檔案', '{n} archivos en el sitio del editor', "{n} fichiers sur le site de l'éditeur", '{n} Dateien auf der Seite des Herausgebers', '{n} arquivos no site da editora', '{n} файлов на сайте издателя', '発行元サイトのファイル {n} 件', '발행처 사이트의 파일 {n}개', '{n} קבצים באתר המוציא לאור', '{n} ملفات على موقع الناشر'),
 }

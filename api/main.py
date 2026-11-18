@@ -12831,6 +12831,7 @@ async def api_courses(request: Request):
     if not locked:
         have = {c["slug"] for c in mine if c["slug"]}
         out["packs"] = [{k: p[k] for k in ("slug", "title", "about", "lang", "level", "subject", "right", "credit")} | {"parts": len(p["parts"])}
+                        | ({"links": p["links"], "terms": p["terms"], "terms_url": p["terms_url"]} if p.get("links") else {})
                         for p in _course_packs().values() if p["slug"] not in have]
     return out
 
@@ -12873,6 +12874,9 @@ async def api_course_add(request: Request):
         pk = _course_packs().get(str(b["pack"]))
         if not pk:
             return no("no such list", 404)
+        if pk.get("links"):
+            # an index entry: its publisher keeps it; tgarr points there and fetches nothing
+            return no("this is kept by its publisher: open it on the publisher's site", 400)
         kind, title, slug, parts = "pack", pk["title"], pk["slug"], _json.dumps(pk["parts"])
         meta.update(about=pk["about"], lang=pk["lang"], level=pk["level"], subject=pk["subject"], license=pk["right"], credit=pk["credit"])
         if pk["channel"]:
@@ -13993,12 +13997,30 @@ async def page_kids_manage():
     ui_lang = _LANG.get().split("-")[0]
     packs = sorted((pk for pk in _course_packs().values() if pk["slug"] not in have_slugs),
                    key=lambda pk: (pk["lang"].split("-")[0] != ui_lang, pk["subject"] != "language", pk["lang"], pk["title"]))
+    def _index_row(pk):
+        """An index entry: the publisher keeps it on its own site; tgarr shows where, and the publisher's terms.
+        Whoever wants it opens or saves it from there, in their own browser - tgarr fetches nothing."""
+        page = next((x for x in pk["links"] if not x["file"]), pk["links"][0])
+        files = [x for x in pk["links"] if x["file"]]
+        a = lambda x: (f'<a href="{html.escape(x["url"], quote=True)}" target="_blank" rel="noopener noreferrer">'  # noqa: E731
+                       f'{html.escape(x["title"] or x["url"])}</a>')
+        return (f'<div class="km-row" data-slug="" {_cattrs(pk["lang"], pk["subject"], pk["level"], pk["title"])}><span class="n" style="white-space:normal">'
+                f'<b>{html.escape(pk["title"])}</b> <small>{html.escape(pk["lang"])} · {_t(_COURSE_SUBJECT[pk["subject"]])} · '
+                f'{_t(_COURSE_LEVEL[pk["level"]])} · {_t("kept by its publisher")}: {html.escape(pk["credit"])}</small>'
+                + (f'<br/><small>{html.escape(pk["about"])}</small>' if pk["about"] else "")
+                + f'<br/><small>{_t("terms of the publisher")}: “{html.escape(pk["terms"])}” '
+                f'<a href="{html.escape(pk["terms_url"], quote=True)}" target="_blank" rel="noopener noreferrer">{_t("read them")}</a></small>'
+                + (f'<details><summary><small>{_t("{n} files on the site of the publisher", n=len(files))}</small></summary><small>'
+                   + " · ".join(a(x) for x in files) + '</small></details>' if files else "")
+                + f'</span><a class="btn" href="{html.escape(page["url"], quote=True)}" target="_blank" rel="noopener noreferrer">{_t("Official page")}</a></div>')
+
     pack_rows = "".join(
+        _index_row(pk) if pk.get("links") else (
         f'<div class="km-row" data-slug="{html.escape(pk["slug"])}" {_cattrs(pk["lang"], pk["subject"], pk["level"], pk["title"])}><span class="n"><b>{html.escape(pk["title"])}</b> <small>{html.escape(pk["lang"])} · '
         f'{_t(_COURSE_SUBJECT[pk["subject"]])} · {_t(_COURSE_LEVEL[pk["level"]])} · {_t("{n} parts", n=len(pk["parts"]))} · {html.escape(pk["right"])}</small>'
         + (f'<br/><small>{html.escape(pk["about"])}</small>' if pk["about"] else "") + '</span>'
         f'<button class="btn ghost" onclick="kcAddSeries(this)" title="{_t("add every course of this series")}">{_t("Add series")}</button>'
-        f'<button class="btn" onclick="kcAdd({{pack: \'{pk["slug"]}\'}})">{_t("Add")}</button></div>' for pk in packs)
+        f'<button class="btn" onclick="kcAdd({{pack: \'{pk["slug"]}\'}})">{_t("Add")}</button></div>') for pk in packs)
     _lname = {"zh": "中文", "vi": "Tiếng Việt", "ko": "한국어", "tl": "Filipino", "fil": "Filipino", "fa": "فارسی", "en": "English",
               "ja": "日本語", "es": "Español", "fr": "Français", "de": "Deutsch", "pt": "Português", "ru": "Русский", "ar": "العربية", "he": "עברית"}
 
@@ -14162,10 +14184,10 @@ async function kcAddMany(slugs){
   for (const s of slugs) { await kcSend("/api/courses", {pack: s}); }
   location.reload();
 }
-function kcAddShown(){ kcAddMany(kcShown("kcPacks").map(r => r.dataset.slug)); }
+function kcAddShown(){ kcAddMany(kcShown("kcPacks").map(r => r.dataset.slug).filter(s => s)); }
 function kcAddSeries(b){
   const row = b.closest(".km-row");
-  kcAddMany(Array.from(document.querySelectorAll("#kcPacks .km-row")).filter(r => r.dataset.series === row.dataset.series && r.dataset.lang === row.dataset.lang).map(r => r.dataset.slug));
+  kcAddMany(Array.from(document.querySelectorAll("#kcPacks .km-row")).filter(r => r.dataset.series === row.dataset.series && r.dataset.lang === row.dataset.lang).map(r => r.dataset.slug).filter(s => s));
 }
 function kcAllowShown(on){
   kcShown("kcMine").forEach(r => { const c = r.querySelector('input[type="checkbox"]'); if (c && c.checked !== on) { c.checked = on; c.onchange(); } });
