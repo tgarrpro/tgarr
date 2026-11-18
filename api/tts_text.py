@@ -215,11 +215,17 @@ def numbers_to_english(text: str) -> str:
     return _RX_INT.sub(lambda m: number_words(int(m.group().replace(",", ""))), t)
 
 
+# symbols without a spoken form: emoji and pictographs, dingbats, arrows, the variation selectors and joiners that build emoji
+_RX_NO_READING = re.compile("[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF\U00002190-\U000021FF"
+                            "\U0001F1E6-\U0001F1FF\U0000FE00-\U0000FE0F\U0000200D\U000020E3\U0000E000-\U0000F8FF]")
+
+
 def tidy(text: str) -> str:
     """The text as the voice should be given it: no marks it would skip a word over, pauses
     where a dash or dots stood, and - in a sentence without Chinese - figures as words. (In a
     Chinese sentence the voice's own tables read dates and quantities: 12月31日, 3.5吨.)"""
     t = _RX_APOSTROPHE.sub("'", text or "")
+    t = _RX_NO_READING.sub(" ", t)          # emoji and pictographs have no reading: the voice stopped on them (QA #11)
     for q in _QUOTES:
         t = t.replace(q, " ")
     t = re.sub(r"(?<![A-Za-z])'|'(?![A-Za-z])", " ", t)      # a quote mark, not the apostrophe of don't

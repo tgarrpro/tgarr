@@ -41,6 +41,8 @@ for text, want in (
     ok(T.numbers_to_english(text) == want, f"{text!r} -> {T.numbers_to_english(text)!r}")
 
 # ---- tidying ---------------------------------------------------------------------------------
+ok(T.tidy("你好❓世界") == "你好世界" and T.tidy("Hello 👋🏽 world!") == "Hello world!" and T.tidy("❤️爱心") == "爱心",
+   "emoji and pictographs have no reading: they are left out, not given to the voice (it stopped on them)")
 ok(T.tidy('"Well," said the old man, "some journeys take longer, don\'t they?"') == "Well, said the old man, some journeys take longer, don't they?",
    "quote marks go (a voice skipped the word they were stuck to); the apostrophe of don't stays: "
    + repr(T.tidy('"Well," said the old man, "some journeys take longer, don\'t they?"')))

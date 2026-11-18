@@ -806,6 +806,7 @@ async def _migrate_schema():
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_last_run_at TIMESTAMPTZ;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS auto_joined BOOLEAN;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ;
+            ALTER TABLE channels ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE;
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS deep_total_pulled BIGINT NOT NULL DEFAULT 0;
             CREATE INDEX IF NOT EXISTS idx_channels_deep_backfilled ON channels (deep_backfilled);
             ALTER TABLE channels ADD COLUMN IF NOT EXISTS remote_msgs BIGINT;
@@ -7372,11 +7373,11 @@ async def api_internal_arr_scan(payload: dict):
     if not (url and key):
         return JSONResponse({"status": "skipped", "reason": "no key"},
                           status_code=200)
-    # Map crawler-side path (/downloads/tgarr/...) to host-side path that
-    # Sonarr sees. Sonarr's remotePathMapping translates from host -> its
-    # localPath. We feed it host paths.
-    sonarr_path = path.replace("/downloads/tgarr/",
-                               "/DATA/Downloads/tgarr/tgarr/", 1)
+    # The path as the *arr sees it. TGARR_ARR_DOWNLOAD_ROOT names where tgarr's /downloads/tgarr/ is for the *arr;
+    # without it the container's own path is sent and the *arr's Remote Path Mapping translates it. (It once was
+    # one install's host folder, written in: QA 2026-11-17 #7.)
+    root = os.environ.get("TGARR_ARR_DOWNLOAD_ROOT", "").strip()
+    sonarr_path = path.replace("/downloads/tgarr/", root.rstrip("/") + "/", 1) if root else path
     body = _json.dumps({"name": cmd, "path": sonarr_path,
                         "importMode": "move"}).encode()
     req = urllib.request.Request(
@@ -9325,11 +9326,32 @@ async def api_channel_unsubscribe(tg_chat_id: int):
     list for good - not followed, not joined, with a "+ Follow" button and no
     way to take it off. Never a chat the account is in, never a private one."""
     async with db_pool.acquire() as conn:
-        await conn.execute(
+        done = await conn.execute(
             """UPDATE channels SET subscribed = FALSE, unfollowed_at = COALESCE(unfollowed_at, NOW())
                WHERE tg_chat_id = $1 AND username IS NOT NULL AND local_root IS NULL
                  AND (subscribed = TRUE OR COALESCE(is_joined, FALSE) = FALSE)""", tg_chat_id)
+        if done.endswith(" 0"):                       # nothing was changed: say why, not "ok" (QA 2026-11-17 #2)
+            r = await conn.fetchrow("SELECT username, is_joined, local_root FROM channels WHERE tg_chat_id = $1", tg_chat_id)
+            if not r:
+                return JSONResponse({"status": "gone", "message": "not in the list"}, status_code=404)
+            why = ("joined" if r["is_joined"] else "private" if not r["username"] else "local")
+            return JSONResponse({"status": why, "message": {
+                "joined": "this is a chat your Telegram account is in: leave it in Telegram, or hide it here",
+                "private": "a private chat cannot be unfollowed: hide it here instead",
+                "local": "a folder on this computer: remove it under Settings, Local files"}[why]}, status_code=409)
     return {"status": "ok"}
+
+
+@app.post("/api/channel/hide/{tg_chat_id}")
+async def api_channel_hide(tg_chat_id: int, hide: int = 1):
+    """Take a chat out of every list and stop reading it - also one the account is in, which "remove" cannot do
+    (Telegram would bring it back). Its saved files stay. hide=0 shows it again."""
+    async with db_pool.acquire() as conn:
+        done = await conn.execute("UPDATE channels SET hidden = $2, enabled = NOT $2 WHERE tg_chat_id = $1",
+                                  tg_chat_id, bool(hide))
+    if done.endswith(" 0"):
+        return JSONResponse({"status": "gone", "message": "not in the list"}, status_code=404)
+    return {"status": "ok", "hidden": bool(hide)}
 
 
 @app.post("/api/channel/{tg_chat_id}/audience")
@@ -9382,7 +9404,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                  WHERE r.category IN ('movie', 'tv') GROUP BY 1)
                SELECT c.tg_chat_id, c.username, c.title, c.backfilled, c.members_count,
                       c.audience, c.subscribed, c.is_joined, c.dead_at, c.subscribe_error,
-                      c.purged_at, c.unfollowed_at, c.handle_known, c.web_preview,
+                      c.purged_at, c.unfollowed_at, c.handle_known, c.web_preview, COALESCE(c.hidden, FALSE) AS hidden,
                       COALESCE(a.msgs, 0) AS msgs, COALESCE(a.media, 0) AS media,
                       COALESCE(a.videos, 0) AS videos, COALESCE(a.songs, 0) AS songs,
                       COALESCE(a.photos, 0) AS photos, COALESCE(a.docs, 0) AS docs,
@@ -9407,6 +9429,7 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
     def _uf(r):
         return bool(r["unfollowed_at"]) and not r["subscribed"] and not r["is_joined"]
     kinds = {
+        "hidden": lambda r: r["hidden"],
         "all": lambda r: not _uf(r),
         "films": lambda r: r["films"] > 0 and not _uf(r),
         "joined": lambda r: r["is_joined"],
@@ -9417,6 +9440,8 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         "dead": lambda r: r["dead_at"] is not None and not _uf(r),
         "clearing": _uf,
     }
+    # a hidden chat (the user's choice, QA 2026-11-17 #2) is under "hidden" only
+    kinds = {k: (f if k == "hidden" else (lambda r, f=f: not r["hidden"] and f(r))) for k, f in kinds.items()}
     if show not in kinds:
         show = "all"
     counts = {k: sum(1 for r in rows if f(r)) for k, f in kinds.items()}
@@ -9479,6 +9504,9 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
         + (_chip_link(_t("being cleared") + _n("clearing"), "/channels" + _cqs(show="clearing", offset=None),
                       show == "clearing",
                       _tip(_t("channels you unfollowed: their index is being cleared and they then disappear. Follow one again here to keep it."))) if counts["clearing"] else "")
+        + (_chip_link(_t("hidden") + _n("hidden"), "/channels" + _cqs(show="hidden", offset=None),
+                      show == "hidden",
+                      _tip(_t("chats you hid: not read and not listed. Show one again here."))) if counts["hidden"] else "")
         # on a phone there is no room for the column header: the same sorts as chips
         + '<span class="sort-chips"><span class="sep"></span><span class="lbl">' + _t("Sort:") + '</span>'
         + _chip_link(_t("films"), "/channels" + _cqs(sort=None, order=None, offset=None), sort == "films")
@@ -9521,6 +9549,8 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                         + (_t("followed · web") if r["web_preview"] else _t("followed · listed")) + '</span>')
         elif r["subscribed"]:
             tags.append(f'<span class="tag acc" title="{_t("read without joining")}">{_t("followed")}</span>')
+        elif r["unfollowed_at"] and r["purged_at"] and r["purged_at"] >= r["unfollowed_at"]:
+            tags.append(f'<span class="tag" title="{_t("unfollowed and cleared; only files you saved or marked as favourite are still here")}">{_t("not followed · cleared")}</span>')
         elif r["unfollowed_at"]:
             tags.append(f'<span class="tag warn" title="{_t("you unfollowed it: its films and files are being cleared from this index and it will leave this list. Follow it again to keep it.")}">{_t("unfollowed · being cleared")}</span>')
         elif r["purged_at"] and not purge_on:
@@ -9564,6 +9594,13 @@ async def page_channels(q: Optional[str] = None, show: str = "all", sort: str = 
                 # not followed, not joined, and nobody ever unfollowed it: it can be taken off the list
                 act += (f' <button class="abtn" {_ids} onclick="tgRemove(this)" '
                         f'title="{_t("take this channel and its index off this tgarr")}">{_t("Remove")}</button>')
+        if r["hidden"]:
+            act = (f'<button class="abtn" {_ids} onclick="tgHide(this, 0)" '
+                   f'title="{_t("list and read this chat again")}">{_t("Show again")}</button>')
+        elif r["is_joined"] or not r["username"]:
+            # a chat the account is in comes back from Telegram however often it is removed: it can be hidden
+            act += (f' <button class="abtn" {_ids} onclick="tgHide(this, 1)" '
+                    f'title="{_t("stop reading this chat and take it off every list; files you saved stay")}">{_t("Hide")}</button>')
         return (
             f'<div class="ls-row">{_avatar(title)}'
             f'<div class="ls-main"><div class="ls-title">{html.escape(title)} '
@@ -9629,7 +9666,7 @@ function tgUnfollow(b) {
   if (!confirm(tgUnfollowAsk)) return;
   b.disabled = true; b.textContent = "…";
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
-    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChSet(b, false); })
+    .then(function (r) { if (!r.ok) return tgWhy(r); tgChSet(b, false); })
     .catch(function (e) { tgChFail(b, "[[@js:Unfollow]]", e.message); });
 }
 function tgRemove(b) {
@@ -9637,8 +9674,18 @@ function tgRemove(b) {
                + "[[@js:Its films and files leave the index within a few hours. Files you saved and favourites stay. It can be followed again from Discover.]]")) return;
   b.disabled = true; b.textContent = "…";
   fetch("/api/channel/unsubscribe/" + b.dataset.id, {method: "POST"})
-    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); tgChGone(b, "[[@js:Removed]]"); })
+    .then(function (r) { if (!r.ok) return tgWhy(r); tgChGone(b, "[[@js:Removed]]"); })
     .catch(function (e) { tgChFail(b, "[[@js:Remove]]", e.message); });
+}
+function tgWhy(r) {   // a refusal says why (QA #2): show it instead of a silent "done"
+  return r.json().then(function (j) { throw new Error(j.message || ("HTTP " + r.status)); },
+                       function () { throw new Error("HTTP " + r.status); });
+}
+function tgHide(b, on) {
+  b.disabled = true; b.textContent = "…";
+  fetch("/api/channel/hide/" + b.dataset.id + "?hide=" + on, {method: "POST"})
+    .then(function (r) { if (!r.ok) return tgWhy(r); tgChGone(b, on ? "[[@js:Hidden]]" : "[[@js:Shown again]]"); })
+    .catch(function (e) { tgChFail(b, on ? "[[@js:Hide]]" : "[[@js:Show again]]", e.message); });
 }
 function tgFollow(b) {
   b.disabled = true; b.textContent = "…";
@@ -13741,6 +13788,7 @@ async def page_mediacenter(request: Request, kind: str = "video", q: Optional[st
 
 _KIDS_CSS = """<style>
 .km-row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.kc-filter .chip{border:1px solid var(--border);background:transparent;color:inherit;border-radius:999px;padding:5px 12px;cursor:pointer;font:inherit}.kc-filter .chip small{color:var(--muted)}.kc-filter .chip.on{background:var(--accent);border-color:var(--accent);color:#fff}.kc-filter .chip.on small{color:#fff}.km-row[hidden]{display:none}
 .km-row:last-child{border-bottom:none}.km-row span.n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .km-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:22px;overflow:hidden}
 .km-pad{padding:16px 18px}.km-row small{color:var(--muted)}
@@ -13918,8 +13966,19 @@ async def page_kids_manage():
     async with db_pool.acquire() as conn:
         share_on = (await conn.fetchval("SELECT value FROM config WHERE key = 'share_courses'")) != "0"
     kind_word = {"pack": "from the Internet Archive", "folder": "a folder", "channel": "a channel", "list": "an imported list"}
+
+    # Thousands of courses in many languages (Tom 2026-11-18): each row carries its language, subject, level and series,
+    # and the page filters them in place - language tabs, subject, age, a search - with whole-set actions.
+    def _ckey(lang):
+        return (lang or "?").split("-")[0].lower()
+
+    def _cattrs(lang, subject, level, title):
+        series = title.split(" · ")[0] if " · " in title else title
+        return (f'data-lang="{html.escape(_ckey(lang))}" data-subject="{html.escape(subject or "other")}" '
+                f'data-level="{html.escape(level or "all")}" data-series="{html.escape(series, quote=True)}" '
+                f'data-q="{html.escape(title.lower(), quote=True)}"')
     course_rows = "".join(
-        f'<div class="km-row"><input type="checkbox" {"checked" if c["allowed"] else ""} title="{_t("shown in the Media Center")}" '
+        f'<div class="km-row" {_cattrs(c["lang"], c["subject"], c["level"], c["title"])}><input type="checkbox" {"checked" if c["allowed"] else ""} title="{_t("shown in the Media Center")}" '
         f'onchange="kmAllow(\'course\', {c["id"]}, this)"/>'
         f'<span class="n"><b>{html.escape(c["title"])}</b> <small>{_t("{n} lessons", n=c["lessons"])} · {_t(kind_word.get(c["kind"], "a channel"))}'
         + (f' · {html.escape(c["license"])}' if c["license"] else "") + '</small></span>'
@@ -13932,14 +13991,34 @@ async def page_kids_manage():
     packs = sorted((pk for pk in _course_packs().values() if pk["slug"] not in have_slugs),
                    key=lambda pk: (pk["lang"].split("-")[0] != ui_lang, pk["subject"] != "language", pk["lang"], pk["title"]))
     pack_rows = "".join(
-        f'<div class="km-row"><span class="n"><b>{html.escape(pk["title"])}</b> <small>{html.escape(pk["lang"])} · '
+        f'<div class="km-row" data-slug="{html.escape(pk["slug"])}" {_cattrs(pk["lang"], pk["subject"], pk["level"], pk["title"])}><span class="n"><b>{html.escape(pk["title"])}</b> <small>{html.escape(pk["lang"])} · '
         f'{_t(_COURSE_SUBJECT[pk["subject"]])} · {_t(_COURSE_LEVEL[pk["level"]])} · {_t("{n} parts", n=len(pk["parts"]))} · {html.escape(pk["right"])}</small>'
         + (f'<br/><small>{html.escape(pk["about"])}</small>' if pk["about"] else "") + '</span>'
+        f'<button class="btn ghost" onclick="kcAddSeries(this)" title="{_t("add every course of this series")}">{_t("Add series")}</button>'
         f'<button class="btn" onclick="kcAdd({{pack: \'{pk["slug"]}\'}})">{_t("Add")}</button></div>' for pk in packs)
+    _lname = {"zh": "中文", "vi": "Tiếng Việt", "ko": "한국어", "tl": "Filipino", "fil": "Filipino", "fa": "فارسی", "en": "English",
+              "ja": "日本語", "es": "Español", "fr": "Français", "de": "Deutsch", "pt": "Português", "ru": "Русский", "ar": "العربية", "he": "עברית"}
+
+    def _cfilter(box, rows_langs):
+        langs = {}
+        for l in rows_langs:
+            langs[l] = langs.get(l, 0) + 1
+        order = sorted(langs, key=lambda l: (l != ui_lang, -langs[l]))
+        chips = "".join(f'<button class="chip" data-l="{html.escape(l)}" onclick="kcLang(\'{box}\', this)">'
+                        f'{html.escape(_lname.get(l, l))} <small>{langs[l]}</small></button>' for l in order)
+        return (f'<div class="kc-filter" data-box="{box}" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0">'
+                + (chips if len(langs) > 1 else "")
+                + f'<select class="km-in" onchange="kcRun(\'{box}\')" data-f="subject"><option value="">{_t("every subject")}</option>{opt(_COURSE_SUBJECT)}</select>'
+                + f'<select class="km-in" onchange="kcRun(\'{box}\')" data-f="level"><option value="">{_t("every age")}</option>{opt(_COURSE_LEVEL)}</select>'
+                + f'<input class="km-in" placeholder="{_t("search")}" oninput="kcRun(\'{box}\')" data-f="q" style="width:180px"/>'
+                + '<small class="kc-n" style="color:var(--muted)"></small></div>')
     opt = lambda table, cur="": "".join(f'<option value="{k}"{" selected" if k == cur else ""}>{_t(v)}</option>' for k, v in table.items())  # noqa: E731
     course_box = (
         '<p class="note">' + _t("A course is a list of lessons in an order. Tick a course and all of it is shown on the Learn shelf of the Media Center; each child's place and what they finished is kept.") + '</p>'
-        + f'<div class="km-box km-list" style="max-height:none;min-height:0">{course_rows or "<div class=km-pad style=color:var(--muted)>" + _t("No courses yet.") + "</div>"}</div>'
+        + (_cfilter("kcMine", [_ckey(c["lang"]) for c in my_courses]) if len(my_courses) > 8 else "")
+        + (f'<div style="margin:0 0 8px"><button class="btn ghost" onclick="kcAllowShown(true)">{_t("Show all listed")}</button> '
+           f'<button class="btn ghost" onclick="kcAllowShown(false)">{_t("Hide all listed")}</button></div>' if len(my_courses) > 8 else "")
+        + f'<div class="km-box km-list" id="kcMine" style="max-height:520px;min-height:0">{course_rows or "<div class=km-pad style=color:var(--muted)>" + _t("No courses yet.") + "</div>"}</div>'
         # what learning earns
         + f'<h2 class="section">{_t("What learning earns")}</h2><div class="km-box"><div class="km-pad">'
         f'<label><input type="checkbox" id="rwOn" {"checked" if rw["on"] else ""}/> {_t("A lesson done earns time in the Media Center")}</label>'
@@ -13965,7 +14044,9 @@ async def page_kids_manage():
         # add a course
         + f'<h2 class="section">{_t("Add a course")}</h2>'
         + (f'<p class="note">{_t("Lists that come with tgarr. Their material is at the Internet Archive and is fetched to this machine when you ask for it.")}</p>'
-           f'<div class="km-box km-list" style="max-height:420px;min-height:0">{pack_rows}</div>' if pack_rows else "")
+           + _cfilter("kcPacks", [_ckey(pk["lang"]) for pk in packs])
+           + f'<div style="margin:0 0 8px"><button class="btn" onclick="kcAddShown()">{_t("Add all listed")}</button></div>'
+           f'<div class="km-box km-list" id="kcPacks" style="max-height:520px;min-height:0">{pack_rows}</div>' if pack_rows else "")
         + '<div class="km-box"><div class="km-pad">'
         f'<b>{_t("From a channel or a folder of your own")}</b>'
         '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">'
@@ -14052,6 +14133,43 @@ function kcSend(path, body){
 function kcAdd(body){ kcSend("/api/courses", body).then(j => { if (j.status === "ok") location.reload(); else alert(j.message || "[[@js:that did not work]]"); }); }
 function kcMake(){ kcAdd({channel: +G("kcChan").value, folder: G("kcPath").value.trim() ? +G("kcChan").value : undefined, path: G("kcPath").value.trim(),
   title: G("kcTitle").value, subject: G("kcSubject").value, level: G("kcLevel").value}); }
+function kcRun(box){
+  const f = document.querySelector('.kc-filter[data-box="' + box + '"]'); if (!f) return;
+  const on = f.querySelector(".chip.on"), lang = on ? on.dataset.l : "";
+  const sub = f.querySelector('[data-f="subject"]').value, lev = f.querySelector('[data-f="level"]').value;
+  const q = f.querySelector('[data-f="q"]').value.trim().toLowerCase();
+  let n = 0;
+  document.querySelectorAll("#" + box + " .km-row").forEach(r => {
+    const ok = (!lang || r.dataset.lang === lang) && (!sub || r.dataset.subject === sub) && (!lev || r.dataset.level === lev)
+               && (!q || r.dataset.q.indexOf(q) >= 0);
+    r.hidden = !ok; if (ok) n++;
+  });
+  f.querySelector(".kc-n").textContent = n + " [[@js:listed]]";
+}
+function kcLang(box, b){
+  const was = b.classList.contains("on");
+  b.parentNode.querySelectorAll(".chip").forEach(c => c.classList.remove("on"));
+  if (!was) b.classList.add("on");
+  kcRun(box);
+}
+function kcShown(box){ return Array.from(document.querySelectorAll("#" + box + " .km-row")).filter(r => !r.hidden); }
+async function kcAddMany(slugs){
+  if (!slugs.length) return;
+  if (!confirm("[[@js:Add these courses?]] (" + slugs.length + ")")) return;
+  for (const s of slugs) { await kcSend("/api/courses", {pack: s}); }
+  location.reload();
+}
+function kcAddShown(){ kcAddMany(kcShown("kcPacks").map(r => r.dataset.slug)); }
+function kcAddSeries(b){
+  const row = b.closest(".km-row");
+  kcAddMany(Array.from(document.querySelectorAll("#kcPacks .km-row")).filter(r => r.dataset.series === row.dataset.series && r.dataset.lang === row.dataset.lang).map(r => r.dataset.slug));
+}
+function kcAllowShown(on){
+  kcShown("kcMine").forEach(r => { const c = r.querySelector('input[type="checkbox"]'); if (c && c.checked !== on) { c.checked = on; c.onchange(); } });
+}
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll(".kc-filter").forEach(f => { const c = f.querySelector(".chip"); if (c) c.classList.add("on"); kcRun(f.dataset.box); });
+});
 function kcDel(id){ if (confirm("[[@js:Remove this course? Its files stay where they are.]]")) kcSend("/api/courses/" + id + "/delete").then(() => location.reload()); }
 function kcFetch(id, b){
   b.disabled = true;
@@ -17084,6 +17202,13 @@ CAPS_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
       <subcat id="5040" name="TV/HD"/>
       <subcat id="5045" name="TV/UHD"/>
       <subcat id="5070" name="TV/Anime"/>
+    </category>
+    <category id="3000" name="Audio">
+      <subcat id="3010" name="Audio/MP3"/>
+      <subcat id="3030" name="Audio/Audiobook"/>
+    </category>
+    <category id="7000" name="Books">
+      <subcat id="7020" name="Books/EBook"/>
     </category>
     <category id="8000" name="Other">
       <subcat id="8010" name="Other/Misc"/>

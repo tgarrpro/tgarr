@@ -1596,6 +1596,8 @@ async def init_db() -> None:
         await conn.execute(
             "ALTER TABLE channels ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ")
         await conn.execute(
+            "ALTER TABLE channels ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE")
+        await conn.execute(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumb_accessed_at TIMESTAMPTZ")
         await conn.execute(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview_accessed_at TIMESTAMPTZ")
@@ -2097,9 +2099,12 @@ async def ingest_message(msg: Message, live: bool = False) -> bool:
                        COALESCE(subscribed, FALSE) AS followed,
                        (COALESCE(category, '') = 'noise'
                         OR COALESCE(content_category, '') = 'noise') AS noise,
+                       COALESCE(hidden, FALSE) AS hidden,
                        ({PRIVATE_CHAT_SQL}) AS private
                 FROM channels WHERE tg_chat_id = $1""", chat_id)
     if not live and not (st and st["known"]):
+        return False
+    if st and st["hidden"]:                   # the user hid it: nothing of it is kept, joined or not
         return False
     # a chat not seen before arrives live: private until its size is known
     is_private = bool(st["private"]) if st else not getattr(msg.chat, "username", None)
@@ -2433,6 +2438,7 @@ async def backfill_all() -> None:
                    WHERE subscribed = FALSE
                      AND enabled = FALSE
                      AND COALESCE(category,'') <> 'noise'
+                     AND NOT COALESCE(hidden, FALSE)
                      AND tg_chat_id = ANY($1::bigint[])
                    RETURNING tg_chat_id, title""",
                 ids_list)
@@ -6399,7 +6405,7 @@ async def decay_eviction_worker() -> None:
                     WHERE (
                       (media_type='video'    AND file_size < 5000000) OR
                       (media_type='audio'    AND file_size < 100000)  OR
-                      (media_type='document' AND file_size < 10000 AND NOT (COALESCE(file_name, '') <> '' AND """ + BOOK_SQL + """) OR
+                      (media_type='document' AND file_size < 10000 AND NOT (COALESCE(file_name, '') <> '' AND """ + BOOK_SQL + """)) OR
                       (media_type='document' AND file_size < """ + str(BOOK_MIN_BYTES) + """)
                     )
                     AND COALESCE(local_path, '') = ''
@@ -7100,6 +7106,7 @@ _UNFOLLOW_PICK_SQL = """
       AND COALESCE(c.subscribed, FALSE) = FALSE
       AND COALESCE(c.title, '') NOT ILIKE 'KwickPOS%'
       AND COALESCE(c.category, '') <> 'personal'
+      AND (c.purged_at IS NULL OR c.purged_at < c.unfollowed_at)      -- cleared since it was unfollowed: done
       AND (c.unfollowed_at < NOW() - make_interval(hours => $1)
            OR NOT EXISTS (SELECT 1 FROM messages m
                           WHERE m.channel_id = c.id AND m.file_unique_id IS NOT NULL
@@ -7134,8 +7141,9 @@ async def _unfollow_clear_once() -> "str | None":
             await conn.execute("DELETE FROM channels WHERE id = $1", ch["id"])
             log.info("[unfollow] @%s: cleared, removed from the list", uname)
             return f"@{uname}: removed"
-        await conn.execute(
-            "UPDATE channels SET unfollowed_at = NULL, purged_at = NOW() WHERE id = $1", ch["id"])
+        # still unfollowed - clearing unfollowed_at once put the channel back in the main list (QA 2026-11-17 #1);
+        # purged_at after unfollowed_at marks it done, and _UNFOLLOW_PICK_SQL passes it by from now on
+        await conn.execute("UPDATE channels SET purged_at = NOW() WHERE id = $1", ch["id"])
         log.info("[unfollow] @%s: cleared; %d saved / favourite / downloading row(s) kept", uname, left)
         return f"@{uname}: cleared, kept {left}"
 

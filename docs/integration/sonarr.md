@@ -86,6 +86,8 @@ Share the downloads folder with the Sonarr host (NFS, SMB) and mount it there, f
 |---|---|---|
 | `<your-host>` | `/downloads` | `/mnt/tgarr` |
 
+Or, instead of a mapping, tell tgarr where its downloads are as Sonarr/Radarr see them: `TGARR_ARR_DOWNLOAD_ROOT=/mnt/tgarr/tgarr` in tgarr's `.env` (the folder that holds what tgarr downloads for the *arr). Without it tgarr sends its own path, `/downloads/tgarr/…`.
+
 ## 5. Test end-to-end
 
 1. Sonarr **→ Series → ➕ Add → search for a show**.
