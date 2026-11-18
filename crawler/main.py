@@ -6448,6 +6448,7 @@ async def decay_eviction_worker() -> None:
                                          WHERE NOT COALESCE(subscribed, FALSE) AND NOT COALESCE(is_joined, FALSE)
                                            AND title LIKE '@%' AND title LIKE '%(resolving%')
                     AND posted_at < NOW() - INTERVAL '14 days'
+                    AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND COALESCE(local_path, '') = ''
                     AND id NOT IN (SELECT msg_id FROM favorites)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
