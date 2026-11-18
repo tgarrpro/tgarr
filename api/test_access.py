@@ -77,4 +77,19 @@ try:
 except ValueError:
     ok(True, "a name with a dot in it is refused")
 
+# QA #33: a person's own PIN must not wipe the count of wrong guesses at the owner's
+g = A.Guesses()
+for _ in range(4):
+    g.wrong("kid", now=0)
+g.wrong("kid", now=0)          # counted before checking: the 5th try locks
+ok(g.wait("kid", now=1) > 0, "the fifth try is counted even when it turns out to be a person's PIN")
+g2 = A.Guesses()
+for _ in range(3):
+    g2.wrong("kid", now=0)
+g2.wrong("kid", now=0)
+g2.undo("kid")                 # it was the child's own PIN: that one guess is taken back, not all of them
+ok(g2.by["kid"][0] == 3, "a person's PIN takes back one guess, never resets the count")
+g2.undo("nobody")
+ok("nobody" not in g2.by, "taking back a guess nobody made does nothing")
+
 print(f"ok - {n} checks")

@@ -19,3 +19,7 @@ Only in the header: tgarr does not take it from the address, so it is not left i
 The same key is the one Sonarr, Radarr and Prowlarr use (`apikey=` for `/newznab`, `/sabnzbd` and `/api`).
 
 Keep the key away from the children's devices: whoever has it can change every setting.
+
+**Before you set it, if Sonarr, Radarr or Prowlarr already use tgarr:** without a key tgarr accepts any `apikey`.
+Once `TGARR_API_KEY` is set, `/newznab`, `/sabnzbd` and `/api` accept only that key, so put the same key in every
+*arr entry for tgarr (indexer and download client) at the same time, or their searches and downloads stop.

@@ -69,4 +69,23 @@ ok("await _hist_gap()        # the next item costs a request" in src and "_HIST_
 ok("AND tg_chat_id > -100000000000000000" in src, "own files are never turned into releases")
 ok('return {"kept": "by the api"}' in src, "a revoked session deletes no private chat")
 
+# QA #35: a favourite is never swept - every DELETE in the eviction worker spares favorites
+fav = sweep.count("NOT IN (SELECT msg_id FROM favorites)")
+ok(fav >= deletes, f"every sweep spares favourites ({fav} of {deletes})")
+# QA #37: every purge path keeps favourites and saved files
+pm = src[src.index("async def _purge_messages("):src.index("async def index_purge_worker(")]
+ok("protected" in pm and "SELECT msg_id FROM favorites" in pm and "| protected" in pm,
+   "the purge keeps favourites and saved files, and their releases")
+# QA #36: a placeholder channel is merged, never deleted with its rows
+mg = src[src.index("async def _merge_channel_rows("):src.index("async def _adopt_real_chat_id(")]
+ok("UPDATE releases SET primary_msg_id" in mg and "INSERT INTO favorites" in mg and mg.index("DELETE FROM channels") > mg.index("UPDATE messages SET channel_id"),
+   "a placeholder's releases, favourites and rows move over before it goes")
+ok(src.count("await _merge_channel_rows(conn,") == 2, "both merge places use the merge")
+# QA #31: photos are fetched, into a folder of their own
+ok('else msg.photo if mt == "photo"' in src and 'PHOTO_ROOT if mt == "photo"' in src, "an on-demand photo is fetched, into photo/")
+
+ok("AND m.id NOT IN (SELECT msg_id FROM favorites)" in src[src.index("async def index_purge_worker("):],
+   "the noise purge does not pick a channel holding only kept rows")
+ok("if expected and written < expected:" in src, "an on-demand file is complete only at its full size (QA #48)")
+
 print(f"ok - {n} checks")

@@ -112,4 +112,12 @@ class Guesses:
         return 0
 
     def right(self, who: str) -> None:
+        """The owner's PIN: the address starts afresh."""
         self.by.pop(who, None)
+
+    def undo(self, who: str) -> None:
+        """A guess counted before it was checked turned out to be a person's PIN: take that one guess back, but
+        never wipe the count - a child's own PIN must not reset the tries at the owner's (QA #33)."""
+        st = self.by.get(who)
+        if st and st[0] > 0:
+            st[0] -= 1

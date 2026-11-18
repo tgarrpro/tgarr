@@ -89,7 +89,7 @@ BACKFILL_LIMIT = int(os.environ.get("TG_BACKFILL_LIMIT", "5000"))
 PARSE_SCORE_MIN = float(os.environ.get("TG_PARSE_SCORE_MIN", "0.30"))
 DOWNLOAD_ROOT = os.environ.get("TG_DOWNLOAD_ROOT", "/downloads/tgarr")
 # Single source for the version this crawler reports to the registry.
-TGARR_VERSION = "0.5.16"
+TGARR_VERSION = "0.5.17"
 TGARR_UA = f"tgarr/{TGARR_VERSION} (+https://tgarr.me)"
 
 # ── adult (NSFW) classification ────────────────────────────────────────
@@ -874,6 +874,26 @@ async def _poll_without_account(row) -> bool:
     return False
 
 
+async def _merge_channel_rows(conn, old: int, new: int, chat_id: int) -> None:
+    """Move a placeholder channel's rows onto the real channel row, then drop the placeholder (QA #36). A post both
+    rows hold keeps one copy: the survivor gets the placeholder's favourite, its saved file and its releases first,
+    so nothing is cascade-deleted and the delete never fails on releases.primary_msg_id. Run inside a transaction."""
+    pairs = await conn.fetch(
+        """SELECT m.id AS old_id, o.id AS new_id, m.local_path AS old_lp, o.local_path AS new_lp
+           FROM messages m JOIN messages o ON o.channel_id = $2 AND o.tg_message_id = m.tg_message_id
+           WHERE m.channel_id = $1""", old, new)
+    for p in pairs:
+        await conn.execute("UPDATE releases SET primary_msg_id = $2 WHERE primary_msg_id = $1", p["old_id"], p["new_id"])
+        await conn.execute("""INSERT INTO favorites (msg_id) SELECT $2 FROM favorites WHERE msg_id = $1
+                              ON CONFLICT (msg_id) DO NOTHING""", p["old_id"], p["new_id"])
+        if p["old_lp"] and not p["old_lp"].startswith("__") and not (p["new_lp"] and not p["new_lp"].startswith("__")):
+            await conn.execute("UPDATE messages SET local_path = $2 WHERE id = $1", p["new_id"], p["old_lp"])
+    if pairs:
+        await conn.execute("DELETE FROM messages WHERE id = ANY($1::bigint[])", [p["old_id"] for p in pairs])
+    await conn.execute("UPDATE messages SET channel_id = $2, tg_chat_id = $3 WHERE channel_id = $1", old, new, chat_id)
+    await conn.execute("DELETE FROM channels WHERE id = $1", old)
+
+
 async def _adopt_real_chat_id(channel_id: int, real_chat_id: int) -> int:
     """The account has resolved a channel that so far was only known by name:
     give the channel row (and its messages) the real chat id. If the real
@@ -884,12 +904,7 @@ async def _adopt_real_chat_id(channel_id: int, real_chat_id: int) -> int:
             other = await conn.fetchval(
                 "SELECT id FROM channels WHERE tg_chat_id = $1 AND id <> $2", real_chat_id, channel_id)
             if other:
-                await conn.execute(
-                    """UPDATE messages m SET channel_id = $2, tg_chat_id = $3
-                       WHERE m.channel_id = $1 AND NOT EXISTS (
-                           SELECT 1 FROM messages o WHERE o.channel_id = $2
-                             AND o.tg_message_id = m.tg_message_id)""", channel_id, other, real_chat_id)
-                await conn.execute("DELETE FROM channels WHERE id = $1", channel_id)
+                await _merge_channel_rows(conn, channel_id, other, real_chat_id)
                 await conn.execute(
                     "UPDATE channels SET subscribed = TRUE, handle_known = TRUE WHERE id = $1", other)
                 return other
@@ -3044,6 +3059,7 @@ PER_SEED_DELAY_SEC = int(os.environ.get("TGARR_SEED_DELAY_SEC", "60"))  # 1 min/
 AUDIO_ROOT = "/downloads/audio"
 LIBRARY_ROOT = "/downloads/library"
 VIDEO_ROOT = "/downloads/video"
+PHOTO_ROOT = "/downloads/photo"     # photos fetched on demand (an export of a chat's photos): never the books library (QA #31)
 MAX_AUDIO_BYTES = int(os.environ.get("TG_MAX_AUDIO_BYTES", str(150 * 1024 * 1024)))
 MAX_BOOK_BYTES = int(os.environ.get("TG_MAX_BOOK_BYTES", str(80 * 1024 * 1024)))
 MAX_AUDIO_COUNT = int(os.environ.get("TG_MAX_AUDIO_COUNT", "300"))
@@ -5128,9 +5144,10 @@ async def subscription_poller() -> None:
                     existing = await conn.fetchval(
                         "SELECT id FROM channels WHERE tg_chat_id=$1", real_chat_id)
                     if existing and existing != row["id"]:
-                        # Real chat already in table (joined or pre-subscribed),
-                        # merge by deleting placeholder row
-                        await conn.execute("DELETE FROM channels WHERE id=$1", row["id"])
+                        # Real chat already in table (joined or pre-subscribed): its rows move over, then the
+                        # placeholder goes (QA #36: a bare DELETE cascaded its rows or failed on releases for ever)
+                        async with conn.transaction():
+                            await _merge_channel_rows(conn, row["id"], existing, real_chat_id)
                         await conn.execute(
                             """UPDATE channels SET subscribed=TRUE, username=$1,
                                last_polled_at=NOW() WHERE id=$2""",
@@ -6046,8 +6063,11 @@ async def _ondemand_fetch_one(row) -> None:
     await _heartbeat("on_demand_media_downloader", f"streaming msg {row['id']} ({mt})")
     root = (AUDIO_ROOT if mt == "audio"
             else VIDEO_ROOT if mt == "video"
+            else PHOTO_ROOT if mt == "photo"
             else LIBRARY_ROOT)
-    target = os.path.join(root, stored_name(row["file_name"], row["id"]))
+    os.makedirs(root, exist_ok=True)
+    fname = row["file_name"] or (f"photo-{row['id']}.jpg" if mt == "photo" else None)   # a photo has no name of its own
+    target = os.path.join(root, stored_name(fname, row["id"]))
     rel = os.path.relpath(target, "/downloads")
     # Two different files with one name (every scan is "book.pdf" to somebody): the second
     # one must not be taken for the first, nor be written over it. If another row already
@@ -6059,7 +6079,7 @@ async def _ondemand_fetch_one(row) -> None:
                     AND (file_unique_id IS DISTINCT FROM $3 OR $3 IS NULL) LIMIT 1""",
                 rel, row["id"], row["file_unique_id"])
         if other:
-            target = os.path.join(root, stored_name(row["file_name"], row["id"], taken=True))
+            target = os.path.join(root, stored_name(fname, row["id"], taken=True))
             rel = os.path.relpath(target, "/downloads")
     except Exception as e:
         log.warning("[on-demand-media] id=%s: could not look whether its name is taken: %s", row["id"], e)
@@ -6090,6 +6110,7 @@ async def _ondemand_fetch_one(row) -> None:
             raise RuntimeError("msg gone")
         media = (msg.audio if mt == "audio"
                  else msg.video if mt == "video"
+                 else msg.photo if mt == "photo"          # QA #31: photos had no branch, every one failed
                  else msg.document)
         if not media:
             raise RuntimeError("no media obj")
@@ -6162,7 +6183,7 @@ async def _ondemand_fetch_one(row) -> None:
         if not expected or written >= expected:
             _drop_tail_sidecar(target)       # the file is whole: no longer needed
 
-        if expected and written < expected * 0.95:
+        if expected and written < expected:             # a file short of its size is not complete (QA #48: 95% passed)
             log.warning("[on-demand-media] short download id=%s wrote=%s expected=%s",
                         row["id"], written, expected)
             async with db_pool.acquire() as conn:
@@ -6362,6 +6383,7 @@ async def decay_eviction_worker() -> None:
                     AND COALESCE(local_path, '') = ''
                     AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                    AND id NOT IN (SELECT msg_id FROM favorites)          -- a favourite is never swept (QA #35)
                 """, r'(\bcrypto\b|\bnft\b|\busdt\b|赌博|博彩|casino|gamble|gambling|'
                      r'投资理财|做单|赚钱|月入|代理|代充|代购|刷单|'
                      r'telegram[\s_]*bot|airdrop|'
@@ -6380,6 +6402,7 @@ async def decay_eviction_worker() -> None:
                     AND COALESCE(local_path, '') = ''
                     AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                    AND id NOT IN (SELECT msg_id FROM favorites)          -- a favourite is never swept (QA #35)
                 """, r'(qrcode|qr[\s_]*code|二维码|'
                      r'微信号|wechat[\s_]*id|加微信|加[\s_]*wx|'
                      r'contact[\s_]*us|联系我|联系方式|'
@@ -6406,6 +6429,7 @@ async def decay_eviction_worker() -> None:
                       AND NOT (c.username IS NULL AND COALESCE(c.members_count, 0) < 200)
                       AND COALESCE(m.local_path, '') = ''
                       AND m.id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                      AND m.id NOT IN (SELECT msg_id FROM favorites)      -- a favourite is never swept (QA #35)
                 """)
                 photo_n = int(r2a.split()[-1]) if r2a.startswith("DELETE") else 0
 
@@ -6421,6 +6445,7 @@ async def decay_eviction_worker() -> None:
                     AND COALESCE(local_path, '') = ''
                     AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                    AND id NOT IN (SELECT msg_id FROM favorites)          -- a favourite is never swept (QA #35)
                 """)
                 micro_n = (int(r2b.split()[-1]) if r2b.startswith("DELETE") else 0) + photo_n
 
@@ -6438,6 +6463,7 @@ async def decay_eviction_worker() -> None:
                     AND COALESCE(local_path, '') = ''
                     AND channel_id NOT IN (SELECT id FROM channels WHERE username IS NULL AND COALESCE(members_count, 0) < 200)
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                    AND id NOT IN (SELECT msg_id FROM favorites)          -- a favourite is never swept (QA #35)
                 """)
                 spam_n = int(r3.split()[-1]) if r3.startswith("DELETE") else 0
                 # 4) a channel that was never followed nor joined and never resolved ("@name (resolving…)")
@@ -7311,10 +7337,18 @@ async def _rehydrate_channel(channel_id: int, tg_chat_id: int, username: str, af
 async def _purge_messages(channel_id: int, msg_ids) -> int:
     """FK-safe delete of messages for one channel (downloads → releases →
     messages, one transaction). msg_ids=None purges every message in the
-    channel. Messages whose release has an active/queued download are kept.
-    Returns count of messages deleted."""
+    channel. Messages whose release has an active/queued download are kept, and so are favourites and rows
+    with a saved file (QA #37: every purge path used to delete them). Returns count of messages deleted."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
+            protected = {r["id"] for r in await conn.fetch(
+                """SELECT id FROM messages WHERE channel_id = $1
+                     AND (id IN (SELECT msg_id FROM favorites)
+                          OR (local_path IS NOT NULL AND local_path NOT LIKE '\\_\\_%' ESCAPE '\\'))""", channel_id)}
+            if msg_ids is not None:
+                msg_ids = [m for m in msg_ids if m not in protected]
+                if not msg_ids:
+                    return 0
             if msg_ids is None:
                 rel = await conn.fetch(
                     "SELECT id, primary_msg_id FROM releases WHERE primary_msg_id IN "
@@ -7323,6 +7357,7 @@ async def _purge_messages(channel_id: int, msg_ids) -> int:
                 rel = await conn.fetch(
                     "SELECT id, primary_msg_id FROM releases "
                     "WHERE primary_msg_id = ANY($1::bigint[])", msg_ids)
+            rel = [r for r in rel if r["primary_msg_id"] not in protected]     # a kept message keeps its release
             rel_ids = [r["id"] for r in rel]
             blocked_rel = set()
             if rel_ids:
@@ -7340,7 +7375,7 @@ async def _purge_messages(channel_id: int, msg_ids) -> int:
                         "DELETE FROM downloads WHERE release_id = ANY($1::bigint[])", purge_rel)
                     await conn.execute(
                         "DELETE FROM releases WHERE id = ANY($1::bigint[])", purge_rel)
-            keep_msgs = {r["primary_msg_id"] for r in rel if r["id"] in blocked_rel}
+            keep_msgs = {r["primary_msg_id"] for r in rel if r["id"] in blocked_rel} | protected
             if msg_ids is None:
                 if keep_msgs:
                     res = await conn.execute(
@@ -7423,7 +7458,11 @@ async def index_purge_worker() -> None:
                       AND COALESCE(c.subscribed,FALSE)=FALSE
                       AND COALESCE(c.title,'') NOT ILIKE 'KwickPOS%'
                       AND COALESCE(c.category,'') <> 'personal'
-                      AND EXISTS (SELECT 1 FROM messages m WHERE m.channel_id=c.id)
+                      -- a row the purge may take: favourites and saved files stay, so a channel holding only
+                      -- those must not be picked again every cycle (it starved the purge below for good)
+                      AND EXISTS (SELECT 1 FROM messages m WHERE m.channel_id=c.id
+                                  AND m.id NOT IN (SELECT msg_id FROM favorites)
+                                  AND (m.local_path IS NULL OR m.local_path LIKE '\\_\\_%' ESCAPE '\\'))
                     ORDER BY c.id
                     LIMIT 1
                 """)
