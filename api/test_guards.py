@@ -105,7 +105,16 @@ ok("WHEN EXCLUDED.art_server IS NOT NULL THEN EXCLUDED.art_lo ELSE usenet_cards.
    "numbers of two servers are never mixed")
 sb = src[src.index("def _usenet_scan_block("):src.index("async def _usenet_count(")]
 ok('mode == "back"' in sb and "newest = max(first, last - count + 1)" in sb and "USENET_START" not in sb, "the scan reads newest first, then backwards")
-ok('mode = "back" if (turns[grp] % 3 == 2 and back_at is not None) else "live"' in src, "two live blocks to one backward block")
+ok('mode = "back" if (turns[grp] % 3 == 2 and back_at) else "live"' in src, "two live blocks to one backward block")
 ok("budget, sorted(own))" in src, "the lease asks for the operator's groups and within its budget")
+
+# --- 0.5.18 review ------------------------------------------------------------------------------------------
+st = src[src.index("async def _usenet_store("):src.index("def _nzb_sample_alive(")] if "def _nzb_sample_alive(" in src[src.index("async def _usenet_store("):] else src[src.index("async def _usenet_store("):src.index("async def _usenet_store(") + 3000]
+ok("LEAST(usenet_cards.art_lo, EXCLUDED.art_lo) ELSE EXCLUDED.art_lo END" in st, "the own scan never mixes another server's numbers")
+ok('backs[grp] = cursor if cursor > first else 0' in src and 'and back_at) else "live"' in src, "a finished backward scan stays finished after a restart")
+ok("(resume if mode != \"back\" else cursors.get(grp, live_at))" in src, "live reading restarts where releases still settling begin")
+ok("began > live_at" in src, "a live jump leaves the skipped stretch to the backward reader")
+ok('mode == "back" and r["art_lo"] < start + USENET_SETTLE and start > first' in src, "a release at a backward block's edge is carried over")
+ok("html.unescape(m) for m in re.findall" in src, "kept NZB message-ids are unescaped before STAT")
 
 print(f"ok - {n} checks")

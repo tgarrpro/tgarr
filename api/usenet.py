@@ -129,7 +129,7 @@ class NNTP:
         the same on every one (QA #23)."""
         mid = str(message_id).strip().strip("<>")
         if not mid or any(c.isspace() or c in "<>" for c in mid):
-            return 430, {}
+            return 501, {}                  # a malformed id says nothing about the article: not "gone"
         code, _text = self.cmd(f"HEAD <{mid}>")
         if code != 221:
             return code, {}

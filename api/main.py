@@ -10203,6 +10203,8 @@ def _usenet_scan_block(cfg: dict, grp: str, start, asm, count: int, mode: str = 
         for k, r in list(asm.rel.items()):
             if mode != "back" and r["art_hi"] >= cursor - USENET_SETTLE and cursor <= last:
                 continue                              # may still be arriving
+            if mode == "back" and r["art_lo"] < start + USENET_SETTLE and start > first:
+                continue                              # its earlier parts are in the next (older) block
             del asm.rel[k]
             c = usenet.card(r)
             if not c:
@@ -10264,7 +10266,8 @@ async def _usenet_scan_worker():
             live_at = cursors.get(grp, k["live_next"] if k else None)
             back_at = backs.get(grp, k["back_next"] if k else None)
             # two live blocks to one backward block; backward only once live reading has begun somewhere
-            mode = "back" if (turns[grp] % 3 == 2 and back_at is not None) else "live"
+            # back_next: None = not begun, 0 = read back to the oldest article the provider keeps (done)
+            mode = "back" if (turns[grp] % 3 == 2 and back_at) else "live"
             turns[grp] += 1
             asm = (backasms if mode == "back" else asms).setdefault(grp, usenet.Assembler(grp))
             try:
@@ -10279,10 +10282,13 @@ async def _usenet_scan_worker():
                 await asyncio.sleep(120)
                 continue
             if mode == "back":
-                backs[grp] = cursor if cursor > first else None     # back at the oldest article kept: done
+                backs[grp] = cursor if cursor > first else 0        # back at the oldest article kept: done
             else:
-                if back_at is None and grp not in backs:            # where live reading began: backward starts there
-                    backs[grp] = cursor - n
+                began = cursor - n
+                if (back_at is None and grp not in backs) or (live_at is not None and began > live_at):
+                    # where live reading began - or jumped ahead to, past articles it never read: the backward
+                    # reader goes on from there, so the most recent unread stretch is read first (QA #25 review)
+                    backs[grp] = began
                 cursors[grp] = cursor
             async with db_pool.acquire() as conn:
                 await _usenet_store(conn, cards, cfg.get("host"))
@@ -10292,7 +10298,9 @@ async def _usenet_scan_worker():
                        ON CONFLICT (grp) DO UPDATE SET first_article = $2, last_article = $3, live_next = $4, back_next = $5,
                            headers = usenet_progress.headers + $6, cards = usenet_progress.cards + $7,
                            bytes = usenet_progress.bytes + $8, note = NULL, updated_at = NOW()""",
-                    grp, first, last, cursors.get(grp, live_at), backs.get(grp, back_at), n, len(cards), nbytes)
+                    # live: kept where the releases still settling begin, so a restart reads them whole again
+                    grp, first, last, (resume if mode != "back" else cursors.get(grp, live_at)),
+                    backs.get(grp, back_at), n, len(cards), nbytes)
                 await _usenet_count(conn, "usenet_today", day, n)
             logu.info("[usenet] %s: %s headers, %s cards, %.0f MB", grp, f"{n:,}", len(cards), nbytes / 1e6)
             await asyncio.sleep(20 if cursor <= last else 600)
@@ -10306,22 +10314,27 @@ _USENET_COLS = ("id", "name", "kind", "size", "grp", "poster", "posted_from", "p
 
 
 async def _usenet_store(conn, cards: list, server=None) -> None:
-    """Cards of this install's own scan: their numbers are this server's."""
+    """Cards of this install's own scan: their numbers are this server's. A card that held another server's numbers
+    (from the registry) takes these instead; they are never mixed (QA #23 review)."""
+    srv = (server or "").lower() or None
+    cols = _USENET_COLS + ("art_server",)
     for c in cards:
         row = dict(c)
         row["grp"] = row.pop("group", row.get("grp"))
+        row["art_server"] = srv
         await conn.execute(
-            f"""INSERT INTO usenet_cards ({", ".join(_USENET_COLS)})
-                VALUES ({", ".join(f"${i + 1}" for i in range(len(_USENET_COLS)))})
+            f"""INSERT INTO usenet_cards ({", ".join(cols)})
+                VALUES ({", ".join(f"${i + 1}" for i in range(len(cols)))})
                 ON CONFLICT (id) DO UPDATE SET size = EXCLUDED.size, files = EXCLUDED.files,
                     segments = EXCLUDED.segments, segments_expected = EXCLUDED.segments_expected,
-                    complete = EXCLUDED.complete, art_lo = LEAST(usenet_cards.art_lo, EXCLUDED.art_lo),
-                    art_hi = GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi), alive = EXCLUDED.alive,
+                    complete = EXCLUDED.complete,
+                    art_lo = CASE WHEN usenet_cards.art_server IS NOT DISTINCT FROM EXCLUDED.art_server
+                                  THEN LEAST(usenet_cards.art_lo, EXCLUDED.art_lo) ELSE EXCLUDED.art_lo END,
+                    art_hi = CASE WHEN usenet_cards.art_server IS NOT DISTINCT FROM EXCLUDED.art_server
+                                  THEN GREATEST(usenet_cards.art_hi, EXCLUDED.art_hi) ELSE EXCLUDED.art_hi END,
+                    art_server = EXCLUDED.art_server, alive = EXCLUDED.alive,
                     posted_to = EXCLUDED.posted_to""",
-            *[bool(row.get(k)) if k == "complete" else row.get(k) for k in _USENET_COLS])
-    if server and cards:
-        await conn.execute("UPDATE usenet_cards SET art_server = $2 WHERE id = ANY($1::text[])",
-                           [c["id"] for c in cards], server.lower())
+            *[bool(row.get(k)) if k == "complete" else row.get(k) for k in cols])
 
 
 def _usenet_nzb(cfg: dict, c) -> str:
@@ -10350,7 +10363,7 @@ NZB_KEEP_MAX = 8 * 1024 * 1024        # a built NZB is kept (gzipped) up to this
 def _nzb_sample_alive(cfg: dict, text: str) -> bool:
     """A kept NZB is served after a look at three of its articles: still there, or not (retention)."""
     import random
-    ids = re.findall(r">([^<>\s]+@[^<>\s]+)</segment>", text)
+    ids = [html.unescape(m) for m in re.findall(r">([^<>\s]+@[^<>\s]+)</segment>", text)]
     if not ids:
         return False
     nn = _usenet_connect(cfg)
