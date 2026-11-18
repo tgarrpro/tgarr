@@ -6296,6 +6296,16 @@ async def dialog_gc_worker() -> None:
         await asyncio.sleep(21600)  # 6h
 
 
+async def _evict_step(conn, name: str, sql: str, *args) -> str:
+    """One statement of the eviction sweep; a failure is logged with the step's name and the
+    sweep goes on with the next one (one broken statement used to skip all after it)."""
+    try:
+        return await conn.execute(sql, *args)
+    except Exception as e:
+        log.error("[eviction] step %s failed: %s", name, e)
+        return "DELETE 0"
+
+
 async def decay_eviction_worker() -> None:
     """Periodic LRU-by-decay cleanup: drop messages whose value has decayed
     below pull cost. Same model as deep_backfill cutoff but operating on
@@ -6316,10 +6326,10 @@ async def decay_eviction_worker() -> None:
                 async with db_pool.acquire() as conn:
                     # Don't delete rows that user has grabbed (local_path set)
                     # — those are local cache the user is using.
-                    result = await conn.execute(
+                    result = await _evict_step(conn, "decay " + category, 
                         f"""DELETE FROM messages
                            WHERE channel_id IN (
-                             SELECT id FROM channels WHERE content_category = $1
+                             SELECT id FROM channels WHERE COALESCE(content_category, 'mixed') = $1
                            )
                            AND posted_at < NOW() - ($2 || ' days')::INTERVAL
                            AND channel_id NOT IN (SELECT id FROM channels WHERE {PRIVATE_CHAT_SQL})
@@ -6343,7 +6353,7 @@ async def decay_eviction_worker() -> None:
             async with db_pool.acquire() as conn:
                 # 1a) Core ad keywords (crypto/gambling/scams) in file_name or
                 # caption — applied to ALL media types.
-                r1a = await conn.execute("""
+                r1a = await _evict_step(conn, "ad words", """
                     DELETE FROM messages
                     WHERE (
                         COALESCE(file_name, '') ~* $1
@@ -6360,7 +6370,7 @@ async def decay_eviction_worker() -> None:
                 # 1b) Photo-promo keywords (qrcode/微信号/招代理/引流) — PHOTO
                 # ONLY. These legitimately appear in Chinese marketing-book
                 # EPUB titles; applying them to documents false-positives.
-                r1b = await conn.execute("""
+                r1b = await _evict_step(conn, "photo promo words", """
                     DELETE FROM messages
                     WHERE media_type = 'photo'
                     AND (
@@ -6380,7 +6390,7 @@ async def decay_eviction_worker() -> None:
                 # 2) Tiered photo eviction by channel members_count. The client
                 # has no gold_score (federation-only) so members_count is the
                 # best quality proxy. Tighter for low-trust channels.
-                r2a = await conn.execute("""
+                r2a = await _evict_step(conn, "small photos", """
                     DELETE FROM messages m
                     USING channels c
                     WHERE m.channel_id = c.id
@@ -6400,7 +6410,7 @@ async def decay_eviction_worker() -> None:
                 photo_n = int(r2a.split()[-1]) if r2a.startswith("DELETE") else 0
 
                 # 2b) Non-photo micro-media — unchanged thresholds.
-                r2b = await conn.execute("""
+                r2b = await _evict_step(conn, "micro media", """
                     DELETE FROM messages
                     WHERE (
                       (media_type='video'    AND file_size < 5000000) OR
@@ -6417,7 +6427,7 @@ async def decay_eviction_worker() -> None:
                 # 3) Cross-channel hash spam — tightened 20 → 10. Same thumb
                 # in 10+ channels = forwarded promo bundle (sticker drops,
                 # coordinated drops), not legitimate organic reach.
-                r3 = await conn.execute("""
+                r3 = await _evict_step(conn, "cross-channel spam", """
                     DELETE FROM messages
                     WHERE thumb_md5 IN (
                         SELECT thumb_md5 FROM messages
@@ -6430,6 +6440,19 @@ async def decay_eviction_worker() -> None:
                     AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
                 """)
                 spam_n = int(r3.split()[-1]) if r3.startswith("DELETE") else 0
+                # 4) a channel that was never followed nor joined and never resolved ("@name (resolving…)")
+                # kept its rows for ever when it had no category (QA #21b: 1,462 videos of one such channel)
+                r4 = await _evict_step(conn, "abandoned placeholders", """
+                    DELETE FROM messages
+                    WHERE channel_id IN (SELECT id FROM channels
+                                         WHERE NOT COALESCE(subscribed, FALSE) AND NOT COALESCE(is_joined, FALSE)
+                                           AND title LIKE '@%' AND title LIKE '%(resolving%')
+                    AND posted_at < NOW() - INTERVAL '14 days'
+                    AND COALESCE(local_path, '') = ''
+                    AND id NOT IN (SELECT msg_id FROM favorites)
+                    AND id NOT IN (SELECT primary_msg_id FROM releases WHERE primary_msg_id IS NOT NULL)
+                """)
+                spam_n += int(r4.split()[-1]) if r4.startswith("DELETE") else 0
             if ads_n + micro_n + spam_n:
                 log.info("[eviction] quality sweep: ads=%d micro=%d cross-spam=%d",
                          ads_n, micro_n, spam_n)

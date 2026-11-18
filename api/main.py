@@ -10208,7 +10208,9 @@ _USENET_EP_RX = re.compile(r"S(\d{1,2})E(\d{1,3})", re.I)
 
 def _usenet_item_xml(c, base_url: str, apikey: str) -> str:
     link = html.escape(f"{base_url}/newznab/usenet/api?t=get&id=un-{c['id']}&apikey={apikey}", quote=True)
-    name, hd = c["name"], bool(re.search(r"\b(720|1080|2160)[pi]\b", c["name"], re.I))
+    raw = c["name"]
+    name = usenet.clean_release_name(raw) or raw                # cards made before 0.5.16 kept the posting header (QA #22)
+    hd = bool(re.search(r"\b(720|1080|2160)[pi]\b", name, re.I))
     ep = _USENET_EP_RX.search(name)
     if c["kind"] == "video":
         cat = ("5040" if hd else "5030") if ep or re.search(r"\b\d{4}[. ]\d{2}[. ]\d{2}\b", name) else ("2040" if hd else "2030")
@@ -10224,6 +10226,7 @@ def _usenet_item_xml(c, base_url: str, apikey: str) -> str:
             f"      <guid isPermaLink=\"false\">un-{c['id']}</guid>\n      <link>{link}</link>\n"
             f"      <pubDate>{when}</pubDate>\n      <category>{cat}</category>\n      <size>{c['size'] or 0}</size>\n"
             f"      <description>Usenet, {html.escape(c['grp'])}</description>\n"
+            + (f"      <comments>{html.escape(raw)}</comments>\n" if raw != name else "") +
             f"      <enclosure url=\"{link}\" length=\"{c['size'] or 0}\" type=\"application/x-nzb\"/>\n{attrs}    </item>")
 
 
@@ -10296,8 +10299,9 @@ async def newznab_usenet(request: Request, t: str = Query("search"), q: Optional
     where, params = ["alive >= 0.5"], []
     for w in re.split(r"[\s.]+", q or "")[:8]:
         if w:
-            params.append("%" + w.replace("%", "").replace("_", r"\_") + "%")
-            where.append(f"name ILIKE ${len(params)}")
+            # from the start of a word: "lexx" finds Lexx.S02E01, not Flexx or Alexx (QA #22)
+            params.append(r"\m" + re.escape(w))
+            where.append(f"name ~* ${len(params)}")
     if t == "tvsearch":
         where.append(r"kind = 'video' AND name ~* 'S\d{1,2}E\d{1,3}|\d{4}[. ]\d{2}[. ]\d{2}'")
         def _n(v):
@@ -11235,7 +11239,7 @@ async def _archive_for_arr(q: str) -> list:
         if asked_year and year != asked_year:      # asked with a year: an item that names none is not offered
             continue                               # (it could be the other film of that title)
         out.append({"guid": str(uuid.uuid5(uuid.NAMESPACE_URL, "https://archive.org/details/" + i["id"])),
-                    "name": archive_org.release_name(p["title"], year, f["height"]), "size": f["size"], "year": year,
+                    "name": archive_org.release_name(p["title"], year, f["height"], asked), "size": f["size"], "year": year,
                     "item_id": i["id"], "file": f["name"]})
     if out:
         async with db_pool.acquire() as conn:

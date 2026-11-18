@@ -120,4 +120,13 @@ try:
 except U.NNTPError:
     ok(True, "any other refusal is still an error")
 
+# ── release names as the *arrs read them (QA 2026-11-17 #22: Sonarr said "Unknown Series" to all of these) ──
+for subj, want in (("12916]-[FULL]-[#a.b.teevee@EFNet]-[ Lexx.S02E01.Mantrid.DVDRip.XviD-BE", "Lexx.S02E01.Mantrid.DVDRip.XviD-BE"),
+                   ("13096]-[FULL]-[#a.b.teevee@EFNet]-[ Lexx.S03E07.DVDRip.DivX-LOL", "Lexx.S03E07.DVDRip.DivX-LOL"),
+                   ("13198]-[FULL]-[#a.b.teevee@EFNet]-[ Lexx.S04E13.769.DVDRIP.XVID-BE", "Lexx.S04E13.769.DVDRIP.XVID-BE"),
+                   ("[REQ] Cory Doctorow - Down and Out [01/12] - yEnc", "Cory Doctorow - Down and Out")):
+    ok(U.clean_release_name(subj) == want, f"{subj!r} -> {want!r}, not {U.clean_release_name(subj)!r}")
+_r = {"title": "12916]-[FULL]-[#a.b.teevee@EFNet]-[ ", "files": {"Lexx.S02E01.Mantrid.DVDRip.XviD-BE.part01.rar": {"bytes": 50}, "x.nfo": {"bytes": 1}}}
+ok(U.display_name(_r) == "Lexx.S02E01.Mantrid.DVDRip.XviD-BE", "a subject with no name takes the release's name from its files")
+
 print(f"ok - {n} checks")
