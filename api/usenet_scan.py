@@ -494,9 +494,9 @@ class Sketch:
 
     @staticmethod
     def items_of(r: dict) -> list:
-        """The files of a release with the Message-IDs of their parts, in order - when every
-        file of it is small and what it holds is the kind fetched one file at a time. Only
-        files seen whole are listed."""
+        """The files of a release by name and size - when every file of it is small and what it holds is the kind
+        fetched one file at a time. Only files seen whole are listed. No Message-IDs: the registry only indexes
+        (Tom 2026-11-18); an NZB is built by each install for itself."""
         if r["kind"] not in ITEM_KINDS:
             return []
         payload = {k: v for k, v in r["files"].items() if k and not RX_HELPER.search(k)}
@@ -507,7 +507,7 @@ class Sketch:
             v = payload[name]
             ids = v[3] if len(v) > 3 else {}
             if all(p in ids for p in range(1, v[0] + 1)):
-                out.append({"name": name[:300], "size": int(v[2] * 0.97), "message_ids": [ids[p] for p in range(1, v[0] + 1)]})
+                out.append({"name": name[:300], "size": int(v[2] * 0.97)})
         return out
 
     def poster_lines(self, least: int = 5) -> list:
