@@ -14,10 +14,18 @@ go on using the browser's own, as before.
     install(what)           fetch 'voice' or 'pronunciation' (in a thread; see status)
     remove(what)            delete it again
     say(text) -> bytes      a WAV of the text, from the cache when it was said before
+
+The voice runs in a process of its own (QA 2026-11-17 #3): it takes 0.6-2 GB, and when the kernel
+took that memory back it killed the whole API with it - the web pages too. Now only the voice's
+process goes, the request is answered "use the browser's voice", and the next start is lighter
+(no pronunciation model for half an hour). Before a start the free memory is looked at: too little
+for the pronunciation model, the voice comes without it; too little for the voice, it is not
+started at all. A voice unused for a quarter of an hour ends its process, and the memory is back.
 """
 import hashlib
 import io
 import logging
+import multiprocessing
 import os
 import shutil
 import tarfile
@@ -102,7 +110,8 @@ def available() -> bool:
 
 
 def status() -> dict:
-    out = {"available": available(), "loaded": _engine["tts"] is not None}
+    w = _w["proc"]
+    out = {"available": available(), "loaded": bool(w is not None and w.is_alive()), "light": _light()}
     for what in FILES:
         s = _state[what]
         out[what] = {"installed": installed(what), "installing": s["doing"], "bytes": SIZES[what], "done": s["done"], "error": s["error"]}
@@ -218,16 +227,20 @@ def remove(what: str) -> None:
 # ───────────────────────── the voice ─────────────────────────
 
 def unload() -> None:
-    with _lock:
-        _engine.update(tts=None, lex=None, reader=None, words=None, key="")
+    """End the voice's process: its memory goes back at once."""
+    with _wlock:
+        _stop()
 
 
 def unload_if_idle() -> None:
-    """Called now and then: a model nobody has used for a quarter of an hour is let go
-    (the voice takes about 600 MB of memory, the pronunciation model about a gigabyte)."""
-    if _engine["tts"] is not None and time.time() - _engine["used"] > IDLE_UNLOAD_S:
-        unload()
-        log.info("[tts] voice put away after a quarter of an hour unused")
+    """Called now and then. The voice's process ends by itself after a quarter of an hour unused
+    (the voice takes about 600 MB of memory, the pronunciation model about a gigabyte); here the
+    parent lets go of a process that has ended."""
+    with _wlock:
+        p = _w["proc"]
+        if p is not None and not p.is_alive():
+            _stop()
+            log.info("[tts] voice put away after a quarter of an hour unused")
 
 
 def _load(pronunciation: bool) -> None:
@@ -241,7 +254,7 @@ def _load(pronunciation: bool) -> None:
         g.write(lex.lexicon_text(zh))
     os.replace(STANDIN_LEXICON + ".new", STANDIN_LEXICON)
     rule = ",".join(p for p in (os.path.join(VOICE_DIR, n) for n in ("phone-zh.fst", "date-zh.fst", "number-zh.fst")) if os.path.exists(p))
-    threads = max(1, min(4, (os.cpu_count() or 2) - 1))
+    threads = int(os.environ.get("TGARR_TTS_THREADS") or 0) or max(1, min(4, (os.cpu_count() or 2) - 1))
     cfg = sherpa_onnx.OfflineTtsConfig(
         model=sherpa_onnx.OfflineTtsModelConfig(
             kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
@@ -311,16 +324,32 @@ def say(text: str, pronunciation: bool = True, zh: str = "", en: str = "") -> by
         raise RuntimeError("nothing to say")
     if not available():
         raise RuntimeError("no voice is installed")
-    key = "p" if (pronunciation and installed("pronunciation")) else "-"
+    pronunciation = bool(pronunciation and installed("pronunciation"))
     sid = speaker(bool(tts_text.HAN.search(text)), zh, en)
+    for key in (("p", "-") if pronunciation else ("-",)):     # said before, with or without the model: from the cache
+        try:
+            with open(_cache_path(text, key, sid), "rb") as f:
+                data = f.read()
+            os.utime(_cache_path(text, key, sid), None)
+            if key == "p" or not pronunciation or _light():
+                return data
+        except OSError:
+            pass
+    data, key = _ask_worker(text, pronunciation, zh, en)
     path = _cache_path(text, key, sid)
     try:
-        with open(path, "rb") as f:
-            data = f.read()
-        os.utime(path, None)
-        return data
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(path + ".tmp", path)
     except OSError:
         pass
+    return data
+
+
+def _say_here(text: str, pronunciation: bool, zh: str, en: str) -> bytes:
+    """In the voice's process: make the sound."""
+    sid = speaker(bool(tts_text.HAN.search(text)), zh, en)
     with _lock:
         _load(pronunciation)
         e = _engine
@@ -333,14 +362,120 @@ def say(text: str, pronunciation: bool = True, zh: str = "", en: str = "") -> by
             raise RuntimeError("the voice made no sound for this")
         data = _wav(audio.samples, audio.sample_rate)
         e["used"] = time.time()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path + ".tmp", "wb") as f:
-            f.write(data)
-        os.replace(path + ".tmp", path)
-    except OSError:
-        pass
     return data
+
+
+# ───────────────────────── the voice's own process ─────────────────────────
+
+NEED_VOICE_MB = int(os.environ.get("TGARR_TTS_VOICE_MB") or 900)          # the voice, with room to work
+NEED_PRONUNCIATION_MB = int(os.environ.get("TGARR_TTS_PRONUNCIATION_MB") or 1100)   # the pronunciation model on top
+LIGHT_AFTER_CRASH_S = 30 * 60
+_w = {"proc": None, "conn": None, "key": "", "crash_at": 0.0}
+_wlock = threading.Lock()
+
+
+def _light() -> bool:
+    """After the voice's process was killed, it comes back without the pronunciation model for a while."""
+    return time.time() - _w["crash_at"] < LIGHT_AFTER_CRASH_S
+
+
+def headroom_mb():
+    """Memory free for a new process, in MB: the smaller of what this container may still take and
+    what the machine has available. None when neither can be read."""
+    out = []
+    try:
+        mx = open("/sys/fs/cgroup/memory.max").read().strip()
+        if mx != "max":
+            out.append((int(mx) - int(open("/sys/fs/cgroup/memory.current").read().strip())) / 2 ** 20)
+    except (OSError, ValueError):
+        pass
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                out.append(int(line.split()[1]) / 1024)
+                break
+    except (OSError, ValueError):
+        pass
+    return min(out) if out else None
+
+
+def _worker_main(conn) -> None:
+    """The voice's process: sentences in, sound out, until told to stop or unused for IDLE_UNLOAD_S."""
+    last = time.time()
+    while True:
+        if conn.poll(30):
+            try:
+                msg = conn.recv()
+            except EOFError:
+                return
+            if msg is None:
+                return
+            text, pron, zh, en = msg
+            try:
+                conn.send(("ok", _say_here(text, pron, zh, en)))
+            except RuntimeError as e:
+                conn.send(("err", str(e)))
+            except Exception as e:
+                conn.send(("err", "the voice could not say this: " + type(e).__name__))
+            last = time.time()
+        elif time.time() - last > IDLE_UNLOAD_S:
+            return
+
+
+def _stop() -> None:
+    p, c = _w["proc"], _w["conn"]
+    _w.update(proc=None, conn=None, key="")
+    if c is not None:
+        try:
+            c.send(None)
+        except Exception:
+            pass
+        try:
+            c.close()
+        except Exception:
+            pass
+    if p is not None:
+        p.join(5)
+        if p.is_alive():
+            p.kill()
+
+
+def _ask_worker(text: str, pronunciation: bool, zh: str, en: str):
+    """(WAV, key) from the voice's process, started first when it is not running."""
+    with _wlock:
+        p = _w["proc"]
+        want = "p" if (pronunciation and not _light()) else "-"
+        if p is not None and (not p.is_alive() or (_w["key"] == "-" and want == "p")):
+            _stop()
+            p = None
+        if p is None:
+            room = headroom_mb()
+            if room is not None and room < NEED_VOICE_MB:
+                raise RuntimeError(f"not enough free memory for the server voice ({room:.0f} MB, it needs about "
+                                   f"{NEED_VOICE_MB} MB): the browser's own voice reads instead")
+            if want == "p" and room is not None and room < NEED_VOICE_MB + NEED_PRONUNCIATION_MB:
+                want = "-"
+                log.info("[tts] %d MB free: the voice starts without the pronunciation model", room)
+            ctx = multiprocessing.get_context("spawn")
+            mine, theirs = ctx.Pipe()
+            p = ctx.Process(target=_worker_main, args=(theirs,), name="tgarr-voice", daemon=True)
+            p.start()
+            theirs.close()
+            _w.update(proc=p, conn=mine, key=want)
+        key = _w["key"]
+        try:
+            _w["conn"].send((text, key == "p", zh, en))
+            status, val = _w["conn"].recv()
+        except (EOFError, BrokenPipeError, ConnectionResetError, OSError):
+            code = p.exitcode if p is not None else None
+            _w["crash_at"] = time.time()
+            _stop()
+            log.warning("[tts] the voice's process ended (exit %s) - most likely out of memory; the API goes on, "
+                        "the voice comes back without the pronunciation model for half an hour", code)
+            raise RuntimeError("the server voice ran out of memory: the browser's own voice reads instead")
+    if status != "ok":
+        raise RuntimeError(val)
+    return val, key
 
 
 def trim_cache() -> int:

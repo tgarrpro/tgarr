@@ -1,5 +1,10 @@
 """Courses - the part with no web framework and no database in it.
 
+Besides courses the catalogue may hold index entries ("links"): free material that its publisher
+keeps on its own site - a textbook series, say. tgarr only points there: it shows the publisher, the
+publisher's own terms and the addresses; whoever uses it opens or downloads it from that site in their
+own browser. Nothing of it is fetched, copied or kept by tgarr.
+
 A course is a list of sources in an order: a "pack" - one of the lists shipped with tgarr
 (coursepacks/<language>/*.json), which names either items of the Internet Archive or a public
 Telegram channel (all of it, or the posts that carry one tag) - a folder of one's own files, or
@@ -22,8 +27,11 @@ TG_RX = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")          # a public channel'
 TAG_RX = re.compile(r"^#[^\s#]{1,40}$")                    # one tag: the posts of a channel that belong to this course
 LEVELS = ("all", "5-8", "8-12", "12-16", "16+")
 SUBJECTS = ("reading", "language", "math", "science", "history", "arts", "music", "computing", "life", "other")
-RIGHTS = ("PD", "CC BY", "CC BY-SA", "CC BY-NC", "CC BY-NC-SA", "CC BY-ND", "CC BY-NC-ND", "OLD", "USGOV", "NOCR")
+RIGHTS = ("PD", "CC BY", "CC BY-SA", "CC BY-NC", "CC BY-NC-SA", "CC BY-ND", "CC BY-NC-ND", "OLD", "USGOV", "NOCR",
+          "PUB")                                       # PUB: the publisher's own terms - an index entry quotes them
 PARTS_MOST = 400
+LINKS_MOST = 120
+URL_RX = re.compile(r"^https://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::\d+)?(?:/[^\s<>\"']*)?$")
 
 # rewards: what a parent may set, and the limits it is kept within
 REWARD_DEFAULT = {"on": False, "per_lesson": 20, "most": 120, "share": 70, "book_minutes": 20, "learn_free": True}
@@ -53,6 +61,29 @@ def clean_pack(raw) -> dict:
     if right not in RIGHTS:
         raise ValueError(f"right: one of {RIGHTS} (a list names the right its material is under)")
     channel, tag = str(raw.get("channel") or "").lstrip("@"), str(raw.get("tag") or "")
+    if raw.get("links"):
+        # an index entry: where the publisher keeps it, and on what terms - never parts, never a channel
+        if raw.get("parts") or channel:
+            raise ValueError("an index entry names links only, not parts or a channel")
+        if right != "PUB":
+            raise ValueError("an index entry is under its publisher's own terms: right PUB")
+        terms_url = str(raw.get("terms_url") or "")
+        if not URL_RX.match(terms_url):
+            raise ValueError("terms_url: the https address of the publisher's terms")
+        terms = " ".join(str(raw.get("terms") or "").split())[:500]
+        if not terms:
+            raise ValueError("terms: the publisher's own words on how it may be used")
+        links = []
+        for x in raw.get("links") or []:
+            if not isinstance(x, dict) or not URL_RX.match(str(x.get("url") or "")):
+                raise ValueError("a link is {url: https://..., title, file: true when it is a file to save}")
+            links.append({"url": str(x["url"]), "title": " ".join(str(x.get("title") or "").split())[:160], "file": bool(x.get("file"))})
+        if len(links) > LINKS_MOST:
+            raise ValueError(f"more than {LINKS_MOST} links")
+        return {"slug": slug, "title": title, "about": " ".join(str(raw.get("about") or "").split())[:600],
+                "lang": str(raw.get("lang") or "en")[:12], "level": level, "subject": subject, "right": right,
+                "credit": " ".join(str(raw.get("credit") or "").split())[:300], "parts": [], "channel": "", "tag": "", "upto": 0,
+                "links": links, "terms": terms, "terms_url": terms_url}
     if channel:
         # the lessons are the files posted in a public channel, in the order posted
         if raw.get("parts"):
@@ -118,7 +149,7 @@ def load_packs(folder: str, log=None) -> dict:
 # nothing else - and a catalogue older than the one an install has is not taken (so that an old
 # one, with a list since withdrawn, cannot be played back to it).
 CATALOGUE_KEYS = ("UNQXsA23nwAYFx7yGTvc9gSxHHOXID49Rby5MaPpvMQ=",)
-CATALOGUE_CHANNELS = ("tgarr0",)
+CATALOGUE_CHANNELS = ("tgarr0", "tgarr_vi", "tgarr_ko", "tgarr_tl", "tgarr_fa")   # tgarr's own: Chinese, Vietnamese, Korean, Filipino, Persian
 CATALOGUE_MOST, CATALOGUE_BYTES = 2000, 8 * 1024 * 1024
 
 
