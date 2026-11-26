@@ -1,0 +1,60 @@
+# The website and README link to releases/latest/download/<file> for the three one-click installers. GitHub serves
+# those from the *latest* release only, so every release must carry them - v0.5.14 to v0.5.19 shipped without them
+# and all three links answered 404 for a week.
+#
+# The files do not change with the version (the installers fetch install.ps1 / install.sh from main and pull :latest
+# images; the TV app is a WebView signed with a key that is not in CI), so the job copies them from the newest earlier
+# release that has them, then checks that every public link answers 200. It fails loudly if it cannot.
+name: release assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'     # daily as well: a release made some other way still gets checked within a day
+
+permissions:
+  contents: write
+
+jobs:
+  assets:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      FILES: install-tgarr.cmd install-tgarr-macos.zip tgarr-tv.apk
+    steps:
+      - name: Carry the installers onto the latest release
+        run: |
+          set -eu
+          tag=$(gh release view --json tagName -q .tagName)
+          have=$(gh release view "$tag" --json assets -q '.assets[].name')
+          missing=""
+          for f in $FILES; do echo "$have" | grep -qxF "$f" || missing="$missing $f"; done
+          if [ -z "$missing" ]; then echo "$tag already has all three"; exit 0; fi
+          echo "$tag is missing:$missing"
+          src=""
+          for t in $(gh release list -L 100 --json tagName -q '.[].tagName'); do
+            [ "$t" = "$tag" ] && continue
+            a=$(gh release view "$t" --json assets -q '.assets[].name')
+            ok=1
+            for f in $missing; do echo "$a" | grep -qxF "$f" || ok=0; done
+            if [ "$ok" = 1 ]; then src=$t; break; fi
+          done
+          if [ -z "$src" ]; then echo "::error::no earlier release has$missing"; exit 1; fi
+          echo "copying from $src"
+          mkdir -p carry && cd carry
+          for f in $missing; do gh release download "$src" -p "$f"; done
+          gh release upload "$tag" $missing
+
+      - name: Every public download link answers 200
+        run: |
+          set -u
+          bad=0
+          for f in $FILES; do
+            code=$(curl -sL -o /dev/null -w '%{http_code}' "https://github.com/$GH_REPO/releases/latest/download/$f")
+            echo "$f $code"
+            [ "$code" = 200 ] || { echo "::error::$f answers $code"; bad=1; }
+          done
+          exit $bad
